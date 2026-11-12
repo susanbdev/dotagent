@@ -10,7 +10,10 @@
 	autocrlf = input
 
 [protocol]
-	allow = https
+	allow = never
+
+[protocol "https"]
+	allow = always
 
 [protocol "file"]
 	allow = never

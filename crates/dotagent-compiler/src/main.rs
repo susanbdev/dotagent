@@ -335,7 +335,10 @@ fn render_hardened_gitconfig() -> String {
 	autocrlf = input
 
 [protocol]
-	allow = https
+	allow = never
+
+[protocol "https"]
+	allow = always
 
 [protocol "file"]
 	allow = never

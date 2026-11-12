@@ -32,7 +32,8 @@ git config --global core.fsmonitor false
 git config --global core.pager cat
 git config --global core.symlinks false
 git config --global core.autocrlf input
-git config --global protocol.allow https
+git config --global protocol.allow never
+git config --global protocol.https.allow always
 git config --global protocol.file.allow never
 git config --global protocol.ext.allow never
 git config --global protocol.git.allow never
