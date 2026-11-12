@@ -1,0 +1,701 @@
+#![forbid(unsafe_code)]
+
+//! Canonical + lexical path policy engine.
+//! Enforces:
+//! - Zero access to temp (`/tmp`, `/var/tmp`, `/dev/shm`, `tmp/`, `.tmp/`)
+//! - Zero access to caches (`.cache/`, `~/.cache`, `__pycache__/`, `.next/`, `.turbo/`, etc.)
+//! - Zero access to dependency trees (`node_modules/`, `vendor/`, `.venv/`, `site-packages/`, etc.)
+//! - Zero access to secrets/credentials (`.env*`, `*.pem`, `*.key`, `~/.ssh`, `~/.aws`, etc.)
+//! - Component-by-component symlink escape detection (`lstat` + `read_link`)
+//! - Strict per-repo boundary (blocks cross-repo cache/context bleed)
+//! - Single Root Authority File (`<repo_root>/AGENTS.md` ONLY — all nested/shadow instruction files blocked)
+//! - Control-plane immutability (`AGENTS.md`, `.git/`, `.claude/`, `.codex/`, `.cursor/`, `.guard/`)
+//! - Max 2-level directory walk / relative `..` climb restriction
+
+use std::fs;
+use std::path::{Component, Path, PathBuf};
+
+use crate::unicode_guard::{ScanMode, scan_unicode};
+
+pub const MAX_DIRECTORY_WALK_DEPTH: usize = 2;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PathAccess {
+    Read,
+    Write,
+    ListSearch {
+        requested_depth: Option<usize>,
+    },
+    /// Used when inspecting a pointer/link mentioned inside a doc or source file.
+    ReferencePointer,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PathViolation {
+    pub code: &'static str,
+    pub detail: String,
+    pub is_poisoned_zone: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ValidatedPath {
+    pub canonical_or_norm: PathBuf,
+    pub repo_rel: String,
+    pub is_root_authority: bool,
+}
+
+pub fn validate_path(
+    repo_root: &Path,
+    cwd: &Path,
+    raw_path: &str,
+    access: PathAccess,
+) -> Result<ValidatedPath, PathViolation> {
+    let trimmed = raw_path.trim();
+    if trimmed.is_empty() {
+        return Err(PathViolation {
+            code: "EMPTY_PATH",
+            detail: "Empty path rejected".to_string(),
+            is_poisoned_zone: false,
+        });
+    }
+
+    if trimmed.contains('\n') || trimmed.contains('\r') || trimmed.contains('\0') {
+        return Err(PathViolation {
+            code: "PATH_CONTROL_INJECTION",
+            detail: "Control or newline character inside file path rejected".to_string(),
+            is_poisoned_zone: false,
+        });
+    }
+
+    let unicode_issues = scan_unicode(trimmed, ScanMode::StrictPathOrCommand);
+    if let Some(first) = unicode_issues.first() {
+        return Err(PathViolation {
+            code: first.code,
+            detail: format!("Path '{}' failed Unicode check: {}", trimmed, first.detail),
+            is_poisoned_zone: false,
+        });
+    }
+
+    // Expand leading `~` so home-directory caches/secrets (`~/.cache`, `~/.ssh`) are caught immediately
+    let expanded = expand_tilde(trimmed);
+
+    // 1. Check raw lexical prefixes and segments BEFORE resolving symlinks or `..`
+    check_forbidden_zones_lexical(&expanded, trimmed)?;
+
+    // Check relative `..` climb depth (max 2 levels)
+    let parent_climbs = Path::new(&expanded)
+        .components()
+        .filter(|c| matches!(c, Component::ParentDir))
+        .count();
+    if parent_climbs > MAX_DIRECTORY_WALK_DEPTH {
+        return Err(PathViolation {
+            code: "MAX_TRAVERSAL_DEPTH_EXCEEDED",
+            detail: format!(
+                "Path '{trimmed}' climbs {parent_climbs} parent levels (> max {MAX_DIRECTORY_WALK_DEPTH} levels)"
+            ),
+            is_poisoned_zone: false,
+        });
+    }
+
+    // Enforce directory search / walk depth ceiling (<= 2)
+    if let PathAccess::ListSearch { requested_depth } = access {
+        match requested_depth {
+            None => {
+                return Err(PathViolation {
+                    code: "UNBOUNDED_TRAVERSAL_BLOCKED",
+                    detail: format!(
+                        "Unbounded recursive traversal on '{trimmed}' is forbidden; restrict depth to <= {MAX_DIRECTORY_WALK_DEPTH} levels."
+                    ),
+                    is_poisoned_zone: false,
+                });
+            }
+            Some(d) if d > MAX_DIRECTORY_WALK_DEPTH => {
+                return Err(PathViolation {
+                    code: "MAX_TRAVERSAL_DEPTH_EXCEEDED",
+                    detail: format!(
+                        "Requested traversal depth {d} on '{trimmed}' exceeds max {MAX_DIRECTORY_WALK_DEPTH} levels."
+                    ),
+                    is_poisoned_zone: false,
+                });
+            }
+            _ => {}
+        }
+    }
+
+    let canon_repo = fs::canonicalize(repo_root).unwrap_or_else(|_| lexical_normalize(repo_root));
+    let base_dir = if Path::new(&expanded).is_absolute() {
+        PathBuf::from(&expanded)
+    } else {
+        cwd.join(&expanded)
+    };
+
+    // 2. Walk every existing component to detect symlinks pointing to forbidden zones or escaping repo_root
+    let resolved = resolve_checking_symlinks(&base_dir, &canon_repo)?;
+
+    // 3. Re-check forbidden zones on resolved canonical path
+    check_forbidden_zones_lexical(&resolved.to_string_lossy(), trimmed)?;
+
+    // 4. Enforce strict repository boundary (anti-cross-repo cache/context bleed)
+    if !resolved.starts_with(&canon_repo) {
+        return Err(PathViolation {
+            code: "REPO_BOUNDARY_ESCAPE",
+            detail: format!(
+                "Path '{trimmed}' resolves to '{}' outside repository root '{}' (cross-boundary access / cache bleed blocked)",
+                resolved.display(),
+                canon_repo.display()
+            ),
+            is_poisoned_zone: false,
+        });
+    }
+
+    let rel_path_buf = resolved
+        .strip_prefix(&canon_repo)
+        .unwrap_or(Path::new(""))
+        .to_path_buf();
+    let repo_rel = path_to_slash_string(&rel_path_buf);
+
+    // 5. Enforce Single Root Authority File (`<repo_root>/AGENTS.md` ONLY)
+    let is_root_authority = check_authority_file_policy(&repo_rel, access)?;
+
+    // 6. Enforce Control-Plane Immutability on Writes
+    if access == PathAccess::Write {
+        check_immutable_control_plane(&repo_rel)?;
+    }
+
+    // 7. Block reading lockfiles & minified bundles that saturate context windows
+    if access == PathAccess::Read {
+        check_lockfile_or_bundle(&repo_rel)?;
+    }
+
+    Ok(ValidatedPath {
+        canonical_or_norm: resolved,
+        repo_rel,
+        is_root_authority,
+    })
+}
+
+fn expand_tilde(raw: &str) -> String {
+    if raw == "~" {
+        if let Ok(home) = std::env::var("HOME") {
+            return home;
+        }
+    } else if let Some(rest) = raw.strip_prefix("~/") {
+        if let Ok(home) = std::env::var("HOME") {
+            return format!("{}/{rest}", home.trim_end_matches('/'));
+        }
+    }
+    raw.to_string()
+}
+
+pub fn check_forbidden_zones_lexical(
+    path_str: &str,
+    display_raw: &str,
+) -> Result<(), PathViolation> {
+    let normalized_slashes = path_str.replace('\\', "/");
+    let lower = normalized_slashes.to_ascii_lowercase();
+
+    // System temp & shared-memory prefixes
+    const TMP_PREFIXES: &[&str] = &[
+        "/tmp",
+        "/var/tmp",
+        "/dev/shm",
+        "/run/user",
+        "/private/tmp",
+        "/private/var/tmp",
+    ];
+    for prefix in TMP_PREFIXES {
+        if lower == *prefix || lower.starts_with(&format!("{prefix}/")) {
+            return Err(PathViolation {
+                code: "FORBIDDEN_TMP_PATH",
+                detail: format!(
+                    "Access to temporary directory '{display_raw}' is strictly forbidden."
+                ),
+                is_poisoned_zone: true,
+            });
+        }
+    }
+
+    // System secret / proxy / procfs prefixes
+    const SYSTEM_SECRET_PREFIXES: &[&str] = &[
+        "/proc/self/environ",
+        "/var/lib/agy-plugin-proxy",
+        "/etc/shadow",
+        "/etc/gshadow",
+    ];
+    for prefix in SYSTEM_SECRET_PREFIXES {
+        if lower == *prefix || lower.starts_with(&format!("{prefix}/")) {
+            return Err(PathViolation {
+                code: "FORBIDDEN_SECRET_PATH",
+                detail: format!("Access to sensitive system path '{display_raw}' is forbidden."),
+                is_poisoned_zone: true,
+            });
+        }
+    }
+    if lower.starts_with("/proc/") && lower.ends_with("/environ") {
+        return Err(PathViolation {
+            code: "FORBIDDEN_SECRET_PATH",
+            detail: format!("Reading process environment '{display_raw}' is forbidden."),
+            is_poisoned_zone: true,
+        });
+    }
+
+    let segments: Vec<&str> = normalized_slashes
+        .split('/')
+        .filter(|s| !s.is_empty() && *s != ".")
+        .collect();
+
+    for (idx, seg) in segments.iter().enumerate() {
+        let seg_lower = seg.to_ascii_lowercase();
+
+        // Temp directory segments anywhere in path
+        if matches!(seg_lower.as_str(), "tmp" | ".tmp" | "temp" | ".temp") {
+            return Err(PathViolation {
+                code: "FORBIDDEN_TMP_PATH",
+                detail: format!(
+                    "Access to temp folder segment '{seg}' in '{display_raw}' is forbidden."
+                ),
+                is_poisoned_zone: true,
+            });
+        }
+
+        // Cache directory segments anywhere in path
+        if is_cache_segment(&seg_lower) {
+            return Err(PathViolation {
+                code: "FORBIDDEN_CACHE_PATH",
+                detail: format!("Access to cache folder '{seg}' in '{display_raw}' is forbidden."),
+                is_poisoned_zone: true,
+            });
+        }
+
+        // `~/.cargo/registry` or `~/.cargo/git` or `Library/Caches`
+        if seg_lower == ".cargo" {
+            if let Some(next) = segments.get(idx + 1) {
+                let nl = next.to_ascii_lowercase();
+                if nl == "registry" || nl == "git" {
+                    return Err(PathViolation {
+                        code: "FORBIDDEN_CACHE_PATH",
+                        detail: format!(
+                            "Access to Cargo registry/git cache in '{display_raw}' is forbidden."
+                        ),
+                        is_poisoned_zone: true,
+                    });
+                }
+            }
+        }
+        if seg_lower == "library"
+            && segments
+                .get(idx + 1)
+                .is_some_and(|n| n.eq_ignore_ascii_case("caches"))
+        {
+            return Err(PathViolation {
+                code: "FORBIDDEN_CACHE_PATH",
+                detail: format!("Access to macOS Library/Caches in '{display_raw}' is forbidden."),
+                is_poisoned_zone: true,
+            });
+        }
+
+        // Dependency / vendor / package folders
+        if is_dependency_segment(&seg_lower) {
+            return Err(PathViolation {
+                code: "FORBIDDEN_DEPENDENCY_PATH",
+                detail: format!(
+                    "Snooping inside dependency folder '{seg}' in '{display_raw}' is strictly forbidden."
+                ),
+                is_poisoned_zone: true,
+            });
+        }
+        // Rust `target/{debug,release}/deps` or `target/{debug,release}/build`
+        if seg_lower == "target" {
+            if let (Some(profile), Some(sub)) = (segments.get(idx + 1), segments.get(idx + 2)) {
+                let pl = profile.to_ascii_lowercase();
+                let sl = sub.to_ascii_lowercase();
+                if matches!(pl.as_str(), "debug" | "release")
+                    && matches!(sl.as_str(), "deps" | "build" | ".fingerprint")
+                {
+                    return Err(PathViolation {
+                        code: "FORBIDDEN_DEPENDENCY_PATH",
+                        detail: format!(
+                            "Access to compiled dependency/cache artifact '{display_raw}' is forbidden."
+                        ),
+                        is_poisoned_zone: true,
+                    });
+                }
+            }
+        }
+
+        // Secret / credential directories & files
+        if is_secret_segment(&seg_lower) {
+            return Err(PathViolation {
+                code: "FORBIDDEN_SECRET_PATH",
+                detail: format!("Access to secret/credential path '{display_raw}' is forbidden."),
+                is_poisoned_zone: true,
+            });
+        }
+        if seg_lower == ".config"
+            && segments
+                .get(idx + 1)
+                .is_some_and(|n| matches!(n.to_ascii_lowercase().as_str(), "gh" | "gcloud" | "op"))
+        {
+            return Err(PathViolation {
+                code: "FORBIDDEN_SECRET_PATH",
+                detail: format!("Access to CLI credential store '{display_raw}' is forbidden."),
+                is_poisoned_zone: true,
+            });
+        }
+        if seg_lower == ".git"
+            && segments
+                .get(idx + 1)
+                .is_some_and(|n| matches!(n.to_ascii_lowercase().as_str(), "hooks" | "config"))
+        {
+            return Err(PathViolation {
+                code: "FORBIDDEN_GIT_CONTROL_PATH",
+                detail: format!(
+                    "Access to '.git/hooks' or '.git/config' ('{display_raw}') is strictly forbidden."
+                ),
+                is_poisoned_zone: true,
+            });
+        }
+    }
+
+    Ok(())
+}
+
+fn is_cache_segment(seg_lower: &str) -> bool {
+    matches!(
+        seg_lower,
+        ".cache"
+            | "__pycache__"
+            | ".pytest_cache"
+            | ".mypy_cache"
+            | ".ruff_cache"
+            | ".hypothesis"
+            | ".tox"
+            | ".nox"
+            | ".next"
+            | ".nuxt"
+            | ".turbo"
+            | ".parcel-cache"
+            | ".vite"
+            | ".eslintcache"
+            | ".stylelintcache"
+            | ".angular"
+            | ".svelte-kit"
+            | ".docusaurus"
+            | ".ccache"
+            | ".sass-cache"
+            | ".gradle"
+            | ".m2"
+            | ".ivy2"
+            | ".sbt"
+            | ".npm"
+            | ".pnpm-store"
+            | ".rustup"
+    )
+}
+
+fn is_dependency_segment(seg_lower: &str) -> bool {
+    matches!(
+        seg_lower,
+        "node_modules"
+            | "bower_components"
+            | "jspm_packages"
+            | "vendor"
+            | ".venv"
+            | "venv"
+            | "virtualenv"
+            | "site-packages"
+            | "dist-packages"
+            | "__pypackages__"
+            | ".pnpm"
+            | ".yarn"
+            | "pods"
+            | "carthage"
+            | ".bundle"
+            | "elm-stuff"
+            | "deps"
+    )
+}
+
+fn is_secret_segment(seg_lower: &str) -> bool {
+    if seg_lower == ".env" || seg_lower.starts_with(".env.") {
+        return true;
+    }
+    if matches!(
+        seg_lower,
+        ".ssh"
+            | ".aws"
+            | ".gnupg"
+            | ".kube"
+            | ".netrc"
+            | ".git-credentials"
+            | ".gitcookies"
+            | ".npmrc"
+            | ".pypirc"
+            | "id_rsa"
+            | "id_ed25519"
+            | "id_ecdsa"
+            | "id_dsa"
+    ) {
+        return true;
+    }
+    if seg_lower.starts_with("id_rsa.")
+        || seg_lower.starts_with("id_ed25519.")
+        || seg_lower.starts_with("id_ecdsa.")
+    {
+        return true;
+    }
+    for ext in [".pem", ".key", ".p12", ".pfx", ".jks", ".keystore", ".kdbx"] {
+        if seg_lower.ends_with(ext) {
+            return true;
+        }
+    }
+    false
+}
+
+fn resolve_checking_symlinks(abs_path: &Path, canon_repo: &Path) -> Result<PathBuf, PathViolation> {
+    let mut acc = PathBuf::new();
+    for comp in abs_path.components() {
+        match comp {
+            Component::RootDir => acc.push("/"),
+            Component::Prefix(p) => acc.push(p.as_os_str()),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                acc.pop();
+            }
+            Component::Normal(seg) => {
+                acc.push(seg);
+                if let Ok(meta) = fs::symlink_metadata(&acc) {
+                    if meta.file_type().is_symlink() {
+                        let target = fs::read_link(&acc).map_err(|e| PathViolation {
+                            code: "SYMLINK_READ_ERROR",
+                            detail: format!("Failed reading symlink '{}': {e}", acc.display()),
+                            is_poisoned_zone: false,
+                        })?;
+                        // Check raw link target lexically first (catches broken symlink to `/tmp/payload`!)
+                        check_forbidden_zones_lexical(
+                            &target.to_string_lossy(),
+                            &acc.to_string_lossy(),
+                        )?;
+
+                        let resolved_target = if target.is_absolute() {
+                            target
+                        } else {
+                            let mut base = acc.clone();
+                            base.pop();
+                            base.join(target)
+                        };
+                        let canon_target = fs::canonicalize(&resolved_target)
+                            .unwrap_or_else(|_| lexical_normalize(&resolved_target));
+
+                        check_forbidden_zones_lexical(
+                            &canon_target.to_string_lossy(),
+                            &acc.to_string_lossy(),
+                        )?;
+
+                        // Only enforce repo containment once inside repo_root (allow OS symlinks above repo_root if any)
+                        if acc.starts_with(canon_repo) && !canon_target.starts_with(canon_repo) {
+                            return Err(PathViolation {
+                                code: "SYMLINK_BOUNDARY_ESCAPE",
+                                detail: format!(
+                                    "Symlink '{}' points outside repository root to '{}' (confused-deputy symlink escape blocked)",
+                                    acc.display(),
+                                    canon_target.display()
+                                ),
+                                is_poisoned_zone: true,
+                            });
+                        }
+                        acc = canon_target;
+                    }
+                }
+            }
+        }
+    }
+    Ok(acc)
+}
+
+fn check_authority_file_policy(repo_rel: &str, access: PathAccess) -> Result<bool, PathViolation> {
+    if repo_rel.is_empty() {
+        return Ok(false);
+    }
+
+    // Exact root `AGENTS.md` is the ONLY permitted authority file in the repository
+    if repo_rel == "AGENTS.md" {
+        if access == PathAccess::Write {
+            return Err(PathViolation {
+                code: "IMMUTABLE_ROOT_AUTHORITY",
+                detail: "Root 'AGENTS.md' is immutable to agents; propose changes in prose for human review."
+                    .to_string(),
+                is_poisoned_zone: false,
+            });
+        }
+        return Ok(true);
+    }
+
+    let lower = repo_rel.to_ascii_lowercase();
+    let file_name = lower.rsplit('/').next().unwrap_or(&lower);
+
+    let is_shadow_or_nested_authority = matches!(
+        file_name,
+        "agents.md"
+            | "agents.override.md"
+            | "claude.md"
+            | "claude.local.md"
+            | "gemini.md"
+            | ".cursorrules"
+            | ".windsurfrules"
+            | ".clinerules"
+            | ".roorules"
+            | "copilot-instructions.md"
+            | ".aider.conf.yml"
+    ) || file_name.ends_with(".instructions.md")
+        || lower.starts_with(".cursor/rules/")
+        || lower.contains("/.cursor/rules/")
+        || lower.starts_with(".claude/rules/")
+        || lower.contains("/.claude/rules/")
+        || lower.starts_with(".github/instructions/")
+        || lower.contains("/.github/instructions/");
+
+    if is_shadow_or_nested_authority {
+        return Err(PathViolation {
+            code: "UNAUTHORIZED_INSTRUCTION_FILE",
+            detail: format!(
+                "Instruction file '{repo_rel}' is blocked: ONLY root 'AGENTS.md' is an authorized instruction source. All nested/shadow instruction files are untrusted."
+            ),
+            is_poisoned_zone: true,
+        });
+    }
+
+    Ok(false)
+}
+
+fn check_immutable_control_plane(repo_rel: &str) -> Result<(), PathViolation> {
+    let lower = repo_rel.to_ascii_lowercase();
+    let protected_prefixes = [
+        ".git/",
+        ".guard/",
+        ".agent-guard/",
+        ".claude/",
+        ".codex/",
+        ".cursor/",
+        ".gemini/",
+        ".github/",
+    ];
+    for p in protected_prefixes {
+        if lower == p.trim_end_matches('/') || lower.starts_with(p) {
+            return Err(PathViolation {
+                code: "IMMUTABLE_CONTROL_PLANE",
+                detail: format!(
+                    "Modifying control-plane path '{repo_rel}' is hard-blocked (self-tampering prohibition)."
+                ),
+                is_poisoned_zone: false,
+            });
+        }
+    }
+    if matches!(
+        lower.as_str(),
+        "agents.md"
+            | "review.md"
+            | ".gitconfig"
+            | ".envrc"
+            | ".ignore"
+            | ".rgignore"
+            | ".cursorignore"
+    ) {
+        return Err(PathViolation {
+            code: "IMMUTABLE_CONTROL_PLANE",
+            detail: format!("Modifying protected configuration '{repo_rel}' is hard-blocked."),
+            is_poisoned_zone: false,
+        });
+    }
+    Ok(())
+}
+
+fn check_lockfile_or_bundle(repo_rel: &str) -> Result<(), PathViolation> {
+    let lower = repo_rel.to_ascii_lowercase();
+    let file_name = lower.rsplit('/').next().unwrap_or(&lower);
+    if matches!(
+        file_name,
+        "package-lock.json"
+            | "pnpm-lock.yaml"
+            | "yarn.lock"
+            | "bun.lockb"
+            | "composer.lock"
+            | "gemfile.lock"
+            | "poetry.lock"
+    ) || file_name.ends_with(".min.js")
+        || file_name.ends_with(".min.css")
+        || file_name.ends_with(".js.map")
+        || file_name.ends_with(".css.map")
+        || file_name.ends_with(".wasm")
+    {
+        return Err(PathViolation {
+            code: "LOCKFILE_OR_BUNDLE_BLOCKED",
+            detail: format!(
+                "Reading lockfile or compiled bundle '{repo_rel}' is blocked to prevent token exhaustion and dependency-metadata injection."
+            ),
+            is_poisoned_zone: false,
+        });
+    }
+    Ok(())
+}
+
+pub fn lexical_normalize(p: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for comp in p.components() {
+        match comp {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                out.pop();
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
+}
+
+fn path_to_slash_string(p: &Path) -> String {
+    let mut parts = Vec::new();
+    for c in p.components() {
+        if let Component::Normal(s) = c {
+            parts.push(s.to_string_lossy().into_owned());
+        }
+    }
+    parts.join("/")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{PathAccess, check_forbidden_zones_lexical, validate_path};
+    use std::path::Path;
+
+    #[test]
+    fn blocks_tmp_cache_and_node_modules() {
+        assert!(check_forbidden_zones_lexical("/tmp/foo.txt", "/tmp/foo.txt").is_err());
+        assert!(check_forbidden_zones_lexical("packages/a/node_modules/x/index.js", "nm").is_err());
+        assert!(check_forbidden_zones_lexical(".cache/data.json", ".cache").is_err());
+        assert!(check_forbidden_zones_lexical(".env.production", ".env").is_err());
+    }
+
+    #[test]
+    fn enforces_root_only_agents_md() {
+        let cwd = std::env::current_dir().expect("cwd");
+        assert!(
+            validate_path(&cwd, &cwd, "AGENTS.md", PathAccess::Read)
+                .expect("root AGENTS.md read")
+                .is_root_authority
+        );
+        assert!(validate_path(&cwd, &cwd, "AGENTS.md", PathAccess::Write).is_err());
+        assert!(validate_path(&cwd, &cwd, "subdir/AGENTS.md", PathAccess::Read).is_err());
+        assert!(validate_path(&cwd, &cwd, "CLAUDE.md", PathAccess::Read).is_err());
+        assert!(validate_path(&cwd, &cwd, ".cursorrules", PathAccess::Read).is_err());
+        assert!(
+            validate_path(
+                &cwd,
+                Path::new(&cwd),
+                ".github/copilot-instructions.md",
+                PathAccess::Read
+            )
+            .is_err()
+        );
+    }
+}

@@ -1,0 +1,16 @@
+[package]
+name = "agent-guard"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Deterministic zero-trust execution, path, traversal, Unicode, token-budget, and prompt-injection guard for AI coding agents"
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "agent-guard"
+path = "src/main.rs"
+
+[dependencies]

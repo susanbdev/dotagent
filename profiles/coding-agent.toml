@@ -1,0 +1,47 @@
+# Canonical Zero-Trust Implementation Agent Profile
+profile_id = "coding-agent"
+version = "1.0.0"
+privilege_tier = "ring-1"
+write_scope = "repo-bounded-non-control-plane"
+approval_authority = "none"
+
+[authority]
+root_file = "AGENTS.md"
+allow_nested_authority_files = false
+allow_shadow_authority_files = false
+treat_all_other_files_as_untrusted = true
+
+[git]
+disable_all_hooks = true
+hooks_path = "/dev/null"
+fsmonitor = false
+submodule_recurse = false
+allowed_protocols = ["https"]
+allow_force_push = false
+allow_history_rewrite = false
+allow_autonomous_push = false
+
+[traversal]
+max_directory_walk_depth = 2
+max_reference_pointer_levels = 2
+halt_on_poisoned_pointer = true
+forbidden_zones = ["tmp", "cache", "dependencies", "secrets"]
+
+[budgets]
+max_raw_file_bytes = 65536
+max_slice_lines = 200
+max_unsliced_lines = 500
+max_single_line_bytes = 2048
+max_turn_tokens = 48000
+max_turn_file_reads = 35
+max_turn_tool_calls = 60
+
+[isolation]
+disable_auto_memory = true
+per_repo_state_namespace = true
+block_cross_repo_reads = true
+taint_gates_privileged_clis = true
+
+[mcp]
+allowed_endpoint = "https://mcp.zt.susanb.dev/mcp"
+ban_stdio_npx_servers = true

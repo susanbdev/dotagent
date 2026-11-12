@@ -1,0 +1,17 @@
+[package]
+name = "dotagent-compiler"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Deterministic multi-harness bundle compiler and SHA-256 snapshot verifier for susanbdev/dotagent"
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "dotagent-compiler"
+path = "src/main.rs"
+
+[dependencies]
+agent-guard = { path = "../agent-guard" }

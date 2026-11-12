@@ -1,0 +1,36 @@
+# Pure Read-Only Sandboxed Exploration Profile
+profile_id = "research-readonly"
+version = "1.0.0"
+privilege_tier = "ring-1"
+write_scope = "none"
+enable_write_tools = false
+network_access = "none"
+approval_authority = "none"
+
+[authority]
+root_file = "AGENTS.md"
+allow_nested_authority_files = false
+allow_shadow_authority_files = false
+treat_all_other_files_as_untrusted = true
+
+[git]
+disable_all_hooks = true
+hooks_path = "/dev/null"
+fsmonitor = false
+
+[traversal]
+max_directory_walk_depth = 2
+max_reference_pointer_levels = 2
+halt_on_poisoned_pointer = true
+forbidden_zones = ["tmp", "cache", "dependencies", "secrets"]
+
+[budgets]
+max_raw_file_bytes = 65536
+max_slice_lines = 200
+max_single_line_bytes = 2048
+max_turn_tokens = 32000
+
+[isolation]
+disable_auto_memory = true
+per_repo_state_namespace = true
+block_cross_repo_reads = true

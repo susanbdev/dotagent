@@ -1,0 +1,18 @@
+# Managed by susanbdev/dotagent — OpenAI Codex Zero-Trust Configuration
+approval_policy = "on-request"
+sandbox_mode = "workspace-write"
+project_doc_max_bytes = 16384
+project_doc_fallback_filenames = []
+
+[sandbox_workspace_write]
+network_access = false
+exclude_tmpdir_env_var = true
+exclude_slash_tmp = true
+
+[shell_environment_policy]
+inherit = "core"
+ignore_default_excludes = false
+exclude = ["AWS_*", "GITHUB_*", "GH_*", "ANTHROPIC_*", "OPENAI_*", "GEMINI_*", "*_TOKEN", "*_SECRET", "*_KEY"]
+
+[mcp_servers.susanbdev]
+url = "https://mcp.zt.susanb.dev/mcp"

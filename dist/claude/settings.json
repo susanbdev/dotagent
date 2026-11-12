@@ -1,0 +1,127 @@
+{
+  "autoMemoryEnabled": false,
+  "disableAllHooks": false,
+  "env": {
+    "GIT_CONFIG_NOSYSTEM": "1",
+    "PYTHONDONTWRITEBYTECODE": "1",
+    "PIP_NO_CACHE_DIR": "1",
+    "NPM_CONFIG_IGNORE_SCRIPTS": "true",
+    "HISTFILE": "/dev/null"
+  },
+  "permissions": {
+    "allow": [],
+    "deny": [
+      "Read(/tmp/**)",
+      "Read(/var/tmp/**)",
+      "Read(/dev/shm/**)",
+      "Read(**/tmp/**)",
+      "Read(**/.tmp/**)",
+      "Read(**/.cache/**)",
+      "Read(~/.cache/**)",
+      "Read(**/__pycache__/**)",
+      "Read(**/.pytest_cache/**)",
+      "Read(**/.mypy_cache/**)",
+      "Read(**/.ruff_cache/**)",
+      "Read(**/.next/**)",
+      "Read(**/.turbo/**)",
+      "Read(**/node_modules/**)",
+      "Read(**/vendor/**)",
+      "Read(**/.venv/**)",
+      "Read(**/venv/**)",
+      "Read(**/site-packages/**)",
+      "Read(.env)",
+      "Read(.env.*)",
+      "Read(**/.env)",
+      "Read(**/.env.*)",
+      "Read(**/*.pem)",
+      "Read(**/*.key)",
+      "Read(~/.ssh/**)",
+      "Read(~/.aws/**)",
+      "Read(~/.gnupg/**)",
+      "Read(~/.config/gh/**)",
+      "Read(CLAUDE.md)",
+      "Read(**/CLAUDE.md)",
+      "Read(CLAUDE.local.md)",
+      "Read(**/CLAUDE.local.md)",
+      "Read(*/AGENTS.md)",
+      "Read(**/*/AGENTS.md)",
+      "Read(.cursorrules)",
+      "Read(**/.cursorrules)",
+      "Read(.github/copilot-instructions.md)",
+      "Edit(AGENTS.md)",
+      "Write(AGENTS.md)",
+      "Edit(.claude/**)",
+      "Write(.claude/**)",
+      "Edit(.guard/**)",
+      "Write(.guard/**)",
+      "Edit(.git/**)",
+      "Write(.git/**)",
+      "Bash(curl *)",
+      "Bash(wget *)",
+      "Bash(nc *)",
+      "Bash(ssh *)",
+      "Bash(sudo *)",
+      "Bash(mktemp*)",
+      "Bash(npx *)",
+      "Bash(git push*)",
+      "Bash(git rebase*)",
+      "Bash(git reset --hard*)",
+      "Bash(git commit --amend*)",
+      "Bash(git hook*)"
+    ]
+  },
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "agent-guard user-prompt",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "agent-guard pre-tool",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "agent-guard post-tool",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "agent-guard on-stop",
+            "timeout": 15
+          }
+        ]
+      }
+    ]
+  },
+  "mcpServers": {
+    "susanbdev": {
+      "type": "http",
+      "url": "https://mcp.zt.susanb.dev/mcp"
+    }
+  }
+}
