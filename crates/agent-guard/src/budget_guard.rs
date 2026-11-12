@@ -12,15 +12,16 @@ use std::fs::File;
 use std::io::Read;
 use std::path::Path;
 
-pub const MAX_RAW_FILE_BYTES: u64 = 65_536; // 64 KiB max un-sliced read
+pub const MAX_RAW_FILE_BYTES: u64 = 24_576; // 24 KiB max un-sliced read (tiny context micro-window)
 pub const MAX_SLICED_FILE_BYTES: u64 = 1_048_576; // 1 MiB absolute ceiling even when sliced
-pub const MAX_SLICE_LINES: usize = 200;
-pub const MAX_UNSLICED_LINES: usize = 500;
+pub const MAX_SLICE_LINES: usize = 150;
+pub const MAX_UNSLICED_LINES: usize = 300;
 pub const MAX_SINGLE_LINE_BYTES: usize = 2_048;
-pub const MAX_TOOL_OUTPUT_BYTES: usize = 49_152; // 48 KiB dynamic tool stdout cap
-pub const MAX_TURN_TOKENS: usize = 48_000;
-pub const MAX_TURN_FILE_READS: usize = 35;
-pub const MAX_TURN_TOOL_CALLS: usize = 60;
+pub const MAX_TOOL_OUTPUT_BYTES: usize = 16_384; // 16 KiB dynamic tool stdout cap
+pub const STEP_SOFT_COMPACT_TOKENS: usize = 8_000; // Soft step threshold -> trigger immediate compaction
+pub const MAX_TURN_TOKENS: usize = 16_000; // Hard per-step untrusted token ceiling
+pub const MAX_TURN_FILE_READS: usize = 18;
+pub const MAX_TURN_TOOL_CALLS: usize = 28;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ContentMetrics {
@@ -34,6 +35,88 @@ pub struct ContentMetrics {
 pub struct BudgetViolation {
     pub code: &'static str,
     pub detail: String,
+}
+
+/// Validates on-disk hygiene after `Write`/`Edit` (regular file, `<= 1 MiB`, no NUL bytes,
+/// valid UTF-8, no single-line or repetition bombs) without applying the `24 KiB` LLM
+/// context-read cap so legitimate multi-hundred-line source files remain editable.
+pub fn inspect_file_on_disk_hygiene(path: &Path) -> Result<String, BudgetViolation> {
+    let meta = std::fs::symlink_metadata(path).map_err(|e| BudgetViolation {
+        code: "FILE_STAT_ERROR",
+        detail: format!("Cannot stat '{}': {e}", path.display()),
+    })?;
+
+    if !meta.file_type().is_file() {
+        return Err(BudgetViolation {
+            code: "NON_REGULAR_FILE",
+            detail: format!(
+                "Refusing non-regular file '{}' (FIFO/socket/device/symlink blocked)",
+                path.display()
+            ),
+        });
+    }
+
+    let file_len = meta.len();
+    if file_len > MAX_SLICED_FILE_BYTES {
+        return Err(BudgetViolation {
+            code: "FILE_ABSOLUTE_SIZE_EXCEEDED",
+            detail: format!(
+                "File '{}' is {file_len} bytes (> {MAX_SLICED_FILE_BYTES} byte safety ceiling).",
+                path.display()
+            ),
+        });
+    }
+
+    let cap = (MAX_SLICED_FILE_BYTES as usize) + 1;
+    let file = File::open(path).map_err(|e| BudgetViolation {
+        code: "FILE_OPEN_ERROR",
+        detail: format!("Cannot open '{}': {e}", path.display()),
+    })?;
+
+    let mut raw = Vec::new();
+    file.take(cap as u64)
+        .read_to_end(&mut raw)
+        .map_err(|e| BudgetViolation {
+            code: "FILE_READ_ERROR",
+            detail: format!("Cannot read '{}': {e}", path.display()),
+        })?;
+
+    if raw.contains(&0u8) {
+        return Err(BudgetViolation {
+            code: "BINARY_FILE_BLOCKED",
+            detail: format!(
+                "Binary file '{}' (contains NUL bytes) rejected.",
+                path.display()
+            ),
+        });
+    }
+
+    let text = String::from_utf8(raw).map_err(|_| BudgetViolation {
+        code: "INVALID_UTF8_BLOCKED",
+        detail: format!("Non-UTF-8 file '{}' rejected.", path.display()),
+    })?;
+
+    for (idx, line) in text.split('\n').enumerate() {
+        if line.len() > MAX_SINGLE_LINE_BYTES {
+            return Err(BudgetViolation {
+                code: "SINGLE_LINE_BOMB_BLOCKED",
+                detail: format!(
+                    "Line {} is {} bytes (> {MAX_SINGLE_LINE_BYTES} byte ceiling — minified/base64 bomb blocked).",
+                    idx + 1,
+                    line.len()
+                ),
+            });
+        }
+    }
+
+    if has_pathological_run(&text) {
+        return Err(BudgetViolation {
+            code: "REPETITION_SATURATION_BOMB",
+            detail: "Pathological repeated character/token run detected.".to_string(),
+        });
+    }
+
+    Ok(text)
 }
 
 /// Safely reads up to `MAX_RAW_FILE_BYTES + 1` (or bounded slice) using `Read::take`

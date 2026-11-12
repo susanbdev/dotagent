@@ -18,8 +18,10 @@
 //!    - Stored under `~/.local/state/agent-guard/sessions` (`0700`), never `/tmp` or `~/.cache`.
 
 use std::collections::BTreeMap;
-use std::fs;
+use std::fs::{self, OpenOptions};
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::budget_guard::{MAX_TURN_FILE_READS, MAX_TURN_TOKENS, MAX_TURN_TOOL_CALLS};
 use crate::json::JsonValue;
@@ -33,7 +35,7 @@ pub struct TraversalNode {
     pub level: u8,
     /// Provenance chain description, e.g. "docs/A.md -> docs/B.md"
     pub chain: String,
-    /// Whether this file itself has already been read in this turn
+    /// Whether this file itself has already been read in this step
     pub was_read: bool,
 }
 
@@ -41,6 +43,8 @@ pub struct TraversalNode {
 pub struct SessionLedger {
     pub repo_root: String,
     pub session_id: String,
+    pub turn_nonce: String,
+    pub compaction_epoch: usize,
     pub halted: bool,
     pub halt_reason: Option<String>,
     pub tainted: bool,
@@ -53,9 +57,13 @@ pub struct SessionLedger {
 
 impl SessionLedger {
     pub fn new(repo_root: &Path, session_id: &str) -> Self {
+        let clean_sid = sanitize_session_id(session_id);
+        let turn_nonce = generate_turn_nonce(repo_root, &clean_sid, 0);
         Self {
             repo_root: repo_root.to_string_lossy().into_owned(),
-            session_id: sanitize_session_id(session_id),
+            session_id: clean_sid,
+            turn_nonce,
+            compaction_epoch: 0,
             halted: false,
             halt_reason: None,
             tainted: false,
@@ -103,6 +111,20 @@ impl SessionLedger {
         Ok(fresh)
     }
 
+    /// Resets per-step context window counters (`cumulative_tokens`, `file_reads`, `tool_calls`)
+    /// and rotates the 128-bit spotlighting `turn_nonce` upon step compaction while preserving
+    /// circuit-breaker halts, provenance taint, and the `A -> B -> C` hop graph!
+    pub fn compact_step(&mut self, repo_root: &Path) {
+        self.compaction_epoch = self.compaction_epoch.saturating_add(1);
+        self.cumulative_tokens = 0;
+        self.file_reads = 0;
+        self.tool_calls = 0;
+        self.turn_nonce = generate_turn_nonce(repo_root, &self.session_id, self.compaction_epoch);
+        for node in self.nodes.values_mut() {
+            node.was_read = false;
+        }
+    }
+
     pub fn trip_circuit_breaker(&mut self, reason: String) {
         self.halted = true;
         self.halt_reason = Some(reason);
@@ -133,7 +155,7 @@ impl SessionLedger {
         self.check_not_halted()?;
         if self.tool_calls >= MAX_TURN_TOOL_CALLS {
             return Err(format!(
-                "Turn tool-call ceiling exceeded ({MAX_TURN_TOOL_CALLS} calls). Halting to prevent runaway loop / token exhaustion."
+                "Step tool-call ceiling exceeded ({MAX_TURN_TOOL_CALLS} calls). Compact step context immediately before continuing."
             ));
         }
         self.tool_calls += 1;
@@ -169,7 +191,7 @@ impl SessionLedger {
             return Err((
                 "FILE_READ_BUDGET_EXCEEDED",
                 format!(
-                    "Turn file-read limit ({MAX_TURN_FILE_READS} files) reached; refusing '{rel_path}' to prevent context window saturation."
+                    "Step file-read limit ({MAX_TURN_FILE_READS} files) reached; compact step context before reading '{rel_path}'."
                 ),
             ));
         }
@@ -179,7 +201,7 @@ impl SessionLedger {
             return Err((
                 "TURN_TOKEN_BUDGET_EXCEEDED",
                 format!(
-                    "Reading '{rel_path}' (+{estimated_tokens} est. tokens) would exceed turn untrusted token ceiling ({next_tokens} > {MAX_TURN_TOKENS}). Stop and summarize before saturating context."
+                    "Reading '{rel_path}' (+{estimated_tokens} est. tokens) would exceed tight step context ceiling ({next_tokens} > {MAX_TURN_TOKENS}). Compact this step immediately rather than carrying multi-step history."
                 ),
             ));
         }
@@ -265,6 +287,14 @@ impl SessionLedger {
                 "session_id".to_string(),
                 JsonValue::Str(self.session_id.clone()),
             ),
+            (
+                "turn_nonce".to_string(),
+                JsonValue::Str(self.turn_nonce.clone()),
+            ),
+            (
+                "compaction_epoch".to_string(),
+                JsonValue::Number(self.compaction_epoch as f64),
+            ),
             ("halted".to_string(), JsonValue::Bool(self.halted)),
             (
                 "halt_reason".to_string(),
@@ -303,6 +333,18 @@ impl SessionLedger {
         let v = JsonValue::parse(raw).ok()?;
         let repo_root = v.get("repo_root")?.as_str()?.to_string();
         let session_id = v.get("session_id")?.as_str()?.to_string();
+        let compaction_epoch = v
+            .get("compaction_epoch")
+            .and_then(JsonValue::as_u64)
+            .unwrap_or(0) as usize;
+        let turn_nonce = v
+            .get("turn_nonce")
+            .and_then(JsonValue::as_str)
+            .filter(|s| s.len() == 32 && s.bytes().all(|b| b.is_ascii_hexdigit()))
+            .map(String::from)
+            .unwrap_or_else(|| {
+                generate_turn_nonce(Path::new(&repo_root), &session_id, compaction_epoch)
+            });
         let halted = v.get("halted")?.as_bool()?;
         let halt_reason = v
             .get("halt_reason")
@@ -337,6 +379,8 @@ impl SessionLedger {
         Some(Self {
             repo_root,
             session_id,
+            turn_nonce,
+            compaction_epoch,
             halted,
             halt_reason,
             tainted,
@@ -347,6 +391,28 @@ impl SessionLedger {
             nodes,
         })
     }
+}
+
+fn generate_turn_nonce(repo_root: &Path, session_id: &str, epoch: usize) -> String {
+    let mut seed = Vec::with_capacity(128);
+    if let Ok(mut f) = fs::File::open("/dev/urandom") {
+        let mut entropy = [0u8; 16];
+        if f.read_exact(&mut entropy).is_ok() {
+            seed.extend_from_slice(&entropy);
+        }
+    }
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    seed.extend_from_slice(&nanos.to_le_bytes());
+    seed.extend_from_slice(&std::process::id().to_le_bytes());
+    seed.extend_from_slice(&epoch.to_le_bytes());
+    seed.extend_from_slice(repo_root.to_string_lossy().as_bytes());
+    seed.push(b':');
+    seed.extend_from_slice(session_id.as_bytes());
+    let hex = sha256_hex(&seed);
+    hex[..32].to_string()
 }
 
 fn sanitize_session_id(raw: &str) -> String {
@@ -377,6 +443,75 @@ pub fn state_base_dir() -> PathBuf {
             .join("sessions");
     }
     PathBuf::from(".agent-guard-state")
+}
+
+pub fn audit_log_path() -> PathBuf {
+    let base = state_base_dir();
+    if base.file_name().is_some_and(|n| n == "sessions") {
+        if let Some(parent) = base.parent() {
+            return parent.join("audit.jsonl");
+        }
+    }
+    base.join("audit.jsonl")
+}
+
+/// Appends a single pure-ASCII JSONL record (`0600`) to `audit.jsonl` for forensic review
+/// of blocked prompt injections, poisoned pointers, or budget violations.
+pub fn append_audit_jsonl(
+    repo_root: &Path,
+    session_id: &str,
+    tool: &str,
+    code: &str,
+    detail: &str,
+    halted: bool,
+) {
+    let path = audit_log_path();
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = fs::set_permissions(parent, fs::Permissions::from_mode(0o700));
+        }
+    }
+    let ts_secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let ascii_detail: String = detail
+        .chars()
+        .map(|c| {
+            if c.is_ascii() && !c.is_ascii_control() {
+                c
+            } else {
+                '?'
+            }
+        })
+        .take(240)
+        .collect();
+    let record = JsonValue::Object(vec![
+        ("ts".to_string(), JsonValue::Number(ts_secs as f64)),
+        (
+            "repo".to_string(),
+            JsonValue::Str(repo_root.to_string_lossy().into_owned()),
+        ),
+        (
+            "session_id".to_string(),
+            JsonValue::Str(sanitize_session_id(session_id)),
+        ),
+        ("tool".to_string(), JsonValue::Str(tool.to_string())),
+        ("code".to_string(), JsonValue::Str(code.to_string())),
+        ("halted".to_string(), JsonValue::Bool(halted)),
+        ("detail".to_string(), JsonValue::Str(ascii_detail)),
+    ]);
+    if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(&path) {
+        let _ = writeln!(file, "{}", record.to_json_string());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = fs::set_permissions(&path, fs::Permissions::from_mode(0o600));
+        }
+    }
 }
 
 fn ledger_file_path(repo_root: &Path, session_id: &str) -> PathBuf {

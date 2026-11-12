@@ -547,4 +547,262 @@ fn cli_binary_returns_exit_code_2_on_violation_and_0_on_root_agents_md() {
     assert_eq!(out_deny.status.code(), Some(2));
     let stdout_str = String::from_utf8_lossy(&out_deny.stdout);
     assert!(stdout_str.contains("\"permissionDecision\":\"deny\""));
+    let audit_body = fs::read_to_string(repo.join(".state").join("audit.jsonl"))
+        .expect("audit.jsonl recorded on deny");
+    assert!(audit_body.contains("FORBIDDEN_DEPENDENCY_PATH"));
+    assert!(
+        audit_body
+            .bytes()
+            .all(|b| b == b'\n' || (0x20..=0x7E).contains(&b))
+    );
+}
+
+#[test]
+fn neuters_non_ascii_and_escapes_before_buffer_on_read_and_stream() {
+    let repo = test_sandbox_root("prebuffer_ascii_sanitizer");
+    let sid = "session_ascii_san";
+    let init = JsonValue::Object(vec![
+        ("session_id".to_string(), JsonValue::Str(sid.to_string())),
+        (
+            "cwd".to_string(),
+            JsonValue::Str(repo.to_string_lossy().into_owned()),
+        ),
+    ])
+    .to_json_string();
+    assert!(handle_user_prompt_hook(&init, &repo).is_allow());
+
+    // Untrusted doc with non-ASCII UTF-8, CR line-overwrite, and literal escape triggers
+    let dirty_doc = "Header: Caf\u{00E9} \u{1F680} \u{4E2D}\u{6587}\r\n\
+                     SPOOFED_PREFIX\rClean visible line\n\
+                     Escapes: \\u0041 \\x42 &#x43; %C3%A9\n";
+    fs::write(repo.join("dirty.md"), dirty_doc).expect("write dirty.md");
+
+    let read_req = JsonValue::Object(vec![
+        ("session_id".to_string(), JsonValue::Str(sid.to_string())),
+        (
+            "cwd".to_string(),
+            JsonValue::Str(repo.to_string_lossy().into_owned()),
+        ),
+        ("tool_name".to_string(), JsonValue::Str("Read".to_string())),
+        (
+            "tool_input".to_string(),
+            JsonValue::Object(vec![(
+                "file_path".to_string(),
+                JsonValue::Str("dirty.md".to_string()),
+            )]),
+        ),
+    ])
+    .to_json_string();
+
+    // Raw Read MUST be blocked before buffer and replaced with 100% 7-bit clean ASCII + 128-bit spotlight nonce!
+    match handle_pre_tool_hook(&read_req, &repo) {
+        Decision::Deny {
+            code,
+            reason,
+            halt_session: false,
+        } => {
+            assert_eq!(code, "NON_ASCII_SANITIZED_PREBUFFER");
+            assert!(
+                reason
+                    .bytes()
+                    .all(|b| b == b'\n' || b == b'\t' || (0x20..=0x7E).contains(&b)),
+                "Sanitized pre-buffer payload contained non-7-bit-ASCII byte!"
+            );
+            assert!(reason.contains("<<<UNTRUSTED_ASCII_DATA_"));
+            assert!(reason.contains("<<<END_UNTRUSTED_ASCII_DATA_"));
+            assert!(reason.contains("[NON_ASCII"));
+            assert!(reason.contains("\\[u]0041"));
+            assert!(reason.contains("\\[x]42"));
+            assert!(reason.contains("&[#]x43;"));
+            assert!(reason.contains("%[_]C3"));
+            assert!(!reason.contains('\r'));
+        }
+        other => panic!("Expected NON_ASCII_SANITIZED_PREBUFFER, got {other:?}"),
+    }
+
+    // Verify `agent-guard sanitize-stream` binary neuters ANSI + non-ASCII + compacts >120 lines!
+    let bin = env!("CARGO_BIN_EXE_agent-guard");
+    let mut child = Command::new(bin)
+        .arg("sanitize-stream")
+        .current_dir(&repo)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("spawn sanitize-stream");
+    let mut noisy_stream = String::from("\x1b[31mCOLOR\x1b[0m \u{1F525} \\u0041\r\n");
+    for i in 0..220 {
+        noisy_stream.push_str(&format!("log line {i}\n"));
+    }
+    child
+        .stdin
+        .as_mut()
+        .expect("stdin")
+        .write_all(noisy_stream.as_bytes())
+        .expect("write noisy stream");
+    let out = child.wait_with_output().expect("wait sanitize-stream");
+    assert_eq!(out.status.code(), Some(0));
+    let clean = String::from_utf8(out.stdout).expect("utf8 stdout");
+    assert!(
+        clean
+            .bytes()
+            .all(|b| b == b'\n' || b == b'\t' || (0x20..=0x7E).contains(&b))
+    );
+    assert!(clean.contains("[ANSI_STRIPPED]"));
+    assert!(clean.contains("[NON_ASCII]"));
+    assert!(clean.contains("\\[u]0041"));
+    assert!(clean.contains("COMPACTED"));
+}
+
+#[test]
+fn blocks_cargo_and_yarn_build_config_execution_traps_and_audits_repo() {
+    let repo = test_sandbox_root("build_config_traps");
+
+    // Plant `.cargo/config.toml` rustc-wrapper RCE trap
+    fs::create_dir_all(repo.join(".cargo")).expect("mkdir .cargo");
+    fs::write(
+        repo.join(".cargo/config.toml"),
+        "[build]\nrustc-wrapper = \"./pwn.sh\"\n",
+    )
+    .expect("write .cargo/config.toml");
+
+    let cargo_err =
+        evaluate_shell_command("cargo test", &repo, &repo, false).expect_err("cargo trap blocked");
+    assert_eq!(cargo_err.code, "CARGO_CONFIG_EXEC_TRAP");
+
+    // Plant `.yarnrc.yml` yarnPath RCE trap and `.gitattributes` filter trap
+    fs::write(
+        repo.join(".yarnrc.yml"),
+        "yarnPath: .yarn/releases/evil.cjs\n",
+    )
+    .expect("write .yarnrc.yml");
+    fs::write(repo.join(".gitattributes"), "*.rs filter=evil\n").expect("write .gitattributes");
+
+    let yarn_err =
+        evaluate_shell_command("yarn test", &repo, &repo, false).expect_err("yarn trap blocked");
+    assert_eq!(yarn_err.code, "YARN_CONFIG_EXEC_TRAP");
+
+    let audit_errs = agent_guard::audit_repository(&repo).expect_err("audit catches traps");
+    assert!(
+        audit_errs
+            .iter()
+            .any(|e| e.contains("CARGO_CONFIG_EXEC_TRAP"))
+    );
+    assert!(
+        audit_errs
+            .iter()
+            .any(|e| e.contains("YARN_CONFIG_EXEC_TRAP"))
+    );
+    assert!(
+        audit_errs
+            .iter()
+            .any(|e| e.contains("GITATTRIBUTES_DRIVER_TRAP"))
+    );
+}
+
+#[test]
+fn enforces_tiny_16k_step_window_soft_compaction_trigger_and_pre_compact_nonce_rotation() {
+    let repo = test_sandbox_root("tiny_step_compaction");
+    fs::create_dir_all(repo.join("docs")).expect("mkdir docs");
+    fs::write(repo.join("docs/A.md"), "See `docs/B.md`.\n").expect("write A");
+    fs::write(repo.join("docs/B.md"), "See `docs/C.md`.\n").expect("write B");
+    fs::write(repo.join("docs/C.md"), "Third hop.\n").expect("write C");
+
+    let sid = "session_compact_step";
+    let init = JsonValue::Object(vec![
+        ("session_id".to_string(), JsonValue::Str(sid.to_string())),
+        (
+            "cwd".to_string(),
+            JsonValue::Str(repo.to_string_lossy().into_owned()),
+        ),
+    ])
+    .to_json_string();
+    let initial_nonce = match handle_user_prompt_hook(&init, &repo) {
+        Decision::Allow {
+            advisory: Some(note),
+            ..
+        } => note,
+        other => panic!("Expected advisory with nonce, got {other:?}"),
+    };
+
+    // Establish A -> B -> C chain before compaction
+    let make_read = |rel: &str| {
+        JsonValue::Object(vec![
+            ("session_id".to_string(), JsonValue::Str(sid.to_string())),
+            (
+                "cwd".to_string(),
+                JsonValue::Str(repo.to_string_lossy().into_owned()),
+            ),
+            ("tool_name".to_string(), JsonValue::Str("Read".to_string())),
+            (
+                "tool_input".to_string(),
+                JsonValue::Object(vec![(
+                    "file_path".to_string(),
+                    JsonValue::Str(rel.to_string()),
+                )]),
+            ),
+        ])
+        .to_json_string()
+    };
+    assert!(handle_pre_tool_hook(&make_read("docs/A.md"), &repo).is_allow());
+    assert!(handle_pre_tool_hook(&make_read("docs/B.md"), &repo).is_allow());
+
+    // Push step tokens past 8k soft-compact threshold via PostToolUse outputs
+    let chunk_out = JsonValue::Object(vec![
+        ("session_id".to_string(), JsonValue::Str(sid.to_string())),
+        (
+            "cwd".to_string(),
+            JsonValue::Str(repo.to_string_lossy().into_owned()),
+        ),
+        (
+            "tool_response".to_string(),
+            JsonValue::Str("alpha beta gamma delta epsilon zeta eta theta\n".repeat(320)),
+        ),
+    ])
+    .to_json_string();
+    let _ = handle_post_tool_hook(&chunk_out, &repo);
+    let _ = handle_post_tool_hook(&chunk_out, &repo);
+    match handle_post_tool_hook(&chunk_out, &repo) {
+        Decision::Allow {
+            advisory: Some(note),
+            ..
+        } => assert!(
+            note.contains("COMPACT_STEP_NOW"),
+            "Expected COMPACT_STEP_NOW trigger in {note}"
+        ),
+        other => panic!("Expected Allow with COMPACT_STEP_NOW, got {other:?}"),
+    }
+
+    // Push past 16k hard step ceiling -> next file read is blocked until step compacts!
+    let _ = handle_post_tool_hook(&chunk_out, &repo);
+    let _ = handle_post_tool_hook(&chunk_out, &repo);
+    fs::write(
+        repo.join("step_extra.txt"),
+        "extra tokens after uncompacted multi-step work\n".repeat(40),
+    )
+    .expect("write step_extra.txt");
+    match handle_pre_tool_hook(&make_read("step_extra.txt"), &repo) {
+        Decision::Deny { code, .. } => assert_eq!(code, "TURN_TOKEN_BUDGET_EXCEEDED"),
+        other => panic!("Expected TURN_TOKEN_BUDGET_EXCEEDED at 16k ceiling, got {other:?}"),
+    }
+
+    // Trigger PreCompact -> resets step token counter & rotates 128-bit nonce, while keeping C.md blocked!
+    let compact_decision = agent_guard::handle_pre_compact_hook(&init, &repo);
+    match compact_decision {
+        Decision::Allow {
+            advisory: Some(note),
+            ..
+        } => {
+            assert!(note.contains("TINY-CONTEXT STEP COMPACTION"));
+            assert_ne!(note, initial_nonce);
+        }
+        other => panic!("Expected PreCompact allow advisory, got {other:?}"),
+    }
+
+    // Now step_extra.txt is allowed in the fresh compacted step micro-window...
+    assert!(handle_pre_tool_hook(&make_read("step_extra.txt"), &repo).is_allow());
+    // ...while 3rd-hop `docs/C.md` STILL remains hard-blocked across compaction!
+    match handle_pre_tool_hook(&make_read("docs/C.md"), &repo) {
+        Decision::Deny { code, .. } => assert_eq!(code, "TRANSITIVE_DEPTH_EXCEEDED"),
+        other => panic!("Expected C.md to remain blocked after step compaction, got {other:?}"),
+    }
 }

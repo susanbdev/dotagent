@@ -355,6 +355,22 @@ pub fn check_forbidden_zones_lexical(
                 is_poisoned_zone: true,
             });
         }
+        // Self-blindness: block reading or modifying agent-guard's own state ledger, turn_nonce, or audit.jsonl
+        if seg_lower == ".agent-guard-state"
+            || (seg_lower == "state"
+                && segments
+                    .get(idx + 1)
+                    .is_some_and(|n| n.eq_ignore_ascii_case("agent-guard")))
+            || seg_lower == "audit.jsonl"
+        {
+            return Err(PathViolation {
+                code: "FORBIDDEN_GUARD_STATE_PATH",
+                detail: format!(
+                    "Access to agent-guard internal state/audit path '{display_raw}' is strictly forbidden (self-blindness enforcement)."
+                ),
+                is_poisoned_zone: true,
+            });
+        }
     }
 
     Ok(())
@@ -570,6 +586,7 @@ fn check_authority_file_policy(repo_rel: &str, access: PathAccess) -> Result<boo
 
 fn check_immutable_control_plane(repo_rel: &str) -> Result<(), PathViolation> {
     let lower = repo_rel.to_ascii_lowercase();
+    let file_name = lower.rsplit('/').next().unwrap_or(&lower);
     let protected_prefixes = [
         ".git/",
         ".guard/",
@@ -579,13 +596,18 @@ fn check_immutable_control_plane(repo_rel: &str) -> Result<(), PathViolation> {
         ".cursor/",
         ".gemini/",
         ".github/",
+        ".cargo/",
+        ".yarn/",
     ];
     for p in protected_prefixes {
-        if lower == p.trim_end_matches('/') || lower.starts_with(p) {
+        if lower == p.trim_end_matches('/')
+            || lower.starts_with(p)
+            || lower.contains(&format!("/{p}"))
+        {
             return Err(PathViolation {
                 code: "IMMUTABLE_CONTROL_PLANE",
                 detail: format!(
-                    "Modifying control-plane path '{repo_rel}' is hard-blocked (self-tampering prohibition)."
+                    "Modifying control-plane or build-runner path '{repo_rel}' is hard-blocked (self-tampering / build-hook prohibition)."
                 ),
                 is_poisoned_zone: false,
             });
@@ -595,15 +617,31 @@ fn check_immutable_control_plane(repo_rel: &str) -> Result<(), PathViolation> {
         lower.as_str(),
         "agents.md"
             | "review.md"
+            | ".agent-policy.json"
             | ".gitconfig"
+            | ".gitattributes"
             | ".envrc"
             | ".ignore"
             | ".rgignore"
             | ".cursorignore"
+    ) || matches!(
+        file_name,
+        ".gitattributes"
+            | ".envrc"
+            | ".npmrc"
+            | ".yarnrc"
+            | ".yarnrc.yml"
+            | ".pnpmfile.cjs"
+            | "rust-toolchain"
+            | "rust-toolchain.toml"
+            | ".mise.toml"
+            | ".tool-versions"
     ) {
         return Err(PathViolation {
             code: "IMMUTABLE_CONTROL_PLANE",
-            detail: format!("Modifying protected configuration '{repo_rel}' is hard-blocked."),
+            detail: format!(
+                "Modifying protected execution/filter configuration '{repo_rel}' is hard-blocked."
+            ),
             is_poisoned_zone: false,
         });
     }

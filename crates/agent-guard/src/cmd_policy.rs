@@ -511,17 +511,35 @@ fn check_single_command(
         });
     }
 
-    // Prevent agent from invoking `agent-guard` state-reset or user-prompt hooks directly
+    // Prevent agent from invoking `agent-guard` state-reset, user-prompt, or pre-compact hooks directly
     if bin == "agent-guard" {
         if let Some(sub) = args.first().map(String::as_str) {
-            if matches!(sub, "user-prompt" | "reset" | "reset-session") {
+            if matches!(
+                sub,
+                "user-prompt" | "reset" | "reset-session" | "pre-compact" | "compact-reset"
+            ) {
                 return Err(CommandViolation {
                     code: "SELF_TAMPERING_BLOCKED",
                     detail:
-                        "Agents may not reset agent-guard session state or spoof UserPromptSubmit."
+                        "Agents may not reset agent-guard session/compaction state or spoof lifecycle hooks."
                             .to_string(),
                     halt_session: true,
                 });
+            }
+            if matches!(sub, "read-safe" | "scan-file") {
+                if let Some(target_file) = args.get(1) {
+                    validate_path(repo_root, cwd, target_file, PathAccess::Read).map_err(|pv| {
+                        CommandViolation {
+                            code: pv.code,
+                            detail: pv.detail,
+                            halt_session: pv.is_poisoned_zone,
+                        }
+                    })?;
+                }
+                return Ok(());
+            }
+            if sub == "sanitize-stream" {
+                return Ok(());
             }
         }
     }
@@ -570,9 +588,9 @@ fn check_single_command(
         return Ok(());
     }
 
-    // 8. Package Manager Lifecycle Script & Publish Lockdown
+    // 8. Package Manager Lifecycle Script, Build-Config Trap, & Publish Lockdown
     if matches!(bin, "npm" | "pnpm" | "yarn" | "bun" | "npx" | "bunx") {
-        check_node_pkg_manager(bin, args)?;
+        check_node_pkg_manager(bin, args, repo_root)?;
         return Ok(());
     }
     if matches!(bin, "pip" | "pip3" | "uv") {
@@ -580,7 +598,7 @@ fn check_single_command(
         return Ok(());
     }
     if bin == "cargo" {
-        check_cargo_command(args)?;
+        check_cargo_command(args, repo_root)?;
         return Ok(());
     }
 
@@ -1051,7 +1069,11 @@ fn check_git_inline_config(kv: &str) -> Result<(), CommandViolation> {
     Ok(())
 }
 
-fn check_node_pkg_manager(bin: &str, args: &[String]) -> Result<(), CommandViolation> {
+fn check_node_pkg_manager(
+    bin: &str,
+    args: &[String],
+    repo_root: &Path,
+) -> Result<(), CommandViolation> {
     if matches!(bin, "npx" | "bunx") {
         return Err(CommandViolation {
             code: "UNVETTED_NPX_BLOCKED",
@@ -1061,6 +1083,41 @@ fn check_node_pkg_manager(bin: &str, args: &[String]) -> Result<(), CommandViola
             halt_session: true,
         });
     }
+
+    // Check repo-level `.yarnrc.yml` / `.yarnrc` / `.npmrc` execution hijack traps BEFORE running node pkg manager
+    for rel in [".yarnrc.yml", ".yarnrc"] {
+        let p = repo_root.join(rel);
+        if let Ok(raw) = std::fs::read_to_string(&p) {
+            let lower = raw.to_ascii_lowercase();
+            for bad in ["yarnpath", "plugins:"] {
+                if lower.contains(bad) {
+                    return Err(CommandViolation {
+                        code: "YARN_CONFIG_EXEC_TRAP",
+                        detail: format!(
+                            "Repository '{rel}' defines `{bad}` binary/plugin hijack — refusing `{bin}` execution."
+                        ),
+                        halt_session: true,
+                    });
+                }
+            }
+        }
+    }
+    let npmrc = repo_root.join(".npmrc");
+    if let Ok(raw) = std::fs::read_to_string(&npmrc) {
+        let lower = raw.to_ascii_lowercase();
+        for bad in ["script-shell", "onload-script"] {
+            if lower.contains(bad) {
+                return Err(CommandViolation {
+                    code: "NPMRC_SCRIPT_TRAP",
+                    detail: format!(
+                        "Repository '.npmrc' defines `{bad}` shell hijack — refusing `{bin}` execution."
+                    ),
+                    halt_session: true,
+                });
+            }
+        }
+    }
+
     let sub = args.first().map(String::as_str).unwrap_or("");
     if matches!(
         sub,
@@ -1113,7 +1170,37 @@ fn check_python_pkg_manager(bin: &str, args: &[String]) -> Result<(), CommandVio
     Ok(())
 }
 
-fn check_cargo_command(args: &[String]) -> Result<(), CommandViolation> {
+fn check_cargo_command(args: &[String], repo_root: &Path) -> Result<(), CommandViolation> {
+    // Inspect `.cargo/config.toml` and `.cargo/config` for `rustc-wrapper` / `linker` / `runner` RCE traps!
+    for rel in [".cargo/config.toml", ".cargo/config"] {
+        let cfg_path = repo_root.join(rel);
+        if let Ok(raw) = std::fs::read_to_string(&cfg_path) {
+            let lower = raw.to_ascii_lowercase();
+            for bad in [
+                "rustc-wrapper",
+                "rustc_wrapper",
+                "workspace-wrapper",
+                "linker =",
+                "linker=",
+                "runner =",
+                "runner=",
+                "[alias]",
+                "rustc =",
+                "rustc=",
+            ] {
+                if lower.contains(bad) {
+                    return Err(CommandViolation {
+                        code: "CARGO_CONFIG_EXEC_TRAP",
+                        detail: format!(
+                            "Repository '{rel}' contains dangerous execution directive matching `{bad}` — refusing `cargo` invocation."
+                        ),
+                        halt_session: true,
+                    });
+                }
+            }
+        }
+    }
+
     let sub = args.first().map(String::as_str).unwrap_or("");
     if matches!(sub, "publish" | "login" | "owner" | "yank" | "install") {
         return Err(CommandViolation {
@@ -1123,6 +1210,54 @@ fn check_cargo_command(args: &[String]) -> Result<(), CommandViolation> {
         });
     }
     Ok(())
+}
+
+/// Static audit helper checking repository build-tool and `.gitattributes` execution traps.
+pub fn inspect_repo_build_config_traps(repo_root: &Path) -> Vec<String> {
+    let mut findings = Vec::new();
+    for rel in [".cargo/config.toml", ".cargo/config"] {
+        let p = repo_root.join(rel);
+        if let Ok(raw) = std::fs::read_to_string(&p) {
+            let lower = raw.to_ascii_lowercase();
+            for bad in [
+                "rustc-wrapper",
+                "rustc_wrapper",
+                "workspace-wrapper",
+                "linker =",
+                "linker=",
+                "runner =",
+                "runner=",
+                "[alias]",
+            ] {
+                if lower.contains(bad) {
+                    findings.push(format!("CARGO_CONFIG_EXEC_TRAP: '{rel}' contains `{bad}`"));
+                }
+            }
+        }
+    }
+    for rel in [".yarnrc.yml", ".yarnrc"] {
+        let p = repo_root.join(rel);
+        if let Ok(raw) = std::fs::read_to_string(&p) {
+            let lower = raw.to_ascii_lowercase();
+            for bad in ["yarnpath", "plugins:"] {
+                if lower.contains(bad) {
+                    findings.push(format!("YARN_CONFIG_EXEC_TRAP: '{rel}' contains `{bad}`"));
+                }
+            }
+        }
+    }
+    let gitattributes = repo_root.join(".gitattributes");
+    if let Ok(raw) = std::fs::read_to_string(&gitattributes) {
+        let lower = raw.to_ascii_lowercase();
+        for bad in ["filter=", "diff=", "merge=", "textconv"] {
+            if lower.contains(bad) {
+                findings.push(format!(
+                    "GITATTRIBUTES_DRIVER_TRAP: '.gitattributes' contains `{bad}`"
+                ));
+            }
+        }
+    }
+    findings
 }
 
 fn check_interpreter_command(

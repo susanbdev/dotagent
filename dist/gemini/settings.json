@@ -3,6 +3,14 @@
   "checkpointing": {
     "enabled": false
   },
+  "model": {
+    "compressionThreshold": 0.15,
+    "maxSessionTurns": 25
+  },
+  "tools": {
+    "truncateToolOutputThreshold": 12000,
+    "truncateToolOutputLines": 120
+  },
   "hooks": {
     "BeforeAgent": [
       {
@@ -37,6 +45,18 @@
             "name": "agent-guard-post-tool",
             "type": "command",
             "command": "agent-guard post-tool",
+            "timeout": 5000
+          }
+        ]
+      }
+    ],
+    "PreCompress": [
+      {
+        "hooks": [
+          {
+            "name": "agent-guard-pre-compact",
+            "type": "command",
+            "command": "agent-guard pre-compact",
             "timeout": 5000
           }
         ]

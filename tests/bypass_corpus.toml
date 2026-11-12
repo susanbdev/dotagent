@@ -293,5 +293,22 @@ vectors = [
   { kind = "cmd", payload = "rg --max-depth 3 TODO" },
   { kind = "cmd", payload = "rg -u TODO --max-depth 1" },
   { kind = "glob", payload = "**/*.rs" },
-  { kind = "glob", payload = "a/b/c/*.rs" }
+  { kind = "glob", payload = "a/b/c/*.rs" },
+
+  # --- 11. Build-Tool Config Traps, Gitattributes & Self-Blindness Violations (15) ---
+  { kind = "write_path", payload = ".cargo/config.toml" },
+  { kind = "write_path", payload = ".cargo/config" },
+  { kind = "write_path", payload = "crates/sub/.cargo/config.toml" },
+  { kind = "write_path", payload = ".yarnrc.yml" },
+  { kind = "write_path", payload = ".yarn/releases/yarn.cjs" },
+  { kind = "write_path", payload = ".npmrc" },
+  { kind = "write_path", payload = "rust-toolchain.toml" },
+  { kind = "write_path", payload = ".gitattributes" },
+  { kind = "write_path", payload = ".envrc" },
+  { kind = "read_path", payload = "~/.local/state/agent-guard/sessions/abc.json" },
+  { kind = "read_path", payload = "~/.local/state/agent-guard/audit.jsonl" },
+  { kind = "read_path", payload = ".agent-guard-state/default.json" },
+  { kind = "read_path", payload = "audit.jsonl" },
+  { kind = "cmd", payload = "agent-guard pre-compact" },
+  { kind = "cmd", payload = "cat ~/.local/state/agent-guard/audit.jsonl" }
 ]

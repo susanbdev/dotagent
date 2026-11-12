@@ -1,0 +1,44 @@
+name: Zero-Trust Guardrail CI
+
+on:
+  push:
+    branches: ["main", "feat/**"]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  verify-guardrails:
+    name: Rust 2024 Security Kernel & Bundle Verification
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      CARGO_TERM_COLOR: always
+      GIT_CONFIG_NOSYSTEM: "1"
+    steps:
+      - name: Checkout repository (zero persisted credentials)
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          submodules: false
+
+      - name: Install Rust 1.85+ (Edition 2024) toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Verify formatting (cargo fmt)
+        run: cargo fmt --all -- --check
+
+      - name: Verify strict lints & forbid(unsafe_code) (cargo clippy)
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Run unit + 250+ adversarial bypass suite (cargo test)
+        run: cargo test --workspace
+
+      - name: Verify deterministic multi-harness bundles & SHA-256 lock manifest
+        run: cargo run --release -p dotagent-compiler -- verify .
+
+      - name: Run static zero-trust repository audit
+        run: cargo run --release -p agent-guard -- audit-repo .

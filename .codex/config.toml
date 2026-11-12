@@ -1,8 +1,10 @@
-# Managed by susanbdev/dotagent — OpenAI Codex Zero-Trust Configuration
+# Managed by susanbdev/dotagent -- OpenAI Codex Zero-Trust Configuration
 approval_policy = "on-request"
 sandbox_mode = "workspace-write"
 project_doc_max_bytes = 16384
 project_doc_fallback_filenames = []
+model_auto_compact_token_limit = 20000
+tool_output_token_limit = 2500
 
 [sandbox_workspace_write]
 network_access = false
