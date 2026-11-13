@@ -1,48 +1,101 @@
 {
-  "schema": "dotagent.plan_dag.v2",
-  "plan_id": "DOTAGENT-PLAN-SWARM-V2",
+  "schema": "dotagent.plan_dag.v2.0",
+  "plan_id": "DOTAGENT-PLAN-SWARM-2.0",
   "spec_ref": "docs/SWARM_TECHNICAL_SPEC.md",
   "adr_ref": "docs/adr/ADR-0001-zero-trust-swarm-and-counterfactual-optimization.md",
   "plan_doc_ref": "docs/SWARM_IMPLEMENTATION_PLAN.md",
+  "isolation_policy": {
+    "per_task_git_worktree": true,
+    "private_cargo_target_dir": true,
+    "enforce_observed_writes_subset": true
+  },
   "waves": [
     {
+      "wave_id": "W0",
+      "description": "Shared Rust contracts, minimal hmac/sha2 setup, and upfront frozen QA suite",
+      "parallel": false,
+      "nodes": ["W0.A", "W0.B"]
+    },
+    {
       "wave_id": "W1",
-      "description": "Parallel pure-Rust foundational modules with strictly disjoint write sets",
+      "description": "Parallel lightweight Rust hook modules with strictly disjoint write sets",
       "parallel": true,
-      "nodes": ["W1.A", "W1.B", "W1.C", "W1.D", "W1.E"]
+      "nodes": ["W1.A", "W1.B", "W1.C", "W1.D"]
     },
     {
       "wave_id": "W2",
-      "description": "Parallel persistence, single-writer breadcrumb queue, work ledger gate, and Agora encrypted delta bundler",
-      "parallel": true,
+      "description": "Drop-in SKILL.md pack, compiled multi-harness subagent configs, and agent-guard CLI wiring",
+      "parallel": false,
       "nodes": ["W2.A", "W2.B", "W2.C"]
     },
     {
       "wave_id": "W3",
-      "description": "Parallel kernel/CLI integration and multi-harness profile compilation",
-      "parallel": true,
-      "nodes": ["W3.A", "W3.B"]
-    },
-    {
-      "wave_id": "W4",
-      "description": "Upfront & adversarial QA verification suite, RFC crypto vectors, and compiler lock check",
+      "description": "Crash-recovery, worktree, role-bypass, and fail-closed stop-gate verification suite",
       "parallel": false,
-      "nodes": ["W4.A"]
+      "nodes": ["W3.A"]
     }
   ],
   "tasks": [
     {
-      "id": "W1.A",
-      "wave": "W1",
-      "title": "RFC 2104 HMAC-SHA256 & Turn-T Fork-Safe Merkle Event Chain",
+      "id": "W0.A",
+      "wave": "W0",
+      "title": "Minimal hmac+sha2 Crates, Frozen swarm_contracts.rs & Wired Module Stubs",
       "depends_on": [],
-      "allowed_write_paths": ["crates/agent-guard/src/hmac_merkle.rs"],
+      "domain_floor": 9,
+      "allowed_write_paths": [
+        "Cargo.toml",
+        "Cargo.lock",
+        "crates/agent-guard/Cargo.toml",
+        "crates/agent-guard/src/swarm_contracts.rs",
+        "crates/agent-guard/src/lib.rs",
+        "crates/agent-guard/src/role_sandbox.rs",
+        "crates/agent-guard/src/qa_suspects.rs",
+        "crates/agent-guard/src/breadcrumbs.rs",
+        "crates/agent-guard/src/work_ledger.rs"
+      ],
       "assigned_read_paths": [
-        "crates/agent-guard/src/sha256.rs",
+        "Cargo.toml",
+        "crates/agent-guard/Cargo.toml",
+        "crates/agent-guard/src/lib.rs",
         "docs/SWARM_TECHNICAL_SPEC.md",
         "docs/SWARM_IMPLEMENTATION_PLAN.md"
       ],
-      "cascade_sensitivity": 1.0,
+      "criticality_score": 10,
+      "min_coverage_pct": 95,
+      "recommended_model_tier": "frontier"
+    },
+    {
+      "id": "W0.B",
+      "wave": "W0",
+      "title": "Upfront Frozen QA Specification Tests & 3-Tier Attribution Matrix",
+      "depends_on": ["W0.A"],
+      "domain_floor": 9,
+      "allowed_write_paths": [
+        "crates/agent-guard/tests/swarm_v2_contracts.rs",
+        "tests/swarm_v2_attribution.toml"
+      ],
+      "assigned_read_paths": [
+        "crates/agent-guard/src/swarm_contracts.rs",
+        "docs/SWARM_TECHNICAL_SPEC.md",
+        "docs/SWARM_IMPLEMENTATION_PLAN.md"
+      ],
+      "criticality_score": 10,
+      "min_coverage_pct": 95,
+      "recommended_model_tier": "frontier"
+    },
+    {
+      "id": "W1.A",
+      "wave": "W1",
+      "title": "5+1 Role Sandbox, Depth-20 Scout Exemption, Lockfile Doc Broker & Hard 2-Round Cap",
+      "depends_on": ["W0.B"],
+      "domain_floor": 10,
+      "allowed_write_paths": ["crates/agent-guard/src/role_sandbox.rs"],
+      "assigned_read_paths": [
+        "crates/agent-guard/src/swarm_contracts.rs",
+        "crates/agent-guard/src/path_policy.rs",
+        "crates/agent-guard/tests/swarm_v2_contracts.rs",
+        "docs/SWARM_IMPLEMENTATION_PLAN.md"
+      ],
       "criticality_score": 10,
       "min_coverage_pct": 95,
       "recommended_model_tier": "local_7b_or_mid"
@@ -50,31 +103,33 @@
     {
       "id": "W1.B",
       "wave": "W1",
-      "title": "Bounded PolicyVector Weights, Hard Clamps & Canonical SHA-256",
-      "depends_on": [],
-      "allowed_write_paths": ["crates/agent-guard/src/policy_vector.rs"],
+      "title": "Domain-Floored DAG Criticality Validator & 1/0..2/0..N Suspect Solver",
+      "depends_on": ["W0.B"],
+      "domain_floor": 9,
+      "allowed_write_paths": ["crates/agent-guard/src/qa_suspects.rs"],
       "assigned_read_paths": [
+        "crates/agent-guard/src/swarm_contracts.rs",
         "crates/agent-guard/src/json.rs",
-        "crates/agent-guard/src/sha256.rs",
+        "crates/agent-guard/tests/swarm_v2_contracts.rs",
         "docs/SWARM_IMPLEMENTATION_PLAN.md"
       ],
-      "cascade_sensitivity": 0.5,
       "criticality_score": 9,
       "min_coverage_pct": 90,
-      "recommended_model_tier": "local_7b"
+      "recommended_model_tier": "local_7b_or_mid"
     },
     {
       "id": "W1.C",
       "wave": "W1",
-      "title": "5+1 Swarm Role Capability Sandbox, Reviewer URL Allowlist & 4-Trigger Master Escalation",
-      "depends_on": [],
-      "allowed_write_paths": ["crates/agent-guard/src/role_sandbox.rs"],
+      "title": "Complete-Record HMAC Receipts, CRC32 Spools & Worktree-Safe .breadcrumbs.jsonl Queue",
+      "depends_on": ["W0.B"],
+      "domain_floor": 10,
+      "allowed_write_paths": ["crates/agent-guard/src/breadcrumbs.rs"],
       "assigned_read_paths": [
-        "crates/agent-guard/src/path_policy.rs",
-        "docs/SWARM_TECHNICAL_SPEC.md",
+        "crates/agent-guard/src/swarm_contracts.rs",
+        "crates/agent-guard/src/json.rs",
+        "crates/agent-guard/tests/swarm_v2_contracts.rs",
         "docs/SWARM_IMPLEMENTATION_PLAN.md"
       ],
-      "cascade_sensitivity": 1.0,
       "criticality_score": 10,
       "min_coverage_pct": 95,
       "recommended_model_tier": "local_7b_or_mid"
@@ -82,113 +137,47 @@
     {
       "id": "W1.D",
       "wave": "W1",
-      "title": "DAG Topological/Disjoint-Path Validator, Criticality Scorer & 3-Tier QA Fault Triangulator",
-      "depends_on": [],
-      "allowed_write_paths": ["crates/agent-guard/src/qa_triangulator.rs"],
+      "title": "0-LLM 4-Tag Smell Engine & Git-Tree-OID Bound 2+2 Sentence Work Ledger Gate",
+      "depends_on": ["W0.B"],
+      "domain_floor": 9,
+      "allowed_write_paths": ["crates/agent-guard/src/work_ledger.rs"],
       "assigned_read_paths": [
-        "crates/agent-guard/src/json.rs",
-        "docs/SWARM_TECHNICAL_SPEC.md",
+        "crates/agent-guard/src/swarm_contracts.rs",
+        "crates/agent-guard/src/sanitizer.rs",
+        "crates/agent-guard/src/injection_scan.rs",
+        "crates/agent-guard/tests/swarm_v2_contracts.rs",
         "docs/SWARM_IMPLEMENTATION_PLAN.md"
       ],
-      "cascade_sensitivity": 0.5,
       "criticality_score": 9,
       "min_coverage_pct": 90,
       "recommended_model_tier": "local_7b_or_mid"
-    },
-    {
-      "id": "W1.E",
-      "wave": "W1",
-      "title": "Zero-LLM Stream Normalizer & 4-Bucket Flight Heuristic Tagger",
-      "depends_on": [],
-      "allowed_write_paths": ["crates/agent-guard/src/flight_heuristics.rs"],
-      "assigned_read_paths": [
-        "crates/agent-guard/src/sanitizer.rs",
-        "crates/agent-guard/src/injection_scan.rs",
-        "docs/SWARM_IMPLEMENTATION_PLAN.md"
-      ],
-      "cascade_sensitivity": 0.5,
-      "criticality_score": 8,
-      "min_coverage_pct": 85,
-      "recommended_model_tier": "local_7b"
     },
     {
       "id": "W2.A",
       "wave": "W2",
-      "title": "Lock-Free Session Spool & Single-Writer Per-Directory .breadcrumbs.jsonl Queue",
-      "depends_on": ["W1.A"],
-      "allowed_write_paths": ["crates/agent-guard/src/breadcrumb_queue.rs"],
+      "title": "Author Drop-In Swarm Skills (swarm-master, qa-fault-triangulation, grunt-execution)",
+      "depends_on": ["W1.A", "W1.B", "W1.D"],
+      "domain_floor": 9,
+      "allowed_write_paths": [
+        "skills/swarm-master/SKILL.md",
+        "skills/qa-fault-triangulation/SKILL.md",
+        "skills/grunt-execution/SKILL.md"
+      ],
       "assigned_read_paths": [
-        "crates/agent-guard/src/hmac_merkle.rs",
-        "crates/agent-guard/src/json.rs",
+        "skills/zero-trust-guardrails/SKILL.md",
+        "docs/SWARM_TECHNICAL_SPEC.md",
         "docs/SWARM_IMPLEMENTATION_PLAN.md"
       ],
-      "cascade_sensitivity": 0.5,
       "criticality_score": 9,
       "min_coverage_pct": 90,
-      "recommended_model_tier": "local_7b_or_mid"
+      "recommended_model_tier": "frontier"
     },
     {
       "id": "W2.B",
       "wave": "W2",
-      "title": "2+2 Sentence Work Ledger Validator, HMAC Pin Verifier & on-stop Gate",
-      "depends_on": ["W1.A", "W1.E"],
-      "allowed_write_paths": ["crates/agent-guard/src/work_ledger.rs"],
-      "assigned_read_paths": [
-        "crates/agent-guard/src/hmac_merkle.rs",
-        "crates/agent-guard/src/flight_heuristics.rs",
-        "crates/agent-guard/src/sanitizer.rs",
-        "docs/SWARM_IMPLEMENTATION_PLAN.md"
-      ],
-      "cascade_sensitivity": 1.0,
-      "criticality_score": 9,
-      "min_coverage_pct": 90,
-      "recommended_model_tier": "local_7b_or_mid"
-    },
-    {
-      "id": "W2.C",
-      "wave": "W2",
-      "title": "Pure-Rust X25519 + ChaCha20-Poly1305 Envelope, Merkle Delta Bundler & Agora GRPO Scorer",
-      "depends_on": ["W1.A", "W1.B"],
-      "allowed_write_paths": ["crates/agent-guard/src/agora_bundle.rs"],
-      "assigned_read_paths": [
-        "crates/agent-guard/src/hmac_merkle.rs",
-        "crates/agent-guard/src/policy_vector.rs",
-        "crates/agent-guard/src/sha256.rs",
-        "docs/SWARM_IMPLEMENTATION_PLAN.md"
-      ],
-      "cascade_sensitivity": 1.0,
-      "criticality_score": 10,
-      "min_coverage_pct": 95,
-      "recommended_model_tier": "frontier_or_mid"
-    },
-    {
-      "id": "W3.A",
-      "wave": "W3",
-      "title": "agent-guard Kernel Hook Integration & 8 Swarm CLI Subcommands",
-      "depends_on": ["W1.A", "W1.B", "W1.C", "W1.D", "W1.E", "W2.A", "W2.B", "W2.C"],
-      "allowed_write_paths": [
-        "crates/agent-guard/src/lib.rs",
-        "crates/agent-guard/src/main.rs",
-        "crates/agent-guard/src/path_policy.rs",
-        "crates/agent-guard/src/cmd_policy.rs"
-      ],
-      "assigned_read_paths": [
-        "crates/agent-guard/src/lib.rs",
-        "crates/agent-guard/src/main.rs",
-        "crates/agent-guard/src/path_policy.rs",
-        "crates/agent-guard/src/cmd_policy.rs",
-        "docs/SWARM_IMPLEMENTATION_PLAN.md"
-      ],
-      "cascade_sensitivity": 1.0,
-      "criticality_score": 10,
-      "min_coverage_pct": 92,
-      "recommended_model_tier": "frontier"
-    },
-    {
-      "id": "W3.B",
-      "wave": "W3",
-      "title": "6 Swarm Role Profiles, baseline.v1.json & dotagent-compiler Bundle Generation",
-      "depends_on": ["W1.B", "W1.C"],
+      "title": "6 Role TOML Profiles & dotagent-compiler Multi-Harness Subagent Generation",
+      "depends_on": ["W1.A", "W2.A"],
+      "domain_floor": 9,
       "allowed_write_paths": [
         "profiles/master-orchestrator.toml",
         "profiles/zero-trust-investigator.toml",
@@ -196,8 +185,15 @@
         "profiles/standard-grunt.toml",
         "profiles/adversarial-reviewer.toml",
         "profiles/forensic-coroner.toml",
-        "profiles/weights/baseline.v1.json",
-        "crates/dotagent-compiler/src/main.rs"
+        "crates/dotagent-compiler/src/main.rs",
+        "skills/manifest.lock.json",
+        "dist/claude/agents/master.md",
+        "dist/claude/agents/investigator.md",
+        "dist/claude/agents/qa-engineer.md",
+        "dist/claude/agents/grunt.md",
+        "dist/claude/agents/adversarial-reviewer.md",
+        "dist/claude/agents/forensic-coroner.md",
+        "dist-verify/manifest.sha256"
       ],
       "assigned_read_paths": [
         "profiles/coding-agent.toml",
@@ -205,26 +201,50 @@
         "crates/dotagent-compiler/src/main.rs",
         "docs/SWARM_IMPLEMENTATION_PLAN.md"
       ],
-      "cascade_sensitivity": 0.5,
-      "criticality_score": 8,
-      "min_coverage_pct": 85,
+      "criticality_score": 9,
+      "min_coverage_pct": 90,
       "recommended_model_tier": "local_7b_or_mid"
     },
     {
-      "id": "W4.A",
-      "wave": "W4",
-      "title": "Swarm v2 Adversarial Suite, RFC Crypto Vectors & Golden Manifest Verification",
-      "depends_on": ["W3.A", "W3.B"],
+      "id": "W2.C",
+      "wave": "W2",
+      "title": "agent-guard Kernel Hook & 8 Swarm CLI Subcommands Wiring",
+      "depends_on": ["W1.A", "W1.B", "W1.C", "W1.D"],
+      "domain_floor": 9,
       "allowed_write_paths": [
-        "crates/agent-guard/tests/swarm_v2_suite.rs",
+        "crates/agent-guard/src/lib.rs",
+        "crates/agent-guard/src/main.rs",
+        "crates/agent-guard/src/path_policy.rs",
+        "crates/agent-guard/src/cmd_policy.rs"
+      ],
+      "assigned_read_paths": [
+        "crates/agent-guard/src/swarm_contracts.rs",
+        "crates/agent-guard/src/lib.rs",
+        "crates/agent-guard/src/main.rs",
+        "crates/agent-guard/src/path_policy.rs",
+        "crates/agent-guard/src/cmd_policy.rs",
+        "docs/SWARM_IMPLEMENTATION_PLAN.md"
+      ],
+      "criticality_score": 10,
+      "min_coverage_pct": 92,
+      "recommended_model_tier": "frontier"
+    },
+    {
+      "id": "W3.A",
+      "wave": "W3",
+      "title": "Crash-Recovery, Worktree, Exfiltration-Block & Fail-Closed Stop-Gate Adversarial Suite",
+      "depends_on": ["W2.B", "W2.C"],
+      "domain_floor": 9,
+      "allowed_write_paths": [
+        "crates/agent-guard/tests/swarm_v2_adversarial.rs",
         "tests/bypass_corpus.toml"
       ],
       "assigned_read_paths": [
         "crates/agent-guard/tests/adversarial_suite.rs",
+        "crates/agent-guard/tests/swarm_v2_contracts.rs",
         "tests/bypass_corpus.toml",
         "docs/SWARM_IMPLEMENTATION_PLAN.md"
       ],
-      "cascade_sensitivity": 1.0,
       "criticality_score": 10,
       "min_coverage_pct": 95,
       "recommended_model_tier": "frontier"
