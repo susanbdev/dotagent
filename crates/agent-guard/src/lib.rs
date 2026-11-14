@@ -14,15 +14,20 @@
 //! - Cache bleed & cross-repository context contamination (`SHA-256` repo-isolated ledger)
 //! - Confused deputy attacks (git hooks disabled, lifecycle scripts blocked, taint-gated CLIs, MCP lock)
 
+pub mod breadcrumbs;
 pub mod budget_guard;
 pub mod cmd_policy;
 pub mod injection_scan;
 pub mod json;
 pub mod path_policy;
+pub mod qa_suspects;
+pub mod role_sandbox;
 pub mod sanitizer;
 pub mod sha256;
+pub mod swarm_contracts;
 pub mod traversal_ledger;
 pub mod unicode_guard;
+pub mod work_ledger;
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -216,7 +221,33 @@ pub fn handle_pre_tool_hook(raw_json: &str, fallback_cwd: &Path) -> Decision {
     let tool_name = extract_tool_name(&parsed);
     let tool_input = parsed.get("tool_input").unwrap_or(&parsed);
 
-    let decision = evaluate_tool_invocation(&tool_name, tool_input, &repo_root, &cwd, &mut ledger);
+    let (role, cap_opt) = match role_sandbox::resolve_active_role(&repo_root, &session_id) {
+        Ok(rc) => rc,
+        Err(err) => {
+            return Decision::deny("INVALID_SWARM_ROLE", err, true);
+        }
+    };
+
+    let decision = if let Some(role_denial) = role_sandbox::enforce_role_pre_tool(
+        role,
+        cap_opt.as_ref(),
+        &tool_name,
+        tool_input,
+        &repo_root,
+        &cwd,
+    ) {
+        role_denial
+    } else {
+        evaluate_tool_invocation(
+            &tool_name,
+            tool_input,
+            &repo_root,
+            &cwd,
+            &mut ledger,
+            role,
+            cap_opt.as_ref(),
+        )
+    };
     if let Decision::Deny {
         code,
         ref reason,
@@ -225,6 +256,10 @@ pub fn handle_pre_tool_hook(raw_json: &str, fallback_cwd: &Path) -> Decision {
     {
         if halt_session {
             ledger.trip_circuit_breaker(format!("{code}: {reason}"));
+            if let Some(mut c) = cap_opt {
+                c.malicious_flags = c.malicious_flags.saturating_add(1);
+                let _ = role_sandbox::save_session_capability(&repo_root, &c);
+            }
         }
         append_audit_jsonl(
             &repo_root,
@@ -249,6 +284,8 @@ fn evaluate_tool_invocation(
     repo_root: &Path,
     cwd: &Path,
     ledger: &mut SessionLedger,
+    role: swarm_contracts::SwarmRole,
+    cap: Option<&swarm_contracts::SessionCapability>,
 ) -> Decision {
     let norm_tool = tool_name.to_ascii_lowercase();
 
@@ -335,6 +372,13 @@ fn evaluate_tool_invocation(
             Ok(p) => p,
             Err(cv) => return Decision::deny(cv.code, cv.detail, cv.halt_session),
         };
+
+        let write_rels: Vec<String> = plan.write_files.iter().map(|(r, _)| r.clone()).collect();
+        if let Err(role_denial) =
+            role_sandbox::check_role_shell_write_scope(role, cap, &write_rels, repo_root)
+        {
+            return role_denial;
+        }
 
         // Pre-inspect every file read by the shell command (enforces A->B->C, Unicode, injection, & token budget!)
         for (rel, abs_path, is_root_auth) in &plan.read_files {
@@ -494,21 +538,22 @@ fn evaluate_tool_invocation(
                 return Decision::deny(first.code, first.detail.clone(), true);
             }
             if norm_tool.contains("glob") || norm_tool == "find_by_name" {
-                if pat.contains("**") {
+                let role_max_depth = role_sandbox::max_walk_depth_for_role(role);
+                if pat.contains("**") && role != swarm_contracts::SwarmRole::Investigator {
                     return Decision::deny(
                         "UNBOUNDED_GLOB_DEPTH",
                         format!(
-                            "Glob pattern '{pat}' uses unbounded `**` recursion; traversal is restricted to max {MAX_DIRECTORY_WALK_DEPTH} levels."
+                            "Glob pattern '{pat}' uses unbounded `**` recursion; traversal is restricted to max {role_max_depth} levels."
                         ),
                         false,
                     );
                 }
                 let slash_depth = pat.trim_matches('/').chars().filter(|&c| c == '/').count();
-                if slash_depth >= MAX_DIRECTORY_WALK_DEPTH {
+                if slash_depth >= role_max_depth {
                     return Decision::deny(
                         "MAX_GLOB_DEPTH_EXCEEDED",
                         format!(
-                            "Glob pattern '{pat}' traverses {} directory levels (> max {MAX_DIRECTORY_WALK_DEPTH} levels).",
+                            "Glob pattern '{pat}' traverses {} directory levels (> max {role_max_depth} levels).",
                             slash_depth + 1
                         ),
                         false,
@@ -810,6 +855,27 @@ pub fn handle_post_edit(file_path: &str, cwd: &Path) -> Decision {
             ),
             true,
         );
+    }
+
+    if let Ok(sid) = std::env::var("AGENT_GUARD_SESSION_ID") {
+        let trimmed = sid.trim();
+        if !trimmed.is_empty() {
+            if let Ok(cap) = role_sandbox::load_session_capability(&repo_root, trimmed) {
+                let doc_digest = breadcrumbs::sha256_digest(content.as_bytes());
+                let plan_bytes =
+                    swarm_contracts::hex_decode_32(&cap.plan_sha256).unwrap_or([0u8; 32]);
+                let _ = breadcrumbs::append_breadcrumb_for_path(
+                    &repo_root,
+                    &cap.session_id,
+                    &cap.task_id,
+                    plan_bytes,
+                    swarm_contracts::EventOp::FileEdit,
+                    &valid.repo_rel,
+                    None,
+                    doc_digest,
+                );
+            }
+        }
     }
 
     Decision::allow()

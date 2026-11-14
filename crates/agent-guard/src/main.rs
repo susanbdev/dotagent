@@ -438,6 +438,13 @@ fn run_on_stop(cwd: &Path) -> ExitCode {
         return ExitCode::from(2);
     }
 
+    // 3. Enforce Swarm v2 fail-closed stop gates (reject staged `.breadcrumbs.jsonl`
+    //    and require verified green-tree `WORK_LEDGER.jsonl` receipt for active Grunt sessions)
+    if let Err(swarm_err) = agent_guard::work_ledger::verify_on_stop_swarm_gates(&repo_root) {
+        eprintln!("[AGENT-GUARD ON-STOP FAIL] {swarm_err}");
+        return ExitCode::from(2);
+    }
+
     println!(
         "[AGENT-GUARD ON-STOP OK] Repository '{}' passed security audit.",
         repo_root.display()

@@ -1,0 +1,56 @@
+# Upfront QA Fault-Attribution Matrix for susanbdev/dotagent Swarm v2
+# Every [[tests]] entry binds 1 primary_suspect, 0..=2 secondary_suspects, and 0..=N boundary_interfaces.
+
+[[tests]]
+name = "f02_rejects_identical_content_path_swap_in_breadcrumbs"
+primary_suspect = "W1.C"
+secondary_suspects = []
+boundary_interfaces = []
+
+[[tests]]
+name = "f06_investigator_depth_20_allowed_while_node_modules_and_writes_blocked"
+primary_suspect = "W1.A"
+secondary_suspects = []
+boundary_interfaces = []
+
+[[tests]]
+name = "f08_reviewer_url_exfiltration_blocked_and_lockfile_doc_broker_verified"
+primary_suspect = "W1.A"
+secondary_suspects = []
+boundary_interfaces = []
+
+[[tests]]
+name = "f10_f21_typed_worker_packets_and_two_round_cap_enforced"
+primary_suspect = "W1.A"
+secondary_suspects = []
+boundary_interfaces = []
+
+[[tests]]
+name = "f14_f16_f17_crc32_spool_quarantines_torn_tail_and_worktree_exclude_dedups"
+primary_suspect = "W1.C"
+secondary_suspects = []
+boundary_interfaces = []
+
+[[tests]]
+name = "f20_f27_domain_floored_coverage_and_fault_triangulation_verdicts"
+primary_suspect = "W1.B"
+secondary_suspects = []
+boundary_interfaces = []
+
+[[tests]]
+name = "f18_f32_f33_work_ledger_two_plus_two_tree_oid_and_smell_badges"
+primary_suspect = "W1.D"
+secondary_suspects = ["W1.C"]
+boundary_interfaces = ["AuthenticatedEvent", "WorkLedgerEntry"]
+
+[[tests]]
+name = "end_to_end_swarm_tool_role_delegation_and_fail_closed_on_stop_cli"
+primary_suspect = "W2.C"
+secondary_suspects = ["W1.A", "W1.D"]
+boundary_interfaces = ["SessionCapability", "WorkLedgerEntry"]
+
+[[tests]]
+name = "all_six_role_skills_readmes_and_compiled_agents_verified"
+primary_suspect = "W2.A"
+secondary_suspects = ["W2.B"]
+boundary_interfaces = ["skills/manifest.lock.json", "dist-verify/manifest.sha256"]

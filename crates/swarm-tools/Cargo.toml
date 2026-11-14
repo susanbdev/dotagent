@@ -1,0 +1,17 @@
+[package]
+name = "swarm-tools"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Role-specific deterministic Rust CLI tooling for dotagent Zero-Trust Swarm v2 skills (master, investigator, qa-engineer, grunt, adversarial-reviewer, forensic-coroner)"
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "swarm-tool"
+path = "src/main.rs"
+
+[dependencies]
+agent-guard = { path = "../agent-guard" }

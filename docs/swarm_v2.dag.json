@@ -155,13 +155,22 @@
     {
       "id": "W2.A",
       "wave": "W2",
-      "title": "Author Drop-In Swarm Skills (swarm-master, qa-fault-triangulation, grunt-execution)",
+      "title": "Author 6 Per-Role Skills & Explicit Role README Manuals (skills/swarm-*/{SKILL.md,README.md})",
       "depends_on": ["W1.A", "W1.B", "W1.D"],
       "domain_floor": 9,
       "allowed_write_paths": [
         "skills/swarm-master/SKILL.md",
-        "skills/qa-fault-triangulation/SKILL.md",
-        "skills/grunt-execution/SKILL.md"
+        "skills/swarm-master/README.md",
+        "skills/swarm-investigator/SKILL.md",
+        "skills/swarm-investigator/README.md",
+        "skills/swarm-qa-engineer/SKILL.md",
+        "skills/swarm-qa-engineer/README.md",
+        "skills/swarm-grunt/SKILL.md",
+        "skills/swarm-grunt/README.md",
+        "skills/swarm-adversarial-reviewer/SKILL.md",
+        "skills/swarm-adversarial-reviewer/README.md",
+        "skills/swarm-forensic-coroner/SKILL.md",
+        "skills/swarm-forensic-coroner/README.md"
       ],
       "assigned_read_paths": [
         "skills/zero-trust-guardrails/SKILL.md",
@@ -179,20 +188,21 @@
       "depends_on": ["W1.A", "W2.A"],
       "domain_floor": 9,
       "allowed_write_paths": [
-        "profiles/master-orchestrator.toml",
-        "profiles/zero-trust-investigator.toml",
-        "profiles/qa-engineer.toml",
-        "profiles/standard-grunt.toml",
-        "profiles/adversarial-reviewer.toml",
-        "profiles/forensic-coroner.toml",
+        "profiles/swarm-master.toml",
+        "profiles/swarm-investigator.toml",
+        "profiles/swarm-qa-engineer.toml",
+        "profiles/swarm-grunt.toml",
+        "profiles/swarm-adversarial-reviewer.toml",
+        "profiles/swarm-forensic-coroner.toml",
         "crates/dotagent-compiler/src/main.rs",
+        "scripts/activate-local.sh",
         "skills/manifest.lock.json",
-        "dist/claude/agents/master.md",
-        "dist/claude/agents/investigator.md",
-        "dist/claude/agents/qa-engineer.md",
-        "dist/claude/agents/grunt.md",
-        "dist/claude/agents/adversarial-reviewer.md",
-        "dist/claude/agents/forensic-coroner.md",
+        "dist/claude/agents/swarm-master.md",
+        "dist/claude/agents/swarm-investigator.md",
+        "dist/claude/agents/swarm-qa-engineer.md",
+        "dist/claude/agents/swarm-grunt.md",
+        "dist/claude/agents/swarm-adversarial-reviewer.md",
+        "dist/claude/agents/swarm-forensic-coroner.md",
         "dist-verify/manifest.sha256"
       ],
       "assigned_read_paths": [
@@ -208,21 +218,21 @@
     {
       "id": "W2.C",
       "wave": "W2",
-      "title": "agent-guard Kernel Hook & 8 Swarm CLI Subcommands Wiring",
+      "title": "agent-guard Kernel Wiring & Dedicated swarm-tool Role Rust CLI",
       "depends_on": ["W1.A", "W1.B", "W1.C", "W1.D"],
       "domain_floor": 9,
       "allowed_write_paths": [
         "crates/agent-guard/src/lib.rs",
         "crates/agent-guard/src/main.rs",
         "crates/agent-guard/src/path_policy.rs",
-        "crates/agent-guard/src/cmd_policy.rs"
+        "crates/swarm-tools/Cargo.toml",
+        "crates/swarm-tools/src/main.rs"
       ],
       "assigned_read_paths": [
         "crates/agent-guard/src/swarm_contracts.rs",
         "crates/agent-guard/src/lib.rs",
         "crates/agent-guard/src/main.rs",
         "crates/agent-guard/src/path_policy.rs",
-        "crates/agent-guard/src/cmd_policy.rs",
         "docs/SWARM_IMPLEMENTATION_PLAN.md"
       ],
       "criticality_score": 10,
@@ -232,17 +242,15 @@
     {
       "id": "W3.A",
       "wave": "W3",
-      "title": "Crash-Recovery, Worktree, Exfiltration-Block & Fail-Closed Stop-Gate Adversarial Suite",
+      "title": "End-to-End Skill Delegation, Crash-Recovery, Worktree & Fail-Closed Stop-Gate Suite",
       "depends_on": ["W2.B", "W2.C"],
       "domain_floor": 9,
       "allowed_write_paths": [
-        "crates/agent-guard/tests/swarm_v2_adversarial.rs",
-        "tests/bypass_corpus.toml"
+        "crates/agent-guard/tests/swarm_v2_suite.rs",
+        "tests/swarm_v2_attribution.toml"
       ],
       "assigned_read_paths": [
         "crates/agent-guard/tests/adversarial_suite.rs",
-        "crates/agent-guard/tests/swarm_v2_contracts.rs",
-        "tests/bypass_corpus.toml",
         "docs/SWARM_IMPLEMENTATION_PLAN.md"
       ],
       "criticality_score": 10,

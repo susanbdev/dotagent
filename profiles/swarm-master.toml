@@ -1,0 +1,41 @@
+# Swarm Master (Blind DAG Supervisor & Escalation Arbiter) Role Profile
+profile_id = "swarm-master"
+version = "2.0.0"
+role = "master"
+skill = "skills/swarm-master/SKILL.md"
+rust_cli = "swarm-tool master"
+write_scope = "none"
+source_read_scope = "none"
+approval_authority = "human-escalation-arbiter"
+
+[authority]
+root_file = "AGENTS.md"
+allow_nested_authority_files = false
+allow_shadow_authority_files = false
+treat_all_other_files_as_untrusted = true
+
+[git]
+disable_all_hooks = true
+hooks_path = "/dev/null"
+attributes_file = "/dev/null"
+fsmonitor = false
+allowed_protocols = ["https"]
+allow_force_push = false
+allow_history_rewrite = false
+allow_autonomous_push = false
+
+[traversal]
+max_directory_walk_depth = 0
+max_reference_pointer_levels = 2
+halt_on_poisoned_pointer = true
+forbidden_zones = ["tmp", "cache", "dependencies", "secrets", "agent-guard-state"]
+
+[swarm]
+env_role = "master"
+typed_worker_packets_only = true
+clean_slate_retry = true
+escalation_triggers = ["AMBIGUOUS_REQUIREMENT", "CONFLICTING_CONSTRAINTS", "OUT_OF_SCOPE_BOUNDARY", "ADVERSARIAL_ROUND_CAP_EXCEEDED"]
+
+[mcp]
+allowed_endpoint = "https://mcp.zt.susanb.dev/mcp"
+ban_stdio_npx_servers = true

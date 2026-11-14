@@ -14,3 +14,6 @@ name = "agent-guard"
 path = "src/main.rs"
 
 [dependencies]
+crc32fast = "1.4"
+hmac = "0.12"
+sha2 = "0.10"

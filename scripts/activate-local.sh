@@ -15,7 +15,7 @@ chmod 700 "${HOME}/.local/state/agent-guard" "${HOME}/.local/state/agent-guard/s
 
 # 1. Build static release binaries and install with read-execute-only VFS mode (0555)
 cargo build --release --manifest-path "${DOTAGENT_ROOT}/Cargo.toml"
-for bin_name in agent-guard dotagent-compiler; do
+for bin_name in agent-guard dotagent-compiler swarm-tool; do
     if [[ -e "${BIN_DIR}/${bin_name}" ]]; then
         chmod u+w "${BIN_DIR}/${bin_name}" 2>/dev/null || true
     fi
@@ -59,21 +59,32 @@ mkdir -p "${HOME}/.gemini"
 cp -f "${DOTAGENT_ROOT}/dist/gemini/GEMINI.md" "${HOME}/.gemini/GEMINI.md"
 cp -f "${DOTAGENT_ROOT}/dist/gemini/settings.json" "${HOME}/.gemini/settings.json"
 
-# 5. Deploy root AGENTS.md + harness hooks + research-airlock subagent
+# 5. Deploy root AGENTS.md + harness hooks + research-airlock & 6 Swarm role subagents
 #    Source repo keeps 0644 for git workflows; deployed runtime workspace gets VFS read-only 0444!
 deploy_harness_bundle() {
     local root="$1"
     local mode="$2"
     mkdir -p "${root}/.claude/agents" "${root}/.cursor" "${root}/.codex"
+    local agent_files=(
+        "research-airlock.md"
+        "swarm-master.md"
+        "swarm-investigator.md"
+        "swarm-qa-engineer.md"
+        "swarm-grunt.md"
+        "swarm-adversarial-reviewer.md"
+        "swarm-forensic-coroner.md"
+    )
     local targets=(
         "${root}/AGENTS.md"
         "${root}/.ignore"
         "${root}/.cursorignore"
         "${root}/.claude/settings.json"
-        "${root}/.claude/agents/research-airlock.md"
         "${root}/.cursor/hooks.json"
         "${root}/.codex/config.toml"
     )
+    for af in "${agent_files[@]}"; do
+        targets+=("${root}/.claude/agents/${af}")
+    done
     for t in "${targets[@]}"; do
         if [[ -e "${t}" ]]; then
             chmod u+w "${t}" 2>/dev/null || true
@@ -83,7 +94,9 @@ deploy_harness_bundle() {
     install -m "${mode}" "${DOTAGENT_ROOT}/dist/.ignore" "${root}/.ignore"
     install -m "${mode}" "${DOTAGENT_ROOT}/dist/cursor/.cursorignore" "${root}/.cursorignore"
     install -m "${mode}" "${DOTAGENT_ROOT}/dist/claude/settings.json" "${root}/.claude/settings.json"
-    install -m "${mode}" "${DOTAGENT_ROOT}/dist/claude/agents/research-airlock.md" "${root}/.claude/agents/research-airlock.md"
+    for af in "${agent_files[@]}"; do
+        install -m "${mode}" "${DOTAGENT_ROOT}/dist/claude/agents/${af}" "${root}/.claude/agents/${af}"
+    done
     install -m "${mode}" "${DOTAGENT_ROOT}/dist/cursor/hooks.json" "${root}/.cursor/hooks.json"
     install -m "${mode}" "${DOTAGENT_ROOT}/dist/codex/config.toml" "${root}/.codex/config.toml"
 }
