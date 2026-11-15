@@ -265,6 +265,31 @@ impl SessionLedger {
         }
     }
 
+    /// Registers repository pointers discovered inside dynamic `PostToolUse` outputs
+    /// (MCP responses, custom tools, etc.) so subsequent `Read` calls cannot bypass
+    /// the `A -> B -> C` transitive hop ceiling.
+    pub fn register_dynamic_tool_pointers(&mut self, tool_label: &str, targets: &[String]) {
+        if targets.is_empty() {
+            return;
+        }
+        let max_read_level = self
+            .nodes
+            .values()
+            .filter(|n| n.was_read)
+            .map(|n| n.level)
+            .max()
+            .unwrap_or(1);
+        let source_key = format!("<tool_output:{tool_label}:{max_read_level}>");
+        self.nodes
+            .entry(source_key.clone())
+            .or_insert(TraversalNode {
+                level: max_read_level,
+                chain: source_key.clone(),
+                was_read: true,
+            });
+        self.register_outgoing_pointers(&source_key, targets);
+    }
+
     fn to_json(&self) -> String {
         let mut nodes_entries = Vec::with_capacity(self.nodes.len());
         for (k, v) in &self.nodes {
@@ -428,11 +453,100 @@ fn sanitize_session_id(raw: &str) -> String {
     }
 }
 
+pub fn validate_state_dir_override(raw: &str) -> Option<PathBuf> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty()
+        || !crate::unicode_guard::scan_unicode(
+            trimmed,
+            crate::unicode_guard::ScanMode::StrictPathOrCommand,
+        )
+        .is_empty()
+    {
+        return None;
+    }
+    let candidate = Path::new(trimmed);
+    if !candidate.is_absolute() {
+        return None;
+    }
+    let slash = trimmed.replace('\\', "/");
+    let lower = slash.to_ascii_lowercase();
+    for bad_prefix in [
+        "/tmp",
+        "/var/tmp",
+        "/dev/shm",
+        "/run/user",
+        "/private/tmp",
+        "/private/var/tmp",
+        "/proc/",
+    ] {
+        if lower == bad_prefix || lower.starts_with(&format!("{bad_prefix}/")) {
+            return None;
+        }
+    }
+
+    let mut acc = PathBuf::new();
+    let mut inside_git_repo = false;
+    for comp in candidate.components() {
+        match comp {
+            std::path::Component::RootDir => acc.push("/"),
+            std::path::Component::Prefix(p) => acc.push(p.as_os_str()),
+            std::path::Component::CurDir | std::path::Component::ParentDir => return None,
+            std::path::Component::Normal(seg) => {
+                let s = seg.to_string_lossy().to_ascii_lowercase();
+                if s == ".git"
+                    || s.starts_with(".env")
+                    || matches!(
+                        s.as_str(),
+                        "tmp"
+                            | ".tmp"
+                            | "temp"
+                            | ".temp"
+                            | ".cache"
+                            | "__pycache__"
+                            | ".pytest_cache"
+                            | ".mypy_cache"
+                            | ".ruff_cache"
+                            | ".next"
+                            | ".turbo"
+                            | "node_modules"
+                            | "vendor"
+                            | ".venv"
+                            | "venv"
+                            | "site-packages"
+                            | ".ssh"
+                            | ".aws"
+                            | ".gnupg"
+                    )
+                {
+                    return None;
+                }
+                acc.push(seg);
+                if let Ok(meta) = fs::symlink_metadata(&acc) {
+                    if meta.file_type().is_symlink() {
+                        return None;
+                    }
+                    if acc.join(".git").exists() {
+                        inside_git_repo = true;
+                    }
+                }
+            }
+        }
+    }
+
+    // Prevent redirecting guard state/audit logs into a repository working tree
+    // (allowing only dedicated `target/test-workspaces/` sandboxes used by cargo tests).
+    let is_test_workspace = lower.contains("/target/test-workspaces/");
+    if inside_git_repo && !is_test_workspace {
+        return None;
+    }
+
+    Some(acc)
+}
+
 pub fn state_base_dir() -> PathBuf {
     if let Ok(override_dir) = std::env::var("AGENT_GUARD_STATE_DIR") {
-        let trimmed = override_dir.trim();
-        if !trimmed.is_empty() {
-            return PathBuf::from(trimmed);
+        if let Some(valid) = validate_state_dir_override(&override_dir) {
+            return valid;
         }
     }
     if let Ok(home) = std::env::var("HOME") {

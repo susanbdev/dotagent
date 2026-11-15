@@ -61,7 +61,7 @@ fn build_all(repo_root: &Path) -> Result<usize, String> {
     validate_profiles(repo_root)?;
 
     let skills_lock_path = repo_root.join("skills").join("manifest.lock.json");
-    write_file(&skills_lock_path, &skills_lock_json)?;
+    write_file_contained(repo_root, &skills_lock_path, &skills_lock_json)?;
 
     let artifacts = render_bundle_artifacts();
     let dist_root = repo_root.join("dist");
@@ -70,13 +70,8 @@ fn build_all(repo_root: &Path) -> Result<usize, String> {
     for (rel_path, content) in &artifacts {
         run_policy_gate_on_artifact(rel_path, content)?;
         let out_path = dist_root.join(rel_path);
-        write_file(&out_path, content)?;
-        if let Some(agent_file) = rel_path.strip_prefix("claude/agents/") {
-            write_file(
-                &repo_root.join(".claude").join("agents").join(agent_file),
-                content,
-            )?;
-        }
+        write_file_contained(repo_root, &out_path, content)?;
+        sync_repo_harness_copy(repo_root, rel_path, content)?;
         let digest = sha256_hex(content.as_bytes());
         manifest_lines.push(format!("{digest}  dist/{rel_path}"));
     }
@@ -88,7 +83,7 @@ fn build_all(repo_root: &Path) -> Result<usize, String> {
     let verify_path = repo_root.join("dist-verify").join("manifest.sha256");
     let mut manifest_body = manifest_lines.join("\n");
     manifest_body.push('\n');
-    write_file(&verify_path, &manifest_body)?;
+    write_file_contained(repo_root, &verify_path, &manifest_body)?;
 
     Ok(artifacts.len() + 1)
 }
@@ -97,9 +92,11 @@ fn verify_all(repo_root: &Path) -> Result<usize, String> {
     let expected_skills_lock = validate_and_lock_skills(repo_root)?;
     validate_profiles(repo_root)?;
 
-    let actual_skills_lock =
-        fs::read_to_string(repo_root.join("skills").join("manifest.lock.json"))
-            .map_err(|e| format!("missing skills/manifest.lock.json: {e}"))?;
+    let actual_skills_lock = read_contained_regular_file(
+        repo_root,
+        &repo_root.join("skills").join("manifest.lock.json"),
+    )
+    .map_err(|e| format!("missing or invalid skills/manifest.lock.json: {e}"))?;
     if actual_skills_lock != expected_skills_lock {
         return Err("skills/manifest.lock.json is out of sync with skills/*/SKILL.md".to_string());
     }
@@ -109,8 +106,12 @@ fn verify_all(repo_root: &Path) -> Result<usize, String> {
     for (rel_path, expected_content) in &artifacts {
         run_policy_gate_on_artifact(rel_path, expected_content)?;
         let disk_path = repo_root.join("dist").join(rel_path);
-        let disk_content = fs::read_to_string(&disk_path)
-            .map_err(|e| format!("missing compiled artifact '{}': {e}", disk_path.display()))?;
+        let disk_content = read_contained_regular_file(repo_root, &disk_path).map_err(|e| {
+            format!(
+                "missing or invalid compiled artifact '{}': {e}",
+                disk_path.display()
+            )
+        })?;
         if &disk_content != expected_content {
             return Err(format!(
                 "compiled artifact 'dist/{rel_path}' drifted from canonical source"
@@ -126,8 +127,11 @@ fn verify_all(repo_root: &Path) -> Result<usize, String> {
     let mut expected_manifest = expected_lines.join("\n");
     expected_manifest.push('\n');
 
-    let actual_manifest = fs::read_to_string(repo_root.join("dist-verify").join("manifest.sha256"))
-        .map_err(|e| format!("missing dist-verify/manifest.sha256: {e}"))?;
+    let actual_manifest = read_contained_regular_file(
+        repo_root,
+        &repo_root.join("dist-verify").join("manifest.sha256"),
+    )
+    .map_err(|e| format!("missing or invalid dist-verify/manifest.sha256: {e}"))?;
     if actual_manifest != expected_manifest {
         return Err("dist-verify/manifest.sha256 hash mismatch".to_string());
     }
@@ -137,21 +141,97 @@ fn verify_all(repo_root: &Path) -> Result<usize, String> {
 
 const MAX_ROLE_README_BYTES: usize = 4_096;
 
+fn ensure_no_symlink_components_under(root: &Path, target: &Path) -> Result<PathBuf, String> {
+    let canon_root = fs::canonicalize(root)
+        .map_err(|e| format!("cannot canonicalize root '{}': {e}", root.display()))?;
+    let rel = target
+        .strip_prefix(root)
+        .or_else(|_| target.strip_prefix(&canon_root))
+        .map_err(|_| {
+            format!(
+                "path '{}' is outside repository root '{}'",
+                target.display(),
+                canon_root.display()
+            )
+        })?;
+    let mut cur = canon_root.clone();
+    for comp in rel.components() {
+        match comp {
+            std::path::Component::Normal(seg) => {
+                cur.push(seg);
+                if let Ok(meta) = fs::symlink_metadata(&cur) {
+                    if meta.file_type().is_symlink() {
+                        return Err(format!(
+                            "refusing symlink component '{}' inside compiler trust boundary",
+                            cur.display()
+                        ));
+                    }
+                }
+            }
+            std::path::Component::CurDir => {}
+            _ => {
+                return Err(format!(
+                    "disallowed path traversal component in '{}'",
+                    target.display()
+                ));
+            }
+        }
+    }
+    Ok(canon_root)
+}
+
+fn read_contained_regular_file(base_dir: &Path, target: &Path) -> Result<String, String> {
+    let canon_base = ensure_no_symlink_components_under(base_dir, target)?;
+    let meta = fs::symlink_metadata(target)
+        .map_err(|e| format!("cannot stat '{}': {e}", target.display()))?;
+    if meta.file_type().is_symlink() || !meta.file_type().is_file() {
+        return Err(format!(
+            "'{}' must be a regular non-symlink file",
+            target.display()
+        ));
+    }
+    let canon_file = fs::canonicalize(target)
+        .map_err(|e| format!("cannot canonicalize '{}': {e}", target.display()))?;
+    if !canon_file.starts_with(&canon_base) {
+        return Err(format!(
+            "'{}' escaped boundary '{}'",
+            canon_file.display(),
+            canon_base.display()
+        ));
+    }
+    fs::read_to_string(&canon_file).map_err(|e| format!("cannot read '{}': {e}", target.display()))
+}
+
 fn validate_and_lock_skills(repo_root: &Path) -> Result<String, String> {
     let skills_dir = repo_root.join("skills");
+    let _ = ensure_no_symlink_components_under(repo_root, &skills_dir)?;
+    let skills_meta = fs::symlink_metadata(&skills_dir)
+        .map_err(|e| format!("cannot stat skills dir '{}': {e}", skills_dir.display()))?;
+    if skills_meta.file_type().is_symlink() || !skills_meta.file_type().is_dir() {
+        return Err("skills/ must be a regular non-symlink directory".to_string());
+    }
     let entries = fs::read_dir(&skills_dir)
         .map_err(|e| format!("cannot read skills dir '{}': {e}", skills_dir.display()))?;
 
     let mut skill_hashes = BTreeMap::new();
     for entry in entries.flatten() {
         let p = entry.path();
-        if !p.is_dir() {
+        let ft = entry
+            .file_type()
+            .map_err(|e| format!("cannot inspect '{}': {e}", p.display()))?;
+        if ft.is_symlink() {
+            return Err(format!(
+                "symlinked skill entry '{}' is forbidden",
+                p.display()
+            ));
+        }
+        if !ft.is_dir() {
             continue;
         }
         let skill_name = entry.file_name().to_string_lossy().into_owned();
         let md_path = p.join("SKILL.md");
-        let body = fs::read_to_string(&md_path)
-            .map_err(|e| format!("missing SKILL.md in '{}': {e}", p.display()))?;
+        let body = read_contained_regular_file(&skills_dir, &md_path)
+            .map_err(|e| format!("invalid SKILL.md in '{}': {e}", p.display()))?;
 
         if body.len() > MAX_SKILL_BYTES {
             return Err(format!(
@@ -174,8 +254,8 @@ fn validate_and_lock_skills(repo_root: &Path) -> Result<String, String> {
             ));
         }
         if readme_path.exists() {
-            let readme_body = fs::read_to_string(&readme_path)
-                .map_err(|e| format!("cannot read '{}': {e}", readme_path.display()))?;
+            let readme_body = read_contained_regular_file(&skills_dir, &readme_path)
+                .map_err(|e| format!("invalid README.md in '{}': {e}", p.display()))?;
             if readme_body.len() > MAX_ROLE_README_BYTES {
                 return Err(format!(
                     "Skill role manual '{skill_name}/README.md' is {} bytes (> {MAX_ROLE_README_BYTES} byte limit)",
@@ -236,6 +316,7 @@ fn validate_skill_doc_hygiene(label: &str, body: &str, strict_ascii: bool) -> Re
 
 fn validate_profiles(repo_root: &Path) -> Result<(), String> {
     let profiles_dir = repo_root.join("profiles");
+    let _ = ensure_no_symlink_components_under(repo_root, &profiles_dir)?;
     for required in [
         "coding-agent.toml",
         "adversarial-reviewer.toml",
@@ -248,8 +329,8 @@ fn validate_profiles(repo_root: &Path) -> Result<(), String> {
         "swarm-forensic-coroner.toml",
     ] {
         let p = profiles_dir.join(required);
-        let text = fs::read_to_string(&p)
-            .map_err(|e| format!("missing profile '{}': {e}", p.display()))?;
+        let text = read_contained_regular_file(&profiles_dir, &p)
+            .map_err(|e| format!("missing or invalid profile '{}': {e}", p.display()))?;
         let uni = scan_unicode(&text, ScanMode::UntrustedContent);
         if let Some(first) = uni.first() {
             return Err(format!(
@@ -312,13 +393,58 @@ fn run_policy_gate_on_artifact(rel_path: &str, content: &str) -> Result<(), Stri
     Ok(())
 }
 
-fn write_file(path: &Path, content: &str) -> Result<(), String> {
+fn write_file_contained(repo_root: &Path, path: &Path, content: &str) -> Result<(), String> {
+    let canon_repo = ensure_no_symlink_components_under(repo_root, path)?;
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)
             .map_err(|e| format!("cannot create '{}': {e}", parent.display()))?;
+        let canon_parent = fs::canonicalize(parent)
+            .map_err(|e| format!("cannot canonicalize '{}': {e}", parent.display()))?;
+        if !canon_parent.starts_with(&canon_repo) {
+            return Err(format!(
+                "parent '{}' escaped repository root '{}'",
+                canon_parent.display(),
+                canon_repo.display()
+            ));
+        }
+    }
+    if let Ok(meta) = fs::symlink_metadata(path) {
+        if meta.file_type().is_symlink() {
+            return Err(format!(
+                "refusing to overwrite symlink destination '{}'",
+                path.display()
+            ));
+        }
     }
     fs::write(path, content.as_bytes())
         .map_err(|e| format!("cannot write '{}': {e}", path.display()))
+}
+
+fn sync_repo_harness_copy(repo_root: &Path, rel_path: &str, content: &str) -> Result<(), String> {
+    let maybe_dest = match rel_path {
+        ".ignore" => Some(repo_root.join(".ignore")),
+        "cursor/.cursorignore" => Some(repo_root.join(".cursorignore")),
+        "claude/settings.json" => Some(repo_root.join(".claude").join("settings.json")),
+        "cursor/hooks.json" => Some(repo_root.join(".cursor").join("hooks.json")),
+        "codex/config.toml" => Some(repo_root.join(".codex").join("config.toml")),
+        _ => rel_path
+            .strip_prefix("claude/agents/")
+            .map(|f| repo_root.join(".claude").join("agents").join(f))
+            .or_else(|| {
+                rel_path
+                    .strip_prefix("cursor/agents/")
+                    .map(|f| repo_root.join(".cursor").join("agents").join(f))
+            })
+            .or_else(|| {
+                rel_path
+                    .strip_prefix("codex/agents/")
+                    .map(|f| repo_root.join(".codex").join("agents").join(f))
+            }),
+    };
+    if let Some(dest) = maybe_dest {
+        write_file_contained(repo_root, &dest, content)?;
+    }
+    Ok(())
 }
 
 fn render_bundle_artifacts() -> BTreeMap<String, String> {
@@ -330,12 +456,17 @@ fn render_bundle_artifacts() -> BTreeMap<String, String> {
     );
     map.insert(".ignore".to_string(), render_universal_ignore());
     map.insert("claude/settings.json".to_string(), render_claude_settings());
-    map.insert(
-        "claude/agents/research-airlock.md".to_string(),
-        render_claude_research_airlock_agent(),
-    );
+    let airlock = render_claude_research_airlock_agent();
+    for harness in ["claude", "cursor", "codex", "gemini"] {
+        map.insert(
+            format!("{harness}/agents/research-airlock.md"),
+            airlock.clone(),
+        );
+    }
     for (name, body) in render_claude_swarm_role_agents() {
-        map.insert(format!("claude/agents/{name}"), body);
+        for harness in ["claude", "cursor", "codex", "gemini"] {
+            map.insert(format!("{harness}/agents/{name}"), body.clone());
+        }
     }
     map.insert("gemini/settings.json".to_string(), render_gemini_settings());
     map.insert("gemini/GEMINI.md".to_string(), render_gemini_global_md());
@@ -504,6 +635,7 @@ target/release/deps/
 # Secrets, credentials, & agent-guard internal state
 .env
 .env.*
+.env*
 *.pem
 *.key
 *.p12
@@ -590,8 +722,10 @@ fn render_claude_settings() -> String {
       "Read(**/site-packages/**)",
       "Read(.env)",
       "Read(.env.*)",
+      "Read(.env*)",
       "Read(**/.env)",
       "Read(**/.env.*)",
+      "Read(**/.env*)",
       "Read(**/*.pem)",
       "Read(**/*.key)",
       "Read(~/.ssh/**)",
@@ -984,6 +1118,7 @@ project_doc_max_bytes = 16384
 project_doc_fallback_filenames = []
 model_auto_compact_token_limit = 20000
 tool_output_token_limit = 2500
+notify = ["agent-guard", "on-stop"]
 
 [sandbox_workspace_write]
 network_access = false

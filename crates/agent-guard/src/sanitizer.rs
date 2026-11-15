@@ -168,10 +168,15 @@ pub fn sanitize_and_compact_bytes(
         san.was_modified = true;
     }
 
+    const TRUNC_MARKER: &str = "\n... [TRUNCATED AT TIGHT STEP BYTE CAP BY AGENT-GUARD] ...";
     if san.clean_ascii.len() > max_bytes {
-        san.clean_ascii.truncate(max_bytes);
-        san.clean_ascii
-            .push_str("\n... [TRUNCATED AT TIGHT STEP BYTE CAP BY AGENT-GUARD] ...");
+        if max_bytes <= TRUNC_MARKER.len() {
+            san.clean_ascii = TRUNC_MARKER[..max_bytes].to_string();
+        } else {
+            let keep = max_bytes - TRUNC_MARKER.len();
+            san.clean_ascii.truncate(keep);
+            san.clean_ascii.push_str(TRUNC_MARKER);
+        }
         san.was_modified = true;
     }
 

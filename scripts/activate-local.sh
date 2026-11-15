@@ -13,6 +13,49 @@ BIN_DIR="${HOME}/.local/bin"
 mkdir -p "${BIN_DIR}" "${HOME}/.local/state/agent-guard/sessions"
 chmod 700 "${HOME}/.local/state/agent-guard" "${HOME}/.local/state/agent-guard/sessions"
 
+# 0. Pre-build bootstrap audit: reject build-tool RCE traps BEFORE invoking Cargo
+audit_prebuild_traps() {
+    local scan_dir="${DOTAGENT_ROOT}"
+    while true; do
+        for cargo_cfg in "${scan_dir}/.cargo/config" "${scan_dir}/.cargo/config.toml"; do
+            if [[ -L "${cargo_cfg}" || -L "${scan_dir}/.cargo" ]]; then
+                echo "[activate-local] HARD DENY: symlinked .cargo config at ${cargo_cfg}" >&2
+                exit 2
+            fi
+            if [[ -f "${cargo_cfg}" ]] && grep -Eiq '(rustc-wrapper|workspace-wrapper|linker\s*=|runner\s*=|\brustc\s*=)' "${cargo_cfg}"; then
+                echo "[activate-local] HARD DENY: dangerous Cargo wrapper/linker/runner in ${cargo_cfg}" >&2
+                exit 2
+            fi
+        done
+        if [[ "${scan_dir}" == "/" || "${scan_dir}" == "${HOME}" ]]; then
+            break
+        fi
+        local parent_dir
+        parent_dir="$(dirname "${scan_dir}")"
+        if [[ "${parent_dir}" == "${scan_dir}" ]]; then
+            break
+        fi
+        scan_dir="${parent_dir}"
+    done
+
+    if [[ -L "${DOTAGENT_ROOT}/AGENTS.md" ]]; then
+        echo "[activate-local] HARD DENY: root AGENTS.md must not be a symlink" >&2
+        exit 2
+    fi
+    if [[ -L "${DOTAGENT_ROOT}/.gitattributes" ]] || ([[ -f "${DOTAGENT_ROOT}/.gitattributes" ]] && grep -Eiq '(filter\s*=|diff\s*=|merge\s*=|textconv\s*=)' "${DOTAGENT_ROOT}/.gitattributes"); then
+        echo "[activate-local] HARD DENY: dangerous .gitattributes driver in ${DOTAGENT_ROOT}/.gitattributes" >&2
+        exit 2
+    fi
+    for yarn_cfg in "${DOTAGENT_ROOT}/.yarnrc" "${DOTAGENT_ROOT}/.yarnrc.yml" "${DOTAGENT_ROOT}/.yarnrc.yaml"; do
+        if [[ -L "${yarn_cfg}" ]] || ([[ -f "${yarn_cfg}" ]] && grep -Eiq 'yarnPath' "${yarn_cfg}"); then
+            echo "[activate-local] HARD DENY: dangerous yarnPath override in ${yarn_cfg}" >&2
+            exit 2
+        fi
+    done
+}
+
+audit_prebuild_traps
+
 # 1. Build static release binaries and install with read-execute-only VFS mode (0555)
 cargo build --release --manifest-path "${DOTAGENT_ROOT}/Cargo.toml"
 for bin_name in agent-guard dotagent-compiler swarm-tool; do
@@ -30,41 +73,58 @@ fi
 # 2. Verify compiled bundles match golden SHA-256 manifest
 "${BIN_DIR}/dotagent-compiler" verify "${DOTAGENT_ROOT}"
 
-# 3. Apply global Git hardening (preserving user.name / user.email and credential helpers)
-if ! grep -q 'attributesFile = /dev/null' "${HOME}/.gitconfig" 2>/dev/null; then
-    git config --global core.hooksPath /dev/null
-    git config --global core.attributesFile /dev/null
-    git config --global core.fsmonitor false
-    git config --global core.pager cat
-    git config --global core.symlinks false
-    git config --global core.autocrlf input
-    git config --global core.protectHFS true
-    git config --global core.protectNTFS true
-    git config --global gc.auto 0
-    git config --global protocol.allow never
-    git config --global protocol.https.allow always
-    git config --global protocol.file.allow never
-    git config --global protocol.ext.allow never
-    git config --global protocol.git.allow never
-    git config --global submodule.recurse false
-    git config --global submodule.fetchJobs 0
-    git config --global transfer.fsckObjects true
-    git config --global fetch.fsckObjects true
-    git config --global receive.fsckObjects true
-fi
+# 3. Apply and verify ALL 19 global Git hardening keys (preserving user.name / user.email and credential helpers)
+REQUIRED_GIT_SETTINGS=(
+    "core.hooksPath:/dev/null"
+    "core.attributesFile:/dev/null"
+    "core.fsmonitor:false"
+    "core.pager:cat"
+    "core.symlinks:false"
+    "core.autocrlf:input"
+    "core.protectHFS:true"
+    "core.protectNTFS:true"
+    "gc.auto:0"
+    "protocol.allow:never"
+    "protocol.https.allow:always"
+    "protocol.file.allow:never"
+    "protocol.ext.allow:never"
+    "protocol.git.allow:never"
+    "submodule.recurse:false"
+    "submodule.fetchJobs:0"
+    "transfer.fsckObjects:true"
+    "fetch.fsckObjects:true"
+    "receive.fsckObjects:true"
+)
 
-# 4. Install Gemini / Antigravity global constitution & hook wiring
+for entry in "${REQUIRED_GIT_SETTINGS[@]}"; do
+    key="${entry%%:*}"
+    expected="${entry#*:}"
+    current="$(git config --global --get "${key}" 2>/dev/null || true)"
+    if [[ "${current}" != "${expected}" ]]; then
+        git config --global "${key}" "${expected}"
+    fi
+    verified="$(git config --global --get "${key}" 2>/dev/null || true)"
+    if [[ "${verified}" != "${expected}" ]]; then
+        echo "[activate-local] HARD DENY: failed to enforce git config --global ${key}=${expected} (got '${verified}')" >&2
+        exit 2
+    fi
+done
+
+# 4. Install Gemini / Antigravity global constitution, hook wiring, & Swarm role subagents
 # Use `cp -f` so FUSE/virtiofs persistent ~/.gemini mounts that disallow chmod succeed cleanly.
-mkdir -p "${HOME}/.gemini"
+mkdir -p "${HOME}/.gemini/agents"
 cp -f "${DOTAGENT_ROOT}/dist/gemini/GEMINI.md" "${HOME}/.gemini/GEMINI.md"
 cp -f "${DOTAGENT_ROOT}/dist/gemini/settings.json" "${HOME}/.gemini/settings.json"
+for af in research-airlock.md swarm-master.md swarm-investigator.md swarm-qa-engineer.md swarm-grunt.md swarm-adversarial-reviewer.md swarm-forensic-coroner.md; do
+    cp -f "${DOTAGENT_ROOT}/dist/gemini/agents/${af}" "${HOME}/.gemini/agents/${af}"
+done
 
-# 5. Deploy root AGENTS.md + harness hooks + research-airlock & 6 Swarm role subagents
+# 5. Deploy root AGENTS.md + harness hooks + research-airlock & 6 Swarm role subagents across Claude, Cursor, and Codex
 #    Source repo keeps 0644 for git workflows; deployed runtime workspace gets VFS read-only 0444!
 deploy_harness_bundle() {
     local root="$1"
     local mode="$2"
-    mkdir -p "${root}/.claude/agents" "${root}/.cursor" "${root}/.codex"
+    mkdir -p "${root}/.claude/agents" "${root}/.cursor/agents" "${root}/.codex/agents"
     local agent_files=(
         "research-airlock.md"
         "swarm-master.md"
@@ -83,7 +143,11 @@ deploy_harness_bundle() {
         "${root}/.codex/config.toml"
     )
     for af in "${agent_files[@]}"; do
-        targets+=("${root}/.claude/agents/${af}")
+        targets+=(
+            "${root}/.claude/agents/${af}"
+            "${root}/.cursor/agents/${af}"
+            "${root}/.codex/agents/${af}"
+        )
     done
     for t in "${targets[@]}"; do
         if [[ -e "${t}" ]]; then
@@ -96,6 +160,8 @@ deploy_harness_bundle() {
     install -m "${mode}" "${DOTAGENT_ROOT}/dist/claude/settings.json" "${root}/.claude/settings.json"
     for af in "${agent_files[@]}"; do
         install -m "${mode}" "${DOTAGENT_ROOT}/dist/claude/agents/${af}" "${root}/.claude/agents/${af}"
+        install -m "${mode}" "${DOTAGENT_ROOT}/dist/cursor/agents/${af}" "${root}/.cursor/agents/${af}"
+        install -m "${mode}" "${DOTAGENT_ROOT}/dist/codex/agents/${af}" "${root}/.codex/agents/${af}"
     done
     install -m "${mode}" "${DOTAGENT_ROOT}/dist/cursor/hooks.json" "${root}/.cursor/hooks.json"
     install -m "${mode}" "${DOTAGENT_ROOT}/dist/codex/config.toml" "${root}/.codex/config.toml"

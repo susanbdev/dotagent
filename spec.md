@@ -1,11 +1,6 @@
-# `susanbdev/dotagent` — Canonical Secure-by-Design Agent Harnesses, Skills & Guardrails Specification
+# `susanbdev/dotagent` — Agent Guardrails, Skills & Multi-Harness Bundle Specification
 
-**Repository**: `susanbdev/dotagent`  
-**Status**: Canonical v1.0 Specification  
-**Privilege Tier**: Ring 1 (Subordinate to `susanbdev/policy-hub` Ring-0 Constitutional Ceilings)  
-**Target Harnesses**: Claude Code (`.claude/`), OpenAI Codex (`.codex/`), Cursor (`.cursor/`), Gemini / Antigravity, and Remote Container Environments (`susanbdev/environments` `env-agent-workspace`)  
-**Enforcement Binary**: `agent-guard` (`Rust 2024`, `#![forbid(unsafe_code)]`, static zero-dependency binary)  
-**Human Credential Policy**: **Zero secrets in skills, prompts, settings, or MCP client configurations**
+`susanbdev/dotagent` compiles the static `agent-guard` hook binary (`< 2 ms` cold start), token-bounded `SKILL.md` modules, and reproducible harness configuration trees for `.claude/`, `.codex/`, `.cursor/`, Gemini, and `prim-dotagent` (`/opt/dotagent`).
 
 ---
 
@@ -80,44 +75,21 @@ dotagent/
 
 ---
 
-## 3. `agent-guard` Shell AST & Symlink-Safe Enforcement
+## 2. `agent-guard` Hook Lifecycle
 
-Unlike brittle regex hooks bypassed via quoting, base64, or subshells, `crates/agent-guard` parses shell commands into a full concrete syntax tree (`tree-sitter-bash`) and canonicalizes all filesystem paths (`realpath` / symlink traversal check):
-
-1. **Pre-Tool Execution Gate (`agent-guard pre-tool`)**:
-   * Inspects every command node inside pipelines (`|`), logical chains (`&&`, `||`, `;`), command substitutions (`$(...)`, backticks), process substitutions (`<(...)`), and `xargs` / `find -exec` / `sh -c` invocations.
-   * Denies subshell/interpreter escapes attempting to read forbidden credential paths, open raw sockets, mutate protected `.guard` / `.github` paths, or invoke destructive `git` subcommands.
-   * Returns structured exit code `2` with a crisp human-readable denial reason; per `AGENTS.md`, the agent **must** stop immediately, show the denial verbatim, and ask the human rather than retrying via an alternate tool or encoding.
-2. **Post-Edit Immediate Verification (`agent-guard post-edit <file>`)**:
-   * Runs `< 200 ms` incremental syntax, format, lint, and forbidden-construct checks on the exact touched file (e.g., immediately catching `<svg>`, inline `style={{}}`, `useState` in `vespoli-ui`, `unsafe` in Rust, or accidental high-entropy token literals) before the agent moves to the next file.
-3. **On-Stop Gate (`agent-guard on-stop`)**:
-   * Executes the repository's canonical test, typecheck, and `policy-hub` compliance suite, recording a locally signed receipt tied to the working tree digest so agents cannot claim "tests pass" without actual execution.
+1. **`agent-guard pre-tool`**:
+   * Parses candidate shell strings with `Command::validate()` (`tree-sitter-bash` across `|`, `&&`, `$(...)`, `<(...)`, `xargs`, `find -exec`, `sh -c`) and resolves file arguments via `SafePath::resolve()`.
+   * Blocks reads of credential paths (`.env*`, `*.pem`, `*.key`, `~/.ssh`, `~/.aws`, `~/.netrc`), writes to control paths (`.guard/`, `.agent-guard/`, `.claude/`, `.codex/`, `.cursor/`, `.github/`, `AGENTS.md`, `CLAUDE.md`, `REVIEW.md`), destructive `git` flags (`--amend`, `rebase`, `reset --hard`, `--force*`, `--no-verify`), and lifecycle-script package installs.
+   * Exits with code **`2`** and a structured denial message instructing the harness to halt and surface the denial verbatim without retrying via alternate encodings or tools.
+2. **`agent-guard post-edit <file>`**:
+   * Runs `< 200 ms` incremental AST checks (`Hygiene::inspectFile()`) on the modified file—rejecting `policy-hub` Noun/Verb naming violations, duplicated `susanbdev/shared` primitives, `<svg>` / inline `style` in UI code, `unsafe` in Rust, and `SecretFinding::scan()` hits before the agent touches another file.
+3. **`agent-guard on-stop`**:
+   * Executes `.guard/checks/on-stop` (the target repo's full test, typecheck, and Rego suite) and emits a signed `StopReceipt` bound to the working tree `Digest` so completion cannot be claimed without passing checks.
 
 ---
 
-## 4. Skill Architecture (`skills/*/SKILL.md`)
+## 3. `HarnessBundle` Compiler & Skill Rules
 
-Every skill in `susanbdev/dotagent` adheres to four strict quality and safety rules:
-* **Token-Minimal & High-Signal**: Each `SKILL.md` is `<= 3 KB` (`< 800 tokens`) of dense, unambiguous constraints and exact code patterns—zero filler prose.
-* **Content-Addressed Helper Scripts**: Any bundled helper script under `skills/<name>/scripts/` is pure Rust or zero-dependency Python/Node with its exact `SHA-256` pinned in `skills/manifest.lock.json` and verified by `agent-guard` prior to execution.
-* **Zero Implicit Network / Zero Telemetry**: Skills never fetch remote prompt fragments, remote instructions, or external registries at runtime.
-* **Role-Gated Availability**: Implementation agents (`coding-agent.toml`) receive authoring and verification skills; `adversarial-reviewer.toml` receives strictly read-only auditing and formal spec-diffing skills with `enable_write_tools = false`.
-
----
-
-## 5. Multi-Harness Compilation & Automated Org Sync
-
-`dotagent-compiler` emits byte-for-byte reproducible configuration bundles from `profiles/*`, `skills/*`, and `susanbdev/policy-hub`'s `ai-constitution/`:
-1. **Repository Sync (via `susanbdev/automation`)**:
-   * Keeps `.guard/`, `AGENTS.md`, `CLAUDE.md`, `REVIEW.md`, `.claude/settings.json`, `.codex/`, and `.cursor/` synchronized across all `susanbdev/*` repositories via signed PRs validated against `policy-hub/rego/dotagent_harness.rego`.
-2. **Container Image Layer (`susanbdev/environments`)**:
-   * Publishes the `prim-dotagent` OCI artifact consumed by `environments/env-agent-workspace`, mounting `agent-guard` and vetted skills at `/opt/dotagent` (`0555` read-only).
-
----
-
-## 6. Verification & CI Gates
-
-`susanbdev/dotagent` CI **MUST** block promotion unless all checks pass:
-* `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings` (`#![forbid(unsafe_code)]`), and `cargo test --workspace`.
-* **Adversarial Bypass Corpus (`tests/bypass_corpus.toml`)**: `250+` real-world shell/symlink/encoding bypass attempts (base64-encoded commands, `python -c` file reads, symlinked `.env` targets, nested `bash -c "$(...)"`, `git push origin +HEAD:main` refspec force-pushes, `--no-verify` flags) **MUST** be `100%` blocked by `agent-guard`.
-* **`policy-hub` Rego Gate**: Verifies compiled `.claude`, `.codex`, `.cursor`, and `env-agent-workspace` bundles against `dotagent_harness.rego` (`0` external MCP URLs other than `https://mcp.zt.susanb.dev/mcp`, `0` wildcard command allowlists).
+* **`HarnessBundle::compile(profile)`**: Consumes `policy-hub/constitution/{AGENTS,REVIEW}.md`, `profiles/*.toml`, and `skills/*` to emit deterministic harness trees wiring MCP exclusively to `https://mcp.zt.susanb.dev/mcp`.
+* **Skill Constraints**: Every `SKILL.md` is `<= 3,072` bytes, fetches zero remote content at runtime, and pins any helper script's `SHA-256` in `skills/manifest.lock.json` (verified by `agent-guard` prior to execution).
+* **Corpus Gate**: `cargo test` runs all `250+` entries in `tests/bypasses.toml` (base64 subshells, `python -c` file reads, symlinked `.env` targets, `+HEAD:main` refspecs) requiring a `100%` block rate.

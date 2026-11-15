@@ -23,6 +23,9 @@ jobs:
           persist-credentials: false
           submodules: false
 
+      - name: Apply hardened global Git configuration
+        run: cp dist/gitconfig.hardened ~/.gitconfig
+
       - name: Install Rust 1.85+ (Edition 2024) toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
