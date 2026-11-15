@@ -300,6 +300,8 @@ pub fn list_session_capabilities(repo_root: &Path) -> Result<Vec<SessionCapabili
 }
 
 /// Resolves active `SwarmRole` and optional minted `SessionCapability` for a hook turn.
+/// When a minted capability exists for `session_id`, `AGENT_GUARD_ROLE` (if set) MUST
+/// match `cap.role`; attempts to downgrade or spoof a different role fail closed.
 pub fn resolve_active_role(
     repo_root: &Path,
     session_id: &str,
@@ -308,9 +310,19 @@ pub fn resolve_active_role(
     if let Ok(raw_role) = std::env::var("AGENT_GUARD_ROLE") {
         let trimmed = raw_role.trim();
         if !trimmed.is_empty() {
-            let role = SwarmRole::from_str_id(trimmed)
+            let env_role = SwarmRole::from_str_id(trimmed)
                 .ok_or_else(|| format!("unrecognized AGENT_GUARD_ROLE '{trimmed}'"))?;
-            return Ok((role, cap));
+            if let Some(ref c) = cap {
+                if env_role != c.role {
+                    return Err(format!(
+                        "ROLE_CAPABILITY_MISMATCH: AGENT_GUARD_ROLE '{}' conflicts with minted session '{}' capability role '{}'",
+                        env_role.as_str_id(),
+                        c.session_id,
+                        c.role.as_str_id()
+                    ));
+                }
+            }
+            return Ok((env_role, cap));
         }
     }
     if let Some(c) = cap {
@@ -484,46 +496,47 @@ pub fn enforce_role_pre_tool(
                     }
                 }
             }
-            if let Some(c) = cap {
-                if is_read_tool {
-                    if let Some(raw_p) = extract_path_arg(input) {
-                        if let Ok(valid) =
-                            validate_path_with_max_depth(repo_root, cwd, raw_p, PathAccess::Read, 2)
-                        {
-                            if !is_grunt_path_in_read_scope(&valid.repo_rel, c) {
-                                bump_blocked_scope(repo_root, c);
-                                return Some(Decision::deny(
-                                    "GRUNT_READ_OUT_OF_SCOPE",
-                                    format!(
-                                        "Path '{}' is outside session '{}' assigned_read_paths.",
-                                        valid.repo_rel, c.session_id
-                                    ),
-                                    false,
-                                ));
-                            }
+            let Some(c) = cap else {
+                return Some(Decision::deny(
+                    "GRUNT_MISSING_CAPABILITY",
+                    "Swarm Grunt requires a Master-minted SessionCapability (`swarm-tool master mint-session --role grunt ...`) before invoking tools.",
+                    true,
+                ));
+            };
+            if is_read_tool {
+                if let Some(raw_p) = extract_path_arg(input) {
+                    if let Ok(valid) =
+                        validate_path_with_max_depth(repo_root, cwd, raw_p, PathAccess::Read, 2)
+                    {
+                        if !is_grunt_path_in_read_scope(&valid.repo_rel, c) {
+                            bump_blocked_scope(repo_root, c);
+                            return Some(Decision::deny(
+                                "GRUNT_READ_OUT_OF_SCOPE",
+                                format!(
+                                    "Path '{}' is outside session '{}' assigned_read_paths.",
+                                    valid.repo_rel, c.session_id
+                                ),
+                                false,
+                            ));
                         }
                     }
                 }
-                if is_write_tool {
-                    if let Some(raw_p) = extract_path_arg(input) {
-                        if let Ok(valid) = validate_path_with_max_depth(
-                            repo_root,
-                            cwd,
-                            raw_p,
-                            PathAccess::Write,
-                            2,
-                        ) {
-                            if !path_matches_any_scope(&valid.repo_rel, &c.allowed_write_paths) {
-                                bump_blocked_scope(repo_root, c);
-                                return Some(Decision::deny(
-                                    "GRUNT_WRITE_OUT_OF_SCOPE",
-                                    format!(
-                                        "Path '{}' is outside session '{}' allowed_write_paths.",
-                                        valid.repo_rel, c.session_id
-                                    ),
-                                    false,
-                                ));
-                            }
+            }
+            if is_write_tool {
+                if let Some(raw_p) = extract_path_arg(input) {
+                    if let Ok(valid) =
+                        validate_path_with_max_depth(repo_root, cwd, raw_p, PathAccess::Write, 2)
+                    {
+                        if !path_matches_any_scope(&valid.repo_rel, &c.allowed_write_paths) {
+                            bump_blocked_scope(repo_root, c);
+                            return Some(Decision::deny(
+                                "GRUNT_WRITE_OUT_OF_SCOPE",
+                                format!(
+                                    "Path '{}' is outside session '{}' allowed_write_paths.",
+                                    valid.repo_rel, c.session_id
+                                ),
+                                false,
+                            ));
                         }
                     }
                 }
@@ -620,19 +633,24 @@ pub fn check_role_shell_write_scope(
             Ok(())
         }
         SwarmRole::Grunt => {
-            if let Some(c) = cap {
-                for rel in write_rel_paths {
-                    if !path_matches_any_scope(rel, &c.allowed_write_paths) {
-                        bump_blocked_scope(repo_root, c);
-                        return Err(Decision::deny(
-                            "GRUNT_WRITE_OUT_OF_SCOPE",
-                            format!(
-                                "Grunt shell write '{rel}' is outside session '{}' allowed_write_paths.",
-                                c.session_id
-                            ),
-                            false,
-                        ));
-                    }
+            let Some(c) = cap else {
+                return Err(Decision::deny(
+                    "GRUNT_MISSING_CAPABILITY",
+                    "Swarm Grunt shell write requires a Master-minted SessionCapability.",
+                    true,
+                ));
+            };
+            for rel in write_rel_paths {
+                if !path_matches_any_scope(rel, &c.allowed_write_paths) {
+                    bump_blocked_scope(repo_root, c);
+                    return Err(Decision::deny(
+                        "GRUNT_WRITE_OUT_OF_SCOPE",
+                        format!(
+                            "Grunt shell write '{rel}' is outside session '{}' allowed_write_paths.",
+                            c.session_id
+                        ),
+                        false,
+                    ));
                 }
             }
             Ok(())
@@ -1041,19 +1059,24 @@ pub fn is_qa_writable_path(repo_rel: &str) -> bool {
         || lower == "tests/swarm_v2_attribution.toml"
         || lower.starts_with("tests/")
         || lower.contains("/tests/")
+        || lower.starts_with("__tests__/")
+        || lower.contains("/__tests__/")
         || fname.ends_with("_test.rs")
         || fname.ends_with("_tests.rs")
+        || fname.ends_with("_test.go")
         || fname.ends_with(".test.ts")
         || fname.ends_with(".spec.ts")
         || fname.ends_with(".test.tsx")
         || fname.ends_with(".spec.tsx")
-        || fname.starts_with("test_")
+        || fname.ends_with(".test.js")
+        || fname.ends_with(".spec.js")
+        || (fname.starts_with("test_") && fname.ends_with(".py"))
 }
 
 fn is_grunt_path_in_read_scope(repo_rel: &str, cap: &SessionCapability) -> bool {
     if repo_rel == "AGENTS.md"
-        || repo_rel.starts_with("skills/swarm-grunt/")
-        || repo_rel.starts_with("docs/")
+        || repo_rel == "skills/swarm-grunt/SKILL.md"
+        || repo_rel == "skills/swarm-grunt/README.md"
     {
         return true;
     }

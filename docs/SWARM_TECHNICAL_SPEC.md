@@ -108,7 +108,7 @@ Every touched directory (`READ`, `WRITE`, `DELETE`, `GREP`) receives automated b
 - Worktree-safe git exclusion uses `git rev-parse --git-path info/exclude`, `path_policy` blocks direct LLM edits to `.breadcrumbs.jsonl`, and `on-stop` hard-fails if any `.breadcrumbs.jsonl` file is tracked or staged in `git`.
 
 ### 5.4 Fail-Closed `on-stop` `2 + 2` Sentence Work Ledger
-No subagent task is complete until submitting `WORK_LEDGER.jsonl` via `agent-guard ledger-submit`:
-- **`1..=2` sentences** (pure 7-bit ASCII): explicit actionable changes or findings made.
-- **`1..=2` sentences** (pure 7-bit ASCII): issues hit and how they were mitigated (`EXACT | LOCAL_WORKAROUND | INTERFACE_CHANGED`).
-- **Pinned `event_id[]` receipts**: Verified in $O(1)$ to belong to that `session_id` and match the final `git write-tree` / blob `SHA-256` of modified files. Missing or uncommitted worker ledgers return `exit 2` (`HARD DENY`) on `on-stop`.
+No `Grunt` subagent task is complete until submitting `WORK_LEDGER.jsonl` via `swarm-tool grunt submit-ledger`:
+- **Exact `2` sentences** (pure 7-bit ASCII): explicit actionable changes made (`what_changed`).
+- **Exact `2` sentences** (pure 7-bit ASCII): rationale, issues hit, and verification (`why_changed`).
+- **Pinned `event_ids[]` & Scoped Git-Blob Tree Digest (`git_tree_oid`)**: Every ledger entry pins the session's HMAC-authenticated breadcrumb `event_ids` and the deterministic scoped Git-blob `SHA-256` tree digest (`"blob <len>\0<body>"` over all clean files in `allowed_write_paths`, excluding forbidden zones and symlinks). `agent-guard on-stop` verifies every pinned `event_id` against the authenticated breadcrumb trail and returns `exit 2` (`HARD DENY`) on missing, unpinned, or post-checkpoint-drifted receipts.

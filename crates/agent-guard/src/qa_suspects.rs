@@ -563,9 +563,10 @@ pub fn triangulate_faults(
 
             let both_isolated_green = !primary_isolated_failed
                 && !sec_isolated_failed
-                && (isolated_passes_by_task.contains(r.primary_suspect.as_str())
-                    || isolated_passes_by_task.contains(sec.as_str())
-                    || failing_rules.len() == 1);
+                && isolated_passes_by_task.contains(r.primary_suspect.as_str())
+                && r.secondary_suspects
+                    .iter()
+                    .all(|s| isolated_passes_by_task.contains(s.as_str()));
             if both_isolated_green && !r.boundary_interfaces.is_empty() {
                 return SuspectVerdict::SeamOrSpecConflict {
                     task_a: r.primary_suspect.clone(),
@@ -576,16 +577,36 @@ pub fn triangulate_faults(
         }
     }
 
-    // Case 2: All failing tests point to a single primary suspect
+    // Case 2: All failing tests point to a single primary suspect AND every secondary
+    // suspect on any failing boundary test has been cleared by a passing standalone test
     let primaries: BTreeSet<&str> = failing_rules
         .iter()
         .map(|r| r.primary_suspect.as_str())
         .collect();
-    if primaries.len() == 1 {
+    let uneliminated_secondaries: BTreeSet<&str> = failing_rules
+        .iter()
+        .flat_map(|r| r.secondary_suspects.iter().map(String::as_str))
+        .filter(|sec| !isolated_passes_by_task.contains(sec))
+        .collect();
+
+    if primaries.len() == 1 && uneliminated_secondaries.is_empty() {
         let suspect = (*primaries.iter().next().unwrap_or(&"")).to_string();
         return SuspectVerdict::SuspectIsolated {
             primary_suspect: suspect,
             failing_tests: failing_rules.iter().map(|r| r.test_name.clone()).collect(),
+        };
+    }
+
+    if !uneliminated_secondaries.is_empty() {
+        return SuspectVerdict::InconclusiveAskMaster {
+            reason: format!(
+                "boundary test failed without standalone pass/fail disambiguation across primary ({}) and secondary ({}) suspects",
+                primaries.into_iter().collect::<Vec<_>>().join(", "),
+                uneliminated_secondaries
+                    .into_iter()
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
         };
     }
 

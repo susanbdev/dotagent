@@ -4,13 +4,14 @@
 //! Zero-Trust Swarm v2 roles (`master`, `investigator`, `qa`, `grunt`,
 //! `reviewer`, `coroner`).
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
 use agent_guard::breadcrumbs::{
     append_breadcrumb_for_path, flush_records_idempotent, recover_spool_frames, sha256_digest,
-    spool_file_path, verify_breadcrumbs_file,
+    spool_file_path, trail_path_for_rel_path, verify_breadcrumbs_file,
 };
 use agent_guard::cmd_policy::evaluate_shell_command;
 use agent_guard::json::JsonValue;
@@ -26,7 +27,8 @@ use agent_guard::role_sandbox::{
     path_matches_any_scope, scout_repo_signatures,
 };
 use agent_guard::swarm_contracts::{
-    EventOp, ReviewVerdictOutcome, SuspectVerdict, SwarmRole, WorkerPacket, hex_decode_32,
+    EventOp, ReviewVerdictOutcome, SessionCapability, SuspectVerdict, SwarmRole, WorkerPacket,
+    hex_decode_32,
 };
 use agent_guard::work_ledger::{
     classify_session_smells, load_work_ledger_entries, record_test_checkpoint,
@@ -45,12 +47,24 @@ fn main() -> ExitCode {
     let rest = &args[1..];
 
     let result = match role_ns {
-        "master" => run_master(&repo_root, &cwd, rest),
-        "investigator" => run_investigator(&repo_root, rest),
-        "qa" => run_qa(&repo_root, &cwd, rest),
-        "grunt" => run_grunt(&repo_root, &cwd, rest),
-        "reviewer" => run_reviewer(&repo_root, rest),
-        "coroner" => run_coroner(&repo_root, &cwd, rest),
+        "master" => enforce_ambient_role_namespace(&repo_root, SwarmRole::Master, role_ns)
+            .and_then(|()| run_master(&repo_root, &cwd, rest)),
+        "investigator" => {
+            enforce_ambient_role_namespace(&repo_root, SwarmRole::Investigator, role_ns)
+                .and_then(|()| run_investigator(&repo_root, rest))
+        }
+        "qa" => enforce_ambient_role_namespace(&repo_root, SwarmRole::QaEngineer, role_ns)
+            .and_then(|()| run_qa(&repo_root, &cwd, rest)),
+        "grunt" => enforce_ambient_role_namespace(&repo_root, SwarmRole::Grunt, role_ns)
+            .and_then(|()| run_grunt(&repo_root, &cwd, rest)),
+        "reviewer" => {
+            enforce_ambient_role_namespace(&repo_root, SwarmRole::AdversarialReviewer, role_ns)
+                .and_then(|()| run_reviewer(&repo_root, rest))
+        }
+        "coroner" => {
+            enforce_ambient_role_namespace(&repo_root, SwarmRole::ForensicCoroner, role_ns)
+                .and_then(|()| run_coroner(&repo_root, &cwd, rest))
+        }
         "--help" | "-h" | "help" => {
             print_usage();
             Ok(())
@@ -67,6 +81,58 @@ fn main() -> ExitCode {
             ExitCode::from(2)
         }
     }
+}
+
+fn enforce_ambient_role_namespace(
+    repo_root: &Path,
+    expected_role: SwarmRole,
+    role_ns: &str,
+) -> Result<(), String> {
+    if let Ok(env_sid) = std::env::var("AGENT_GUARD_SESSION_ID") {
+        let sid = env_sid.trim();
+        if !sid.is_empty() {
+            let cap = load_session_capability(repo_root, sid)?;
+            if cap.role != expected_role {
+                return Err(format!(
+                    "ROLE_CAPABILITY_MISMATCH: active session '{}' has role '{}', cannot invoke 'swarm-tool {role_ns}'",
+                    cap.session_id,
+                    cap.role.as_str_id()
+                ));
+            }
+        }
+    }
+    if let Ok(env_role_raw) = std::env::var("AGENT_GUARD_ROLE") {
+        let raw = env_role_raw.trim();
+        if !raw.is_empty() {
+            let env_role = SwarmRole::from_str_id(raw).ok_or_else(|| {
+                format!("INVALID_SWARM_ROLE: unrecognized AGENT_GUARD_ROLE='{raw}'")
+            })?;
+            if env_role != SwarmRole::StandardCoding && env_role != expected_role {
+                return Err(format!(
+                    "ROLE_CAPABILITY_MISMATCH: active AGENT_GUARD_ROLE='{}' cannot invoke 'swarm-tool {role_ns}'",
+                    env_role.as_str_id()
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn load_capability_for_role(
+    repo_root: &Path,
+    session_id: &str,
+    expected_role: SwarmRole,
+    role_ns: &str,
+) -> Result<SessionCapability, String> {
+    let cap = load_session_capability(repo_root, session_id)?;
+    if cap.role != expected_role {
+        return Err(format!(
+            "ROLE_CAPABILITY_MISMATCH: session '{}' has role '{}', cannot invoke 'swarm-tool {role_ns}'",
+            cap.session_id,
+            cap.role.as_str_id()
+        ));
+    }
+    Ok(cap)
 }
 
 fn run_master(repo_root: &Path, cwd: &Path, args: &[String]) -> Result<(), String> {
@@ -253,6 +319,15 @@ fn run_investigator(repo_root: &Path, args: &[String]) -> Result<(), String> {
             let session_id = flag_val(args, "--session")
                 .or_else(|| std::env::var("AGENT_GUARD_SESSION_ID").ok())
                 .ok_or_else(|| "missing --session <sid>".to_string())?;
+            if let Ok(cap) = load_session_capability(repo_root, &session_id) {
+                if cap.role != SwarmRole::Investigator {
+                    return Err(format!(
+                        "ROLE_CAPABILITY_MISMATCH: session '{}' has role '{}', cannot invoke 'swarm-tool investigator'",
+                        cap.session_id,
+                        cap.role.as_str_id()
+                    ));
+                }
+            }
             let task_id =
                 flag_val(args, "--task").ok_or_else(|| "missing --task <task_id>".to_string())?;
             let claim = flag_val(args, "--claim")
@@ -442,7 +517,7 @@ fn run_grunt(repo_root: &Path, cwd: &Path, args: &[String]) -> Result<(), String
     match sub {
         "context" => {
             let sid = resolve_sid(args)?;
-            let cap = load_session_capability(repo_root, &sid)?;
+            let cap = load_capability_for_role(repo_root, &sid, SwarmRole::Grunt, "grunt")?;
             let out = JsonValue::Object(vec![
                 ("session_id".to_string(), JsonValue::Str(cap.session_id)),
                 ("task_id".to_string(), JsonValue::Str(cap.task_id)),
@@ -475,7 +550,7 @@ fn run_grunt(repo_root: &Path, cwd: &Path, args: &[String]) -> Result<(), String
         }
         "record-edit" => {
             let sid = resolve_sid(args)?;
-            let cap = load_session_capability(repo_root, &sid)?;
+            let cap = load_capability_for_role(repo_root, &sid, SwarmRole::Grunt, "grunt")?;
             let raw_file = flag_val(args, "--file")
                 .ok_or_else(|| "missing --file <rel_path>".to_string())?;
             let valid = validate_path(repo_root, cwd, &raw_file, PathAccess::Write)
@@ -517,6 +592,7 @@ fn run_grunt(repo_root: &Path, cwd: &Path, args: &[String]) -> Result<(), String
         }
         "checkpoint-green" => {
             let sid = resolve_sid(args)?;
+            let _cap = load_capability_for_role(repo_root, &sid, SwarmRole::Grunt, "grunt")?;
             let sep_idx = args
                 .iter()
                 .position(|a| a == "--")
@@ -556,6 +632,7 @@ fn run_grunt(repo_root: &Path, cwd: &Path, args: &[String]) -> Result<(), String
         }
         "submit-ledger" => {
             let sid = resolve_sid(args)?;
+            let _cap = load_capability_for_role(repo_root, &sid, SwarmRole::Grunt, "grunt")?;
             let what = flag_val(args, "--what")
                 .ok_or_else(|| "missing --what \"<2 ASCII sentences>\"".to_string())?;
             let why = flag_val(args, "--why")
@@ -566,7 +643,7 @@ fn run_grunt(repo_root: &Path, cwd: &Path, args: &[String]) -> Result<(), String
         }
         "report-blocker" => {
             let sid = resolve_sid(args)?;
-            let cap = load_session_capability(repo_root, &sid)?;
+            let cap = load_capability_for_role(repo_root, &sid, SwarmRole::Grunt, "grunt")?;
             let missing = flag_val(args, "--missing-path").unwrap_or_default();
             let hyp = flag_val(args, "--hypothesis")
                 .ok_or_else(|| "missing --hypothesis \"<ascii>\"".to_string())?;
@@ -732,12 +809,16 @@ fn run_coroner(repo_root: &Path, cwd: &Path, args: &[String]) -> Result<(), Stri
             })?;
             let spool_path = spool_file_path(repo_root, sid)?;
             let report = recover_spool_frames(&spool_path)?;
-            let trail_path = repo_root.join(".breadcrumbs.jsonl");
-            let flushed = if !report.valid_records.is_empty() {
-                flush_records_idempotent(&trail_path, &report.valid_records)?
-            } else {
-                0
-            };
+            let valid_count = report.valid_records.len();
+            let mut by_trail: BTreeMap<PathBuf, Vec<_>> = BTreeMap::new();
+            for rec in report.valid_records {
+                let trail_path = trail_path_for_rel_path(repo_root, &rec.event.canonical_rel_path)?;
+                by_trail.entry(trail_path).or_default().push(rec);
+            }
+            let mut flushed = 0usize;
+            for (trail_path, records) in &by_trail {
+                flushed += flush_records_idempotent(trail_path, records)?;
+            }
             println!(
                 "{}",
                 JsonValue::Object(vec![
@@ -747,7 +828,7 @@ fn run_coroner(repo_root: &Path, cwd: &Path, args: &[String]) -> Result<(), Stri
                     ),
                     (
                         "valid_frames".to_string(),
-                        JsonValue::Number(report.valid_records.len() as f64),
+                        JsonValue::Number(valid_count as f64),
                     ),
                     (
                         "quarantined_tail_bytes".to_string(),

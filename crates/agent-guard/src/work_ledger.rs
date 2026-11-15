@@ -11,10 +11,12 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use crate::breadcrumbs::{
-    append_breadcrumb_for_path, compute_arbitrary_hmac_hex, recover_spool_frames, sha256_digest,
-    spool_file_path, swarm_state_dir,
+    append_breadcrumb_for_path, compute_arbitrary_hmac_hex, flush_records_idempotent,
+    load_or_init_hmac_key, recover_spool_frames, sha256_digest, spool_file_path, swarm_state_dir,
+    trail_path_for_rel_path, verify_breadcrumbs_file, verify_event_mac,
 };
 use crate::json::JsonValue;
+use crate::path_policy::{PathAccess, validate_path_with_max_depth};
 use crate::role_sandbox::{
     load_session_capability, path_matches_any_scope, resolve_active_role, save_session_capability,
 };
@@ -30,42 +32,46 @@ pub fn work_ledger_state_path(repo_root: &Path) -> Result<PathBuf, String> {
     Ok(swarm_state_dir(repo_root)?.join("WORK_LEDGER.jsonl"))
 }
 
-/// Computes a deterministic SHA-256 tree OID over all files matching `allowed_write_paths`
-/// (replacing coarse filesystem `mtime` checks per `F18` so even sub-millisecond edits
-/// after `checkpoint-green` are caught reliably).
+/// Computes a deterministic scoped Git-blob `SHA-256` tree digest (`git_tree_oid`) over all
+/// clean repository files matching `scope_patterns`:
+/// - Each in-scope file is hashed with Git SHA-256 blob framing (`"blob <len>\0<body>"`).
+/// - Forbidden directories/files (temp, cache, `node_modules`, `vendor`, `.venv`, `.env*`,
+///   guard state, `audit.jsonl`, `.breadcrumbs.jsonl`, `.git`, `target`) and symlinks are
+///   excluded via `path_policy` before reading or recursing, with zero artificial depth cap.
 pub fn compute_scoped_tree_oid(
     repo_root: &Path,
     scope_patterns: &[String],
 ) -> Result<String, String> {
     let canon_repo = fs::canonicalize(repo_root).unwrap_or_else(|_| repo_root.to_path_buf());
     let mut file_digests: BTreeMap<String, String> = BTreeMap::new();
-    collect_scoped_blobs(
-        &canon_repo,
-        &canon_repo,
-        scope_patterns,
-        0,
-        &mut file_digests,
-    );
+    collect_scoped_blobs(&canon_repo, &canon_repo, scope_patterns, &mut file_digests);
 
     let mut buf = Vec::new();
-    for (rel, digest) in &file_digests {
+    buf.extend_from_slice(b"DOTAGENT_GIT_BLOB_TREE_V1\0");
+    for (rel, blob_oid) in &file_digests {
+        buf.extend_from_slice(b"100644 ");
         buf.extend_from_slice(&(rel.len() as u32).to_be_bytes());
         buf.extend_from_slice(rel.as_bytes());
-        buf.extend_from_slice(digest.as_bytes());
+        buf.push(0);
+        buf.extend_from_slice(blob_oid.as_bytes());
     }
     Ok(hex_encode(&sha256_digest(&buf)))
+}
+
+fn git_sha256_blob_oid(bytes: &[u8]) -> String {
+    let header = format!("blob {}\0", bytes.len());
+    let mut framed = Vec::with_capacity(header.len() + bytes.len());
+    framed.extend_from_slice(header.as_bytes());
+    framed.extend_from_slice(bytes);
+    hex_encode(&sha256_digest(&framed))
 }
 
 fn collect_scoped_blobs(
     canon_repo: &Path,
     dir: &Path,
     scope_patterns: &[String],
-    depth: usize,
     out: &mut BTreeMap<String, String>,
 ) {
-    if depth > 12 {
-        return;
-    }
     let Ok(entries) = fs::read_dir(dir) else {
         return;
     };
@@ -74,9 +80,9 @@ fn collect_scoped_blobs(
         let name_str = name.to_string_lossy();
         if name_str == ".git"
             || name_str == "target"
-            || name_str == "node_modules"
             || name_str == ".state"
             || name_str == ".breadcrumbs.jsonl"
+            || name_str.ends_with(".breadcrumbs.jsonl.lock")
         {
             continue;
         }
@@ -87,18 +93,45 @@ fn collect_scoped_blobs(
         if ft.is_symlink() {
             continue;
         }
+        let rel = full
+            .strip_prefix(canon_repo)
+            .unwrap_or(&full)
+            .to_string_lossy()
+            .replace('\\', "/");
+
         if ft.is_dir() {
-            collect_scoped_blobs(canon_repo, &full, scope_patterns, depth + 1, out);
-        } else if ft.is_file() {
-            let rel = full
-                .strip_prefix(canon_repo)
-                .unwrap_or(&full)
-                .to_string_lossy()
-                .replace('\\', "/");
-            if scope_patterns.is_empty() || path_matches_any_scope(&rel, scope_patterns) {
-                if let Ok(bytes) = fs::read(&full) {
-                    out.insert(rel, hex_encode(&sha256_digest(&bytes)));
-                }
+            // Skip any forbidden cache, temp, dependency, secret, or guard-state directory before recursing!
+            if validate_path_with_max_depth(
+                canon_repo,
+                canon_repo,
+                &rel,
+                PathAccess::ListSearch {
+                    requested_depth: Some(1),
+                },
+                usize::MAX,
+            )
+            .is_err()
+            {
+                continue;
+            }
+            collect_scoped_blobs(canon_repo, &full, scope_patterns, out);
+        } else if ft.is_file()
+            && (scope_patterns.is_empty() || path_matches_any_scope(&rel, scope_patterns))
+        {
+            // Enforce full path_policy Read validation so .env*, *.pem, audit.jsonl, etc. are never hashed!
+            if validate_path_with_max_depth(
+                canon_repo,
+                canon_repo,
+                &rel,
+                PathAccess::Read,
+                usize::MAX,
+            )
+            .is_err()
+            {
+                continue;
+            }
+            if let Ok(bytes) = fs::read(&full) {
+                out.insert(rel, git_sha256_blob_oid(&bytes));
             }
         }
     }
@@ -112,6 +145,13 @@ pub fn record_test_checkpoint(
     passed: bool,
 ) -> Result<(SessionCapability, String), String> {
     let mut cap = load_session_capability(repo_root, session_id)?;
+    if cap.role != SwarmRole::Grunt {
+        return Err(format!(
+            "ROLE_CAPABILITY_MISMATCH: session '{}' has role '{}', only 'grunt' may record test checkpoints",
+            cap.session_id,
+            cap.role.as_str_id()
+        ));
+    }
     let tree_oid = compute_scoped_tree_oid(repo_root, &cap.allowed_write_paths)?;
     let tree_bytes = hex_decode_32(&tree_oid).unwrap_or([0u8; 32]);
     let plan_bytes = hex_decode_32(&cap.plan_sha256).unwrap_or([0u8; 32]);
@@ -277,8 +317,52 @@ pub fn classify_session_smells(
     Ok(badges)
 }
 
+type TrailRecordsMap = BTreeMap<PathBuf, Vec<crate::breadcrumbs::SignedBreadcrumbRecord>>;
+
+fn collect_verified_session_event_ids(
+    repo_root: &Path,
+    session_id: &str,
+    task_id: &str,
+) -> Result<(Vec<String>, TrailRecordsMap), String> {
+    let key = load_or_init_hmac_key(repo_root)?;
+    let spool_path = spool_file_path(repo_root, session_id)?;
+    if !spool_path.exists() {
+        return Err(format!(
+            "LEDGER_MISSING_PINNED_EVENTS: session '{session_id}' has no breadcrumb spool to pin"
+        ));
+    }
+    let report = recover_spool_frames(&spool_path)?;
+    let mut ids = Vec::new();
+    let mut by_trail: TrailRecordsMap = BTreeMap::new();
+    let mut has_green = false;
+
+    for rec in report.valid_records {
+        verify_event_mac(&key, &rec.event, &rec.record_mac)?;
+        if rec.event.session_id != session_id || rec.event.task_id != task_id {
+            return Err(format!(
+                "LEDGER_FOREIGN_EVENT: spool event belongs to ({}, {}), expected ({session_id}, {task_id})",
+                rec.event.session_id, rec.event.task_id
+            ));
+        }
+        if rec.event.op == EventOp::TestGreen {
+            has_green = true;
+        }
+        ids.push(rec.event_id_hex());
+        let trail = trail_path_for_rel_path(repo_root, &rec.event.canonical_rel_path)?;
+        by_trail.entry(trail).or_default().push(rec);
+    }
+
+    if ids.is_empty() || !has_green {
+        return Err(format!(
+            "LEDGER_MISSING_PINNED_EVENTS: session '{session_id}' has no verified green-checkpoint breadcrumb events"
+        ));
+    }
+    Ok((ids, by_trail))
+}
+
 /// Appends an authenticated `2+2`-sentence `WorkLedgerEntry` ONLY if the workspace
-/// tree OID matches `last_green_tree_oid` (`F18`).
+/// tree OID matches `last_green_tree_oid` (`F18`) and pins all authenticated session
+/// `event_ids` into the HMAC-authenticated ledger receipt.
 pub fn submit_work_ledger_entry(
     repo_root: &Path,
     session_id: &str,
@@ -287,6 +371,13 @@ pub fn submit_work_ledger_entry(
 ) -> Result<WorkLedgerEntry, String> {
     validate_two_plus_two_sentences(what_changed, why_changed)?;
     let cap = load_session_capability(repo_root, session_id)?;
+    if cap.role != SwarmRole::Grunt {
+        return Err(format!(
+            "ROLE_CAPABILITY_MISMATCH: session '{}' has role '{}', only 'grunt' may submit WORK_LEDGER.jsonl receipts",
+            cap.session_id,
+            cap.role.as_str_id()
+        ));
+    }
     let current_oid = compute_scoped_tree_oid(repo_root, &cap.allowed_write_paths)?;
 
     let Some(ref green_oid) = cap.last_green_tree_oid else {
@@ -300,13 +391,21 @@ pub fn submit_work_ledger_entry(
         );
     }
 
+    let (event_ids, by_trail) =
+        collect_verified_session_event_ids(repo_root, &cap.session_id, &cap.task_id)?;
+    for (trail_path, records) in &by_trail {
+        flush_records_idempotent(trail_path, records)?;
+    }
+
     let smell_badges = classify_session_smells(repo_root, &cap)?;
+    let events_csv = event_ids.join(",");
     let mac_payload = format!(
-        "{}|{}|{}|{}|{}|{}",
+        "{}|{}|{}|{}|{}|{}|{}",
         cap.session_id,
         cap.task_id,
         cap.attempt,
         current_oid,
+        events_csv,
         what_changed.trim(),
         why_changed.trim()
     );
@@ -318,6 +417,7 @@ pub fn submit_work_ledger_entry(
         task_id: cap.task_id.clone(),
         attempt: cap.attempt,
         git_tree_oid: current_oid.clone(),
+        event_ids,
         what_changed: what_changed.trim().to_string(),
         why_changed: why_changed.trim().to_string(),
         smell_badges,
@@ -387,6 +487,16 @@ pub fn load_work_ledger_entries(repo_root: &Path) -> Result<Vec<WorkLedgerEntry>
                     .collect()
             })
             .unwrap_or_default();
+        let event_ids = v
+            .get("event_ids")
+            .and_then(JsonValue::as_array)
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(JsonValue::as_str)
+                    .map(String::from)
+                    .collect()
+            })
+            .unwrap_or_default();
 
         out.push(WorkLedgerEntry {
             session_id: v
@@ -405,6 +515,7 @@ pub fn load_work_ledger_entries(repo_root: &Path) -> Result<Vec<WorkLedgerEntry>
                 .and_then(JsonValue::as_str)
                 .unwrap_or("")
                 .to_string(),
+            event_ids,
             what_changed: v
                 .get("what_changed")
                 .and_then(JsonValue::as_str)
@@ -429,7 +540,8 @@ pub fn load_work_ledger_entries(repo_root: &Path) -> Result<Vec<WorkLedgerEntry>
 /// Enforced by `agent-guard on-stop`:
 /// 1. Rejects any git-staged `.breadcrumbs.jsonl` file.
 /// 2. If running as `SwarmRole::Grunt`, fails closed (`Err`) unless `AGENT_GUARD_SESSION_ID`
-///    has a valid, HMAC-verified `WorkLedgerEntry` matching the current workspace tree OID (`F32`/`F33`).
+///    has a valid, HMAC-verified `WorkLedgerEntry` matching the current workspace tree OID
+///    AND pinning authenticated session `event_ids` present in `.breadcrumbs.jsonl` (`F32`/`F33`).
 pub fn verify_on_stop_swarm_gates(repo_root: &Path) -> Result<(), String> {
     // 1. Check git index for staged `.breadcrumbs.jsonl`
     if let Ok(out) = Command::new("git")
@@ -477,6 +589,13 @@ pub fn verify_on_stop_swarm_gates(repo_root: &Path) -> Result<(), String> {
             ));
         };
 
+        if latest.event_ids.is_empty() {
+            return Err(format!(
+                "GRUNT_UNPINNED_WORK_LEDGER: WORK_LEDGER.jsonl receipt for '{}' has empty event_ids",
+                cap.session_id
+            ));
+        }
+
         let current_oid = compute_scoped_tree_oid(repo_root, &cap.allowed_write_paths)?;
         if latest.git_tree_oid != current_oid {
             return Err(format!(
@@ -486,12 +605,14 @@ pub fn verify_on_stop_swarm_gates(repo_root: &Path) -> Result<(), String> {
             ));
         }
 
+        let events_csv = latest.event_ids.join(",");
         let expected_payload = format!(
-            "{}|{}|{}|{}|{}|{}",
+            "{}|{}|{}|{}|{}|{}|{}",
             latest.session_id,
             latest.task_id,
             latest.attempt,
             latest.git_tree_oid,
+            events_csv,
             latest.what_changed,
             latest.why_changed
         );
@@ -502,6 +623,23 @@ pub fn verify_on_stop_swarm_gates(repo_root: &Path) -> Result<(), String> {
                 "GRUNT_FORGED_WORK_LEDGER: WORK_LEDGER.jsonl HMAC tag verification failed"
                     .to_string(),
             );
+        }
+
+        // Verify every pinned event_id exists in authenticated session breadcrumbs & trails!
+        let (verified_ids, by_trail) =
+            collect_verified_session_event_ids(repo_root, &cap.session_id, &cap.task_id)?;
+        let verified_set: std::collections::BTreeSet<&str> =
+            verified_ids.iter().map(String::as_str).collect();
+        for pinned in &latest.event_ids {
+            if !verified_set.contains(pinned.as_str()) {
+                return Err(format!(
+                    "GRUNT_UNVERIFIED_EVENT_PIN: pinned event_id '{pinned}' not found in authenticated session '{}' breadcrumbs",
+                    cap.session_id
+                ));
+            }
+        }
+        for trail_path in by_trail.keys() {
+            verify_breadcrumbs_file(repo_root, trail_path)?;
         }
     }
 

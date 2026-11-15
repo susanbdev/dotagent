@@ -13,11 +13,13 @@
 //!   so linked `git worktree` checkouts stay clean.
 //! - `F17`: Idempotent `event_id` (`record_mac`) deduplication on flush.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Write};
+use std::io::{ErrorKind, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::thread;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256};
@@ -243,10 +245,38 @@ pub fn load_or_init_hmac_key(repo_root: &Path) -> Result<[u8; 32], String> {
         return Err("CSPRNG returned all-zero key; failing closed".to_string());
     }
 
-    fs::write(&key_path, format!("{}\n", hex_encode(&key)))
-        .map_err(|e| format!("failed writing hmac.key: {e}"))?;
-    set_file_0600(&key_path);
-    Ok(key)
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let staging_path = dir.join(format!(".hmac.key.init.{}_{}", std::process::id(), nanos));
+    let encoded = format!("{}\n", hex_encode(&key));
+    {
+        let mut stage_file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&staging_path)
+            .map_err(|e| format!("failed creating staging hmac.key: {e}"))?;
+        stage_file
+            .write_all(encoded.as_bytes())
+            .map_err(|e| format!("failed writing staging hmac.key: {e}"))?;
+        stage_file
+            .sync_all()
+            .map_err(|e| format!("failed fsyncing staging hmac.key: {e}"))?;
+    }
+    set_file_0600(&staging_path);
+
+    let link_res = fs::hard_link(&staging_path, &key_path);
+    let _ = fs::remove_file(&staging_path);
+    match link_res {
+        Ok(()) => Ok(key),
+        Err(e) if e.kind() == ErrorKind::AlreadyExists => {
+            let hex = fs::read_to_string(&key_path)
+                .map_err(|re| format!("failed reading existing hmac.key after race: {re}"))?;
+            hex_decode_32(&hex)
+        }
+        Err(e) => Err(format!("failed atomically publishing hmac.key: {e}")),
+    }
 }
 
 pub fn compute_event_mac(key: &[u8; 32], event: &AuthenticatedEvent) -> Result<[u8; 32], String> {
@@ -449,22 +479,130 @@ pub fn append_breadcrumb_for_path(
     append_spool_frame(&spool_path, &signed)?;
     ensure_git_info_exclude(&canon_repo)?;
 
-    let target_file = canon_repo.join(canonical_rel_path);
-    let trail_dir = target_file
-        .parent()
-        .filter(|p| p.starts_with(&canon_repo) && p.exists())
-        .unwrap_or(&canon_repo);
-    let trail_path = trail_dir.join(".breadcrumbs.jsonl");
+    let trail_path = trail_path_for_rel_path(&canon_repo, canonical_rel_path)?;
     flush_records_idempotent(&trail_path, std::slice::from_ref(&signed))?;
 
     Ok(signed)
 }
 
-/// Idempotently flushes signed records into `<dir>/.breadcrumbs.jsonl` (`F17` dedup by `event_id`).
+/// Resolves the validated `<parent_dir>/.breadcrumbs.jsonl` trail path for `canonical_rel_path`,
+/// refusing symlinks or path traversal outside `repo_root`.
+pub fn trail_path_for_rel_path(
+    repo_root: &Path,
+    canonical_rel_path: &str,
+) -> Result<PathBuf, String> {
+    let canon_repo = fs::canonicalize(repo_root).unwrap_or_else(|_| repo_root.to_path_buf());
+    let clean = canonical_rel_path.trim().trim_start_matches("./");
+    if clean.is_empty() || Path::new(clean).is_absolute() {
+        return Err(format!(
+            "invalid breadcrumb relative path '{canonical_rel_path}'"
+        ));
+    }
+    let mut acc = canon_repo.clone();
+    let rel_path = Path::new(clean);
+    if let Some(parent) = rel_path.parent() {
+        for comp in parent.components() {
+            match comp {
+                std::path::Component::Normal(seg) => {
+                    acc.push(seg);
+                    if let Ok(meta) = fs::symlink_metadata(&acc) {
+                        if meta.file_type().is_symlink() {
+                            return Err(format!(
+                                "refusing symlink directory '{}' in breadcrumb trail path",
+                                acc.display()
+                            ));
+                        }
+                    }
+                }
+                std::path::Component::CurDir => {}
+                _ => {
+                    return Err(format!(
+                        "disallowed traversal component in breadcrumb path '{canonical_rel_path}'"
+                    ));
+                }
+            }
+        }
+    }
+    let trail_dir = if acc.starts_with(&canon_repo) && acc.is_dir() {
+        acc
+    } else {
+        canon_repo
+    };
+    Ok(trail_dir.join(".breadcrumbs.jsonl"))
+}
+
+struct TrailLockGuard {
+    lock_path: PathBuf,
+}
+
+impl TrailLockGuard {
+    fn acquire(trail_path: &Path) -> Result<Self, String> {
+        let mut os = trail_path.as_os_str().to_os_string();
+        os.push(".lock");
+        let lock_path = PathBuf::from(os);
+        for attempt in 0..200u32 {
+            match OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&lock_path)
+            {
+                Ok(mut f) => {
+                    let _ = writeln!(f, "pid={}", std::process::id());
+                    return Ok(Self { lock_path });
+                }
+                Err(e) if e.kind() == ErrorKind::AlreadyExists => {
+                    // Recover stale lock older than 30 seconds if a previous process crashed
+                    if let Ok(meta) = fs::metadata(&lock_path) {
+                        if let Ok(modified) = meta.modified() {
+                            if modified
+                                .elapsed()
+                                .is_ok_and(|age| age > Duration::from_secs(30))
+                            {
+                                let _ = fs::remove_file(&lock_path);
+                                continue;
+                            }
+                        }
+                    }
+                    if attempt == 199 {
+                        return Err(format!(
+                            "timed out acquiring breadcrumb trail lock '{}'",
+                            lock_path.display()
+                        ));
+                    }
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Err(e) => {
+                    return Err(format!(
+                        "failed creating breadcrumb lock '{}': {e}",
+                        lock_path.display()
+                    ));
+                }
+            }
+        }
+        Err(format!(
+            "failed acquiring breadcrumb lock '{}'",
+            lock_path.display()
+        ))
+    }
+}
+
+impl Drop for TrailLockGuard {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.lock_path);
+    }
+}
+
+/// Idempotently flushes signed records into `<dir>/.breadcrumbs.jsonl` (`F17` dedup by `event_id`),
+/// serialized across concurrent processes via `<trail>.lock`.
 pub fn flush_records_idempotent(
     trail_path: &Path,
     records: &[SignedBreadcrumbRecord],
 ) -> Result<usize, String> {
+    if records.is_empty() {
+        return Ok(0);
+    }
+    let _lock = TrailLockGuard::acquire(trail_path)?;
+
     let mut existing_ids = BTreeSet::new();
     if trail_path.exists() {
         let content = fs::read_to_string(trail_path)
@@ -500,14 +638,60 @@ pub fn flush_records_idempotent(
     Ok(to_append.len())
 }
 
-/// Verifies every record and `prev_event_mac` link in a `.breadcrumbs.jsonl` file.
+fn load_verified_session_spool_chain(
+    repo_root: &Path,
+    key: &[u8; 32],
+    session_id: &str,
+) -> Result<Option<BTreeMap<u64, SignedBreadcrumbRecord>>, String> {
+    let spool_path = spool_file_path(repo_root, session_id)?;
+    if !spool_path.exists() {
+        return Ok(None);
+    }
+    let report = recover_spool_frames(&spool_path)?;
+    let mut expected_seq = 1u64;
+    let mut expected_prev = [0u8; 32];
+    let mut map = BTreeMap::new();
+    for rec in report.valid_records {
+        if rec.event.session_id != session_id {
+            return Err(format!(
+                "spool '{}' contains foreign session '{}'",
+                spool_path.display(),
+                rec.event.session_id
+            ));
+        }
+        verify_event_mac(key, &rec.event, &rec.record_mac)?;
+        if rec.event.seq_no != expected_seq || rec.event.prev_event_mac != expected_prev {
+            return Err(format!(
+                "spool '{}' broken sequence/MAC continuity at seq_no={} (expected {})",
+                spool_path.display(),
+                rec.event.seq_no,
+                expected_seq
+            ));
+        }
+        expected_prev = rec.record_mac;
+        map.insert(expected_seq, rec);
+        expected_seq = expected_seq.saturating_add(1);
+    }
+    Ok(Some(map))
+}
+
+/// Verifies every record, monotonic sequence continuity, and `prev_event_mac` link in a
+/// `.breadcrumbs.jsonl` file (bridging legitimate cross-directory hops only via a verified
+/// contiguous session spool chain, and rejecting skipped, duplicate, or reordered records).
 pub fn verify_breadcrumbs_file(repo_root: &Path, trail_path: &Path) -> Result<usize, String> {
     let key = load_or_init_hmac_key(repo_root)?;
+    let canon_repo = fs::canonicalize(repo_root).unwrap_or_else(|_| repo_root.to_path_buf());
+    let canon_trail = fs::canonicalize(trail_path).unwrap_or_else(|_| trail_path.to_path_buf());
+    let trail_dir = canon_trail
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| canon_repo.clone());
     let content = fs::read_to_string(trail_path)
         .map_err(|e| format!("cannot read '{}': {e}", trail_path.display()))?;
 
-    let mut per_session_prev: std::collections::BTreeMap<String, (u64, [u8; 32])> =
-        std::collections::BTreeMap::new();
+    let mut per_session_prev: BTreeMap<String, (u64, [u8; 32])> = BTreeMap::new();
+    let mut spool_cache: BTreeMap<String, Option<BTreeMap<u64, SignedBreadcrumbRecord>>> =
+        BTreeMap::new();
     let mut count = 0usize;
 
     for (idx, line) in content.lines().enumerate() {
@@ -520,17 +704,142 @@ pub fn verify_breadcrumbs_file(repo_root: &Path, trail_path: &Path) -> Result<us
         verify_event_mac(&key, &rec.event, &rec.record_mac)
             .map_err(|e| format!("line {} (session={}): {e}", idx + 1, rec.event.session_id))?;
 
-        if let Some((last_seq, last_mac)) = per_session_prev.get(&rec.event.session_id) {
-            if rec.event.seq_no == last_seq.saturating_add(1)
-                && rec.event.prev_event_mac != *last_mac
-            {
+        let rec_expected_trail =
+            trail_path_for_rel_path(&canon_repo, &rec.event.canonical_rel_path)?;
+        let rec_expected_dir = fs::canonicalize(&rec_expected_trail)
+            .unwrap_or(rec_expected_trail)
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| canon_repo.clone());
+        if rec_expected_dir != trail_dir {
+            return Err(format!(
+                "line {}: foreign-directory breadcrumb '{}' placed inside '{}'",
+                idx + 1,
+                rec.event.canonical_rel_path,
+                trail_path.display()
+            ));
+        }
+
+        if rec.event.seq_no == 0 {
+            return Err(format!(
+                "line {}: invalid seq_no=0 for session '{}'",
+                idx + 1,
+                rec.event.session_id
+            ));
+        }
+        if rec.event.seq_no == 1 && rec.event.prev_event_mac != [0u8; 32] {
+            return Err(format!(
+                "line {}: seq_no=1 must have all-zero prev_event_mac for session '{}'",
+                idx + 1,
+                rec.event.session_id
+            ));
+        }
+        if rec.event.seq_no > 1 && rec.event.prev_event_mac == [0u8; 32] {
+            return Err(format!(
+                "line {}: seq_no={} cannot have all-zero prev_event_mac for session '{}'",
+                idx + 1,
+                rec.event.seq_no,
+                rec.event.session_id
+            ));
+        }
+
+        let (last_seq, last_mac) = per_session_prev
+            .get(&rec.event.session_id)
+            .copied()
+            .unwrap_or((0, [0u8; 32]));
+
+        if rec.event.seq_no <= last_seq {
+            return Err(format!(
+                "line {}: duplicate or out-of-order seq_no={} after seq_no={} for session '{}'",
+                idx + 1,
+                rec.event.seq_no,
+                last_seq,
+                rec.event.session_id
+            ));
+        }
+
+        if rec.event.seq_no == last_seq.saturating_add(1) {
+            if rec.event.prev_event_mac != last_mac {
                 return Err(format!(
-                    "line {}: broken prev_event_mac chain for session '{}'",
+                    "line {}: broken prev_event_mac chain at seq_no={} for session '{}'",
                     idx + 1,
+                    rec.event.seq_no,
                     rec.event.session_id
                 ));
             }
+        } else {
+            // Cross-directory gap: require an authenticated contiguous session spool chain
+            // proving that every omitted seq_no belonged to a DIFFERENT directory trail!
+            if !spool_cache.contains_key(&rec.event.session_id) {
+                let loaded =
+                    load_verified_session_spool_chain(&canon_repo, &key, &rec.event.session_id)?;
+                spool_cache.insert(rec.event.session_id.clone(), loaded);
+            }
+            let Some(Some(spool_chain)) = spool_cache.get(&rec.event.session_id) else {
+                return Err(format!(
+                    "line {}: sequence gap ({} -> {}) without authenticated session spool for '{}'",
+                    idx + 1,
+                    last_seq,
+                    rec.event.seq_no,
+                    rec.event.session_id
+                ));
+            };
+            for missing_seq in (last_seq + 1)..rec.event.seq_no {
+                let Some(intervening) = spool_chain.get(&missing_seq) else {
+                    return Err(format!(
+                        "line {}: missing seq_no={} in session '{}' chain",
+                        idx + 1,
+                        missing_seq,
+                        rec.event.session_id
+                    ));
+                };
+                if let Ok(expected_trail) =
+                    trail_path_for_rel_path(&canon_repo, &intervening.event.canonical_rel_path)
+                {
+                    let canon_exp_dir = fs::canonicalize(&expected_trail)
+                        .unwrap_or(expected_trail)
+                        .parent()
+                        .map(Path::to_path_buf)
+                        .unwrap_or_else(|| canon_repo.clone());
+                    if canon_exp_dir == trail_dir {
+                        return Err(format!(
+                            "line {}: omitted in-directory event seq_no={} for '{}' in '{}'",
+                            idx + 1,
+                            missing_seq,
+                            rec.event.session_id,
+                            trail_path.display()
+                        ));
+                    }
+                }
+            }
+            let Some(prev_in_spool) = spool_chain.get(&(rec.event.seq_no - 1)) else {
+                return Err(format!(
+                    "line {}: missing predecessor seq_no={} in session '{}' spool",
+                    idx + 1,
+                    rec.event.seq_no - 1,
+                    rec.event.session_id
+                ));
+            };
+            if rec.event.prev_event_mac != prev_in_spool.record_mac {
+                return Err(format!(
+                    "line {}: broken cross-directory prev_event_mac at seq_no={} for session '{}'",
+                    idx + 1,
+                    rec.event.seq_no,
+                    rec.event.session_id
+                ));
+            }
+            if spool_chain
+                .get(&rec.event.seq_no)
+                .is_none_or(|s| s.record_mac != rec.record_mac)
+            {
+                return Err(format!(
+                    "line {}: record_mac at seq_no={} disagrees with authenticated session spool",
+                    idx + 1,
+                    rec.event.seq_no
+                ));
+            }
         }
+
         per_session_prev.insert(
             rec.event.session_id.clone(),
             (rec.event.seq_no, rec.record_mac),

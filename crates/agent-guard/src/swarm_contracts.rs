@@ -353,6 +353,7 @@ pub struct WorkLedgerEntry {
     pub task_id: String,
     pub attempt: u32,
     pub git_tree_oid: String,
+    pub event_ids: Vec<String>,
     pub what_changed: String,
     pub why_changed: String,
     pub smell_badges: Vec<SmellBadge>,
@@ -366,6 +367,7 @@ impl WorkLedgerEntry {
             .iter()
             .map(|b| JsonValue::Str(format!("{}:{}", b.bucket.as_str(), b.signal)))
             .collect();
+        let events = self.event_ids.iter().cloned().map(JsonValue::Str).collect();
         JsonValue::Object(vec![
             (
                 "session_id".to_string(),
@@ -380,6 +382,7 @@ impl WorkLedgerEntry {
                 "git_tree_oid".to_string(),
                 JsonValue::Str(self.git_tree_oid.clone()),
             ),
+            ("event_ids".to_string(), JsonValue::Array(events)),
             (
                 "what_changed".to_string(),
                 JsonValue::Str(self.what_changed.clone()),

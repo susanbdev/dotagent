@@ -54,3 +54,9 @@ name = "all_six_role_skills_readmes_and_compiled_agents_verified"
 primary_suspect = "W2.A"
 secondary_suspects = ["W2.B"]
 boundary_interfaces = ["skills/manifest.lock.json", "dist-verify/manifest.sha256"]
+
+[[tests]]
+name = "pr2_review_regressions_role_sandbox_spool_and_ledger_pins"
+primary_suspect = "W1.D"
+secondary_suspects = []
+boundary_interfaces = []

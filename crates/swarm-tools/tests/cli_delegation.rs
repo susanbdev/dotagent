@@ -318,4 +318,62 @@ boundary_interfaces = []
             .unwrap()
             .success()
     );
+
+    // 6. PR #2 CLI regressions:
+    // (a) Investigator session cannot invoke `swarm-tool grunt` (`ROLE_CAPABILITY_MISMATCH`)
+    let cross_role = Command::new(swarm_tool_bin())
+        .args(["grunt", "context", "--session", &inv_sid])
+        .current_dir(&repo)
+        .env("AGENT_GUARD_STATE_DIR", &state)
+        .output()
+        .unwrap();
+    assert!(!cross_role.status.success());
+    assert!(
+        String::from_utf8_lossy(&cross_role.stderr).contains("ROLE_CAPABILITY_MISMATCH"),
+        "expected ROLE_CAPABILITY_MISMATCH, got: {}",
+        String::from_utf8_lossy(&cross_role.stderr)
+    );
+
+    // (b) `AGENT_GUARD_ROLE=standard` cannot downgrade a minted Grunt session on `on-stop`
+    let downgrade_stop = Command::new(agent_guard_bin())
+        .arg("on-stop")
+        .current_dir(&repo)
+        .env("AGENT_GUARD_STATE_DIR", &state)
+        .env("AGENT_GUARD_ROLE", "standard")
+        .env("AGENT_GUARD_SESSION_ID", &grunt_sid)
+        .output()
+        .unwrap();
+    assert_eq!(downgrade_stop.status.code(), Some(2));
+    assert!(
+        String::from_utf8_lossy(&downgrade_stop.stderr).contains("ROLE_CAPABILITY_MISMATCH"),
+        "expected ROLE_CAPABILITY_MISMATCH on env role downgrade, got: {}",
+        String::from_utf8_lossy(&downgrade_stop.stderr)
+    );
+
+    // (c) `coroner recover-spool` flushes nested `src/calc.rs` events to `src/.breadcrumbs.jsonl`
+    fs::remove_file(repo.join("src/.breadcrumbs.jsonl")).unwrap();
+    let rec_out = Command::new(swarm_tool_bin())
+        .args(["coroner", "recover-spool", &grunt_sid])
+        .current_dir(&repo)
+        .env("AGENT_GUARD_STATE_DIR", &state)
+        .output()
+        .unwrap();
+    assert!(
+        rec_out.status.success(),
+        "recover-spool stderr: {}",
+        String::from_utf8_lossy(&rec_out.stderr)
+    );
+    assert!(
+        repo.join("src/.breadcrumbs.jsonl").exists(),
+        "recover-spool must recreate src/.breadcrumbs.jsonl for src/calc.rs edit events"
+    );
+    assert!(
+        Command::new(swarm_tool_bin())
+            .args(["coroner", "verify-trail", "src/.breadcrumbs.jsonl"])
+            .current_dir(&repo)
+            .env("AGENT_GUARD_STATE_DIR", &state)
+            .status()
+            .unwrap()
+            .success()
+    );
 }

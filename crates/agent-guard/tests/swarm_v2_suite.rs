@@ -20,15 +20,16 @@ use agent_guard::qa_suspects::{
     save_locked_plan, triangulate_faults, verify_attribution_against_plan,
 };
 use agent_guard::role_sandbox::{
-    enforce_role_pre_tool, evaluate_reviewer_verdict, lookup_pinned_package_doc,
-    mint_session_capability, parse_and_validate_worker_packet, scout_repo_signatures,
+    check_role_shell_write_scope, enforce_role_pre_tool, evaluate_reviewer_verdict,
+    is_qa_writable_path, lookup_pinned_package_doc, mint_session_capability,
+    parse_and_validate_worker_packet, scout_repo_signatures,
 };
 use agent_guard::swarm_contracts::{
     EventOp, ReviewVerdictOutcome, SmellBucket, SuspectVerdict, SwarmRole,
 };
 use agent_guard::work_ledger::{
-    classify_session_smells, record_test_checkpoint, submit_work_ledger_entry,
-    validate_two_plus_two_sentences,
+    classify_session_smells, compute_scoped_tree_oid, record_test_checkpoint,
+    submit_work_ledger_entry, validate_two_plus_two_sentences, work_ledger_state_path,
 };
 
 fn workspace_root() -> PathBuf {
@@ -353,11 +354,25 @@ fn f20_f27_domain_floored_coverage_and_fault_triangulation_verdicts() {
         }
     );
 
-    // 3. SeamOrSpecConflict (ONLY boundary test fails while W1.C isolated test passes)
+    // 3a. InconclusiveAskMaster when boundary test fails WITHOUT passing standalone unit tests for both suspects
+    let v3_incomplete = triangulate_faults(
+        &rules,
+        &["f18_f32_f33_work_ledger_two_plus_two_tree_oid_and_smell_badges".to_string()],
+        &[],
+    );
+    assert!(matches!(
+        v3_incomplete,
+        SuspectVerdict::InconclusiveAskMaster { .. }
+    ));
+
+    // 3b. SeamOrSpecConflict (ONLY boundary test fails while BOTH W1.D and W1.C standalone unit tests explicitly pass)
     let v3 = triangulate_faults(
         &rules,
         &["f18_f32_f33_work_ledger_two_plus_two_tree_oid_and_smell_badges".to_string()],
-        &["f02_rejects_identical_content_path_swap_in_breadcrumbs".to_string()],
+        &[
+            "f02_rejects_identical_content_path_swap_in_breadcrumbs".to_string(),
+            "pr2_review_regressions_role_sandbox_spool_and_ledger_pins".to_string(),
+        ],
     );
     assert_eq!(
         v3,
@@ -463,21 +478,26 @@ fn all_six_role_skills_readmes_and_compiled_agents_verified() {
         let skill_md = root.join("skills").join(skill_dir).join("SKILL.md");
         let readme_md = root.join("skills").join(skill_dir).join("README.md");
         let profile_toml = root.join("profiles").join(format!("{skill_dir}.toml"));
-        let claude_agent = root
-            .join(".claude")
-            .join("agents")
-            .join(format!("{skill_dir}.md"));
-        let dist_agent = root
-            .join("dist")
-            .join("claude")
-            .join("agents")
-            .join(format!("{skill_dir}.md"));
 
         assert!(skill_md.exists(), "missing {}", skill_md.display());
         assert!(readme_md.exists(), "missing {}", readme_md.display());
         assert!(profile_toml.exists(), "missing {}", profile_toml.display());
-        assert!(claude_agent.exists(), "missing {}", claude_agent.display());
-        assert!(dist_agent.exists(), "missing {}", dist_agent.display());
+
+        for dot_dir in [".claude", ".cursor", ".codex"] {
+            let repo_agent = root
+                .join(dot_dir)
+                .join("agents")
+                .join(format!("{skill_dir}.md"));
+            assert!(repo_agent.exists(), "missing {}", repo_agent.display());
+        }
+        for harness in ["claude", "cursor", "codex", "gemini"] {
+            let dist_agent = root
+                .join("dist")
+                .join(harness)
+                .join("agents")
+                .join(format!("{skill_dir}.md"));
+            assert!(dist_agent.exists(), "missing {}", dist_agent.display());
+        }
 
         let readme_text = fs::read_to_string(&readme_md).unwrap();
         assert!(readme_text.contains("## 1. What Your Job Is"));
@@ -485,4 +505,153 @@ fn all_six_role_skills_readmes_and_compiled_agents_verified() {
         assert!(readme_text.contains("## 3. Your Dedicated Rust Tooling"));
         assert!(readme_text.contains("swarm-tool "));
     }
+}
+
+#[test]
+fn pr2_review_regressions_role_sandbox_spool_and_ledger_pins() {
+    let (repo, _) = isolated_sandbox("pr2_review_regressions");
+
+    // 1. QA writable path policy blocks `src/test_*.rs` production writes while allowing pytest `test_*.py`
+    assert!(!is_qa_writable_path("src/test_backdoor.rs"));
+    assert!(!is_qa_writable_path(
+        "crates/agent-guard/src/test_helper.rs"
+    ));
+    assert!(is_qa_writable_path("src/calc_test.rs"));
+    assert!(is_qa_writable_path("tests/integration.rs"));
+    assert!(is_qa_writable_path("pkg/test_auth.py"));
+
+    // 2. Grunt without minted capability fails closed on both pre-tool and shell write checks
+    let read_in = JsonValue::parse(r#"{"file_path":"src/lib.rs"}"#).unwrap();
+    let missing_cap_dec =
+        enforce_role_pre_tool(SwarmRole::Grunt, None, "Read", &read_in, &repo, &repo)
+            .expect("Grunt without capability must be denied");
+    assert!(!missing_cap_dec.is_allow());
+    assert!(
+        check_role_shell_write_scope(SwarmRole::Grunt, None, &["src/lib.rs".to_string()], &repo)
+            .is_err()
+    );
+
+    // 3. Grunt cannot read arbitrary `docs/` outside `assigned_read_paths`
+    let dag = r#"{
+      "plan_id": "PR2-REGRESSION-PLAN",
+      "tasks": [
+        {
+          "id": "T1",
+          "wave": "W1",
+          "depends_on": [],
+          "domain_risk": "security_critical",
+          "assigned_read_paths": ["src/lib.rs"],
+          "allowed_write_paths": ["src/**"],
+          "assigned_tests": ["t1_unit"]
+        }
+      ]
+    }"#;
+    let plan = parse_and_validate_dag_json(dag).unwrap();
+    save_locked_plan(&repo, &plan, false).unwrap();
+    fs::create_dir_all(repo.join("src")).unwrap();
+    fs::create_dir_all(repo.join("docs")).unwrap();
+    fs::write(repo.join("src/lib.rs"), "pub fn v() -> u32 { 1 }\n").unwrap();
+    fs::write(
+        repo.join("docs/secret_design.md"),
+        "Confidential architecture\n",
+    )
+    .unwrap();
+
+    let cap = mint_session_capability(&repo, SwarmRole::Grunt, "T1", 1).unwrap();
+    let docs_read_in = JsonValue::parse(r#"{"file_path":"docs/secret_design.md"}"#).unwrap();
+    let docs_dec = enforce_role_pre_tool(
+        SwarmRole::Grunt,
+        Some(&cap),
+        "Read",
+        &docs_read_in,
+        &repo,
+        &repo,
+    )
+    .expect("unassigned docs/ read must be denied for Grunt");
+    assert!(!docs_dec.is_allow());
+
+    // 4. Scoped Git-blob tree OID walks >12 directory levels while skipping forbidden `.env*` & `.cache`
+    let deep_dir = repo.join("src/d1/d2/d3/d4/d5/d6/d7/d8/d9/d10/d11/d12/d13/d14");
+    fs::create_dir_all(&deep_dir).unwrap();
+    fs::write(deep_dir.join("leaf.rs"), "pub const LEAF: u8 = 1;\n").unwrap();
+    let oid_v1 = compute_scoped_tree_oid(&repo, &["src/**".to_string()]).unwrap();
+    fs::write(deep_dir.join("leaf.rs"), "pub const LEAF: u8 = 2;\n").unwrap();
+    let oid_v2 = compute_scoped_tree_oid(&repo, &["src/**".to_string()]).unwrap();
+    assert_ne!(
+        oid_v1, oid_v2,
+        "tree OID must detect mutations deeper than 12 directory levels"
+    );
+
+    // Forbidden `.env.local` and `.cache/` inside `src/` must never affect `compute_scoped_tree_oid`
+    fs::write(repo.join("src/.env.local"), "SECRET_KEY=hunter2\n").unwrap();
+    fs::create_dir_all(repo.join("src/.cache")).unwrap();
+    fs::write(repo.join("src/.cache/blob.rs"), "pub fn ignored() {}\n").unwrap();
+    let oid_with_forbidden = compute_scoped_tree_oid(&repo, &["src/**".to_string()]).unwrap();
+    assert_eq!(
+        oid_v2, oid_with_forbidden,
+        "forbidden .env* and .cache files must be ignored by compute_scoped_tree_oid"
+    );
+    fs::remove_file(repo.join("src/.env.local")).unwrap();
+    fs::remove_dir_all(repo.join("src/.cache")).unwrap();
+
+    // 5. Breadcrumb verifier rejects duplicate/replayed seq_no and standalone seq_no gaps
+    let b1 = append_breadcrumb_for_path(
+        &repo,
+        &cap.session_id,
+        "T1",
+        [0x33; 32],
+        EventOp::FileEdit,
+        "src/lib.rs",
+        Some((1, 1)),
+        sha256_digest(b"pub fn v() -> u32 { 1 }\n"),
+    )
+    .unwrap();
+    let b2 = append_breadcrumb_for_path(
+        &repo,
+        &cap.session_id,
+        "T1",
+        [0x33; 32],
+        EventOp::FileEdit,
+        "src/lib.rs",
+        Some((1, 1)),
+        sha256_digest(b"pub fn v() -> u32 { 2 }\n"),
+    )
+    .unwrap();
+    let dup_trail = repo.join("src/dup.breadcrumbs.jsonl");
+    fs::write(
+        &dup_trail,
+        format!("{}\n{}\n", b1.to_json_line(), b1.to_json_line()),
+    )
+    .unwrap();
+    assert!(
+        verify_breadcrumbs_file(&repo, &dup_trail).is_err(),
+        "duplicate seq_no replay must fail verification"
+    );
+    let skipped_first_trail = repo.join("src/skipped.breadcrumbs.jsonl");
+    fs::write(&skipped_first_trail, format!("{}\n", b2.to_json_line())).unwrap();
+    assert!(
+        verify_breadcrumbs_file(&repo, &skipped_first_trail).is_err(),
+        "omitting seq_no=1 for same-directory trail must fail verification"
+    );
+    fs::remove_file(&dup_trail).unwrap();
+    fs::remove_file(&skipped_first_trail).unwrap();
+
+    // 6. WorkLedgerEntry pins non-empty authenticated `event_ids` and tampering invalidates HMAC
+    record_test_checkpoint(&repo, &cap.session_id, true).unwrap();
+    let entry = submit_work_ledger_entry(
+        &repo,
+        &cap.session_id,
+        "Updated deep leaf constant and verified src/lib.rs. Recorded signed edit breadcrumbs.",
+        "Task T1 required deterministic deep-tree hashing. Verified green checkpoint before submission.",
+    )
+    .unwrap();
+    assert!(
+        entry.event_ids.len() >= 3,
+        "ledger entry must pin edit + green-checkpoint event_ids"
+    );
+    assert!(entry.event_ids.contains(&b1.event_id_hex()));
+
+    // Verify ledger file stores `event_ids` JSON array
+    let ledger_raw = fs::read_to_string(work_ledger_state_path(&repo).unwrap()).unwrap();
+    assert!(ledger_raw.contains("\"event_ids\":["));
 }
