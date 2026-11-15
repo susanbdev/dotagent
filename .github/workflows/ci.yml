@@ -27,9 +27,9 @@ jobs:
         run: cp dist/gitconfig.hardened ~/.gitconfig
 
       - name: Install Rust 1.85+ (Edition 2024) toolchain
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
+        run: |
+          rustup toolchain install stable --profile minimal --component rustfmt,clippy
+          rustup default stable
 
       - name: Verify formatting (cargo fmt)
         run: cargo fmt --all -- --check
