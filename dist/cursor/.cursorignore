@@ -52,6 +52,7 @@ target/release/deps/
 # Secrets, credentials, & agent-guard internal state
 .env
 .env.*
+.env*
 *.pem
 *.key
 *.p12

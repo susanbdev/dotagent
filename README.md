@@ -4,10 +4,10 @@ Secure by design Agent and LLM skills, settings, configurations, and tools for v
 
 ## Components
 
-- **`crates/agent-guard`**: Zero-dependency, `#![forbid(unsafe_code)]` Rust 2024 deterministic security kernel intercepting `PreToolUse`, `PostToolUse`, `UserPromptSubmit`, `PreCompact`, `PostEdit`, and `Stop` lifecycle events across Antigravity / Gemini, Claude Code, Cursor, and OpenAI Codex.
+- **`crates/agent-guard`**: Zero-dependency, `#![forbid(unsafe_code)]` Rust 2024 deterministic security kernel intercepting `PreToolUse`, `PostToolUse`, `UserPromptSubmit`, `PreCompact`, `PostEdit`, and `Stop` lifecycle events across Antigravity / Gemini, Claude Code, and Cursor, plus sandbox/MCP lockdown and `notify = ["agent-guard", "on-stop"]` stop-gate verification on OpenAI Codex.
 - **`crates/dotagent-compiler`**: Reproducible bundle compiler and `SHA-256` / `policy-hub` / pure-7-bit-ASCII verifier emitting `dist/` harness configurations, `research-airlock` subagent manifest, `skills/manifest.lock.json`, and `dist-verify/manifest.sha256`.
 - **`profiles/` & `skills/`**: Token-minimal (`<= 3 KiB`), zero-network role manifests and domain skills.
-- **`tests/bypass_corpus.toml`**: `277` adversarial shell AST, symlink, Unicode smuggling, build-config trap, token-bomb, cache-bleed, and confused-deputy bypass vectors verified at `100%` block rate in zero-credential GitHub Actions CI (`.github/workflows/ci.yml`).
+- **`tests/bypass_corpus.toml`**: `290` adversarial shell AST, symlink, Unicode smuggling, build-config trap, token-bomb, cache-bleed, and confused-deputy bypass vectors verified at `100%` block rate in zero-credential GitHub Actions CI (`.github/workflows/ci.yml`).
 
 ## Enforced Security Guarantees
 

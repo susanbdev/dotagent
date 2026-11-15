@@ -108,9 +108,10 @@ fn extract_toml_string_field(line: &str, key: &str) -> Option<String> {
 fn blocks_entire_250_plus_bypass_corpus_at_100_percent() {
     let repo = test_sandbox_root("corpus_sandbox");
     let vectors = load_bypass_corpus();
-    assert!(
-        vectors.len() >= 250,
-        "Expected >= 250 adversarial bypass vectors, got {}",
+    assert_eq!(
+        vectors.len(),
+        290,
+        "Expected exact 290 adversarial bypass vectors, got {}",
         vectors.len()
     );
 
@@ -805,4 +806,174 @@ fn enforces_tiny_16k_step_window_soft_compaction_trigger_and_pre_compact_nonce_r
         Decision::Deny { code, .. } => assert_eq!(code, "TRANSITIVE_DEPTH_EXCEEDED"),
         other => panic!("Expected C.md to remain blocked after step compaction, got {other:?}"),
     }
+}
+
+#[cfg(unix)]
+#[test]
+fn regression_pr1_review_findings() {
+    use std::os::unix::fs::symlink;
+
+    let repo = test_sandbox_root("pr1_regressions");
+
+    // 1. Missing root AGENTS.md must fail audit_repository
+    let missing_errs =
+        agent_guard::audit_repository(&repo).expect_err("missing root AGENTS.md must fail audit");
+    assert!(
+        missing_errs
+            .iter()
+            .any(|e| e.contains("MISSING_ROOT_AGENTS_MD")),
+        "Expected MISSING_ROOT_AGENTS_MD, got {missing_errs:?}"
+    );
+
+    // 2. Symlinked root AGENTS.md must fail both validate_path and audit_repository
+    fs::write(repo.join("real_agents.md"), "# placeholder\n").expect("write real_agents.md");
+    symlink(repo.join("real_agents.md"), repo.join("AGENTS.md")).expect("symlink root AGENTS.md");
+    assert!(validate_path(&repo, &repo, "AGENTS.md", PathAccess::Read).is_err());
+    let sym_errs =
+        agent_guard::audit_repository(&repo).expect_err("symlinked root AGENTS.md must fail");
+    assert!(
+        sym_errs
+            .iter()
+            .any(|e| e.contains("SYMLINKED_ROOT_AGENTS_MD")),
+        "Expected SYMLINKED_ROOT_AGENTS_MD, got {sym_errs:?}"
+    );
+    fs::remove_file(repo.join("AGENTS.md")).expect("remove symlink AGENTS.md");
+    fs::write(repo.join("AGENTS.md"), "# Root AGENTS\n").expect("write regular AGENTS.md");
+    assert!(validate_path(&repo, &repo, "AGENTS.md", PathAccess::Read).is_ok());
+
+    // 3. Nested symlink sub/AGENTS.md -> ../AGENTS.md must be blocked BEFORE symlink resolution
+    fs::create_dir_all(repo.join("sub")).expect("mkdir sub");
+    symlink("../AGENTS.md", repo.join("sub/AGENTS.md")).expect("symlink sub/AGENTS.md");
+    let nested_err = validate_path(&repo, &repo, "sub/AGENTS.md", PathAccess::Read)
+        .expect_err("nested symlink sub/AGENTS.md must be denied");
+    assert_eq!(nested_err.code, "UNAUTHORIZED_INSTRUCTION_FILE");
+
+    // 4. Cross-repo cwd spoofing in hook payload must be hard-denied
+    let sibling_repo = test_sandbox_root("pr1_sibling_repo");
+    let spoof_req = JsonValue::Object(vec![
+        (
+            "session_id".to_string(),
+            JsonValue::Str("pr1_spoof".to_string()),
+        ),
+        (
+            "cwd".to_string(),
+            JsonValue::Str(sibling_repo.to_string_lossy().into_owned()),
+        ),
+        ("tool_name".to_string(), JsonValue::Str("Read".to_string())),
+        (
+            "tool_input".to_string(),
+            JsonValue::Object(vec![(
+                "file_path".to_string(),
+                JsonValue::Str("AGENTS.md".to_string()),
+            )]),
+        ),
+    ])
+    .to_json_string();
+    match handle_pre_tool_hook(&spoof_req, &repo) {
+        Decision::Deny { code, .. } => assert_eq!(code, "CROSS_REPO_CWD_SPOOF"),
+        other => panic!("Expected CROSS_REPO_CWD_SPOOF, got {other:?}"),
+    }
+
+    // 5. PostToolUse must sanitize non-ASCII/escape tool outputs pre-buffer AND register dynamic pointers
+    fs::create_dir_all(repo.join("docs")).expect("mkdir docs");
+    fs::write(repo.join("docs/hop1.md"), "Hop 1.\n").expect("write hop1");
+    fs::write(repo.join("docs/hop2.md"), "See `docs/hop3.md`.\n").expect("write hop2");
+    fs::write(repo.join("docs/hop3.md"), "Hop 3.\n").expect("write hop3");
+
+    let dirty_post = JsonValue::Object(vec![
+        (
+            "session_id".to_string(),
+            JsonValue::Str("pr1_post".to_string()),
+        ),
+        (
+            "cwd".to_string(),
+            JsonValue::Str(repo.to_string_lossy().into_owned()),
+        ),
+        ("tool_name".to_string(), JsonValue::Str("Grep".to_string())),
+        (
+            "tool_response".to_string(),
+            JsonValue::Str("docs/hop1.md:1: cafe\u{00E9} see `docs/hop2.md`\n".to_string()),
+        ),
+    ])
+    .to_json_string();
+    match handle_post_tool_hook(&dirty_post, &repo) {
+        Decision::Deny { code, reason, .. } => {
+            assert_eq!(code, "NON_ASCII_SANITIZED_PREBUFFER");
+            assert!(reason.contains("[NON_ASCII"));
+        }
+        other => panic!("Expected NON_ASCII_SANITIZED_PREBUFFER on PostToolUse, got {other:?}"),
+    }
+
+    // Clean PostToolUse output referencing docs/hop2.md registers hop2 at depth 2 -> hop2's pointer to hop3 is depth 3 (blocked!)
+    let clean_post = JsonValue::Object(vec![
+        (
+            "session_id".to_string(),
+            JsonValue::Str("pr1_post_chain".to_string()),
+        ),
+        (
+            "cwd".to_string(),
+            JsonValue::Str(repo.to_string_lossy().into_owned()),
+        ),
+        ("tool_name".to_string(), JsonValue::Str("Grep".to_string())),
+        (
+            "tool_response".to_string(),
+            JsonValue::Str("match in `docs/hop2.md`\n".to_string()),
+        ),
+    ])
+    .to_json_string();
+    assert!(handle_post_tool_hook(&clean_post, &repo).is_allow());
+    let read_hop2 = JsonValue::Object(vec![
+        (
+            "session_id".to_string(),
+            JsonValue::Str("pr1_post_chain".to_string()),
+        ),
+        (
+            "cwd".to_string(),
+            JsonValue::Str(repo.to_string_lossy().into_owned()),
+        ),
+        ("tool_name".to_string(), JsonValue::Str("Read".to_string())),
+        (
+            "tool_input".to_string(),
+            JsonValue::Object(vec![(
+                "file_path".to_string(),
+                JsonValue::Str("docs/hop2.md".to_string()),
+            )]),
+        ),
+    ])
+    .to_json_string();
+    assert!(handle_pre_tool_hook(&read_hop2, &repo).is_allow());
+    let read_hop3 = JsonValue::Object(vec![
+        (
+            "session_id".to_string(),
+            JsonValue::Str("pr1_post_chain".to_string()),
+        ),
+        (
+            "cwd".to_string(),
+            JsonValue::Str(repo.to_string_lossy().into_owned()),
+        ),
+        ("tool_name".to_string(), JsonValue::Str("Read".to_string())),
+        (
+            "tool_input".to_string(),
+            JsonValue::Object(vec![(
+                "file_path".to_string(),
+                JsonValue::Str("docs/hop3.md".to_string()),
+            )]),
+        ),
+    ])
+    .to_json_string();
+    match handle_pre_tool_hook(&read_hop3, &repo) {
+        Decision::Deny { code, .. } => assert_eq!(code, "TRANSITIVE_DEPTH_EXCEEDED"),
+        other => {
+            panic!("Expected TRANSITIVE_DEPTH_EXCEEDED via PostToolUse pointer, got {other:?}")
+        }
+    }
+
+    // 6. sanitize_and_compact_bytes must never exceed max_bytes even after appending truncation marker
+    let huge = "0123456789abcdef\n".repeat(400);
+    let report = agent_guard::sanitizer::sanitize_and_compact_bytes(huge.as_bytes(), 500, 256);
+    assert!(
+        report.clean_ascii.len() <= 256,
+        "Expected compacted output <= 256 bytes, got {}",
+        report.clean_ascii.len()
+    );
 }

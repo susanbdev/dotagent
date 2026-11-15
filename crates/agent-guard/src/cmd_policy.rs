@@ -773,7 +773,7 @@ fn check_ambient_authority_cli(
             "create" | "close" | "reopen" | "comment" | "edit" | "delete" | "transfer"
         ) | (
             "repo",
-            "create" | "delete" | " archive" | "edit" | "fork" | "rename"
+            "create" | "delete" | "archive" | "edit" | "fork" | "rename"
         ) | ("release", _)
             | ("workflow", "run" | "enable" | "disable")
             | ("gist", _)

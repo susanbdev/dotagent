@@ -23,7 +23,6 @@ pub struct UnicodeViolation {
 
 pub fn scan_unicode(input: &str, mode: ScanMode) -> Vec<UnicodeViolation> {
     let mut findings = Vec::new();
-    let mut prev_variation_selector = false;
     let mut consecutive_braille_blank = 0usize;
 
     for (byte_idx, ch) in input.char_indices() {
@@ -65,19 +64,15 @@ pub fn scan_unicode(input: &str, mode: ScanMode) -> Vec<UnicodeViolation> {
             continue;
         }
 
-        // 4. Basic Variation Selectors (U+FE00..=U+FE0F)
+        // 4. Basic Variation Selectors (U+FE00..=U+FE0F) — always blocked across all modes
         if (0xFE00..=0xFE0F).contains(&cp) {
-            if mode == ScanMode::StrictPathOrCommand || prev_variation_selector {
-                findings.push(UnicodeViolation {
-                    code: "VARIATION_SELECTOR_SMUGGLING",
-                    offset: byte_idx,
-                    detail: format!("Disallowed Variation Selector U+{cp:04X} sequence detected"),
-                });
-            }
-            prev_variation_selector = true;
+            findings.push(UnicodeViolation {
+                code: "VARIATION_SELECTOR_SMUGGLING",
+                offset: byte_idx,
+                detail: format!("Disallowed Variation Selector U+{cp:04X} detected"),
+            });
             continue;
         }
-        prev_variation_selector = false;
 
         // 5. Zero-width, invisible formatters, Hangul fillers, annotation controls
         if is_invisible_smuggler(cp, byte_idx) {

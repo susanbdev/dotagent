@@ -123,11 +123,35 @@ pub fn validate_path(
     }
 
     let canon_repo = fs::canonicalize(repo_root).unwrap_or_else(|_| lexical_normalize(repo_root));
+    let lex_repo = lexical_normalize(repo_root);
     let base_dir = if Path::new(&expanded).is_absolute() {
         PathBuf::from(&expanded)
     } else {
         cwd.join(&expanded)
     };
+
+    // Pre-symlink lexical authority check so `sub/AGENTS.md -> ../AGENTS.md` is rejected!
+    let lex_target = lexical_normalize(&base_dir);
+    let lex_rel_opt = lex_target
+        .strip_prefix(&canon_repo)
+        .ok()
+        .or_else(|| lex_target.strip_prefix(&lex_repo).ok())
+        .map(path_to_slash_string);
+    if let Some(ref lex_rel) = lex_rel_opt {
+        let lex_is_root = check_authority_file_policy(lex_rel, access)?;
+        if lex_is_root {
+            if let Ok(meta) = fs::symlink_metadata(&base_dir) {
+                if meta.file_type().is_symlink() {
+                    return Err(PathViolation {
+                        code: "UNAUTHORIZED_INSTRUCTION_FILE",
+                        detail: "Root 'AGENTS.md' must be a regular file, not a symlink."
+                            .to_string(),
+                        is_poisoned_zone: true,
+                    });
+                }
+            }
+        }
+    }
 
     // 2. Walk every existing component to detect symlinks pointing to forbidden zones or escaping repo_root
     let resolved = resolve_checking_symlinks(&base_dir, &canon_repo)?;
@@ -156,6 +180,15 @@ pub fn validate_path(
 
     // 5. Enforce Single Root Authority File (`<repo_root>/AGENTS.md` ONLY)
     let is_root_authority = check_authority_file_policy(&repo_rel, access)?;
+    if is_root_authority && lex_rel_opt.as_deref() != Some("AGENTS.md") {
+        return Err(PathViolation {
+            code: "UNAUTHORIZED_INSTRUCTION_FILE",
+            detail: format!(
+                "Symlink alias '{trimmed}' pointing to root 'AGENTS.md' is forbidden; access root 'AGENTS.md' directly."
+            ),
+            is_poisoned_zone: true,
+        });
+    }
 
     // 6. Enforce Control-Plane Immutability on Writes
     if access == PathAccess::Write {
@@ -373,6 +406,24 @@ pub fn check_forbidden_zones_lexical(
         }
     }
 
+    // Dynamic self-blindness on active `state_base_dir()` (including validated overrides)
+    let active_state = crate::traversal_ledger::state_base_dir();
+    if active_state.is_absolute() {
+        let state_slash = active_state.to_string_lossy().replace('\\', "/");
+        let state_lower = state_slash.trim_end_matches('/').to_ascii_lowercase();
+        if !state_lower.is_empty()
+            && (lower == state_lower || lower.starts_with(&format!("{state_lower}/")))
+        {
+            return Err(PathViolation {
+                code: "FORBIDDEN_GUARD_STATE_PATH",
+                detail: format!(
+                    "Access to active agent-guard state directory '{display_raw}' is strictly forbidden (self-blindness enforcement)."
+                ),
+                is_poisoned_zone: true,
+            });
+        }
+    }
+
     Ok(())
 }
 
@@ -433,7 +484,7 @@ fn is_dependency_segment(seg_lower: &str) -> bool {
 }
 
 fn is_secret_segment(seg_lower: &str) -> bool {
-    if seg_lower == ".env" || seg_lower.starts_with(".env.") {
+    if seg_lower.starts_with(".env") {
         return true;
     }
     if matches!(
