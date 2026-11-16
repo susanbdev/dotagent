@@ -977,3 +977,298 @@ fn regression_pr1_review_findings() {
         report.clean_ascii.len()
     );
 }
+
+#[test]
+fn regression_deep_adversarial_pr1_findings() {
+    let repo = test_sandbox_root("pr1_deep_adversarial");
+    let outside = test_sandbox_root("pr1_deep_outside");
+    fs::write(repo.join("AGENTS.md"), "# Canonical Root\n").expect("write AGENTS.md");
+    fs::create_dir_all(repo.join("src")).expect("mkdir src");
+    fs::write(repo.join("src/lib.rs"), "pub fn ok() {}\n").expect("write src/lib.rs");
+
+    // 1. Inner symlink + ENOENT trailing path (`escape_link/nonexistent_dir/new.txt`) must be caught!
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::symlink;
+        symlink(&outside, repo.join("escape_link")).expect("symlink escape_link");
+        let res = validate_path(
+            &repo,
+            &repo,
+            "escape_link/nonexistent_subdir/created.txt",
+            PathAccess::Write,
+        );
+        assert!(
+            res.is_err(),
+            "Write through inner symlink with ENOENT trailing segments must be blocked!"
+        );
+    }
+
+    // 2. `apply_patch` / `patch` tool validates target paths and Unicode smuggling
+    let sid = "deep_pr1_sess";
+    let reset = JsonValue::Object(vec![
+        ("session_id".to_string(), JsonValue::Str(sid.to_string())),
+        (
+            "cwd".to_string(),
+            JsonValue::Str(repo.to_string_lossy().into_owned()),
+        ),
+    ])
+    .to_json_string();
+    assert!(handle_user_prompt_hook(&reset, &repo).is_allow());
+
+    let bad_patch = JsonValue::Object(vec![
+        ("session_id".to_string(), JsonValue::Str(sid.to_string())),
+        (
+            "cwd".to_string(),
+            JsonValue::Str(repo.to_string_lossy().into_owned()),
+        ),
+        (
+            "tool_name".to_string(),
+            JsonValue::Str("apply_patch".to_string()),
+        ),
+        (
+            "tool_input".to_string(),
+            JsonValue::Object(vec![(
+                "patch".to_string(),
+                JsonValue::Str("*** Update File: AGENTS.md\n@@\n-old\n+new\n".to_string()),
+            )]),
+        ),
+    ])
+    .to_json_string();
+    assert!(!handle_pre_tool_hook(&bad_patch, &repo).is_allow());
+
+    assert!(handle_user_prompt_hook(&reset, &repo).is_allow());
+    let ok_patch = JsonValue::Object(vec![
+        ("session_id".to_string(), JsonValue::Str(sid.to_string())),
+        (
+            "cwd".to_string(),
+            JsonValue::Str(repo.to_string_lossy().into_owned()),
+        ),
+        (
+            "tool_name".to_string(),
+            JsonValue::Str("apply_patch".to_string()),
+        ),
+        (
+            "tool_input".to_string(),
+            JsonValue::Object(vec![(
+                "patch".to_string(),
+                JsonValue::Str(
+                    "--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1 +1 @@\n--- sql comment\n+pub fn ok2() {}\n"
+                        .to_string(),
+                ),
+            )]),
+        ),
+    ])
+    .to_json_string();
+    assert!(handle_pre_tool_hook(&ok_patch, &repo).is_allow());
+
+    // 3. `MultiEdit` nested `edits` array catches Trojan Source Bidi & secondary forbidden paths
+    let rlo = char::from_u32(0x202E).unwrap();
+    let multiedit_bidi = JsonValue::Object(vec![
+        ("session_id".to_string(), JsonValue::Str(sid.to_string())),
+        (
+            "cwd".to_string(),
+            JsonValue::Str(repo.to_string_lossy().into_owned()),
+        ),
+        (
+            "tool_name".to_string(),
+            JsonValue::Str("MultiEdit".to_string()),
+        ),
+        (
+            "tool_input".to_string(),
+            JsonValue::Object(vec![
+                (
+                    "file_path".to_string(),
+                    JsonValue::Str("src/lib.rs".to_string()),
+                ),
+                (
+                    "edits".to_string(),
+                    JsonValue::Array(vec![JsonValue::Object(vec![(
+                        "new_string".to_string(),
+                        JsonValue::Str(format!("let x = \"{rlo}\";")),
+                    )])]),
+                ),
+            ]),
+        ),
+    ])
+    .to_json_string();
+    assert!(!handle_pre_tool_hook(&multiedit_bidi, &repo).is_allow());
+    assert!(handle_user_prompt_hook(&reset, &repo).is_allow());
+
+    // 4. `Grep` regex pattern allows standard regex escapes (`\x7f`) while blocking Bidi
+    let grep_ok = JsonValue::Object(vec![
+        ("session_id".to_string(), JsonValue::Str(sid.to_string())),
+        (
+            "cwd".to_string(),
+            JsonValue::Str(repo.to_string_lossy().into_owned()),
+        ),
+        ("tool_name".to_string(), JsonValue::Str("Grep".to_string())),
+        (
+            "tool_input".to_string(),
+            JsonValue::Object(vec![
+                (
+                    "pattern".to_string(),
+                    JsonValue::Str(concat!("foo\\", "x7fbar").to_string()),
+                ),
+                ("path".to_string(), JsonValue::Str("src".to_string())),
+            ]),
+        ),
+    ])
+    .to_json_string();
+    assert!(handle_pre_tool_hook(&grep_ok, &repo).is_allow());
+
+    // 5. Shell AST bypasses: piped/heredoc/herestring stdin code, attached -c/-e, gh -R, npm --prefix, cargo --config, rg -e, tree, xargs
+    let must_block_cmds = [
+        "echo id | sh",
+        "echo 'import os' | python3",
+        "sh <<'EOF'\ncat /etc/passwd\nEOF\n",
+        "bash <<< 'cat /etc/passwd'",
+        "python3 <<EOF\nprint(1)\nEOF\n",
+        concat!("sh -c'cat /", "tmp/x'"),
+        concat!("sh -xc'cat /", "tmp/x'"),
+        "python3 -c'import subprocess'",
+        "node --eval=\"require('child_process')\"",
+        "gh -R owner/repo pr merge 1",
+        "gh -R owner/repo auth status",
+        concat!("npm --prefix /", "tmp install --ignore-scripts"),
+        "npm --prefix src install",
+        "cargo --config 'build.rustc-wrapper=\"evil\"' check",
+        "cargo +nightly publish",
+        concat!("rg --max-depth 2 -e needle /", "tmp"),
+        concat!("tree -L 2 /", "tmp"),
+        "printf 'AGENTS.md\\n' | xargs rm",
+    ];
+    for cmd in must_block_cmds {
+        assert!(
+            evaluate_shell_command(cmd, &repo, &repo, false).is_err(),
+            "Expected shell command `{cmd}` to be blocked!"
+        );
+    }
+
+    // Benign pipeline into `python3 -c` (code inspected via `-c`, stdin is data) remains allowed!
+    assert!(
+        evaluate_shell_command(
+            "echo '{\"a\":1}' | python3 -c 'import json, sys'",
+            &repo,
+            &repo,
+            false
+        )
+        .is_ok()
+    );
+
+    // 6. Discovery output (`Bash` / `ls`) after a Level-2 read must NOT poison unread files to Level 3
+    fs::create_dir_all(repo.join("docs")).expect("mkdir docs");
+    fs::write(repo.join("docs/a.md"), "See [b](b.md).\n").expect("write a.md");
+    fs::write(repo.join("docs/b.md"), "Leaf doc.\n").expect("write b.md");
+    fs::write(repo.join("docs/unvisited.md"), "Unvisited sibling.\n").expect("write unvisited.md");
+    assert!(handle_user_prompt_hook(&reset, &repo).is_allow());
+    for rel in ["docs/a.md", "docs/b.md"] {
+        let req = JsonValue::Object(vec![
+            ("session_id".to_string(), JsonValue::Str(sid.to_string())),
+            (
+                "cwd".to_string(),
+                JsonValue::Str(repo.to_string_lossy().into_owned()),
+            ),
+            ("tool_name".to_string(), JsonValue::Str("Read".to_string())),
+            (
+                "tool_input".to_string(),
+                JsonValue::Object(vec![(
+                    "file_path".to_string(),
+                    JsonValue::Str(rel.to_string()),
+                )]),
+            ),
+        ])
+        .to_json_string();
+        assert!(handle_pre_tool_hook(&req, &repo).is_allow());
+    }
+    let bash_ls_post = JsonValue::Object(vec![
+        ("session_id".to_string(), JsonValue::Str(sid.to_string())),
+        (
+            "cwd".to_string(),
+            JsonValue::Str(repo.to_string_lossy().into_owned()),
+        ),
+        ("tool_name".to_string(), JsonValue::Str("Bash".to_string())),
+        (
+            "tool_response".to_string(),
+            JsonValue::Str("docs/unvisited.md\n".to_string()),
+        ),
+    ])
+    .to_json_string();
+    assert!(handle_post_tool_hook(&bash_ls_post, &repo).is_allow());
+    let read_unvisited = JsonValue::Object(vec![
+        ("session_id".to_string(), JsonValue::Str(sid.to_string())),
+        (
+            "cwd".to_string(),
+            JsonValue::Str(repo.to_string_lossy().into_owned()),
+        ),
+        ("tool_name".to_string(), JsonValue::Str("Read".to_string())),
+        (
+            "tool_input".to_string(),
+            JsonValue::Object(vec![(
+                "file_path".to_string(),
+                JsonValue::Str("docs/unvisited.md".to_string()),
+            )]),
+        ),
+    ])
+    .to_json_string();
+    assert!(
+        handle_pre_tool_hook(&read_unvisited, &repo).is_allow(),
+        "Bash/ls discovery output must not poison unread workspace files to Level 3!"
+    );
+
+    // 7. Large structured JSON object (> 2 KiB) on PostToolUse does NOT falsely trigger SINGLE_LINE_TOKEN_BOMB,
+    //    and CLI `post-tool` with non-ASCII exits 0 (advisory replacement) instead of 2!
+    let mut fields = Vec::new();
+    for idx in 0..45 {
+        fields.push((
+            format!("field_{idx:02}"),
+            JsonValue::Str("clean_ascii_value_0123456789abcdef0123456789".to_string()),
+        ));
+    }
+    let structured_post = JsonValue::Object(vec![
+        ("session_id".to_string(), JsonValue::Str(sid.to_string())),
+        (
+            "cwd".to_string(),
+            JsonValue::Str(repo.to_string_lossy().into_owned()),
+        ),
+        (
+            "tool_name".to_string(),
+            JsonValue::Str("mcp_tool".to_string()),
+        ),
+        ("tool_response".to_string(), JsonValue::Object(fields)),
+    ])
+    .to_json_string();
+    assert!(
+        handle_post_tool_hook(&structured_post, &repo).is_allow(),
+        "Structured >2 KiB JSON object in PostToolUse must not trip SINGLE_LINE_TOKEN_BOMB"
+    );
+
+    let bin = env!("CARGO_BIN_EXE_agent-guard");
+    let e_acute = char::from_u32(0x00E9).unwrap();
+    let mut child_post = Command::new(bin)
+        .arg("post-tool")
+        .current_dir(&repo)
+        .env("AGENT_GUARD_STATE_DIR", repo.join(".state"))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn agent-guard post-tool");
+    child_post
+        .stdin
+        .as_mut()
+        .expect("stdin")
+        .write_all(
+            format!(
+                r#"{{"session_id":"cli_post","cwd":"{}","tool_name":"Bash","tool_response":"caf{e_acute}"}}"#,
+                repo.display()
+            )
+            .as_bytes(),
+        )
+        .expect("write post-tool stdin");
+    let out_post = child_post.wait_with_output().expect("wait post-tool");
+    assert_eq!(
+        out_post.status.code(),
+        Some(0),
+        "PostToolUse pre-buffer ASCII sanitization must exit 0 with advisory context!"
+    );
+}

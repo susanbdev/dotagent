@@ -4,7 +4,7 @@ use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use agent_guard::budget_guard::{MAX_SLICED_FILE_BYTES, inspect_file_budget};
+use agent_guard::budget_guard::MAX_SLICED_FILE_BYTES;
 use agent_guard::cmd_policy::evaluate_shell_command;
 use agent_guard::injection_scan::scan_untrusted_content;
 use agent_guard::json::JsonValue;
@@ -325,7 +325,27 @@ fn emit_hook_decision(decision: Decision, phase: HookPhase) -> ExitCode {
             code,
             reason,
             halt_session,
-        } => emit_hook_denial(code, &reason, halt_session),
+        } => {
+            if phase == HookPhase::PostTool && code == "NON_ASCII_SANITIZED_PREBUFFER" {
+                let note = format!(
+                    "[AGENT-GUARD PRE-BUFFER ASCII SANITIZER] Tool output contained non-ASCII or escape bytes and was sanitized to 7-bit ASCII:\n{reason}"
+                );
+                let out = JsonValue::Object(vec![(
+                    "hookSpecificOutput".to_string(),
+                    JsonValue::Object(vec![
+                        (
+                            "hookEventName".to_string(),
+                            JsonValue::Str(phase.event_name().to_string()),
+                        ),
+                        ("updatedMCPToolOutput".to_string(), JsonValue::Str(reason)),
+                        ("additionalContext".to_string(), JsonValue::Str(note)),
+                    ]),
+                )]);
+                println!("{}", out.to_json_string());
+                return ExitCode::SUCCESS;
+            }
+            emit_hook_denial(code, &reason, halt_session)
+        }
     }
 }
 
@@ -386,17 +406,72 @@ fn emit_cli_decision(decision: Decision) -> ExitCode {
     }
 }
 
+fn is_pinned_dist_bundle_artifact(repo_root: &Path, raw_path: &str) -> Option<(PathBuf, String)> {
+    let cand = if Path::new(raw_path).is_absolute() {
+        PathBuf::from(raw_path)
+    } else {
+        repo_root.join(raw_path)
+    };
+    let canon = std::fs::canonicalize(&cand).ok()?;
+    let canon_repo = std::fs::canonicalize(repo_root).ok()?;
+    if !canon.starts_with(&canon_repo) {
+        return None;
+    }
+    let rel = canon
+        .strip_prefix(&canon_repo)
+        .ok()?
+        .to_string_lossy()
+        .replace('\\', "/");
+    if !rel.starts_with("dist/") {
+        return None;
+    }
+    let manifest = std::fs::read_to_string(canon_repo.join("dist-verify/manifest.sha256")).ok()?;
+    let bytes = std::fs::read(&canon).ok()?;
+    let actual_hex = agent_guard::sha256::sha256_hex(&bytes);
+    for line in manifest.lines() {
+        let mut parts = line.split_whitespace();
+        let Some(expected_hex) = parts.next() else {
+            continue;
+        };
+        let Some(path_col) = parts.next() else {
+            continue;
+        };
+        if path_col == rel && expected_hex == actual_hex {
+            return Some((canon, rel));
+        }
+    }
+    None
+}
+
 fn run_scan_file(raw_path: &str, cwd: &Path) -> ExitCode {
     let repo_root = resolve_repo_root(cwd);
-    let valid = match validate_path(&repo_root, cwd, raw_path, PathAccess::Read) {
-        Ok(v) => v,
-        Err(pv) => {
-            return emit_cli_decision(Decision::deny(pv.code, pv.detail, pv.is_poisoned_zone));
-        }
-    };
+    let (canon_path, repo_rel, is_trusted_authority) =
+        match validate_path(&repo_root, cwd, raw_path, PathAccess::Read) {
+            Ok(v) => (v.canonical_or_norm, v.repo_rel, v.is_root_authority),
+            Err(pv) => {
+                if pv.code == "UNAUTHORIZED_INSTRUCTION_FILE" {
+                    if let Some((canon, rel)) = is_pinned_dist_bundle_artifact(&repo_root, raw_path)
+                    {
+                        (canon, rel, true)
+                    } else {
+                        return emit_cli_decision(Decision::deny(
+                            pv.code,
+                            pv.detail,
+                            pv.is_poisoned_zone,
+                        ));
+                    }
+                } else {
+                    return emit_cli_decision(Decision::deny(
+                        pv.code,
+                        pv.detail,
+                        pv.is_poisoned_zone,
+                    ));
+                }
+            }
+        };
 
-    let (content, metrics) = match inspect_file_budget(&valid.canonical_or_norm, None, None) {
-        Ok(r) => r,
+    let content = match agent_guard::budget_guard::inspect_file_on_disk_hygiene(&canon_path) {
+        Ok(c) => c,
         Err(bv) => return emit_cli_decision(Decision::deny(bv.code, bv.detail, false)),
     };
 
@@ -405,18 +480,22 @@ fn run_scan_file(raw_path: &str, cwd: &Path) -> ExitCode {
         return emit_cli_decision(Decision::deny(first.code, first.detail.clone(), true));
     }
 
-    let parent = valid.canonical_or_norm.parent().unwrap_or(&repo_root);
-    let report = scan_untrusted_content(&content, &repo_root, parent, valid.is_root_authority);
+    let parent = canon_path.parent().unwrap_or(&repo_root);
+    let report = scan_untrusted_content(&content, &repo_root, parent, is_trusted_authority);
     if let Some(halt) = report.first_halt() {
         return emit_cli_decision(Decision::deny(halt.code, halt.detail.clone(), true));
     }
 
+    let est_tokens = agent_guard::budget_guard::estimate_bpe_tokens(&content);
     println!(
         "CLEAN: '{}' ({} bytes, {} lines, ~{} tokens, {} in-repo pointers)",
-        valid.repo_rel,
-        metrics.byte_len,
-        metrics.line_count,
-        metrics.estimated_tokens,
+        repo_rel,
+        content.len(),
+        content
+            .lines()
+            .count()
+            .max(usize::from(!content.is_empty())),
+        est_tokens,
         report.valid_repo_pointers.len()
     );
     ExitCode::SUCCESS

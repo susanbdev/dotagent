@@ -150,7 +150,7 @@ pub fn validate_path_with_max_depth(
         cwd.join(&expanded)
     };
 
-    // Pre-symlink lexical authority check so `sub/AGENTS.md -> ../AGENTS.md` is rejected!
+    // Pre-symlink lexical authority gate so nested symlinked AGENTS.md is rejected!
     let lex_target = lexical_normalize(&base_dir);
     let lex_rel_opt = lex_target
         .strip_prefix(&canon_repo)
@@ -540,6 +540,25 @@ fn is_secret_segment(seg_lower: &str) -> bool {
 }
 
 fn resolve_checking_symlinks(abs_path: &Path, canon_repo: &Path) -> Result<PathBuf, PathViolation> {
+    resolve_checking_symlinks_depth(abs_path, canon_repo, 0)
+}
+
+fn resolve_checking_symlinks_depth(
+    abs_path: &Path,
+    canon_repo: &Path,
+    symlink_depth: usize,
+) -> Result<PathBuf, PathViolation> {
+    if symlink_depth > 16 {
+        return Err(PathViolation {
+            code: "SYMLINK_LOOP_DEPTH_EXCEEDED",
+            detail: format!(
+                "Symlink resolution exceeded max depth (16) while validating '{}'",
+                abs_path.display()
+            ),
+            is_poisoned_zone: true,
+        });
+    }
+
     let mut acc = PathBuf::new();
     for comp in abs_path.components() {
         match comp {
@@ -571,8 +590,14 @@ fn resolve_checking_symlinks(abs_path: &Path, canon_repo: &Path) -> Result<PathB
                             base.pop();
                             base.join(target)
                         };
-                        let canon_target = fs::canonicalize(&resolved_target)
-                            .unwrap_or_else(|_| lexical_normalize(&resolved_target));
+
+                        // Recursively walk `resolved_target` component-by-component so inner symlinks
+                        // are resolved even when a trailing child component does not exist yet (`ENOENT`).
+                        let canon_target = resolve_checking_symlinks_depth(
+                            &resolved_target,
+                            canon_repo,
+                            symlink_depth + 1,
+                        )?;
 
                         check_forbidden_zones_lexical(
                             &canon_target.to_string_lossy(),

@@ -272,6 +272,34 @@ impl SessionLedger {
         if targets.is_empty() {
             return;
         }
+        let norm = tool_label.to_ascii_lowercase();
+        let is_local_discovery = matches!(
+            norm.as_str(),
+            "bash"
+                | "sh"
+                | "shell"
+                | "run_command"
+                | "run_shell_command"
+                | "execute_command"
+                | "grep"
+                | "glob"
+                | "ls"
+                | "grep_search"
+                | "find_by_name"
+                | "list_dir"
+                | "list_directory"
+        );
+        if is_local_discovery {
+            for target in targets {
+                self.nodes.entry(target.clone()).or_insert(TraversalNode {
+                    level: 1,
+                    chain: target.clone(),
+                    was_read: false,
+                });
+            }
+            return;
+        }
+
         let max_read_level = self
             .nodes
             .values()

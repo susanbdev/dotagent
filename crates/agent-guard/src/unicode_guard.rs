@@ -127,7 +127,7 @@ pub fn scan_unicode(input: &str, mode: ScanMode) -> Vec<UnicodeViolation> {
         }
     }
 
-    // 8. Mixed-script identifier/segment spoofing (e.g. Cyrillic 'а' U+0430 inside ASCII word/filename)
+    // 8. Mixed-script identifier/segment spoofing (e.g. Cyrillic U+0430 inside ASCII word/filename)
     if mode == ScanMode::StrictPathOrCommand {
         scan_mixed_script_tokens(input, &mut findings);
     }
@@ -197,7 +197,7 @@ fn is_forbidden_control(cp: u32, mode: ScanMode) -> bool {
 fn is_path_or_flag_homoglyph(cp: u32) -> bool {
     matches!(
         cp,
-        // Unicode hyphens/dashes used to spoof CLI flags (e.g. `git —no-verify` or `−rf`)
+        // Unicode hyphens/dashes used to spoof CLI flags (e.g. git --no-verify with U+2014 or U+2212)
         0x2010..=0x2015
             | 0x2212
             | 0xFE58
@@ -331,7 +331,9 @@ fn scan_encoded_escapes(input: &str, mode: ScanMode, findings: &mut Vec<UnicodeV
                     i += 2;
                     continue;
                 }
-                b'0' if bytes.get(i + 2..i + 4) == Some(b"33") => {
+                b'0' if mode == ScanMode::StrictPathOrCommand
+                    && bytes.get(i + 2..i + 4) == Some(b"33") =>
+                {
                     findings.push(UnicodeViolation {
                         code: "ENCODED_ESCAPE_SMUGGLING",
                         offset: i,
@@ -343,7 +345,8 @@ fn scan_encoded_escapes(input: &str, mode: ScanMode, findings: &mut Vec<UnicodeV
                 b'x' => {
                     if let Some(val) = parse_hex_slice(bytes.get(i + 2..i + 4)) {
                         line_escape_count += 1;
-                        if val == 0x1B || val == 0x00 || mode == ScanMode::StrictPathOrCommand {
+                        if is_dangerous_decoded_scalar(val) || mode == ScanMode::StrictPathOrCommand
+                        {
                             findings.push(UnicodeViolation {
                                 code: "ENCODED_ESCAPE_SMUGGLING",
                                 offset: i,
@@ -441,7 +444,7 @@ fn scan_encoded_escapes(input: &str, mode: ScanMode, findings: &mut Vec<UnicodeV
             }
         }
 
-        // HTML hex entity smuggling: &#xE0041; or &#x202E;
+        // HTML hex entity smuggling (e.g. amp-hash-x E0041 or 202E)
         if bytes[i] == b'&'
             && bytes.get(i + 1) == Some(&b'#')
             && matches!(bytes.get(i + 2), Some(b'x' | b'X'))
@@ -461,7 +464,7 @@ fn scan_encoded_escapes(input: &str, mode: ScanMode, findings: &mut Vec<UnicodeV
             }
         }
 
-        // Percent-encoded UTF-8 Bidi (e.g. %E2%80%AE = U+202E) or path traversal (%2e%2e%2f)
+        // Percent-encoded UTF-8 Bidi (e.g. E2-80-AE = U+202E) or path traversal (%2e%2e%2f)
         if bytes[i] == b'%' && i + 8 < bytes.len() && bytes[i + 3] == b'%' && bytes[i + 6] == b'%' {
             if let (Some(b1), Some(b2), Some(b3)) = (
                 parse_hex_slice(bytes.get(i + 1..i + 3)),
@@ -510,11 +513,33 @@ mod tests {
 
     #[test]
     fn blocks_trojan_bidi_and_tags_and_glassworm() {
-        assert!(!scan_unicode("safe text \u{202E} evil", ScanMode::UntrustedContent).is_empty());
-        assert!(!scan_unicode("tag \u{E0041}\u{E0042}", ScanMode::UntrustedContent).is_empty());
-        assert!(!scan_unicode("glassworm \u{E0100}", ScanMode::UntrustedContent).is_empty());
-        assert!(!scan_unicode("escaped \\u202e", ScanMode::UntrustedContent).is_empty());
-        assert!(!scan_unicode("fullwidth ．．／etc", ScanMode::StrictPathOrCommand).is_empty());
-        assert!(!scan_unicode("АGENTS.md", ScanMode::StrictPathOrCommand).is_empty()); // Cyrillic А
+        let rlo = char::from_u32(0x202E).unwrap();
+        let tag_a = char::from_u32(0xE0041).unwrap();
+        let tag_b = char::from_u32(0xE0042).unwrap();
+        let vs17 = char::from_u32(0xE0100).unwrap();
+        let fw_dot = char::from_u32(0xFF0E).unwrap();
+        let fw_slash = char::from_u32(0xFF0F).unwrap();
+        let cyr_a = char::from_u32(0x0410).unwrap();
+
+        assert!(
+            !scan_unicode(&format!("safe text {rlo} evil"), ScanMode::UntrustedContent).is_empty()
+        );
+        assert!(
+            !scan_unicode(&format!("tag {tag_a}{tag_b}"), ScanMode::UntrustedContent).is_empty()
+        );
+        assert!(!scan_unicode(&format!("glassworm {vs17}"), ScanMode::UntrustedContent).is_empty());
+        assert!(
+            !scan_unicode(concat!("escaped \\", "u202e"), ScanMode::UntrustedContent).is_empty()
+        );
+        assert!(
+            !scan_unicode(
+                &format!("fullwidth {fw_dot}{fw_dot}{fw_slash}etc"),
+                ScanMode::StrictPathOrCommand
+            )
+            .is_empty()
+        );
+        assert!(
+            !scan_unicode(&format!("{cyr_a}GENTS.md"), ScanMode::StrictPathOrCommand).is_empty()
+        );
     }
 }
