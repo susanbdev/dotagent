@@ -404,6 +404,17 @@ fn blocks_token_exhaustion_files_output_floods_and_json_surrogate_tags() {
         ));
     }
     fs::write(repo.join("large.txt"), &big_lines).expect("write large.txt");
+    for sid in ["s_budget", "s_flood", "s_tag"] {
+        let init = JsonValue::Object(vec![
+            ("session_id".to_string(), JsonValue::Str(sid.to_string())),
+            (
+                "cwd".to_string(),
+                JsonValue::Str(repo.to_string_lossy().into_owned()),
+            ),
+        ])
+        .to_json_string();
+        assert!(handle_user_prompt_hook(&init, &repo).is_allow());
+    }
 
     let unsliced = JsonValue::Object(vec![
         (
@@ -881,6 +892,17 @@ fn regression_pr1_review_findings() {
     fs::write(repo.join("docs/hop1.md"), "Hop 1.\n").expect("write hop1");
     fs::write(repo.join("docs/hop2.md"), "See `docs/hop3.md`.\n").expect("write hop2");
     fs::write(repo.join("docs/hop3.md"), "Hop 3.\n").expect("write hop3");
+    for sid in ["pr1_post", "pr1_post_chain"] {
+        let init = JsonValue::Object(vec![
+            ("session_id".to_string(), JsonValue::Str(sid.to_string())),
+            (
+                "cwd".to_string(),
+                JsonValue::Str(repo.to_string_lossy().into_owned()),
+            ),
+        ])
+        .to_json_string();
+        assert!(handle_user_prompt_hook(&init, &repo).is_allow());
+    }
 
     let dirty_post = JsonValue::Object(vec![
         (
@@ -916,7 +938,10 @@ fn regression_pr1_review_findings() {
             "cwd".to_string(),
             JsonValue::Str(repo.to_string_lossy().into_owned()),
         ),
-        ("tool_name".to_string(), JsonValue::Str("Grep".to_string())),
+        (
+            "tool_name".to_string(),
+            JsonValue::Str("mcp_doc_search".to_string()),
+        ),
         (
             "tool_response".to_string(),
             JsonValue::Str("match in `docs/hop2.md`\n".to_string()),
