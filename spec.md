@@ -33,7 +33,7 @@ Every skill, hook, and configuration compiled from this repository **MUST** upho
 9. **Unicode Smuggling & Escape Immunity (`unicode_guard`)**:
    * Blocks Trojan Source Bidi controls (`U+202A..U+202E`, `U+2066..U+2069`), Unicode Tags (`U+E0000..U+E007F`), Variation Selectors (`U+FE00..U+FE0F`, `U+E0100..U+E01EF`), zero-width characters, ANSI `$'...'` / OSC-52 escapes, JSON surrogate-pair tag escapes, and homoglyph path/flag spoofing.
 10. **Token-Exhaustion & Cache-Bleed Elimination (`budget_guard` + Repo Namespace Isolation)**:
-    * Enforces `64 KiB` raw file ceiling, `2 KiB` single-line ceiling, `200`-line slice ceiling, BPE splitter-bomb rejection, `48k` per-turn token cap, disabled harness `autoMemory`, and `SHA-256` per-repository session state isolation (blocking cross-repo reads).
+    * Enforces `24 KiB` unsliced raw file ceiling (`64 KiB` sliced cap), `2 KiB` single-line ceiling, `150`-line slice ceiling, BPE splitter-bomb rejection, `16k` per-step token cap, disabled harness `autoMemory`, and `SHA-256` per-repository session state isolation (blocking cross-repo reads).
 
 ---
 
@@ -44,7 +44,7 @@ dotagent/
 ├── spec.md                         # Canonical specification (this file)
 ├── README.md
 ├── AGENTS.md                       # Root-only repository security authority
-├── Cargo.toml                      # Zero-dependency Rust 2024 workspace (#![forbid(unsafe_code)])
+├── Cargo.toml                      # Minimal vetted-dependency Rust 2024 workspace (#![forbid(unsafe_code)])
 ├── crates/
 │   ├── agent-guard/                # Static Rust policy & hook engine (pre-tool, post-tool, user-prompt, post-edit, on-stop)
 │   │   └── src/

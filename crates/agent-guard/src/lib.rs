@@ -444,7 +444,47 @@ fn evaluate_tool_invocation(
         ));
     }
 
-    // 5. File Writing / Editing tools (`Write`, `Edit`, `MultiEdit`, `write_to_file`, `replace_file_content`)
+    // 4b. Patch tools (`apply_patch`, `patch`) — extract and validate every modified/added/deleted path!
+    if matches!(norm_tool.as_str(), "apply_patch" | "patch") {
+        let patch_body = extract_first_str(
+            input,
+            &[
+                "patch",
+                "input",
+                "diff",
+                "content",
+                "raw_patch",
+                "patchText",
+            ],
+        )
+        .unwrap_or("");
+        let targets = extract_patch_target_paths(patch_body);
+        if targets.is_empty() {
+            return Decision::deny(
+                "MISSING_PATCH_TARGETS",
+                "Patch tool payload missing recognizable target file headers; refusing unvalidated write.",
+                false,
+            );
+        }
+        for raw_p in &targets {
+            if let Err(pv) = validate_path(repo_root, cwd, raw_p, PathAccess::Write) {
+                return Decision::deny(pv.code, pv.detail, pv.is_poisoned_zone);
+            }
+        }
+        if let Some(first) = find_first_unicode_violation_in_json(input) {
+            return Decision::deny(
+                first.code,
+                format!(
+                    "Refusing to apply patch containing forbidden Unicode: {}",
+                    first.detail
+                ),
+                true,
+            );
+        }
+        return Decision::allow();
+    }
+
+    // 5. File Writing / Editing tools (`Write`, `Edit`, `MultiEdit`, `write_to_file`, `replace_file_content`, `NotebookEdit`)
     if matches!(
         norm_tool.as_str(),
         "write"
@@ -457,7 +497,8 @@ fn evaluate_tool_invocation(
             | "multi_replace_file_content"
             | "notebookedit"
     ) {
-        let Some(raw_path) = extract_first_str(
+        let mut target_paths = Vec::new();
+        if let Some(raw_path) = extract_first_str(
             input,
             &[
                 "file_path",
@@ -466,33 +507,36 @@ fn evaluate_tool_invocation(
                 "target_file",
                 "notebook_path",
             ],
-        ) else {
+        ) {
+            target_paths.push(raw_path.to_string());
+        }
+        collect_nested_path_fields(input, &mut target_paths);
+
+        if target_paths.is_empty() {
             return Decision::deny(
                 "MISSING_FILE_PATH",
                 "Write/Edit tool missing target path.",
                 false,
             );
-        };
-
-        if let Err(pv) = validate_path(repo_root, cwd, raw_path, PathAccess::Write) {
-            return Decision::deny(pv.code, pv.detail, pv.is_poisoned_zone);
         }
 
-        // Prevent writing Trojan Source / Unicode Tag / invisible smuggling into codebase!
-        for field in ["content", "CodeContent", "new_string", "ReplacementContent"] {
-            if let Some(body) = input.get(field).and_then(JsonValue::as_str) {
-                let uni = scan_unicode(body, ScanMode::UntrustedContent);
-                if let Some(first) = uni.first() {
-                    return Decision::deny(
-                        first.code,
-                        format!(
-                            "Refusing to write forbidden Unicode into '{raw_path}': {}",
-                            first.detail
-                        ),
-                        true,
-                    );
-                }
+        for raw_path in &target_paths {
+            if let Err(pv) = validate_path(repo_root, cwd, raw_path, PathAccess::Write) {
+                return Decision::deny(pv.code, pv.detail, pv.is_poisoned_zone);
             }
+        }
+
+        // Recursively scan ALL string fields (including nested `edits` / `ReplacementChunks` / `new_source`)
+        // to prevent writing Trojan Source / Unicode Tag / invisible smuggling into codebase!
+        if let Some(first) = find_first_unicode_violation_in_json(input) {
+            return Decision::deny(
+                first.code,
+                format!(
+                    "Refusing to write forbidden Unicode into '{}': {}",
+                    target_paths[0], first.detail
+                ),
+                true,
+            );
         }
         return Decision::allow();
     }
@@ -510,11 +554,17 @@ fn evaluate_tool_invocation(
 
         // Enforce Glob / Search pattern depth <= 2 levels (block `**` deep snooping or > 2 `/` levels!)
         if let Some(pat) = extract_first_str(input, &["pattern", "Pattern", "glob", "Query"]) {
-            let uni = scan_unicode(pat, ScanMode::StrictPathOrCommand);
+            let is_glob_tool = norm_tool.contains("glob") || norm_tool == "find_by_name";
+            let scan_mode = if is_glob_tool {
+                ScanMode::StrictPathOrCommand
+            } else {
+                ScanMode::UntrustedContent
+            };
+            let uni = scan_unicode(pat, scan_mode);
             if let Some(first) = uni.first() {
                 return Decision::deny(first.code, first.detail.clone(), true);
             }
-            if norm_tool.contains("glob") || norm_tool == "find_by_name" {
+            if is_glob_tool {
                 if pat.contains("**") {
                     return Decision::deny(
                         "UNBOUNDED_GLOB_DEPTH",
@@ -1246,11 +1296,218 @@ fn extract_tool_response_text(v: &JsonValue) -> String {
         if let Some(val) = v.get(key) {
             return match val {
                 JsonValue::Str(s) => s.clone(),
-                other => other.to_json_string(),
+                other => {
+                    let mut out = String::new();
+                    format_json_multiline(other, 0, &mut out);
+                    out
+                }
             };
         }
     }
     String::new()
+}
+
+fn format_json_multiline(v: &JsonValue, indent: usize, out: &mut String) {
+    let pad = "  ".repeat(indent.min(8));
+    match v {
+        JsonValue::Null => out.push_str("null"),
+        JsonValue::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
+        JsonValue::Number(n) => out.push_str(&n.to_string()),
+        JsonValue::Str(s) => {
+            if s.contains('\n') {
+                out.push_str("\"\"\"\n");
+                for line in s.lines() {
+                    out.push_str(&pad);
+                    out.push_str(line);
+                    out.push('\n');
+                }
+                out.push_str(&pad);
+                out.push_str("\"\"\"");
+            } else {
+                out.push_str(&v.to_json_string());
+            }
+        }
+        JsonValue::Array(items) => {
+            if items.is_empty() {
+                out.push_str("[]");
+                return;
+            }
+            out.push_str("[\n");
+            let child_pad = "  ".repeat((indent + 1).min(8));
+            for (idx, item) in items.iter().enumerate() {
+                out.push_str(&child_pad);
+                format_json_multiline(item, indent + 1, out);
+                if idx + 1 < items.len() {
+                    out.push(',');
+                }
+                out.push('\n');
+            }
+            out.push_str(&pad);
+            out.push(']');
+        }
+        JsonValue::Object(entries) => {
+            if entries.is_empty() {
+                out.push_str("{}");
+                return;
+            }
+            out.push_str("{\n");
+            let child_pad = "  ".repeat((indent + 1).min(8));
+            for (idx, (k, val)) in entries.iter().enumerate() {
+                out.push_str(&child_pad);
+                out.push_str(&JsonValue::Str(k.clone()).to_json_string());
+                out.push_str(": ");
+                format_json_multiline(val, indent + 1, out);
+                if idx + 1 < entries.len() {
+                    out.push(',');
+                }
+                out.push('\n');
+            }
+            out.push_str(&pad);
+            out.push('}');
+        }
+    }
+}
+
+fn extract_patch_target_paths(patch: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let lines: Vec<&str> = patch.lines().collect();
+    let mut push_unique = |raw: &str| {
+        let trimmed = raw.split('\t').next().unwrap_or(raw).trim();
+        if trimmed.is_empty() || trimmed == "/dev/null" {
+            return;
+        }
+        if !out.iter().any(|existing| existing == trimmed) {
+            out.push(trimmed.to_string());
+        }
+    };
+
+    let mut in_hunk = false;
+    for (idx, &line) in lines.iter().enumerate() {
+        for prefix in [
+            "*** Update File: ",
+            "*** Add File: ",
+            "*** Delete File: ",
+            "*** Move to: ",
+        ] {
+            if let Some(rest) = line.strip_prefix(prefix) {
+                in_hunk = false;
+                push_unique(rest);
+            }
+        }
+
+        if let Some(rest) = line.strip_prefix("diff --git ") {
+            in_hunk = false;
+            let parts: Vec<&str> = rest.split_whitespace().collect();
+            if parts.len() >= 2 {
+                let p1 = parts[0].strip_prefix("a/").unwrap_or(parts[0]);
+                let p2 = parts[1].strip_prefix("b/").unwrap_or(parts[1]);
+                push_unique(p1);
+                push_unique(p2);
+            }
+            continue;
+        }
+
+        if line.starts_with("@@ ") {
+            in_hunk = true;
+            continue;
+        }
+
+        // Standard unified diff pair (`--- a/foo` immediately followed by `+++ b/foo`)
+        if let Some(old_raw) = line.strip_prefix("--- ") {
+            if let Some(next_line) = lines.get(idx + 1) {
+                if let Some(new_raw) = next_line.strip_prefix("+++ ") {
+                    let old_clean = old_raw.split('\t').next().unwrap_or(old_raw).trim();
+                    let new_clean = new_raw.split('\t').next().unwrap_or(new_raw).trim();
+                    let strip_ab = (old_clean.starts_with("a/") || old_clean == "/dev/null")
+                        && (new_clean.starts_with("b/") || new_clean == "/dev/null");
+                    let old_p = if strip_ab {
+                        old_clean.strip_prefix("a/").unwrap_or(old_clean)
+                    } else {
+                        old_clean
+                    };
+                    let new_p = if strip_ab {
+                        new_clean.strip_prefix("b/").unwrap_or(new_clean)
+                    } else {
+                        new_clean
+                    };
+                    push_unique(old_p);
+                    push_unique(new_p);
+                    continue;
+                }
+            }
+        }
+
+        // Catch standalone `+++ ` / `--- ` headers outside hunk bodies
+        if !in_hunk {
+            if let Some(raw_p) = line.strip_prefix("+++ ") {
+                let clean = raw_p.split('\t').next().unwrap_or(raw_p).trim();
+                push_unique(clean.strip_prefix("b/").unwrap_or(clean));
+            } else if let Some(raw_p) = line.strip_prefix("--- ") {
+                let clean = raw_p.split('\t').next().unwrap_or(raw_p).trim();
+                push_unique(clean.strip_prefix("a/").unwrap_or(clean));
+            }
+        }
+    }
+    out
+}
+
+fn collect_nested_path_fields(v: &JsonValue, out: &mut Vec<String>) {
+    match v {
+        JsonValue::Object(entries) => {
+            for (k, val) in entries {
+                if matches!(
+                    k.as_str(),
+                    "file_path" | "TargetFile" | "path" | "target_file" | "notebook_path"
+                ) {
+                    if let Some(s) = val.as_str() {
+                        if !out.iter().any(|existing| existing == s) {
+                            out.push(s.to_string());
+                        }
+                    }
+                }
+                collect_nested_path_fields(val, out);
+            }
+        }
+        JsonValue::Array(items) => {
+            for item in items {
+                collect_nested_path_fields(item, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn find_first_unicode_violation_in_json(
+    v: &JsonValue,
+) -> Option<crate::unicode_guard::UnicodeViolation> {
+    match v {
+        JsonValue::Str(s) => scan_unicode(s, ScanMode::UntrustedContent)
+            .into_iter()
+            .next(),
+        JsonValue::Array(items) => {
+            for item in items {
+                if let Some(viol) = find_first_unicode_violation_in_json(item) {
+                    return Some(viol);
+                }
+            }
+            None
+        }
+        JsonValue::Object(entries) => {
+            for (k, val) in entries {
+                if let Some(viol) = scan_unicode(k, ScanMode::UntrustedContent)
+                    .into_iter()
+                    .next()
+                {
+                    return Some(viol);
+                }
+                if let Some(viol) = find_first_unicode_violation_in_json(val) {
+                    return Some(viol);
+                }
+            }
+            None
+        }
+        _ => None,
+    }
 }
 
 fn extract_first_str<'a>(v: &'a JsonValue, keys: &[&str]) -> Option<&'a str> {

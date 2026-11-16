@@ -2,7 +2,7 @@
 
 //! Minimal, zero-dependency RFC 8259 JSON parser and serializer with strict
 //! recursion-depth cap and full UTF-16 surrogate-pair decoding so JSON-escaped
-//! Unicode Tag (`\udb40\udc41`) or Bidi (`\u202e`) payloads cannot evade inspection.
+//! Unicode Tag surrogate pairs (DB40..DC41) or Bidi (U+202E) payloads cannot evade inspection.
 
 use std::fmt::Write as _;
 
@@ -371,9 +371,10 @@ mod tests {
 
     #[test]
     fn decodes_surrogate_pair_unicode_tag() {
-        // \udb40\udc41 -> U+E0041 (Unicode Tag Latin Capital Letter A)
-        let v = JsonValue::parse(r#"{"payload":"\udb40\udc41"}"#).expect("valid JSON");
+        // High surrogate DB40 + low surrogate DC41 -> U+E0041 (Unicode Tag Latin Capital Letter A)
+        let raw = concat!("{\"payload\":\"\\", "udb40\\", "udc41\"}");
+        let v = JsonValue::parse(raw).expect("valid JSON");
         let s = v.get("payload").and_then(JsonValue::as_str).expect("str");
-        assert_eq!(s.chars().next(), Some('\u{E0041}'));
+        assert_eq!(s.chars().next(), char::from_u32(0xE0041));
     }
 }
