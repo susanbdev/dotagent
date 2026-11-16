@@ -406,28 +406,84 @@ fn emit_cli_decision(decision: Decision) -> ExitCode {
     }
 }
 
-fn is_pinned_dist_bundle_artifact(repo_root: &Path, raw_path: &str) -> Option<(PathBuf, String)> {
-    let cand = if Path::new(raw_path).is_absolute() {
+fn resolve_nonsymlink_dist_bundle_artifact(
+    repo_root: &Path,
+    cwd: &Path,
+    raw_path: &str,
+) -> Option<(PathBuf, String, bool)> {
+    let canon_repo = std::fs::canonicalize(repo_root).ok()?;
+    let joined = if Path::new(raw_path).is_absolute() {
         PathBuf::from(raw_path)
     } else {
-        repo_root.join(raw_path)
+        let canon_cwd = std::fs::canonicalize(cwd).ok()?;
+        if !canon_cwd.starts_with(&canon_repo) {
+            return None;
+        }
+        canon_cwd.join(raw_path)
     };
-    let canon = std::fs::canonicalize(&cand).ok()?;
-    let canon_repo = std::fs::canonicalize(repo_root).ok()?;
-    if !canon.starts_with(&canon_repo) {
+    let rel_raw = joined.strip_prefix(&canon_repo).ok()?;
+
+    // Walk every relative path component from `canon_repo` WITHOUT following symlinks or `..`!
+    let mut cur = canon_repo.clone();
+    let mut rel_parts = Vec::new();
+    for comp in rel_raw.components() {
+        match comp {
+            std::path::Component::CurDir => continue,
+            std::path::Component::Normal(seg) => {
+                let seg_str = seg.to_str()?;
+                cur.push(seg);
+                let meta = std::fs::symlink_metadata(&cur).ok()?;
+                if meta.file_type().is_symlink() {
+                    return None;
+                }
+                rel_parts.push(seg_str.to_string());
+            }
+            _ => return None,
+        }
+    }
+    let final_meta = std::fs::symlink_metadata(&cur).ok()?;
+    if final_meta.file_type().is_symlink() || !final_meta.file_type().is_file() {
         return None;
     }
-    let rel = canon
-        .strip_prefix(&canon_repo)
-        .ok()?
-        .to_string_lossy()
-        .replace('\\', "/");
+
+    let rel = rel_parts.join("/");
     if !rel.starts_with("dist/") {
         return None;
     }
-    let manifest = std::fs::read_to_string(canon_repo.join("dist-verify/manifest.sha256")).ok()?;
-    let bytes = std::fs::read(&canon).ok()?;
+
+    let bytes = std::fs::read(&cur).ok()?;
     let actual_hex = agent_guard::sha256::sha256_hex(&bytes);
+
+    // ONLY `dist/AGENTS.md` (matching non-symlink root `AGENTS.md`) and `dist/gemini/GEMINI.md`
+    // (matching the compiled-in `CANONICAL_DIST_GEMINI_SHA256` constant) may receive
+    // `is_trusted_authority = true`. Mutable `manifest.sha256` can NEVER grant authority exemption!
+    if rel == "dist/AGENTS.md" {
+        let root_agents = canon_repo.join("AGENTS.md");
+        let rmeta = std::fs::symlink_metadata(&root_agents).ok()?;
+        if rmeta.file_type().is_symlink() || !rmeta.file_type().is_file() {
+            return None;
+        }
+        let root_bytes = std::fs::read(&root_agents).ok()?;
+        if agent_guard::sha256::sha256_hex(&root_bytes) == actual_hex {
+            return Some((cur, rel, true));
+        }
+        return None;
+    }
+    if rel == "dist/gemini/GEMINI.md" {
+        if actual_hex == agent_guard::CANONICAL_DIST_GEMINI_SHA256 {
+            return Some((cur, rel, true));
+        }
+        return None;
+    }
+
+    // Any other `dist/*` artifact matching non-symlink `dist-verify/manifest.sha256` is scanned
+    // strictly as UNTRUSTED passive data (`is_trusted_authority = false`).
+    let manifest_path = canon_repo.join("dist-verify/manifest.sha256");
+    let mmeta = std::fs::symlink_metadata(&manifest_path).ok()?;
+    if mmeta.file_type().is_symlink() || !mmeta.file_type().is_file() {
+        return None;
+    }
+    let manifest = std::fs::read_to_string(&manifest_path).ok()?;
     for line in manifest.lines() {
         let mut parts = line.split_whitespace();
         let Some(expected_hex) = parts.next() else {
@@ -437,7 +493,7 @@ fn is_pinned_dist_bundle_artifact(repo_root: &Path, raw_path: &str) -> Option<(P
             continue;
         };
         if path_col == rel && expected_hex == actual_hex {
-            return Some((canon, rel));
+            return Some((cur, rel, false));
         }
     }
     None
@@ -450,9 +506,10 @@ fn run_scan_file(raw_path: &str, cwd: &Path) -> ExitCode {
             Ok(v) => (v.canonical_or_norm, v.repo_rel, v.is_root_authority),
             Err(pv) => {
                 if pv.code == "UNAUTHORIZED_INSTRUCTION_FILE" {
-                    if let Some((canon, rel)) = is_pinned_dist_bundle_artifact(&repo_root, raw_path)
+                    if let Some((canon, rel, trusted)) =
+                        resolve_nonsymlink_dist_bundle_artifact(&repo_root, cwd, raw_path)
                     {
-                        (canon, rel, true)
+                        (canon, rel, trusted)
                     } else {
                         return emit_cli_decision(Decision::deny(
                             pv.code,

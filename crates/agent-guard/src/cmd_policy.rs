@@ -185,6 +185,7 @@ fn check_single_command(
         if target == "/dev/null" {
             continue;
         }
+        reject_shell_glob_in_operand("redirection", target)?;
         let access = match kind {
             RedirKind::Read => PathAccess::Read,
             RedirKind::Write => PathAccess::Write,
@@ -411,6 +412,7 @@ fn check_single_command(
                     });
                 }
                 if !a.starts_with('-') {
+                    reject_shell_glob_in_operand(bin, a)?;
                     let valid =
                         validate_path(repo_root, cwd, a, PathAccess::Read).map_err(|pv| {
                             CommandViolation {
@@ -444,6 +446,7 @@ fn check_single_command(
         }
         "source" | "." => {
             if let Some(script_path) = args.first() {
+                reject_shell_glob_in_operand(bin, script_path)?;
                 let valid =
                     validate_path(repo_root, cwd, script_path, PathAccess::Read).map_err(|pv| {
                         CommandViolation {
@@ -469,6 +472,7 @@ fn check_single_command(
                 ) {
                     if args[idx] == "-a" {
                         if let Some(f) = args.get(idx + 1) {
+                            reject_shell_glob_in_operand("xargs -a", f)?;
                             let valid = validate_path(repo_root, cwd, f, PathAccess::Read)
                                 .map_err(|pv| CommandViolation {
                                     code: pv.code,
@@ -974,7 +978,27 @@ fn check_git_command(
         idx += 1;
     }
 
-    let _ = target_dir;
+    inspect_repo_git_config_and_hooks(repo_root)?;
+    if let Some(dir_str) = target_dir {
+        let sub_dir = if Path::new(dir_str).is_absolute() {
+            std::path::PathBuf::from(dir_str)
+        } else {
+            cwd.join(dir_str)
+        };
+        if sub_dir != repo_root {
+            inspect_repo_git_config_and_hooks(&sub_dir)?;
+        }
+    }
+    if repo_root.join(".git").join("config").exists()
+        && let Err(msg) = crate::verify_global_git_hardening()
+    {
+        return Err(CommandViolation {
+            code: "GIT_HARDENING_NOT_ACTIVE",
+            detail: msg,
+            halt_session: true,
+        });
+    }
+
     let Some(sub) = args.get(idx).map(String::as_str) else {
         return Ok(());
     };
@@ -1205,12 +1229,10 @@ fn check_node_pkg_manager(
     }
 
     let check_dir_traps = |dir: &Path| -> Result<(), CommandViolation> {
-        for rel in [".yarnrc.yml", ".yarnrc"] {
-            let p = dir.join(rel);
-            if let Ok(raw) = std::fs::read_to_string(&p) {
-                let lower = raw.to_ascii_lowercase();
-                for bad in ["yarnpath", "plugins:"] {
-                    if lower.contains(bad) {
+        for rel in [".yarnrc.yml", ".yarnrc.yaml", ".yarnrc"] {
+            if let Some(keys) = read_bounded_nonsymlink_config_keys(dir, rel)? {
+                for bad in ["yarnpath", "plugins"] {
+                    if keys.iter().any(|k| k.contains(bad)) {
                         return Err(CommandViolation {
                             code: "YARN_CONFIG_EXEC_TRAP",
                             detail: format!(
@@ -1222,11 +1244,9 @@ fn check_node_pkg_manager(
                 }
             }
         }
-        let npmrc = dir.join(".npmrc");
-        if let Ok(raw) = std::fs::read_to_string(&npmrc) {
-            let lower = raw.to_ascii_lowercase();
+        if let Some(keys) = read_bounded_nonsymlink_config_keys(dir, ".npmrc")? {
             for bad in ["script-shell", "onload-script"] {
-                if lower.contains(bad) {
+                if keys.iter().any(|k| k.contains(bad)) {
                     return Err(CommandViolation {
                         code: "NPMRC_SCRIPT_TRAP",
                         detail: format!(
@@ -1318,16 +1338,41 @@ fn check_node_pkg_manager(
 
     if matches!(
         sub,
-        "dlx" | "exec" | "create" | "publish" | "login" | "adduser" | "token"
+        "dlx"
+            | "exec"
+            | "x"
+            | "create"
+            | "init"
+            | "publish"
+            | "login"
+            | "adduser"
+            | "token"
+            | "run"
+            | "run-script"
+            | "rum"
+            | "urn"
+            | "start"
+            | "restart"
+            | "stop"
+            | "rebuild"
+            | "rb"
+            | "link"
+            | "ln"
+            | "pack"
     ) {
         return Err(CommandViolation {
             code: "PKG_EXEC_OR_PUBLISH_BLOCKED",
-            detail: format!("`{bin} {sub}` is hard-blocked."),
+            detail: format!(
+                "`{bin} {sub}` executes arbitrary package scripts or publishes externally and is hard-blocked."
+            ),
             halt_session: false,
         });
     }
-    if matches!(sub, "" | "install" | "i" | "add" | "ci" | "update" | "up") {
-        let has_ignore_scripts = args.iter().any(|a| a == "--ignore-scripts");
+    let has_ignore_scripts = args.iter().any(|a| a == "--ignore-scripts");
+    if matches!(
+        sub,
+        "" | "install" | "i" | "add" | "ci" | "update" | "up" | "remove" | "rm" | "uninstall"
+    ) {
         if !has_ignore_scripts {
             return Err(CommandViolation {
                 code: "LIFECYCLE_SCRIPTS_NOT_DISABLED",
@@ -1338,8 +1383,30 @@ fn check_node_pkg_manager(
                 halt_session: false,
             });
         }
+        return Ok(());
     }
-    Ok(())
+    if matches!(sub, "test" | "t" | "tst") {
+        if bin == "bun" && sub == "test" {
+            return Ok(());
+        }
+        return Err(CommandViolation {
+            code: "PKG_EXEC_OR_PUBLISH_BLOCKED",
+            detail: format!(
+                "`{bin} {sub}` executes arbitrary `package.json` test scripts and is blocked (invoke the test runner directly)."
+            ),
+            halt_session: false,
+        });
+    }
+    if matches!(sub, "list" | "ls" | "why" | "outdated" | "audit") {
+        return Ok(());
+    }
+    Err(CommandViolation {
+        code: "PKG_EXEC_OR_PUBLISH_BLOCKED",
+        detail: format!(
+            "Unapproved `{bin}` subcommand '{sub}' blocked (prevents shorthand package.json script execution)."
+        ),
+        halt_session: false,
+    })
 }
 
 fn check_python_pkg_manager(bin: &str, args: &[String]) -> Result<(), CommandViolation> {
@@ -1372,24 +1439,22 @@ fn check_cargo_command(
     repo_root: &Path,
     cwd: &Path,
 ) -> Result<(), CommandViolation> {
-    // Inspect `.cargo/config.toml` and `.cargo/config` for `rustc-wrapper` / `linker` / `runner` RCE traps!
+    // Inspect `.cargo/config.toml` and `.cargo/config` (no-symlink, bounded, key-only) for RCE traps!
     for rel in [".cargo/config.toml", ".cargo/config"] {
-        let cfg_path = repo_root.join(rel);
-        if let Ok(raw) = std::fs::read_to_string(&cfg_path) {
-            let lower = raw.to_ascii_lowercase();
+        if let Some(keys) = read_bounded_nonsymlink_config_keys(repo_root, rel)? {
             for bad in [
                 "rustc-wrapper",
                 "rustc_wrapper",
                 "workspace-wrapper",
-                "linker =",
-                "linker=",
-                "runner =",
-                "runner=",
+                "linker",
+                "runner",
                 "[alias]",
-                "rustc =",
-                "rustc=",
+                "rustc",
             ] {
-                if lower.contains(bad) {
+                if keys
+                    .iter()
+                    .any(|k| k == bad || (bad != "rustc" && k.contains(bad)))
+                {
                     return Err(CommandViolation {
                         code: "CARGO_CONFIG_EXEC_TRAP",
                         detail: format!(
@@ -1492,50 +1557,278 @@ fn check_cargo_command(
     Ok(())
 }
 
+/// Reads a config file inside `base_dir` up to 16 KiB without following symlinks on any path
+/// component, returning ONLY normalized lowercase section headers and key names (stripping all
+/// RHS values so credentials/tokens inside `.npmrc`/`.yarnrc*` are never retained in memory).
+fn read_bounded_nonsymlink_config_keys(
+    base_dir: &Path,
+    rel: &str,
+) -> Result<Option<Vec<String>>, CommandViolation> {
+    let raw_opt = read_bounded_nonsymlink_raw(base_dir, rel, 16_384)?;
+    let Some(raw) = raw_opt else {
+        return Ok(None);
+    };
+    let mut keys = Vec::new();
+    for line in raw.lines() {
+        let trimmed = line
+            .split('#')
+            .next()
+            .unwrap_or("")
+            .split(';')
+            .next()
+            .unwrap_or("")
+            .trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if trimmed.starts_with('[') && trimmed.ends_with(']') {
+            keys.push(trimmed.to_ascii_lowercase());
+            continue;
+        }
+        if let Some((lhs, _rhs)) = trimmed.split_once('=').or_else(|| trimmed.split_once(':')) {
+            let k = lhs
+                .trim()
+                .trim_matches('"')
+                .trim_matches('\'')
+                .to_ascii_lowercase();
+            if !k.is_empty() {
+                keys.push(k);
+            }
+        }
+    }
+    Ok(Some(keys))
+}
+
+fn read_bounded_nonsymlink_raw(
+    base_dir: &Path,
+    rel: &str,
+    max_bytes: u64,
+) -> Result<Option<String>, CommandViolation> {
+    use std::io::Read;
+    let mut cur = base_dir.to_path_buf();
+    let parts: Vec<&str> = rel.split('/').filter(|s| !s.is_empty()).collect();
+    for (idx, seg) in parts.iter().enumerate() {
+        cur.push(seg);
+        let is_last = idx + 1 == parts.len();
+        match std::fs::symlink_metadata(&cur) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => {
+                return Err(CommandViolation {
+                    code: "CONFIG_STAT_ERROR",
+                    detail: format!("Cannot stat '{rel}': {e}"),
+                    halt_session: true,
+                });
+            }
+            Ok(meta) => {
+                if meta.file_type().is_symlink() {
+                    return Err(CommandViolation {
+                        code: "SYMLINKED_BUILD_CONFIG_BLOCKED",
+                        detail: format!(
+                            "Configuration path '{rel}' contains a symlink component and is blocked."
+                        ),
+                        halt_session: true,
+                    });
+                }
+                if is_last {
+                    if !meta.file_type().is_file() {
+                        return Ok(None);
+                    }
+                    if meta.len() > max_bytes {
+                        return Err(CommandViolation {
+                            code: "OVERSIZED_BUILD_CONFIG_BLOCKED",
+                            detail: format!(
+                                "Configuration file '{rel}' exceeds {max_bytes}-byte inspection ceiling."
+                            ),
+                            halt_session: true,
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    let file = std::fs::File::open(&cur).map_err(|e| CommandViolation {
+        code: "CONFIG_OPEN_ERROR",
+        detail: format!("Cannot open '{rel}': {e}"),
+        halt_session: true,
+    })?;
+    let mut buf = Vec::new();
+    file.take(max_bytes + 1)
+        .read_to_end(&mut buf)
+        .map_err(|e| CommandViolation {
+            code: "CONFIG_READ_ERROR",
+            detail: format!("Cannot read '{rel}': {e}"),
+            halt_session: true,
+        })?;
+    if buf.len() as u64 > max_bytes {
+        return Err(CommandViolation {
+            code: "OVERSIZED_BUILD_CONFIG_BLOCKED",
+            detail: format!("Configuration file '{rel}' exceeds {max_bytes} bytes."),
+            halt_session: true,
+        });
+    }
+    String::from_utf8(buf)
+        .map(Some)
+        .map_err(|_| CommandViolation {
+            code: "INVALID_BUILD_CONFIG_UTF8",
+            detail: format!("Configuration file '{rel}' contains non-UTF-8 bytes."),
+            halt_session: true,
+        })
+}
+
+/// Fail-closed pre-tool and static-audit inspector for repo-local `.git/config` and `.git/hooks`.
+pub fn inspect_repo_git_config_and_hooks(repo_root: &Path) -> Result<(), CommandViolation> {
+    let git_dir = repo_root.join(".git");
+    if let Ok(gmeta) = std::fs::symlink_metadata(&git_dir)
+        && gmeta.file_type().is_symlink()
+    {
+        return Err(CommandViolation {
+            code: "SYMLINKED_GIT_DIR_BLOCKED",
+            detail: "Repository '.git' is a symlink, which is forbidden.".to_string(),
+            halt_session: true,
+        });
+    }
+
+    if let Some(cfg_text) = read_bounded_nonsymlink_raw(repo_root, ".git/config", 65_536)? {
+        let mut section = String::new();
+        for raw_line in cfg_text.lines() {
+            let line = raw_line
+                .split('#')
+                .next()
+                .unwrap_or("")
+                .split(';')
+                .next()
+                .unwrap_or("")
+                .trim();
+            if line.is_empty() {
+                continue;
+            }
+            if line.starts_with('[') && line.ends_with(']') {
+                section = line.to_ascii_lowercase();
+                if section.starts_with("[filter ") && !section.contains("\"lfs\"") {
+                    return Err(CommandViolation {
+                        code: "REPO_GIT_CONFIG_TRAP",
+                        detail: format!(
+                            "Repository '.git/config' defines custom filter driver {section}."
+                        ),
+                        halt_session: true,
+                    });
+                }
+                continue;
+            }
+            let lower = line.to_ascii_lowercase();
+            if let Some((raw_k, raw_v)) = lower.split_once('=') {
+                let k = raw_k.trim();
+                let v = raw_v.trim().trim_matches('"');
+                let is_bad = match k {
+                    "hookspath" => v != "/dev/null",
+                    "attributesfile" => v != "/dev/null",
+                    "fsmonitor" => v != "false" && !v.is_empty(),
+                    "symlinks" => v == "true",
+                    "sshcommand" | "gitproxy" | "askpass" | "editor" | "external" | "textconv"
+                    | "uploadpack" | "receivepack" => !v.is_empty(),
+                    "pager" => !v.is_empty() && v != "cat",
+                    "smudge" | "clean" | "process" if section.starts_with("[filter ") => {
+                        !v.is_empty()
+                    }
+                    _ if section == "[alias]" && v.starts_with('!') => true,
+                    _ => false,
+                };
+                if is_bad {
+                    return Err(CommandViolation {
+                        code: "REPO_GIT_CONFIG_TRAP",
+                        detail: format!(
+                            "Repository '.git/config' overrides hardened setting `{k}` in {section}."
+                        ),
+                        halt_session: true,
+                    });
+                }
+            }
+        }
+    }
+
+    let hooks_dir = git_dir.join("hooks");
+    if let Ok(hmeta) = std::fs::symlink_metadata(&hooks_dir)
+        && hmeta.file_type().is_symlink()
+    {
+        return Err(CommandViolation {
+            code: "SYMLINKED_GIT_HOOKS_BLOCKED",
+            detail: "Repository '.git/hooks' is a symlink.".to_string(),
+            halt_session: true,
+        });
+    }
+    Ok(())
+}
+
 /// Static audit helper checking repository build-tool and `.gitattributes` execution traps.
 pub fn inspect_repo_build_config_traps(repo_root: &Path) -> Vec<String> {
     let mut findings = Vec::new();
     for rel in [".cargo/config.toml", ".cargo/config"] {
-        let p = repo_root.join(rel);
-        if let Ok(raw) = std::fs::read_to_string(&p) {
-            let lower = raw.to_ascii_lowercase();
-            for bad in [
-                "rustc-wrapper",
-                "rustc_wrapper",
-                "workspace-wrapper",
-                "linker =",
-                "linker=",
-                "runner =",
-                "runner=",
-                "[alias]",
-            ] {
-                if lower.contains(bad) {
-                    findings.push(format!("CARGO_CONFIG_EXEC_TRAP: '{rel}' contains `{bad}`"));
+        match read_bounded_nonsymlink_config_keys(repo_root, rel) {
+            Err(cv) => findings.push(format!("{}: {}", cv.code, cv.detail)),
+            Ok(Some(keys)) => {
+                for bad in [
+                    "rustc-wrapper",
+                    "rustc_wrapper",
+                    "workspace-wrapper",
+                    "linker",
+                    "runner",
+                    "[alias]",
+                    "rustc",
+                ] {
+                    if keys
+                        .iter()
+                        .any(|k| k == bad || (bad != "rustc" && k.contains(bad)))
+                    {
+                        findings.push(format!("CARGO_CONFIG_EXEC_TRAP: '{rel}' contains `{bad}`"));
+                    }
+                }
+            }
+            Ok(None) => {}
+        }
+    }
+    for rel in [".yarnrc.yml", ".yarnrc.yaml", ".yarnrc"] {
+        match read_bounded_nonsymlink_config_keys(repo_root, rel) {
+            Err(cv) => findings.push(format!("{}: {}", cv.code, cv.detail)),
+            Ok(Some(keys)) => {
+                for bad in ["yarnpath", "plugins"] {
+                    if keys.iter().any(|k| k.contains(bad)) {
+                        findings.push(format!("YARN_CONFIG_EXEC_TRAP: '{rel}' contains `{bad}`"));
+                    }
+                }
+            }
+            Ok(None) => {}
+        }
+    }
+    if let Err(cv) = read_bounded_nonsymlink_config_keys(repo_root, ".npmrc").and_then(|opt| {
+        if let Some(keys) = opt {
+            for bad in ["script-shell", "onload-script"] {
+                if keys.iter().any(|k| k.contains(bad)) {
+                    return Err(CommandViolation {
+                        code: "NPMRC_SCRIPT_TRAP",
+                        detail: format!("'.npmrc' contains `{bad}`"),
+                        halt_session: true,
+                    });
                 }
             }
         }
+        Ok(())
+    }) {
+        findings.push(format!("{}: {}", cv.code, cv.detail));
     }
-    for rel in [".yarnrc.yml", ".yarnrc"] {
-        let p = repo_root.join(rel);
-        if let Ok(raw) = std::fs::read_to_string(&p) {
+    match read_bounded_nonsymlink_raw(repo_root, ".gitattributes", 16_384) {
+        Err(cv) => findings.push(format!("{}: {}", cv.code, cv.detail)),
+        Ok(Some(raw)) => {
             let lower = raw.to_ascii_lowercase();
-            for bad in ["yarnpath", "plugins:"] {
+            for bad in ["filter=", "diff=", "merge=", "textconv"] {
                 if lower.contains(bad) {
-                    findings.push(format!("YARN_CONFIG_EXEC_TRAP: '{rel}' contains `{bad}`"));
+                    findings.push(format!(
+                        "GITATTRIBUTES_DRIVER_TRAP: '.gitattributes' contains `{bad}`"
+                    ));
                 }
             }
         }
-    }
-    let gitattributes = repo_root.join(".gitattributes");
-    if let Ok(raw) = std::fs::read_to_string(&gitattributes) {
-        let lower = raw.to_ascii_lowercase();
-        for bad in ["filter=", "diff=", "merge=", "textconv"] {
-            if lower.contains(bad) {
-                findings.push(format!(
-                    "GITATTRIBUTES_DRIVER_TRAP: '.gitattributes' contains `{bad}`"
-                ));
-            }
-        }
+        Ok(None) => {}
     }
     findings
 }
@@ -1562,6 +1855,11 @@ fn check_interpreter_command(
             "vendor/",
             ".env",
             ".ssh",
+            ".git",
+            "agent-guard",
+            "audit.jsonl",
+            "plan.lock",
+            "work_ledger",
             "os.environ",
             "process.env",
             "subprocess",
@@ -1578,16 +1876,64 @@ fn check_interpreter_command(
             "rglob(",
             "agents.md",
             "claude.md",
+            "open(",
+            "io.",
+            "pathlib",
+            "path(",
+            "shutil",
+            "glob.",
+            "import os",
+            "from os",
+            "os.",
+            "fs.",
+            "require('fs",
+            "require(\"fs",
+            "node:fs",
+            "readfile",
+            "writefile",
+            "appendfile",
+            "unlink",
+            "rename(",
+            "chmod",
+            "symlink",
+            "mkdir",
+            "rmdir",
+            "file.",
+            "file_get_contents",
+            "file_put_contents",
+            "fopen",
+            "__import__",
+            "importlib",
+            "builtins",
+            "getattr(",
+            "eval(",
+            "exec(",
+            "compile(",
         ];
         for needle in FORBIDDEN_SNIPPETS {
             if lower.contains(needle) {
                 return Err(CommandViolation {
                     code: "INTERPRETER_BYPASS_BLOCKED",
                     detail: format!(
-                        "Inline `{bin} {flag_desc}` script references forbidden API or path '{needle}'."
+                        "Inline `{bin} {flag_desc}` script references forbidden file/OS/exec API or path '{needle}'."
                     ),
                     halt_session: true,
                 });
+            }
+        }
+        // Also extract any quoted path-like string literals and validate against PathAccess::Write!
+        for lit in extract_quoted_literals(code) {
+            if lit.contains('/') || lit.contains("..") || lit.starts_with('.') {
+                validate_path(repo_root, cwd, &lit, PathAccess::Write).map_err(|pv| {
+                    CommandViolation {
+                        code: pv.code,
+                        detail: format!(
+                            "Inline `{bin} {flag_desc}` path literal '{lit}' denied: {}",
+                            pv.detail
+                        ),
+                        halt_session: pv.is_poisoned_zone,
+                    }
+                })?;
             }
         }
         Ok(())
@@ -1650,6 +1996,7 @@ fn check_interpreter_command(
                 if mod_name == "venv" {
                     for p in &args[rest_idx..] {
                         if !p.starts_with('-') {
+                            reject_shell_glob_in_operand(bin, p)?;
                             validate_path(repo_root, cwd, p, PathAccess::Write).map_err(|pv| {
                                 CommandViolation {
                                     code: pv.code,
@@ -1678,6 +2025,7 @@ fn check_interpreter_command(
             });
         }
         if !a.starts_with('-') {
+            reject_shell_glob_in_operand(bin, a)?;
             let valid = validate_path(repo_root, cwd, a, PathAccess::Read).map_err(|pv| {
                 CommandViolation {
                     code: pv.code,
@@ -1729,6 +2077,7 @@ fn check_search_or_walk_command(
                 }
             }
             for a in args.iter().filter(|a| !a.starts_with('-')) {
+                reject_shell_glob_in_operand(bin, a)?;
                 validate_path(
                     repo_root,
                     cwd,
@@ -1770,6 +2119,7 @@ fn check_search_or_walk_command(
                     skipped_pattern = true;
                     continue;
                 }
+                reject_shell_glob_in_operand(bin, a)?;
                 let valid = validate_path(repo_root, cwd, a, PathAccess::Read).map_err(|pv| {
                     CommandViolation {
                         code: pv.code,
@@ -1827,6 +2177,7 @@ fn check_search_or_walk_command(
                 paths.push(".");
             }
             for p in paths {
+                reject_shell_glob_in_operand(bin, p)?;
                 validate_path(
                     repo_root,
                     cwd,
@@ -1900,6 +2251,7 @@ fn check_search_or_walk_command(
                         explicit_pattern_or_no_pattern = true;
                     }
                     if let Some(fp) = args.get(i + 1) {
+                        reject_shell_glob_in_operand(bin, fp)?;
                         let valid =
                             validate_path(repo_root, cwd, fp, PathAccess::Read).map_err(|pv| {
                                 CommandViolation {
@@ -1931,6 +2283,7 @@ fn check_search_or_walk_command(
                     if !a.starts_with("--ignore-file=") {
                         explicit_pattern_or_no_pattern = true;
                     }
+                    reject_shell_glob_in_operand(bin, fp)?;
                     let valid =
                         validate_path(repo_root, cwd, fp, PathAccess::Read).map_err(|pv| {
                             CommandViolation {
@@ -1991,6 +2344,7 @@ fn check_search_or_walk_command(
                 })?;
             } else {
                 for p in target_paths {
+                    reject_shell_glob_in_operand(bin, p)?;
                     // Single explicit file target is allowed if `Read` passes; directory target requires `max_depth <= 2`
                     let candidate = if Path::new(p).is_absolute() {
                         std::path::PathBuf::from(p)
@@ -2053,6 +2407,7 @@ fn check_search_or_walk_command(
                 }
                 if !after_double_dash && a == "-o" {
                     if let Some(out_p) = args.get(i + 1) {
+                        reject_shell_glob_in_operand(bin, out_p)?;
                         let valid = validate_path(repo_root, cwd, out_p, PathAccess::Write)
                             .map_err(|pv| CommandViolation {
                                 code: pv.code,
@@ -2092,6 +2447,7 @@ fn check_search_or_walk_command(
                 paths.push(".");
             }
             for p in paths {
+                reject_shell_glob_in_operand(bin, p)?;
                 validate_path(
                     repo_root,
                     cwd,
@@ -2220,6 +2576,7 @@ fn check_file_utility_paths(
                 ) {
                     if a == "-f" {
                         if let Some(script_f) = args.get(i + 1) {
+                            reject_shell_glob_in_operand(bin, script_f)?;
                             let valid = validate_path(repo_root, cwd, script_f, PathAccess::Read)
                                 .map_err(|pv| CommandViolation {
                                 code: pv.code,
@@ -2244,6 +2601,7 @@ fn check_file_utility_paths(
                 i += 1;
                 continue;
             }
+            reject_shell_glob_in_operand(bin, a)?;
             let access = if sed_in_place {
                 PathAccess::Write
             } else {
@@ -2271,6 +2629,7 @@ fn check_file_utility_paths(
 
     if is_writer {
         for a in args.iter().filter(|a| !a.starts_with('-')) {
+            reject_shell_glob_in_operand(bin, a)?;
             let valid = validate_path(repo_root, cwd, a, PathAccess::Write).map_err(|pv| {
                 CommandViolation {
                     code: pv.code,
@@ -2288,6 +2647,7 @@ fn check_file_utility_paths(
         let operands: Vec<&String> = args.iter().filter(|a| !a.starts_with('-')).collect();
         if operands.len() >= 2 {
             for src in &operands[..operands.len() - 1] {
+                reject_shell_glob_in_operand(bin, src)?;
                 let valid = validate_path(repo_root, cwd, src, PathAccess::Read).map_err(|pv| {
                     CommandViolation {
                         code: pv.code,
@@ -2302,6 +2662,7 @@ fn check_file_utility_paths(
                 ));
             }
             let dst = operands[operands.len() - 1];
+            reject_shell_glob_in_operand(bin, dst)?;
             let valid_dst =
                 validate_path(repo_root, cwd, dst, PathAccess::Write).map_err(|pv| {
                     CommandViolation {
@@ -2316,13 +2677,17 @@ fn check_file_utility_paths(
         return Ok(());
     }
 
-    // Fallback check for any other command: inspect path-looking arguments for forbidden zones!
+    // Fallback check for any other command: inspect path-looking arguments for globs and forbidden zones!
     for a in args {
+        if a.starts_with(".*") || a.starts_with(".?") || a.starts_with(".[") {
+            reject_shell_glob_in_operand(bin, a)?;
+        }
         if a.contains('/') || a.starts_with('~') || a == ".env" || a.starts_with(".env.") {
             let cleaned = a.split('=').next_back().unwrap_or(a.as_str());
             if cleaned == "/dev/null" {
                 continue;
             }
+            reject_shell_glob_in_operand(bin, cleaned)?;
             if let Err(pv) = check_forbidden_zones_lexical(cleaned, a) {
                 return Err(CommandViolation {
                     code: pv.code,
@@ -2334,6 +2699,52 @@ fn check_file_utility_paths(
     }
 
     Ok(())
+}
+
+fn reject_shell_glob_in_operand(ctx: &str, operand: &str) -> Result<(), CommandViolation> {
+    if operand.contains('*') || operand.contains('?') || operand.contains('[') {
+        return Err(CommandViolation {
+            code: "SHELL_GLOB_OPERAND_BLOCKED",
+            detail: format!(
+                "`{ctx}` file/path operand '{operand}' contains shell glob metacharacters (`*`, `?`, `[`), which expand unpredictably across protected files at runtime."
+            ),
+            halt_session: false,
+        });
+    }
+    Ok(())
+}
+
+fn extract_quoted_literals(code: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let bytes = code.as_bytes();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let q = bytes[i];
+        if q == b'\'' || q == b'"' {
+            i += 1;
+            let mut cur = String::new();
+            while i < bytes.len() && bytes[i] != q {
+                if bytes[i] == b'\\' && i + 1 < bytes.len() {
+                    cur.push(bytes[i + 1] as char);
+                    i += 2;
+                    continue;
+                }
+                let tail = &code[i..];
+                let ch = tail.chars().next().unwrap_or('\0');
+                cur.push(ch);
+                i += ch.len_utf8();
+            }
+            if !cur.is_empty() {
+                out.push(cur);
+            }
+            if i < bytes.len() {
+                i += 1;
+            }
+            continue;
+        }
+        i += 1;
+    }
+    out
 }
 
 fn basename(s: &str) -> &str {

@@ -351,9 +351,183 @@ fn has_pathological_run(text: &str) -> bool {
     false
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeProfile {
+    pub profile_id: String,
+    pub enable_write_tools: bool,
+    pub write_scope_none: bool,
+    pub max_raw_file_bytes: u64,
+    pub max_slice_lines: usize,
+    pub max_single_line_bytes: usize,
+    pub max_turn_tokens: usize,
+    pub max_turn_file_reads: usize,
+    pub max_turn_tool_calls: usize,
+    pub max_return_summary_ascii_tokens: Option<usize>,
+}
+
+impl RuntimeProfile {
+    pub fn coding_agent_default() -> Self {
+        Self {
+            profile_id: "coding-agent".to_string(),
+            enable_write_tools: true,
+            write_scope_none: false,
+            max_raw_file_bytes: MAX_RAW_FILE_BYTES,
+            max_slice_lines: MAX_SLICE_LINES,
+            max_single_line_bytes: MAX_SINGLE_LINE_BYTES,
+            max_turn_tokens: MAX_TURN_TOKENS,
+            max_turn_file_reads: MAX_TURN_FILE_READS,
+            max_turn_tool_calls: MAX_TURN_TOOL_CALLS,
+            max_return_summary_ascii_tokens: Some(200),
+        }
+    }
+
+    pub fn research_readonly_default() -> Self {
+        Self {
+            profile_id: "research-readonly".to_string(),
+            enable_write_tools: false,
+            write_scope_none: true,
+            max_raw_file_bytes: MAX_RAW_FILE_BYTES,
+            max_slice_lines: MAX_SLICE_LINES,
+            max_single_line_bytes: MAX_SINGLE_LINE_BYTES,
+            max_turn_tokens: 12_000,
+            max_turn_file_reads: MAX_TURN_FILE_READS,
+            max_turn_tool_calls: MAX_TURN_TOOL_CALLS,
+            max_return_summary_ascii_tokens: Some(200),
+        }
+    }
+}
+
+/// Loads and enforces the active runtime profile (`AGENT_GUARD_PROFILE`, defaulting to
+/// `coding-agent`), reading `profiles/<id>.toml` when present inside `repo_root` without
+/// following symlinks and clamping every parsed limit to the canonical hard ceiling so a
+/// workspace file can tighten (or match) limits but never loosen kernel invariants.
+pub fn load_active_profile(repo_root: &Path) -> Result<RuntimeProfile, BudgetViolation> {
+    let raw_id = std::env::var("AGENT_GUARD_PROFILE")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "coding-agent".to_string());
+
+    load_profile_by_id(repo_root, &raw_id)
+}
+
+pub fn load_profile_by_id(
+    repo_root: &Path,
+    profile_id: &str,
+) -> Result<RuntimeProfile, BudgetViolation> {
+    let mut profile = match profile_id {
+        "coding-agent" => RuntimeProfile::coding_agent_default(),
+        "research-readonly" => RuntimeProfile::research_readonly_default(),
+        other => {
+            return Err(BudgetViolation {
+                code: "UNKNOWN_RUNTIME_PROFILE",
+                detail: format!(
+                    "Unrecognized AGENT_GUARD_PROFILE '{other}' (expected 'coding-agent' or 'research-readonly')."
+                ),
+            });
+        }
+    };
+
+    let profiles_dir = repo_root.join("profiles");
+    if let Ok(dir_meta) = std::fs::symlink_metadata(&profiles_dir) {
+        if dir_meta.file_type().is_symlink() {
+            return Err(BudgetViolation {
+                code: "SYMLINKED_PROFILE_BLOCKED",
+                detail: "profiles/ directory must not be a symlink.".to_string(),
+            });
+        }
+        let toml_path = profiles_dir.join(format!("{profile_id}.toml"));
+        if let Ok(meta) = std::fs::symlink_metadata(&toml_path) {
+            if meta.file_type().is_symlink() || !meta.file_type().is_file() {
+                return Err(BudgetViolation {
+                    code: "SYMLINKED_PROFILE_BLOCKED",
+                    detail: format!(
+                        "Profile '{}' must be a regular non-symlink file.",
+                        toml_path.display()
+                    ),
+                });
+            }
+            if meta.len() > 16_384 {
+                return Err(BudgetViolation {
+                    code: "OVERSIZED_PROFILE_BLOCKED",
+                    detail: format!("Profile '{}' exceeds 16 KiB ceiling.", toml_path.display()),
+                });
+            }
+            if let Ok(file) = File::open(&toml_path) {
+                let mut buf = Vec::new();
+                if file.take(16_384).read_to_end(&mut buf).is_ok()
+                    && let Ok(text) = String::from_utf8(buf)
+                {
+                    apply_profile_toml_tightening(&mut profile, &text);
+                }
+            }
+        }
+    }
+
+    Ok(profile)
+}
+
+fn apply_profile_toml_tightening(profile: &mut RuntimeProfile, toml_text: &str) {
+    for raw_line in toml_text.lines() {
+        let line = raw_line.split('#').next().unwrap_or("").trim();
+        let Some((k, v)) = line.split_once('=') else {
+            continue;
+        };
+        let key = k.trim();
+        let val = v.trim().trim_matches('"');
+        match key {
+            "enable_write_tools" if val == "false" => {
+                profile.enable_write_tools = false;
+            }
+            "write_scope" if val == "none" => {
+                profile.write_scope_none = true;
+                profile.enable_write_tools = false;
+            }
+            "max_raw_file_bytes" => {
+                if let Ok(n) = val.parse::<u64>() {
+                    profile.max_raw_file_bytes = profile.max_raw_file_bytes.min(n.max(1024));
+                }
+            }
+            "max_slice_lines" => {
+                if let Ok(n) = val.parse::<usize>() {
+                    profile.max_slice_lines = profile.max_slice_lines.min(n.max(10));
+                }
+            }
+            "max_single_line_bytes" => {
+                if let Ok(n) = val.parse::<usize>() {
+                    profile.max_single_line_bytes = profile.max_single_line_bytes.min(n.max(128));
+                }
+            }
+            "max_turn_tokens" => {
+                if let Ok(n) = val.parse::<usize>() {
+                    profile.max_turn_tokens = profile.max_turn_tokens.min(n.max(512));
+                }
+            }
+            "max_turn_file_reads" => {
+                if let Ok(n) = val.parse::<usize>() {
+                    profile.max_turn_file_reads = profile.max_turn_file_reads.min(n.max(1));
+                }
+            }
+            "max_turn_tool_calls" => {
+                if let Ok(n) = val.parse::<usize>() {
+                    profile.max_turn_tool_calls = profile.max_turn_tool_calls.min(n.max(1));
+                }
+            }
+            "max_return_summary_ascii_tokens" | "subagent_airlock_max_tokens" => {
+                if let Ok(n) = val.parse::<usize>() {
+                    let cur = profile.max_return_summary_ascii_tokens.unwrap_or(200);
+                    profile.max_return_summary_ascii_tokens = Some(cur.min(n.max(16)));
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::analyze_text_budget;
+    use super::{analyze_text_budget, load_profile_by_id};
+    use std::path::Path;
 
     #[test]
     fn blocks_minified_single_line_and_splitter_bombs() {
@@ -371,5 +545,9 @@ mod tests {
         }
         let err = analyze_text_budget(&splitter, true).expect_err("must block splitter bomb");
         assert_eq!(err.code, "TOKENIZER_SPLITTER_BOMB");
+
+        let ro = load_profile_by_id(Path::new("."), "research-readonly").expect("ro profile");
+        assert!(!ro.enable_write_tools);
+        assert_eq!(ro.max_turn_tokens, 12_000);
     }
 }

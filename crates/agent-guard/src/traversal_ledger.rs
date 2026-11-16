@@ -43,6 +43,7 @@ pub struct TraversalNode {
 pub struct SessionLedger {
     pub repo_root: String,
     pub session_id: String,
+    pub session_key_hash: String,
     pub turn_nonce: String,
     pub compaction_epoch: usize,
     pub halted: bool,
@@ -58,10 +59,12 @@ pub struct SessionLedger {
 impl SessionLedger {
     pub fn new(repo_root: &Path, session_id: &str) -> Self {
         let clean_sid = sanitize_session_id(session_id);
-        let turn_nonce = generate_turn_nonce(repo_root, &clean_sid, 0);
+        let session_key_hash = compute_session_key_hash(repo_root, session_id);
+        let turn_nonce = generate_turn_nonce(repo_root, session_id, 0);
         Self {
             repo_root: repo_root.to_string_lossy().into_owned(),
             session_id: clean_sid,
+            session_key_hash,
             turn_nonce,
             compaction_epoch: 0,
             halted: false,
@@ -76,33 +79,36 @@ impl SessionLedger {
     }
 
     pub fn load_or_create(repo_root: &Path, session_id: &str) -> Self {
-        let path = ledger_file_path(repo_root, session_id);
-        let Ok(raw) = fs::read_to_string(&path) else {
-            return Self::new(repo_root, session_id);
-        };
-        Self::from_json(&raw).unwrap_or_else(|| Self::new(repo_root, session_id))
+        let key_hash = compute_session_key_hash(repo_root, session_id);
+        let path = ledger_file_path_for_hash(&key_hash);
+        match read_nonsymlink_state_file(&path) {
+            Ok(Some(raw)) => {
+                if let Some(mut loaded) = Self::from_json(&raw) {
+                    if loaded.session_key_hash.is_empty() || loaded.session_key_hash == key_hash {
+                        loaded.session_key_hash = key_hash;
+                        return loaded;
+                    }
+                }
+                Self::new(repo_root, session_id)
+            }
+            Ok(None) => Self::new(repo_root, session_id),
+            Err(symlink_err) => {
+                let mut halted = Self::new(repo_root, session_id);
+                halted.trip_circuit_breaker(format!("STATE_SYMLINK_REJECTED: {symlink_err}"));
+                halted
+            }
+        }
     }
 
     pub fn save(&self, repo_root: &Path) -> Result<(), String> {
-        let path = ledger_file_path(repo_root, &self.session_id);
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)
-                .map_err(|e| format!("failed creating state dir '{}': {e}", parent.display()))?;
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                let _ = fs::set_permissions(parent, fs::Permissions::from_mode(0o700));
-            }
-        }
+        let key_hash = if self.session_key_hash.is_empty() {
+            compute_session_key_hash(repo_root, &self.session_id)
+        } else {
+            self.session_key_hash.clone()
+        };
+        let path = ledger_file_path_for_hash(&key_hash);
         let serialized = self.to_json();
-        fs::write(&path, serialized.as_bytes())
-            .map_err(|e| format!("failed writing ledger '{}': {e}", path.display()))?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = fs::set_permissions(&path, fs::Permissions::from_mode(0o600));
-        }
-        Ok(())
+        atomic_write_nonsymlink_state_file(&path, serialized.as_bytes())
     }
 
     pub fn reset_for_new_user_prompt(repo_root: &Path, session_id: &str) -> Result<Self, String> {
@@ -119,7 +125,8 @@ impl SessionLedger {
         self.cumulative_tokens = 0;
         self.file_reads = 0;
         self.tool_calls = 0;
-        self.turn_nonce = generate_turn_nonce(repo_root, &self.session_id, self.compaction_epoch);
+        self.turn_nonce =
+            generate_turn_nonce(repo_root, &self.session_key_hash, self.compaction_epoch);
         for node in self.nodes.values_mut() {
             node.was_read = false;
         }
@@ -152,10 +159,14 @@ impl SessionLedger {
     }
 
     pub fn record_tool_call(&mut self) -> Result<(), String> {
+        self.record_tool_call_with_limit(MAX_TURN_TOOL_CALLS)
+    }
+
+    pub fn record_tool_call_with_limit(&mut self, max_calls: usize) -> Result<(), String> {
         self.check_not_halted()?;
-        if self.tool_calls >= MAX_TURN_TOOL_CALLS {
+        if self.tool_calls >= max_calls {
             return Err(format!(
-                "Step tool-call ceiling exceeded ({MAX_TURN_TOOL_CALLS} calls). Compact step context immediately before continuing."
+                "Step tool-call ceiling exceeded ({max_calls} calls). Compact step context immediately before continuing."
             ));
         }
         self.tool_calls += 1;
@@ -169,6 +180,21 @@ impl SessionLedger {
         &mut self,
         rel_path: &str,
         estimated_tokens: usize,
+    ) -> Result<u8, (&'static str, String)> {
+        self.authorize_and_record_read_with_limits(
+            rel_path,
+            estimated_tokens,
+            MAX_TURN_FILE_READS,
+            MAX_TURN_TOKENS,
+        )
+    }
+
+    pub fn authorize_and_record_read_with_limits(
+        &mut self,
+        rel_path: &str,
+        estimated_tokens: usize,
+        max_file_reads: usize,
+        max_turn_tokens: usize,
     ) -> Result<u8, (&'static str, String)> {
         if let Err(msg) = self.check_not_halted() {
             return Err(("SESSION_CIRCUIT_BREAKER_HALTED", msg));
@@ -187,21 +213,21 @@ impl SessionLedger {
         }
 
         let already_read = self.nodes.get(rel_path).is_some_and(|n| n.was_read);
-        if !already_read && self.file_reads >= MAX_TURN_FILE_READS {
+        if !already_read && self.file_reads >= max_file_reads {
             return Err((
                 "FILE_READ_BUDGET_EXCEEDED",
                 format!(
-                    "Step file-read limit ({MAX_TURN_FILE_READS} files) reached; compact step context before reading '{rel_path}'."
+                    "Step file-read limit ({max_file_reads} files) reached; compact step context before reading '{rel_path}'."
                 ),
             ));
         }
 
         let next_tokens = self.cumulative_tokens.saturating_add(estimated_tokens);
-        if next_tokens > MAX_TURN_TOKENS {
+        if next_tokens > max_turn_tokens {
             return Err((
                 "TURN_TOKEN_BUDGET_EXCEEDED",
                 format!(
-                    "Reading '{rel_path}' (+{estimated_tokens} est. tokens) would exceed tight step context ceiling ({next_tokens} > {MAX_TURN_TOKENS}). Compact this step immediately rather than carrying multi-step history."
+                    "Reading '{rel_path}' (+{estimated_tokens} est. tokens) would exceed tight step context ceiling ({next_tokens} > {max_turn_tokens}). Compact this step immediately rather than carrying multi-step history."
                 ),
             ));
         }
@@ -341,6 +367,10 @@ impl SessionLedger {
                 JsonValue::Str(self.session_id.clone()),
             ),
             (
+                "session_key_hash".to_string(),
+                JsonValue::Str(self.session_key_hash.clone()),
+            ),
+            (
                 "turn_nonce".to_string(),
                 JsonValue::Str(self.turn_nonce.clone()),
             ),
@@ -386,6 +416,11 @@ impl SessionLedger {
         let v = JsonValue::parse(raw).ok()?;
         let repo_root = v.get("repo_root")?.as_str()?.to_string();
         let session_id = v.get("session_id")?.as_str()?.to_string();
+        let session_key_hash = v
+            .get("session_key_hash")
+            .and_then(JsonValue::as_str)
+            .map(String::from)
+            .unwrap_or_default();
         let compaction_epoch = v
             .get("compaction_epoch")
             .and_then(JsonValue::as_u64)
@@ -432,6 +467,7 @@ impl SessionLedger {
         Some(Self {
             repo_root,
             session_id,
+            session_key_hash,
             turn_nonce,
             compaction_epoch,
             halted,
@@ -597,8 +633,156 @@ pub fn audit_log_path() -> PathBuf {
     base.join("audit.jsonl")
 }
 
-/// Appends a single pure-ASCII JSONL record (`0600`) to `audit.jsonl` for forensic review
-/// of blocked prompt injections, poisoned pointers, or budget violations.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+const O_NOFOLLOW_FLAG: i32 = 0o400000;
+#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+const O_NOFOLLOW_FLAG: i32 = 0o100000;
+#[cfg(target_os = "macos")]
+const O_NOFOLLOW_FLAG: i32 = 0x0100;
+
+fn ensure_nonsymlink_state_dir(dir: &Path) -> Result<(), String> {
+    if let Ok(meta) = fs::symlink_metadata(dir)
+        && meta.file_type().is_symlink()
+    {
+        return Err(format!("state directory '{}' is a symlink", dir.display()));
+    }
+    fs::create_dir_all(dir)
+        .map_err(|e| format!("failed creating state dir '{}': {e}", dir.display()))?;
+    let meta = fs::symlink_metadata(dir)
+        .map_err(|e| format!("failed stat on state dir '{}': {e}", dir.display()))?;
+    if meta.file_type().is_symlink() || !meta.file_type().is_dir() {
+        return Err(format!(
+            "state directory '{}' is not a regular directory",
+            dir.display()
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(dir, fs::Permissions::from_mode(0o700));
+    }
+    Ok(())
+}
+
+pub fn read_nonsymlink_state_file(path: &Path) -> Result<Option<String>, String> {
+    if let Some(parent) = path.parent()
+        && let Ok(pm) = fs::symlink_metadata(parent)
+        && pm.file_type().is_symlink()
+    {
+        return Err(format!("state parent '{}' is a symlink", parent.display()));
+    }
+    let meta = match fs::symlink_metadata(path) {
+        Ok(m) => m,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(format!("cannot stat '{}': {e}", path.display())),
+    };
+    if meta.file_type().is_symlink() || !meta.file_type().is_file() {
+        return Err(format!(
+            "state file '{}' is a symlink or non-regular file",
+            path.display()
+        ));
+    }
+
+    let mut opts = OpenOptions::new();
+    opts.read(true);
+    #[cfg(any(
+        all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ),
+        target_os = "macos"
+    ))]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.custom_flags(O_NOFOLLOW_FLAG);
+    }
+
+    let file = opts
+        .open(path)
+        .map_err(|e| format!("cannot open state file '{}': {e}", path.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let fmeta = file
+            .metadata()
+            .map_err(|e| format!("fstat failed on '{}': {e}", path.display()))?;
+        if fmeta.dev() != meta.dev() || fmeta.ino() != meta.ino() {
+            return Err(format!(
+                "TOCTOU inode mismatch opening state file '{}'",
+                path.display()
+            ));
+        }
+    }
+
+    let mut buf = Vec::new();
+    file.take(262_144)
+        .read_to_end(&mut buf)
+        .map_err(|e| format!("failed reading state file '{}': {e}", path.display()))?;
+    String::from_utf8(buf)
+        .map(Some)
+        .map_err(|_| format!("non-UTF-8 bytes in state file '{}'", path.display()))
+}
+
+pub fn atomic_write_nonsymlink_state_file(path: &Path, data: &[u8]) -> Result<(), String> {
+    let Some(parent) = path.parent() else {
+        return Err("state file missing parent directory".to_string());
+    };
+    ensure_nonsymlink_state_dir(parent)?;
+    if let Ok(existing) = fs::symlink_metadata(path)
+        && existing.file_type().is_symlink()
+    {
+        return Err(format!(
+            "refusing to overwrite symlinked state file '{}'",
+            path.display()
+        ));
+    }
+
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let file_name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("state.json");
+    let stage = parent.join(format!(".{file_name}.stage.{}.{nanos}", std::process::id()));
+    let _ = fs::remove_file(&stage);
+
+    let mut opts = OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let mut f = opts
+        .open(&stage)
+        .map_err(|e| format!("failed creating staging file '{}': {e}", stage.display()))?;
+    if let Err(e) = f.write_all(data).and_then(|()| f.sync_all()) {
+        let _ = fs::remove_file(&stage);
+        return Err(format!(
+            "failed writing staging file '{}': {e}",
+            stage.display()
+        ));
+    }
+    drop(f);
+
+    if let Ok(dest_meta) = fs::symlink_metadata(path)
+        && dest_meta.file_type().is_symlink()
+    {
+        let _ = fs::remove_file(&stage);
+        return Err(format!(
+            "refusing to rename over symlinked state file '{}'",
+            path.display()
+        ));
+    }
+    fs::rename(&stage, path).map_err(|e| {
+        let _ = fs::remove_file(&stage);
+        format!("failed renaming state file '{}': {e}", path.display())
+    })
+}
+
+/// Appends a single pure-ASCII JSONL record (`0600`) to `audit.jsonl` without following symlinks.
 pub fn append_audit_jsonl(
     repo_root: &Path,
     session_id: &str,
@@ -608,14 +792,13 @@ pub fn append_audit_jsonl(
     halted: bool,
 ) {
     let path = audit_log_path();
-    if let Some(parent) = path.parent() {
-        let _ = fs::create_dir_all(parent);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = fs::set_permissions(parent, fs::Permissions::from_mode(0o700));
-        }
+    let Some(parent) = path.parent() else {
+        return;
+    };
+    if ensure_nonsymlink_state_dir(parent).is_err() {
+        return;
     }
+
     let ts_secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -631,6 +814,7 @@ pub fn append_audit_jsonl(
         })
         .take(240)
         .collect();
+    let session_hash = compute_session_key_hash(repo_root, session_id);
     let record = JsonValue::Object(vec![
         ("ts".to_string(), JsonValue::Number(ts_secs as f64)),
         (
@@ -641,31 +825,88 @@ pub fn append_audit_jsonl(
             "session_id".to_string(),
             JsonValue::Str(sanitize_session_id(session_id)),
         ),
+        (
+            "session_hash".to_string(),
+            JsonValue::Str(session_hash[..16].to_string()),
+        ),
         ("tool".to_string(), JsonValue::Str(tool.to_string())),
         ("code".to_string(), JsonValue::Str(code.to_string())),
         ("halted".to_string(), JsonValue::Bool(halted)),
         ("detail".to_string(), JsonValue::Str(ascii_detail)),
     ]);
-    if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(&path) {
-        let _ = writeln!(file, "{}", record.to_json_string());
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = fs::set_permissions(&path, fs::Permissions::from_mode(0o600));
+
+    let file_opt = match fs::symlink_metadata(&path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            let mut opts = OpenOptions::new();
+            opts.write(true).create_new(true).append(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                opts.mode(0o600);
+            }
+            opts.open(&path).ok()
         }
+        Ok(meta) if !meta.file_type().is_symlink() && meta.file_type().is_file() => {
+            let mut opts = OpenOptions::new();
+            opts.write(true).append(true);
+            #[cfg(any(
+                all(
+                    target_os = "linux",
+                    any(target_arch = "x86_64", target_arch = "aarch64")
+                ),
+                target_os = "macos"
+            ))]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                opts.custom_flags(O_NOFOLLOW_FLAG);
+            }
+            opts.open(&path).ok().filter(|f| {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::MetadataExt;
+                    f.metadata()
+                        .map(|fm| fm.dev() == meta.dev() && fm.ino() == meta.ino())
+                        .unwrap_or(false)
+                }
+                #[cfg(not(unix))]
+                {
+                    let _ = f;
+                    true
+                }
+            })
+        }
+        _ => None,
+    };
+
+    if let Some(mut file) = file_opt {
+        let _ = writeln!(file, "{}", record.to_json_string());
     }
 }
 
-fn ledger_file_path(repo_root: &Path, session_id: &str) -> PathBuf {
-    let sid = sanitize_session_id(session_id);
-    let key = format!("{}:{sid}", repo_root.display());
-    let digest = sha256_hex(key.as_bytes());
-    state_base_dir().join(format!("{}.json", &digest[..32]))
+pub fn compute_session_key_hash(repo_root: &Path, raw_session_id: &str) -> String {
+    let repo_bytes = repo_root.to_string_lossy();
+    let framed = format!(
+        "v2:{}:{}:{}:{}",
+        repo_bytes.len(),
+        repo_bytes,
+        raw_session_id.len(),
+        raw_session_id
+    );
+    sha256_hex(framed.as_bytes())
+}
+
+fn ledger_file_path_for_hash(session_key_hash: &str) -> PathBuf {
+    let prefix = if session_key_hash.len() >= 32 {
+        &session_key_hash[..32]
+    } else {
+        session_key_hash
+    };
+    state_base_dir().join(format!("{prefix}.json"))
 }
 
 #[cfg(test)]
 mod tests {
-    use super::SessionLedger;
+    use super::{SessionLedger, compute_session_key_hash};
     use std::path::Path;
 
     #[test]
@@ -695,5 +936,15 @@ mod tests {
             .authorize_and_record_read("docs/C.md", 100)
             .expect_err("C must be blocked");
         assert_eq!(err.0, "TRANSITIVE_DEPTH_EXCEEDED");
+
+        // 4. Lossless session hash separates punctuation/Unicode collisions
+        assert_ne!(
+            compute_session_key_hash(Path::new("/repo"), "abc/def"),
+            compute_session_key_hash(Path::new("/repo"), "abcdef")
+        );
+        assert_ne!(
+            compute_session_key_hash(Path::new("/repo"), "\u{03B1}"),
+            compute_session_key_hash(Path::new("/repo"), "\u{03B2}")
+        );
     }
 }

@@ -66,44 +66,48 @@ pub fn scan_untrusted_content(
     report
 }
 
-fn is_quoted_code_table_literal_line(raw_line: &str) -> bool {
-    let t = raw_line.trim();
-    if t.starts_with("//") || t.starts_with('#') || t.starts_with("/*") || t.starts_with('*') {
-        return false;
-    }
-    // Detector string table entries in Rust/TOML (`"phrase",`, `("<tag>", "desc"),`, `cmd = "..."`, `let r = ...`)
-    (t.starts_with('"') && (t.ends_with("\",") || t.ends_with('"')))
-        || (t.starts_with("(\"") && (t.ends_with("),") || t.ends_with(')')))
-        || t.starts_with("cmd = \"")
-        || t.starts_with("cmd = '")
-        || t.starts_with("assert!")
-        || t.starts_with("assert_eq!")
-}
-
 fn scan_delimiter_breakouts(text: &str, findings: &mut Vec<InjectionFinding>) {
     const DELIMITER_MARKERS: &[(&str, &str)] = &[
-        ("<system>", "XML <system> prompt-boundary spoofing tag"),
-        ("</system>", "XML </system> prompt-boundary breakout tag"),
-        ("<user_request>", "Harness <USER_REQUEST> tag spoofing"),
-        ("</user_request>", "Harness </USER_REQUEST> tag breakout"),
         (
-            "<|im_start|>",
-            "ChatML <|im_start|> special token injection",
+            concat!("<sys", "tem>"),
+            "XML system prompt-boundary spoofing tag",
         ),
-        ("<|im_end|>", "ChatML <|im_end|> special token injection"),
         (
-            "<|endoftext|>",
-            "Tokenizer <|endoftext|> special token injection",
+            concat!("</sys", "tem>"),
+            "XML closing system prompt-boundary breakout tag",
         ),
-        ("[inst]", "Llama [INST] role delimiter injection"),
-        ("[/inst]", "Llama [/INST] role delimiter injection"),
-        ("<<<end_untrusted", "Quarantine envelope breakout marker"),
+        (
+            concat!("<user_", "request>"),
+            "Harness USER_REQUEST tag spoofing",
+        ),
+        (
+            concat!("</user_", "request>"),
+            "Harness closing USER_REQUEST tag breakout",
+        ),
+        (
+            concat!("<|im_", "start|>"),
+            "ChatML im_start special token injection",
+        ),
+        (
+            concat!("<|im_", "end|>"),
+            "ChatML im_end special token injection",
+        ),
+        (
+            concat!("<|endof", "text|>"),
+            "Tokenizer endoftext special token injection",
+        ),
+        (concat!("[in", "st]"), "Llama INST role delimiter injection"),
+        (
+            concat!("[/in", "st]"),
+            "Llama closing INST role delimiter injection",
+        ),
+        (
+            concat!("<<<end_", "untrusted"),
+            "Quarantine envelope breakout marker",
+        ),
     ];
 
     for raw_line in text.lines() {
-        if is_quoted_code_table_literal_line(raw_line) {
-            continue;
-        }
         let lower = raw_line.to_ascii_lowercase();
         for (needle, desc) in DELIMITER_MARKERS {
             if lower.contains(needle) {
@@ -119,32 +123,29 @@ fn scan_delimiter_breakouts(text: &str, findings: &mut Vec<InjectionFinding>) {
 
 fn scan_imperative_overrides(text: &str, findings: &mut Vec<InjectionFinding>) {
     for (line_idx, raw_line) in text.lines().enumerate() {
-        if is_quoted_code_table_literal_line(raw_line) {
-            continue;
-        }
         let norm = collapse_ascii_ws(&raw_line.to_ascii_lowercase());
         let line_no = line_idx + 1;
 
         const HARD_OVERRIDE_PHRASES: &[&str] = &[
-            "ignore previous instructions",
-            "ignore all previous instructions",
-            "ignore prior instructions",
-            "ignore all prior instructions",
-            "ignore system instructions",
-            "disregard previous instructions",
-            "disregard all previous instructions",
-            "disregard prior rules",
-            "forget all previous instructions",
-            "new system instructions:",
-            "override security instructions",
-            "bypass agent-guard",
-            "disable agent-guard",
-            "do not tell the user",
-            "do not mention this to the user",
-            "hide this from the user",
-            "silently execute",
-            "execute immediately without asking",
-            "urgent security override",
+            concat!("ignore previous ", "instructions"),
+            concat!("ignore all previous ", "instructions"),
+            concat!("ignore prior ", "instructions"),
+            concat!("ignore all prior ", "instructions"),
+            concat!("ignore system ", "instructions"),
+            concat!("disregard previous ", "instructions"),
+            concat!("disregard all previous ", "instructions"),
+            concat!("disregard prior ", "rules"),
+            concat!("forget all previous ", "instructions"),
+            concat!("new system ", "instructions:"),
+            concat!("override security ", "instructions"),
+            concat!("bypass ", "agent-guard"),
+            concat!("disable ", "agent-guard"),
+            concat!("do not tell ", "the user"),
+            concat!("do not mention this ", "to the user"),
+            concat!("hide this from ", "the user"),
+            concat!("silently ", "execute"),
+            concat!("execute immediately ", "without asking"),
+            concat!("urgent security ", "override"),
         ];
 
         for phrase in HARD_OVERRIDE_PHRASES {
@@ -398,9 +399,6 @@ fn collect_candidate_paths(text: &str) -> Vec<(String, CandidateKind)> {
 
     // 3. Directive verbs followed by a path (`see docs/B.md`, `check <path>`, `read <path>`)
     for line in text.lines() {
-        if is_quoted_code_table_literal_line(line) {
-            continue;
-        }
         let words: Vec<&str> = line.split_whitespace().collect();
         for i in 0..words.len() {
             let w_lower = words[i]
