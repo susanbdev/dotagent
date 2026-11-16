@@ -404,6 +404,17 @@ fn blocks_token_exhaustion_files_output_floods_and_json_surrogate_tags() {
         ));
     }
     fs::write(repo.join("large.txt"), &big_lines).expect("write large.txt");
+    for sid in ["s_budget", "s_flood", "s_tag"] {
+        let init = JsonValue::Object(vec![
+            ("session_id".to_string(), JsonValue::Str(sid.to_string())),
+            (
+                "cwd".to_string(),
+                JsonValue::Str(repo.to_string_lossy().into_owned()),
+            ),
+        ])
+        .to_json_string();
+        assert!(handle_user_prompt_hook(&init, &repo).is_allow());
+    }
 
     let unsliced = JsonValue::Object(vec![
         (
@@ -475,10 +486,12 @@ fn blocks_token_exhaustion_files_output_floods_and_json_surrogate_tags() {
         other => panic!("Expected TOOL_OUTPUT_FLOOD_BLOCKED, got {other:?}"),
     }
 
-    // 3. JSON UTF-16 surrogate pair smuggling Unicode Tag U+E0041 (`\udb40\udc41`) -> blocked!
+    // 3. JSON UTF-16 surrogate pair smuggling Unicode Tag U+E0041 (surrogates db40 + dc41) -> blocked!
+    let surrogate_tag = concat!("\\", "udb40", "\\", "udc41");
     let surrogate_hook = format!(
-        r#"{{"session_id":"s_tag","cwd":"{}","tool_name":"Write","tool_input":{{"file_path":"src/main.rs","content":"fn main() {{ /* \udb40\udc41 */ }}"}}}}"#,
-        repo.display()
+        r#"{{"session_id":"s_tag","cwd":"{}","tool_name":"Write","tool_input":{{"file_path":"src/main.rs","content":"fn main() {{ /* {} */ }}"}}}}"#,
+        repo.display(),
+        surrogate_tag
     );
     match handle_pre_tool_hook(&surrogate_hook, &repo) {
         Decision::Deny { code, .. } => assert_eq!(code, "UNICODE_TAG_SMUGGLING"),
@@ -879,6 +892,17 @@ fn regression_pr1_review_findings() {
     fs::write(repo.join("docs/hop1.md"), "Hop 1.\n").expect("write hop1");
     fs::write(repo.join("docs/hop2.md"), "See `docs/hop3.md`.\n").expect("write hop2");
     fs::write(repo.join("docs/hop3.md"), "Hop 3.\n").expect("write hop3");
+    for sid in ["pr1_post", "pr1_post_chain"] {
+        let init = JsonValue::Object(vec![
+            ("session_id".to_string(), JsonValue::Str(sid.to_string())),
+            (
+                "cwd".to_string(),
+                JsonValue::Str(repo.to_string_lossy().into_owned()),
+            ),
+        ])
+        .to_json_string();
+        assert!(handle_user_prompt_hook(&init, &repo).is_allow());
+    }
 
     let dirty_post = JsonValue::Object(vec![
         (
@@ -914,7 +938,10 @@ fn regression_pr1_review_findings() {
             "cwd".to_string(),
             JsonValue::Str(repo.to_string_lossy().into_owned()),
         ),
-        ("tool_name".to_string(), JsonValue::Str("Grep".to_string())),
+        (
+            "tool_name".to_string(),
+            JsonValue::Str("mcp_doc_search".to_string()),
+        ),
         (
             "tool_response".to_string(),
             JsonValue::Str("match in `docs/hop2.md`\n".to_string()),
