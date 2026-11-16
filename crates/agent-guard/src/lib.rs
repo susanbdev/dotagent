@@ -401,6 +401,13 @@ fn evaluate_tool_invocation(
             return role_denial;
         }
 
+        let read_rels: Vec<String> = plan.read_files.iter().map(|(r, _, _)| r.clone()).collect();
+        if let Err(role_denial) =
+            role_sandbox::check_role_shell_read_scope(role, cap, &read_rels, repo_root)
+        {
+            return role_denial;
+        }
+
         // Pre-inspect every file read by the shell command (enforces A->B->C, Unicode, injection, & token budget!)
         for (rel, abs_path, is_root_auth) in &plan.read_files {
             if abs_path.exists() {
@@ -1434,7 +1441,7 @@ fn format_json_multiline(v: &JsonValue, indent: usize, out: &mut String) {
     }
 }
 
-fn extract_patch_target_paths(patch: &str) -> Vec<String> {
+pub(crate) fn extract_patch_target_paths(patch: &str) -> Vec<String> {
     let mut out = Vec::new();
     let lines: Vec<&str> = patch.lines().collect();
     let mut push_unique = |raw: &str| {
@@ -1517,7 +1524,7 @@ fn extract_patch_target_paths(patch: &str) -> Vec<String> {
     out
 }
 
-fn collect_nested_path_fields(v: &JsonValue, out: &mut Vec<String>) {
+pub(crate) fn collect_nested_path_fields(v: &JsonValue, out: &mut Vec<String>) {
     match v {
         JsonValue::Object(entries) => {
             for (k, val) in entries {

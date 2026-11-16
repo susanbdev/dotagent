@@ -18,7 +18,8 @@ use crate::breadcrumbs::{
 use crate::json::JsonValue;
 use crate::path_policy::{PathAccess, validate_path_with_max_depth};
 use crate::role_sandbox::{
-    load_session_capability, path_matches_any_scope, resolve_active_role, save_session_capability,
+    clear_active_session_slot, load_active_session_slot, load_session_capability,
+    path_matches_any_scope, resolve_active_role, save_session_capability,
 };
 use crate::swarm_contracts::{
     EventOp, SessionCapability, SmellBadge, SmellBucket, SwarmRole, WorkLedgerEntry, hex_decode_32,
@@ -572,7 +573,7 @@ pub fn verify_on_stop_swarm_gates(repo_root: &Path) -> Result<(), String> {
 
     let (role, cap_opt) = resolve_active_role(repo_root, &sid)?;
     if role == SwarmRole::Grunt {
-        let Some(cap) = cap_opt else {
+        let Some(ref cap) = cap_opt else {
             return Err(format!(
                 "GRUNT_MISSING_WORK_LEDGER: active Grunt session '{sid}' has no minted capability or WORK_LEDGER.jsonl receipt"
             ));
@@ -640,6 +641,14 @@ pub fn verify_on_stop_swarm_gates(repo_root: &Path) -> Result<(), String> {
         }
         for trail_path in by_trail.keys() {
             verify_breadcrumbs_file(repo_root, trail_path)?;
+        }
+    }
+
+    if let Some(ref finished_cap) = cap_opt {
+        if let Ok(Some(slot_cap)) = load_active_session_slot(repo_root) {
+            if slot_cap.session_id == finished_cap.session_id {
+                let _ = clear_active_session_slot(repo_root);
+            }
         }
     }
 

@@ -6,8 +6,8 @@
 - **Executable Wave Graph**: [`swarm_v2.dag.json`](file:///home/antigravity/susanbdev/dotagent/docs/swarm_v2.dag.json)
 - **Hard Constraints**:
   1. `Rust 2024`, `#![forbid(unsafe_code)]`, minimal audited pure-Rust dependencies (`hmac = "0.12"`, `sha2 = "0.10"`, `crc32fast = "1.4"`).
-  2. **Skill-First & Infrastructure-Free**: Zero VM hypervisors, zero encryption daemons, zero external servers--just badass per-role `SKILL.md` + `README.md` manuals, dedicated Rust `swarm-tool` role CLIs, multi-harness subagent configs, and fast local `agent-guard` CLI hooks.
-  3. **100% pure 7-bit ASCII** (`<= 3 KiB` per `SKILL.md`, `<= 4 KiB` per role `README.md`); preserve `100%` pass rate across existing `277` vectors in [`bypass_corpus.toml`](file:///home/antigravity/susanbdev/dotagent/tests/bypass_corpus.toml).
+  2. **Skill-First & Infrastructure-Free**: Zero VM hypervisors, zero encryption daemons, zero external servers--just badass per-role `SKILL.md` + `ROLE_GUIDE.md` manuals, dedicated Rust `swarm-tool` role CLIs, multi-harness subagent configs, and fast local `agent-guard` CLI hooks.
+  3. **100% pure 7-bit ASCII** (`<= 3 KiB` per `SKILL.md`, `<= 4 KiB` per role `ROLE_GUIDE.md`); preserve `100%` pass rate across existing `277` vectors in [`bypass_corpus.toml`](file:///home/antigravity/susanbdev/dotagent/tests/bypass_corpus.toml).
 
 ---
 
@@ -17,7 +17,7 @@
 > Build `susanbdev/dotagent` v2.0 on branch `feat/swarm-v2` across the `4` waves (`W0 -> W1 -> W2 -> W3`) defined in [`swarm_v2.dag.json`](file:///home/antigravity/susanbdev/dotagent/docs/swarm_v2.dag.json):
 > 1. **`W0` (`W0.A -> W0.B`)**: Add `hmac`, `sha2`, and `crc32fast` to `crates/agent-guard/Cargo.toml`, define shared structs in `crates/agent-guard/src/swarm_contracts.rs`, wire modules into [`lib.rs`](file:///home/antigravity/susanbdev/dotagent/crates/agent-guard/src/lib.rs), and write the **upfront frozen QA tests** + `tests/swarm_v2_attribution.toml`.
 > 2. **`W1` (`W1.A..D` in parallel)**: Implement the 4 disjoint Rust hook modules (`role_sandbox.rs`, `qa_suspects.rs`, `breadcrumbs.rs`, `work_ledger.rs`).
-> 3. **`W2` (`W2.A..C` in parallel)**: Author all **6 dedicated role skill folders** (`skills/swarm-{master,investigator,qa-engineer,grunt,adversarial-reviewer,forensic-coroner}/{SKILL.md, README.md}`), compile the 6 role profiles & harness subagents via [`main.rs`](file:///home/antigravity/susanbdev/dotagent/crates/dotagent-compiler/src/main.rs), and build the dedicated Rust role CLI binary `swarm-tool` (`crates/swarm-tools`) + `agent-guard` hook gates.
+> 3. **`W2` (`W2.A..C` in parallel)**: Author all **6 dedicated role skill folders** (`skills/swarm-{master,investigator,qa-engineer,grunt,adversarial-reviewer,forensic-coroner}/{SKILL.md, ROLE_GUIDE.md}`), compile the 6 role profiles & harness subagents via [`main.rs`](file:///home/antigravity/susanbdev/dotagent/crates/dotagent-compiler/src/main.rs), and build the dedicated Rust role CLI binary `swarm-tool` (`crates/swarm-tools`) + `agent-guard` hook gates.
 > 4. **`W3` (`W3.A`)**: Run crash-recovery, git-worktree exclude, Reviewer exfiltration-block, end-to-end `swarm-tool` delegation (`cli_delegation.rs`), and positive/fail-closed `on-stop` verification suites (`swarm_v2_suite.rs`).
 
 ---
@@ -33,7 +33,7 @@ flowchart TD
     W0B --> W1C["W1.C: breadcrumbs.rs (Complete-Record HMAC + CRC32 Spool + Worktree Queue)"]
     W0B --> W1D["W1.D: work_ledger.rs (0-LLM 4-Tag Smell Badge + Tree-OID 2+2 Stop Gate)"]
 
-    W1A --> W2A["W2.A: 6 Role Skill Packs (skills/swarm-*/SKILL.md + README.md)"]
+    W1A --> W2A["W2.A: 6 Role Skill Packs (skills/swarm-*/SKILL.md + ROLE_GUIDE.md)"]
     W1B --> W2A
     W1D --> W2A
 
@@ -115,8 +115,8 @@ pub enum SuspectVerdict {
   - `0`-LLM 4-bucket heuristic tagger (`MALICIOUS`, `OFF_TASK`, `CONFUSED`, `RISKY` including tree-OID `edit_after_last_green_test` check) + `2+2` pure-ASCII sentence `work_ledger.jsonl` validator bound to `(session_id, attempt, git_tree_oid)` + fail-closed `on-stop` check.
 
 ### Wave 2 -- 6 Role Skill Packs, Explicit Role Manuals, Subagent Harnesses & `swarm-tool` CLI
-- **`W2.A` (`skills/swarm-{master,investigator,qa-engineer,grunt,adversarial-reviewer,forensic-coroner}/{SKILL.md, README.md}`)**:
-  - Every role has its own dedicated skill directory containing both a pure 7-bit ASCII `SKILL.md` (`<= 3 KiB`) and an explicit `README.md` manual (`<= 4 KiB`) specifying: `1. What Your Job Is`, `2. Explicit Rules You Must Follow`, and `3. Your Dedicated Rust Tooling`.
+- **`W2.A` (`skills/swarm-{master,investigator,qa-engineer,grunt,adversarial-reviewer,forensic-coroner}/{SKILL.md, ROLE_GUIDE.md}`)**:
+  - Every role has its own dedicated skill directory containing both a pure 7-bit ASCII `SKILL.md` (`<= 3 KiB`) and an explicit `ROLE_GUIDE.md` manual (`<= 4 KiB`) specifying: `1. What Your Job Is`, `2. Explicit Rules You Must Follow`, and `3. Your Dedicated Rust Tooling`.
 - **`W2.B` (`profiles/swarm-*.toml`, `crates/dotagent-compiler/src/main.rs`, `skills/manifest.lock.json`, `dist/**`, `dist-verify/manifest.sha256`)**:
   - Compiles all 6 role profiles and subagent definitions across Claude Code (`.claude/agents/swarm-*.md`), Codex, Cursor, and Gemini.
 - **`W2.C` (`crates/swarm-tools/src/main.rs`, `crates/agent-guard/src/{lib.rs, main.rs, path_policy.rs}`)**:

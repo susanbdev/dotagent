@@ -471,16 +471,22 @@ fn f18_f32_f33_work_ledger_two_plus_two_tree_oid_and_smell_badges() {
 }
 
 #[test]
-fn all_six_role_skills_readmes_and_compiled_agents_verified() {
+fn all_six_role_skills_guides_and_compiled_agents_verified() {
     let root = workspace_root();
     for role in SwarmRole::all_swarm_roles() {
         let skill_dir = role.skill_dir_name().expect("swarm role skill dir");
         let skill_md = root.join("skills").join(skill_dir).join("SKILL.md");
-        let readme_md = root.join("skills").join(skill_dir).join("README.md");
+        let guide_md = root.join("skills").join(skill_dir).join("ROLE_GUIDE.md");
+        let nested_readme = root.join("skills").join(skill_dir).join("README.md");
         let profile_toml = root.join("profiles").join(format!("{skill_dir}.toml"));
 
         assert!(skill_md.exists(), "missing {}", skill_md.display());
-        assert!(readme_md.exists(), "missing {}", readme_md.display());
+        assert!(guide_md.exists(), "missing {}", guide_md.display());
+        assert!(
+            !nested_readme.exists(),
+            "nested README.md must not exist: {}",
+            nested_readme.display()
+        );
         assert!(profile_toml.exists(), "missing {}", profile_toml.display());
 
         for dot_dir in [".claude", ".cursor", ".codex"] {
@@ -499,11 +505,11 @@ fn all_six_role_skills_readmes_and_compiled_agents_verified() {
             assert!(dist_agent.exists(), "missing {}", dist_agent.display());
         }
 
-        let readme_text = fs::read_to_string(&readme_md).unwrap();
-        assert!(readme_text.contains("## 1. What Your Job Is"));
-        assert!(readme_text.contains("## 2. Explicit Rules You Must Follow"));
-        assert!(readme_text.contains("## 3. Your Dedicated Rust Tooling"));
-        assert!(readme_text.contains("swarm-tool "));
+        let guide_text = fs::read_to_string(&guide_md).unwrap();
+        assert!(guide_text.contains("## 1. What Your Job Is"));
+        assert!(guide_text.contains("## 2. Explicit Rules You Must Follow"));
+        assert!(guide_text.contains("## 3. Your Dedicated Rust Tooling"));
+        assert!(guide_text.contains("swarm-tool "));
     }
 }
 
@@ -654,4 +660,135 @@ fn pr2_review_regressions_role_sandbox_spool_and_ledger_pins() {
     // Verify ledger file stores `event_ids` JSON array
     let ledger_raw = fs::read_to_string(work_ledger_state_path(&repo).unwrap()).unwrap();
     assert!(ledger_raw.contains("\"event_ids\":["));
+}
+
+#[test]
+fn pr2_deep_adversarial_capability_slot_hmac_shell_and_patch_regressions() {
+    let (repo, _) = isolated_sandbox("pr2_deep_adversarial");
+    fs::create_dir_all(repo.join("src")).unwrap();
+    fs::create_dir_all(repo.join("docs")).unwrap();
+    fs::write(repo.join("src/allowed.rs"), "pub fn ok() -> u8 { 1 }\n").unwrap();
+    fs::write(repo.join("src/forbidden.rs"), "pub fn nope() -> u8 { 2 }\n").unwrap();
+    fs::write(repo.join("docs/internal.md"), "Internal design doc\n").unwrap();
+
+    let dag = r#"{
+      "plan_id": "PR2-DEEP-ADVERSARIAL",
+      "tasks": [
+        {
+          "id": "TASK-DEEP",
+          "wave": "W1",
+          "depends_on": [],
+          "domain_risk": "security_critical",
+          "assigned_read_paths": ["src/allowed.rs"],
+          "allowed_write_paths": ["src/allowed.rs"],
+          "assigned_tests": []
+        }
+      ]
+    }"#;
+    let plan = parse_and_validate_dag_json(dag).unwrap();
+    save_locked_plan(&repo, &plan, false).unwrap();
+
+    // 1. Minting Grunt capability binds the repo-scoped active slot (`active_session.json`).
+    //    Even when a harness passes a random UUID `session_id` without env vars, `handle_pre_tool_hook`
+    //    enforces Grunt's exact read/write/Bash/apply_patch jail!
+    let cap = mint_session_capability(&repo, SwarmRole::Grunt, "TASK-DEEP", 1).unwrap();
+
+    let allowed_read = agent_guard::handle_pre_tool_hook(
+        r#"{"session_id":"d94e6f18-4b0c-4a12-9f88-112233445566","tool_name":"Read","tool_input":{"file_path":"src/allowed.rs"}}"#,
+        &repo,
+    );
+    assert!(
+        allowed_read.is_allow(),
+        "in-scope Read under active slot must succeed: {allowed_read:?}"
+    );
+
+    let out_of_scope_bash_read = agent_guard::handle_pre_tool_hook(
+        r#"{"session_id":"d94e6f18-4b0c-4a12-9f88-112233445566","tool_name":"Bash","tool_input":{"command":"cat src/forbidden.rs"}}"#,
+        &repo,
+    );
+    assert!(
+        !out_of_scope_bash_read.is_allow(),
+        "Grunt Bash `cat src/forbidden.rs` must be blocked by check_role_shell_read_scope"
+    );
+
+    let out_of_scope_patch = agent_guard::handle_pre_tool_hook(
+        r#"{"session_id":"d94e6f18-4b0c-4a12-9f88-112233445566","tool_name":"apply_patch","tool_input":{"patch":"*** Begin Patch\n*** Update File: src/forbidden.rs\n@@\n-pub fn nope() -> u8 { 2 }\n+pub fn nope() -> u8 { 9 }\n*** End Patch\n"}}"#,
+        &repo,
+    );
+    assert!(
+        !out_of_scope_patch.is_allow(),
+        "Grunt apply_patch on unassigned file must be blocked"
+    );
+
+    // 2. Worker `swarm-tool master` namespace escalation (even via `env -u ...`) is hard-blocked at PreToolUse
+    let worker_escalate = enforce_role_pre_tool(
+        SwarmRole::Grunt,
+        Some(&cap),
+        "Bash",
+        &JsonValue::parse(
+            r#"{"command":"env -u AGENT_GUARD_ROLE -u AGENT_GUARD_SESSION_ID swarm-tool master lock-plan evil.json"}"#,
+        )
+        .unwrap(),
+        &repo,
+        &repo,
+    );
+    assert!(
+        worker_escalate.is_some_and(|d| !d.is_allow()),
+        "Grunt invoking `swarm-tool master` must be denied at PreToolUse"
+    );
+
+    // 3. Master shell rejects command chaining, pipes, and substitutions (`git status && ...`)
+    for chained_master_cmd in [
+        r#"{"command":"git status && cat src/forbidden.rs"}"#,
+        r#"{"command":"git log -n 5; python3 -c 'print(1)'"}"#,
+        r#"{"command":"swarm-tool master status | sh"}"#,
+        r#"{"command":"swarm-tool master ingest-packet \"$(cat src/forbidden.rs)\""}"#,
+    ] {
+        let dec = enforce_role_pre_tool(
+            SwarmRole::Master,
+            None,
+            "Bash",
+            &JsonValue::parse(chained_master_cmd).unwrap(),
+            &repo,
+            &repo,
+        );
+        assert!(
+            dec.is_some_and(|d| !d.is_allow()),
+            "chained/substituted Master command must be denied: {chained_master_cmd}"
+        );
+    }
+    let clean_master_cmd = enforce_role_pre_tool(
+        SwarmRole::Master,
+        None,
+        "Bash",
+        &JsonValue::parse(r#"{"command":"git status --short"}"#).unwrap(),
+        &repo,
+        &repo,
+    );
+    assert!(
+        clean_master_cmd.is_none(),
+        "clean unchained `git status --short` must be permitted by Master role gate"
+    );
+
+    // 4. Zero-write roles block `apply_patch` too
+    let inv_patch = enforce_role_pre_tool(
+        SwarmRole::Investigator,
+        None,
+        "apply_patch",
+        &JsonValue::parse(r#"{"patch":"*** Update File: src/allowed.rs\n"}"#).unwrap(),
+        &repo,
+        &repo,
+    );
+    assert!(inv_patch.is_some_and(|d| !d.is_allow()));
+
+    // 5. Tampering with capability JSON on disk invalidates HMAC and fails closed
+    let cap_path =
+        agent_guard::role_sandbox::session_capability_path(&repo, &cap.session_id).unwrap();
+    let tampered = fs::read_to_string(&cap_path)
+        .unwrap()
+        .replace("src/allowed.rs", "src/forbidden.rs");
+    fs::write(&cap_path, tampered).unwrap();
+    let load_err = agent_guard::role_sandbox::load_session_capability(&repo, &cap.session_id)
+        .expect_err("tampered capability JSON must fail HMAC verification");
+    assert!(load_err.contains("FORGED_SESSION_CAPABILITY"));
 }

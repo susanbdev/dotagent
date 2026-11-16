@@ -155,22 +155,22 @@
     {
       "id": "W2.A",
       "wave": "W2",
-      "title": "Author 6 Per-Role Skills & Explicit Role README Manuals (skills/swarm-*/{SKILL.md,README.md})",
+      "title": "Author 6 Per-Role Skills & Explicit Role Guides (skills/swarm-*/{SKILL.md,ROLE_GUIDE.md})",
       "depends_on": ["W1.A", "W1.B", "W1.D"],
       "domain_floor": 9,
       "allowed_write_paths": [
         "skills/swarm-master/SKILL.md",
-        "skills/swarm-master/README.md",
+        "skills/swarm-master/ROLE_GUIDE.md",
         "skills/swarm-investigator/SKILL.md",
-        "skills/swarm-investigator/README.md",
+        "skills/swarm-investigator/ROLE_GUIDE.md",
         "skills/swarm-qa-engineer/SKILL.md",
-        "skills/swarm-qa-engineer/README.md",
+        "skills/swarm-qa-engineer/ROLE_GUIDE.md",
         "skills/swarm-grunt/SKILL.md",
-        "skills/swarm-grunt/README.md",
+        "skills/swarm-grunt/ROLE_GUIDE.md",
         "skills/swarm-adversarial-reviewer/SKILL.md",
-        "skills/swarm-adversarial-reviewer/README.md",
+        "skills/swarm-adversarial-reviewer/ROLE_GUIDE.md",
         "skills/swarm-forensic-coroner/SKILL.md",
-        "skills/swarm-forensic-coroner/README.md"
+        "skills/swarm-forensic-coroner/ROLE_GUIDE.md"
       ],
       "assigned_read_paths": [
         "skills/zero-trust-guardrails/SKILL.md",

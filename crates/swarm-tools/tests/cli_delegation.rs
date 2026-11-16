@@ -62,6 +62,19 @@ fn end_to_end_swarm_tool_role_delegation_and_fail_closed_on_stop_cli() {
     )
     .unwrap();
     fs::write(
+        repo.join("tests/test_calc.py"),
+        concat!(
+            "import pathlib, unittest\n",
+            "class CalcBoundsTest(unittest.TestCase):\n",
+            "    def test_clamp_95(self):\n",
+            "        src = pathlib.Path('src/calc.rs').read_text(encoding='utf-8')\n",
+            "        self.assertIn('clamp(0, 95)', src)\n",
+            "if __name__ == '__main__':\n",
+            "    unittest.main()\n",
+        ),
+    )
+    .unwrap();
+    fs::write(
         repo.join("plan.dag.json"),
         r#"{
   "plan_id": "E2E-SWARM-DEMO",
@@ -71,7 +84,7 @@ fn end_to_end_swarm_tool_role_delegation_and_fail_closed_on_stop_cli() {
       "wave": "W1",
       "depends_on": [],
       "domain_risk": "security_critical",
-      "assigned_read_paths": ["src/calc.rs"],
+      "assigned_read_paths": ["src/calc.rs", "tests/test_calc.py"],
       "allowed_write_paths": ["src/calc.rs"],
       "assigned_tests": ["calc_bounds_test"]
     }
@@ -180,7 +193,8 @@ boundary_interfaces = []
         .unwrap();
     assert!(attr_out.status.success());
 
-    // 4. GRUNT: mint session -> verify `agent-guard on-stop` FAILS CLOSED (exit 2) before ledger!
+    // 4. GRUNT: mint session -> verify `agent-guard on-stop` FAILS CLOSED (exit 2) before ledger,
+    //    EVEN when neither AGENT_GUARD_ROLE nor AGENT_GUARD_SESSION_ID is passed in env!
     let grunt_mint = Command::new(swarm_tool_bin())
         .args([
             "master",
@@ -202,21 +216,37 @@ boundary_interfaces = []
         .unwrap()
         .to_string();
 
-    let premature_stop = Command::new(agent_guard_bin())
+    let premature_envless_stop = Command::new(agent_guard_bin())
         .arg("on-stop")
         .current_dir(&repo)
         .env("AGENT_GUARD_STATE_DIR", &state)
-        .env("AGENT_GUARD_ROLE", "grunt")
-        .env("AGENT_GUARD_SESSION_ID", &grunt_sid)
+        .env_remove("AGENT_GUARD_ROLE")
+        .env_remove("AGENT_GUARD_SESSION_ID")
         .output()
         .unwrap();
     assert_eq!(
-        premature_stop.status.code(),
+        premature_envless_stop.status.code(),
         Some(2),
-        "Grunt stopping without WORK_LEDGER receipt MUST fail closed with exit 2"
+        "Grunt stopping without env vars MUST still fail closed via active_session.json slot"
     );
 
-    // Grunt edits file, logs breadcrumb, runs checkpoint-green (`true`), and submits 2+2 ledger
+    // While Grunt slot is open, unauthenticated `swarm-tool master` escalation MUST fail closed
+    let grunt_master_escalate = Command::new(swarm_tool_bin())
+        .args(["master", "status"])
+        .current_dir(&repo)
+        .env("AGENT_GUARD_STATE_DIR", &state)
+        .env_remove("AGENT_GUARD_ROLE")
+        .env_remove("AGENT_GUARD_SESSION_ID")
+        .output()
+        .unwrap();
+    assert!(!grunt_master_escalate.status.success());
+    assert!(
+        String::from_utf8_lossy(&grunt_master_escalate.stderr).contains("ROLE_CAPABILITY_MISMATCH"),
+        "expected ROLE_CAPABILITY_MISMATCH on unauthenticated master call during Grunt slot, got: {}",
+        String::from_utf8_lossy(&grunt_master_escalate.stderr)
+    );
+
+    // Grunt edits file, logs breadcrumb, verifies `-- true` is rejected, runs real unittest checkpoint, and submits 2+2 ledger
     fs::write(
         repo.join("src/calc.rs"),
         "pub fn clamp_pct(v: u8) -> u8 { v.clamp(0, 95) }\n",
@@ -240,22 +270,52 @@ boundary_interfaces = []
             .unwrap()
             .success()
     );
+
+    let fake_true_checkpoint = Command::new(swarm_tool_bin())
+        .args([
+            "grunt",
+            "checkpoint-green",
+            "--session",
+            &grunt_sid,
+            "--",
+            "true",
+        ])
+        .current_dir(&repo)
+        .env("AGENT_GUARD_STATE_DIR", &state)
+        .output()
+        .unwrap();
+    assert!(!fake_true_checkpoint.status.success());
     assert!(
-        Command::new(swarm_tool_bin())
-            .args([
-                "grunt",
-                "checkpoint-green",
-                "--session",
-                &grunt_sid,
-                "--",
-                "true",
-            ])
-            .current_dir(&repo)
-            .env("AGENT_GUARD_STATE_DIR", &state)
-            .status()
-            .unwrap()
-            .success()
+        String::from_utf8_lossy(&fake_true_checkpoint.stderr)
+            .contains("INVALID_TEST_RUNNER_COMMAND"),
+        "expected INVALID_TEST_RUNNER_COMMAND on `-- true`, got: {}",
+        String::from_utf8_lossy(&fake_true_checkpoint.stderr)
     );
+
+    let real_checkpoint = Command::new(swarm_tool_bin())
+        .args([
+            "grunt",
+            "checkpoint-green",
+            "--session",
+            &grunt_sid,
+            "--",
+            "python3",
+            "-m",
+            "unittest",
+            "discover",
+            "-s",
+            "tests",
+        ])
+        .current_dir(&repo)
+        .env("AGENT_GUARD_STATE_DIR", &state)
+        .output()
+        .unwrap();
+    assert!(
+        real_checkpoint.status.success(),
+        "real unittest checkpoint stderr: {}",
+        String::from_utf8_lossy(&real_checkpoint.stderr)
+    );
+
     assert!(
         Command::new(swarm_tool_bin())
             .args([
@@ -275,13 +335,13 @@ boundary_interfaces = []
             .success()
     );
 
-    // Now `agent-guard on-stop` MUST PASS (exit 0)!
+    // Now `agent-guard on-stop` MUST PASS (exit 0) even without env vars, and close `active_session.json`!
     let valid_stop = Command::new(agent_guard_bin())
         .arg("on-stop")
         .current_dir(&repo)
         .env("AGENT_GUARD_STATE_DIR", &state)
-        .env("AGENT_GUARD_ROLE", "grunt")
-        .env("AGENT_GUARD_SESSION_ID", &grunt_sid)
+        .env_remove("AGENT_GUARD_ROLE")
+        .env_remove("AGENT_GUARD_SESSION_ID")
         .output()
         .unwrap();
     assert!(

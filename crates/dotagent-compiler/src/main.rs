@@ -247,25 +247,30 @@ fn validate_and_lock_skills(repo_root: &Path) -> Result<String, String> {
             sha256_hex(body.as_bytes()),
         );
 
-        let readme_path = p.join("README.md");
-        if strict_ascii && !readme_path.exists() {
+        if p.join("README.md").exists() {
             return Err(format!(
-                "Swarm role skill '{skill_name}' must include an explicit role manual 'README.md'"
+                "Nested 'skills/{skill_name}/README.md' is forbidden by Rule 2 hygiene; rename to 'ROLE_GUIDE.md'"
             ));
         }
-        if readme_path.exists() {
-            let readme_body = read_contained_regular_file(&skills_dir, &readme_path)
-                .map_err(|e| format!("invalid README.md in '{}': {e}", p.display()))?;
-            if readme_body.len() > MAX_ROLE_README_BYTES {
+        let guide_path = p.join("ROLE_GUIDE.md");
+        if strict_ascii && !guide_path.exists() {
+            return Err(format!(
+                "Swarm role skill '{skill_name}' must include an explicit role manual 'ROLE_GUIDE.md'"
+            ));
+        }
+        if guide_path.exists() {
+            let guide_body = read_contained_regular_file(&skills_dir, &guide_path)
+                .map_err(|e| format!("invalid ROLE_GUIDE.md in '{}': {e}", p.display()))?;
+            if guide_body.len() > MAX_ROLE_README_BYTES {
                 return Err(format!(
-                    "Skill role manual '{skill_name}/README.md' is {} bytes (> {MAX_ROLE_README_BYTES} byte limit)",
-                    readme_body.len()
+                    "Skill role manual '{skill_name}/ROLE_GUIDE.md' is {} bytes (> {MAX_ROLE_README_BYTES} byte limit)",
+                    guide_body.len()
                 ));
             }
-            validate_skill_doc_hygiene(&format!("{skill_name}/README.md"), &readme_body, true)?;
+            validate_skill_doc_hygiene(&format!("{skill_name}/ROLE_GUIDE.md"), &guide_body, true)?;
             skill_hashes.insert(
-                format!("skills/{skill_name}/README.md"),
-                sha256_hex(readme_body.as_bytes()),
+                format!("skills/{skill_name}/ROLE_GUIDE.md"),
+                sha256_hex(guide_body.as_bytes()),
             );
         }
     }
@@ -885,7 +890,7 @@ tools: Read, Bash
 disallowedTools: Write, Edit, MultiEdit, NotebookEdit, Grep, Glob, WebFetch, WebSearch
 maxTurns: 20
 ---
-You operate under `AGENT_GUARD_ROLE=master` and follow `skills/swarm-master/SKILL.md` (`skills/swarm-master/README.md`).
+You operate under `AGENT_GUARD_ROLE=master` and follow `skills/swarm-master/SKILL.md` (`skills/swarm-master/ROLE_GUIDE.md`).
 1. Never read, edit, or search repository source code directly (`agent-guard` blocks source access with exit 2).
 2. Lock wave DAGs via `swarm-tool master lock-plan <dag.json>` and mint scoped sessions via `swarm-tool master mint-session --role <role> --task <id> --attempt <n>`.
 3. Accept only typed worker JSON packets via `swarm-tool master ingest-packet`, wipe failed sessions for clean-slate `attempt + 1` retries, and escalate immediately to the human on the 4 mandatory triggers.
@@ -901,7 +906,7 @@ tools: Read, Grep, Glob, Bash
 disallowedTools: Write, Edit, MultiEdit, NotebookEdit, WebFetch, WebSearch
 maxTurns: 12
 ---
-You operate under `AGENT_GUARD_ROLE=investigator` and follow `skills/swarm-investigator/SKILL.md` (`skills/swarm-investigator/README.md`).
+You operate under `AGENT_GUARD_ROLE=investigator` and follow `skills/swarm-investigator/SKILL.md` (`skills/swarm-investigator/ROLE_GUIDE.md`).
 1. Zero file writes (`exit 2` on any mutation) and zero network access.
 2. Scout signatures safely up to 20 levels via `swarm-tool investigator scout --dir <rel_dir> --max-depth 20 [--filter <substr>]`; never touch `/tmp`, caches, `node_modules`, `.venv`, or `.env*`.
 3. Return findings strictly via `swarm-tool investigator emit-fact` (`<= 200` pure 7-bit ASCII tokens, `path:start-end` slices only).
@@ -917,7 +922,7 @@ tools: Read, Write, Edit, Grep, Glob, Bash
 disallowedTools: WebFetch, WebSearch
 maxTurns: 16
 ---
-You operate under `AGENT_GUARD_ROLE=qa-engineer` and follow `skills/swarm-qa-engineer/SKILL.md` (`skills/swarm-qa-engineer/README.md`).
+You operate under `AGENT_GUARD_ROLE=qa-engineer` and follow `skills/swarm-qa-engineer/SKILL.md` (`skills/swarm-qa-engineer/ROLE_GUIDE.md`).
 1. Write ONLY to test files (`tests/**`, `*_test.*`, `*.spec.*`) and `test_attribution.toml` (`QA_PRODUCTION_WRITE_FORBIDDEN` blocks production `src/` edits).
 2. Check domain-floored coverage targets (`92%` security floor) with `swarm-tool qa coverage-targets` and verify `1 / 0..2 / 0..N` suspect rules via `swarm-tool qa verify-attribution`.
 3. Isolate failing wave tests deterministically via `swarm-tool qa triangulate`.
@@ -933,7 +938,7 @@ tools: Read, Write, Edit, Bash
 disallowedTools: Grep, Glob, WebFetch, WebSearch
 maxTurns: 16
 ---
-You operate under `AGENT_GUARD_ROLE=grunt` and follow `skills/swarm-grunt/SKILL.md` (`skills/swarm-grunt/README.md`).
+You operate under `AGENT_GUARD_ROLE=grunt` and follow `skills/swarm-grunt/SKILL.md` (`skills/swarm-grunt/ROLE_GUIDE.md`).
 1. Zero repo search (`Grep`, `Glob`, `rg`, `grep`, `find`, `fd` exit 2). Check your exact scope via `swarm-tool grunt context`; if a needed file is missing, run `swarm-tool grunt report-blocker` and stop.
 2. Edit only `allowed_write_paths`, log signed breadcrumbs via `swarm-tool grunt record-edit`, and verify green tests via `swarm-tool grunt checkpoint-green -- <test_cmd>`.
 3. Before stopping, submit an exact `2+2` pure-ASCII sentence receipt via `swarm-tool grunt submit-ledger` (`agent-guard on-stop` fails closed without a matching green-tree receipt).
@@ -949,7 +954,7 @@ tools: Read, Grep, Glob, Bash
 disallowedTools: Write, Edit, MultiEdit, NotebookEdit, WebFetch, WebSearch
 maxTurns: 10
 ---
-You operate under `AGENT_GUARD_ROLE=adversarial-reviewer` and follow `skills/swarm-adversarial-reviewer/SKILL.md` (`skills/swarm-adversarial-reviewer/README.md`).
+You operate under `AGENT_GUARD_ROLE=adversarial-reviewer` and follow `skills/swarm-adversarial-reviewer/SKILL.md` (`skills/swarm-adversarial-reviewer/ROLE_GUIDE.md`).
 1. Zero file writes and zero raw URLs (`REVIEWER_EXFILTRATION_URL_BLOCKED` blocks URL exfiltration).
 2. Inspect receipts via `swarm-tool reviewer inspect --task <id>` and verify dependency pins offline via `swarm-tool reviewer lookup-doc --ecosystem <cargo|npm> --package <pkg> --version <ver>`.
 3. Record your decision via `swarm-tool reviewer verdict --task <id> --round <1|2> --decision <approve|reject> --notes "<ascii>"` (`round == 2` rejection auto-escalates to `Master`).
@@ -965,7 +970,7 @@ tools: Read, Bash
 disallowedTools: Write, Edit, MultiEdit, NotebookEdit, WebFetch, WebSearch
 maxTurns: 8
 ---
-You operate under `AGENT_GUARD_ROLE=forensic-coroner` and follow `skills/swarm-forensic-coroner/SKILL.md` (`skills/swarm-forensic-coroner/README.md`).
+You operate under `AGENT_GUARD_ROLE=forensic-coroner` and follow `skills/swarm-forensic-coroner/SKILL.md` (`skills/swarm-forensic-coroner/ROLE_GUIDE.md`).
 1. Spawned lazily only on smell badges or crashed sessions; strictly zero source/test writes and zero network access.
 2. Verify `.breadcrumbs.jsonl` full-field HMAC chains via `swarm-tool coroner verify-trail`, recover interrupted binary spools via `swarm-tool coroner recover-spool <session_id>`, and run `0`-LLM smell classification via `swarm-tool coroner triage --session <session_id>`.
 "#

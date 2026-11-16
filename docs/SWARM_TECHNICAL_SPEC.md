@@ -3,7 +3,7 @@
 - **Document ID**: `DOTAGENT-SPEC-SWARM-2.0`
 - **Status**: Canonical Baseline Agent Specification
 - **Repository**: `susanbdev/dotagent`
-- **Deliverables**: 6 Role Skill Packs (`skills/swarm-*/{SKILL.md, README.md}`) + Dedicated Rust Role CLI (`crates/swarm-tools` `swarm-tool`) + Multi-Harness Subagent Configs (`.claude/`, `.codex/`, `.cursor/`, `gemini`) + Lightweight [`agent-guard`](file:///home/antigravity/susanbdev/dotagent/crates/agent-guard/src/lib.rs) Hooks
+- **Deliverables**: 6 Role Skill Packs (`skills/swarm-*/{SKILL.md, ROLE_GUIDE.md}`) + Dedicated Rust Role CLI (`crates/swarm-tools` `swarm-tool`) + Multi-Harness Subagent Configs (`.claude/`, `.codex/`, `.cursor/`, `gemini`) + Lightweight [`agent-guard`](file:///home/antigravity/susanbdev/dotagent/crates/agent-guard/src/lib.rs) Hooks
 - **Subordinate To**: Root [`AGENTS.md`](file:///home/antigravity/susanbdev/dotagent/AGENTS.md) (`RING-1`) and [`spec.md`](file:///home/antigravity/susanbdev/dotagent/spec.md)
 
 ---
@@ -12,7 +12,7 @@
 
 Standard coding agent setups dump exploration, planning, implementation, testing, and code review into one long-lived `100k-200k` context window. Over multi-step features, context fills with search noise, lossy compaction drops constraints, untrusted code comments sit in the same prompt buffer as orchestration authority, and subagents routinely claim "tests pass" after making untested last-second edits.
 
-`susanbdev/dotagent` v2 solves this **entirely as a portable baseline of 6 Role Skill Packs (each with `SKILL.md` + explicit `README.md` manual), Dedicated Rust Role Tooling (`swarm-tool`), Subagent Definitions, and fast local `agent-guard` CLI hooks** that work out of the box on any repository or workstation--requiring zero external servers, zero custom VMs, and zero cloud lock-in.
+`susanbdev/dotagent` v2 solves this **entirely as a portable baseline of 6 Role Skill Packs (each with `SKILL.md` + explicit `ROLE_GUIDE.md` manual), Dedicated Rust Role Tooling (`swarm-tool`), Subagent Definitions, and fast local `agent-guard` CLI hooks** that work out of the box on any repository or workstation--requiring zero external servers, zero custom VMs, and zero cloud lock-in.
 
 > [!IMPORTANT]
 > **Clear Boundary (Skills & Hook Guard vs. Outer VM Platforms)**:
@@ -41,7 +41,7 @@ flowchart TD
 ```
 
 ### 2.1 Phase 1: Ruthless Scoping & Plan Lock
-1. **No Polite Guessing**: When requirements are incomplete or ambiguous, the `Master` skill (`skills/swarm-master/SKILL.md` + `README.md`) **must interrogate the human upfront without sparing feelings** until confident the plan can finish end-to-end. Starting on a weak spec and failing mid-run is unacceptable.
+1. **No Polite Guessing**: When requirements are incomplete or ambiguous, the `Master` skill (`skills/swarm-master/SKILL.md` + `ROLE_GUIDE.md`) **must interrogate the human upfront without sparing feelings** until confident the plan can finish end-to-end. Starting on a weak spec and failing mid-run is unacceptable.
 2. **Taint-Free Discovery**: `Master` delegates codebase reconnaissance to disposable read-only `Investigator` subagents (`swarm-tool investigator scout` / `emit-fact`) and consumes only structured `ObservedFact` receipts (`canonical_path:Lstart-Lend` + `doc_sha256`), keeping raw untrusted files out of the planning window.
 3. **Structured Plan (`PLAN.lock.json`)**: Locked via `swarm-tool master lock-plan`, containing a topological wave graph (`A, B, C` in parallel -> barrier `D`) with strictly disjoint `allowed_write_paths` per concurrent wave. Treated as hash-pinned task data (`SHA-256` verified on dispatch), never overriding [`AGENTS.md`](file:///home/antigravity/susanbdev/dotagent/AGENTS.md).
 
@@ -51,9 +51,9 @@ flowchart TD
 
 ---
 
-## 3. The 6 Explicit Roles (Dedicated Skill Packs + `README.md` Manuals + `swarm-tool` Rust CLI)
+## 3. The 6 Explicit Roles (Dedicated Skill Packs + `ROLE_GUIDE.md` Manuals + `swarm-tool` Rust CLI)
 
-Every role lives in its own folder under `skills/swarm-*/` with both `SKILL.md` (`<= 3 KiB`) and `README.md` (`<= 4 KiB` explicit job description, hard rules, and Rust commands):
+Every role lives in its own folder under `skills/swarm-*/` with both `SKILL.md` (`<= 3 KiB`) and `ROLE_GUIDE.md` (`<= 4 KiB` explicit job description, hard rules, and Rust commands):
 
 | Role & Skill Folder | Read / Search Scope | Write Scope | Rust CLI (`swarm-tool`) | Core Discipline |
 | :--- | :--- | :--- | :--- | :--- |

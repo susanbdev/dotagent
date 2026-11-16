@@ -475,10 +475,12 @@ fn blocks_token_exhaustion_files_output_floods_and_json_surrogate_tags() {
         other => panic!("Expected TOOL_OUTPUT_FLOOD_BLOCKED, got {other:?}"),
     }
 
-    // 3. JSON UTF-16 surrogate pair smuggling Unicode Tag U+E0041 (`\udb40\udc41`) -> blocked!
+    // 3. JSON UTF-16 surrogate pair smuggling Unicode Tag U+E0041 (surrogates db40 + dc41) -> blocked!
+    let surrogate_tag = concat!("\\", "udb40", "\\", "udc41");
     let surrogate_hook = format!(
-        r#"{{"session_id":"s_tag","cwd":"{}","tool_name":"Write","tool_input":{{"file_path":"src/main.rs","content":"fn main() {{ /* \udb40\udc41 */ }}"}}}}"#,
-        repo.display()
+        r#"{{"session_id":"s_tag","cwd":"{}","tool_name":"Write","tool_input":{{"file_path":"src/main.rs","content":"fn main() {{ /* {} */ }}"}}}}"#,
+        repo.display(),
+        surrogate_tag
     );
     match handle_pre_tool_hook(&surrogate_hook, &repo) {
         Decision::Deny { code, .. } => assert_eq!(code, "UNICODE_TAG_SMUGGLING"),

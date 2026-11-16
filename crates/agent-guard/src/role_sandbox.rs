@@ -18,7 +18,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::Decision;
-use crate::breadcrumbs::{append_breadcrumb_for_path, sha256_digest, swarm_state_dir};
+use crate::breadcrumbs::{
+    append_breadcrumb_for_path, compute_arbitrary_hmac_hex, sha256_digest, swarm_state_dir,
+};
 use crate::budget_guard::estimate_bpe_tokens;
 use crate::json::JsonValue;
 use crate::path_policy::{PathAccess, check_forbidden_zones_lexical, validate_path_with_max_depth};
@@ -29,6 +31,114 @@ use crate::swarm_contracts::{
     WorkerPacket, hex_decode_32, hex_encode,
 };
 use crate::unicode_guard::{ScanMode, scan_unicode};
+
+const CAPABILITY_HMAC_DOMAIN: &[u8] = b"DOTAGENT_SESSION_CAPABILITY_V1";
+const ACTIVE_SLOT_HMAC_DOMAIN: &[u8] = b"DOTAGENT_ACTIVE_SESSION_SLOT_V1";
+
+fn compute_capability_mac_hex(repo_root: &Path, cap: &SessionCapability) -> Result<String, String> {
+    let mut payload = Vec::with_capacity(256);
+    let push_str = |buf: &mut Vec<u8>, s: &str| {
+        buf.extend_from_slice(&(s.len() as u32).to_be_bytes());
+        buf.extend_from_slice(s.as_bytes());
+    };
+    let push_vec = |buf: &mut Vec<u8>, items: &[String]| {
+        buf.extend_from_slice(&(items.len() as u32).to_be_bytes());
+        for item in items {
+            buf.extend_from_slice(&(item.len() as u32).to_be_bytes());
+            buf.extend_from_slice(item.as_bytes());
+        }
+    };
+
+    push_str(&mut payload, &cap.session_id);
+    push_str(&mut payload, cap.role.as_str_id());
+    push_str(&mut payload, &cap.task_id);
+    payload.extend_from_slice(&cap.attempt.to_be_bytes());
+    push_str(&mut payload, &cap.repo_sha256);
+    push_str(&mut payload, &cap.plan_sha256);
+    push_vec(&mut payload, &cap.assigned_read_paths);
+    push_vec(&mut payload, &cap.allowed_write_paths);
+    push_vec(&mut payload, &cap.assigned_tests);
+    match &cap.last_green_tree_oid {
+        Some(oid) => {
+            payload.push(1);
+            push_str(&mut payload, oid);
+        }
+        None => payload.push(0),
+    }
+    payload.extend_from_slice(&cap.consecutive_test_failures.to_be_bytes());
+    payload.extend_from_slice(&cap.blocked_scope_attempts.to_be_bytes());
+    payload.extend_from_slice(&cap.malicious_flags.to_be_bytes());
+
+    compute_arbitrary_hmac_hex(repo_root, CAPABILITY_HMAC_DOMAIN, &payload)
+}
+
+pub fn active_session_slot_path(repo_root: &Path) -> Result<PathBuf, String> {
+    Ok(swarm_state_dir(repo_root)?.join("active_session.json"))
+}
+
+pub fn set_active_session_slot(repo_root: &Path, session_id: &str) -> Result<(), String> {
+    let path = active_session_slot_path(repo_root)?;
+    let mac =
+        compute_arbitrary_hmac_hex(repo_root, ACTIVE_SLOT_HMAC_DOMAIN, session_id.as_bytes())?;
+    let obj = JsonValue::Object(vec![
+        (
+            "active_session_id".to_string(),
+            JsonValue::Str(session_id.to_string()),
+        ),
+        ("record_mac".to_string(), JsonValue::Str(mac)),
+    ]);
+    fs::write(&path, format!("{}\n", obj.to_json_string()))
+        .map_err(|e| format!("failed writing active_session.json: {e}"))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(&path, fs::Permissions::from_mode(0o600));
+    }
+    Ok(())
+}
+
+pub fn clear_active_session_slot(repo_root: &Path) -> Result<(), String> {
+    let path = active_session_slot_path(repo_root)?;
+    if path.exists() {
+        fs::remove_file(&path).map_err(|e| format!("failed clearing active_session.json: {e}"))?;
+    }
+    Ok(())
+}
+
+pub fn load_active_session_slot(repo_root: &Path) -> Result<Option<SessionCapability>, String> {
+    let path = active_session_slot_path(repo_root)?;
+    if !path.exists() {
+        return Ok(None);
+    }
+    let raw = fs::read_to_string(&path)
+        .map_err(|e| format!("FORGED_ACTIVE_SESSION_SLOT: cannot read active_session.json: {e}"))?;
+    let v = JsonValue::parse(&raw)
+        .map_err(|e| format!("FORGED_ACTIVE_SESSION_SLOT: corrupt active_session.json: {e}"))?;
+    let sid = v
+        .get("active_session_id")
+        .and_then(JsonValue::as_str)
+        .filter(|s| !s.trim().is_empty())
+        .ok_or_else(|| {
+            "FORGED_ACTIVE_SESSION_SLOT: missing active_session_id in active_session.json"
+                .to_string()
+        })?;
+    let recorded_mac = v
+        .get("record_mac")
+        .and_then(JsonValue::as_str)
+        .ok_or_else(|| {
+            "FORGED_ACTIVE_SESSION_SLOT: missing record_mac in active_session.json".to_string()
+        })?;
+    let expected_mac =
+        compute_arbitrary_hmac_hex(repo_root, ACTIVE_SLOT_HMAC_DOMAIN, sid.as_bytes())?;
+    if recorded_mac != expected_mac {
+        return Err(
+            "FORGED_ACTIVE_SESSION_SLOT: active_session.json HMAC authentication failed"
+                .to_string(),
+        );
+    }
+    let cap = load_session_capability(repo_root, sid)?;
+    Ok(Some(cap))
+}
 
 pub fn sessions_dir(repo_root: &Path) -> Result<PathBuf, String> {
     let dir = swarm_state_dir(repo_root)?.join("sessions");
@@ -109,6 +219,9 @@ pub fn mint_session_capability(
         malicious_flags: 0,
     };
     save_session_capability(&canon_repo, &cap)?;
+    if role != SwarmRole::Master {
+        set_active_session_slot(&canon_repo, &session_id)?;
+    }
 
     let plan_bytes = hex_decode_32(&locked.plan_sha256).unwrap_or([0u8; 32]);
     let _ = append_breadcrumb_for_path(
@@ -127,6 +240,7 @@ pub fn mint_session_capability(
 
 pub fn save_session_capability(repo_root: &Path, cap: &SessionCapability) -> Result<(), String> {
     let path = session_capability_path(repo_root, &cap.session_id)?;
+    let record_mac = compute_capability_mac_hex(repo_root, cap)?;
     let obj = JsonValue::Object(vec![
         (
             "session_id".to_string(),
@@ -198,6 +312,7 @@ pub fn save_session_capability(repo_root: &Path, cap: &SessionCapability) -> Res
             "malicious_flags".to_string(),
             JsonValue::Number(f64::from(cap.malicious_flags)),
         ),
+        ("record_mac".to_string(), JsonValue::Str(record_mac)),
     ]);
     fs::write(&path, format!("{}\n", obj.to_json_string()))
         .map_err(|e| format!("failed writing session capability: {e}"))?;
@@ -236,11 +351,11 @@ pub fn load_session_capability(
             .unwrap_or_default()
     };
 
-    Ok(SessionCapability {
+    let cap = SessionCapability {
         session_id: v
             .get("session_id")
             .and_then(JsonValue::as_str)
-            .unwrap_or(session_id)
+            .unwrap_or("")
             .to_string(),
         role,
         task_id: v
@@ -278,7 +393,28 @@ pub fn load_session_capability(
             .get("malicious_flags")
             .and_then(JsonValue::as_u64)
             .unwrap_or(0) as u32,
-    })
+    };
+
+    if cap.session_id != session_id {
+        return Err(format!(
+            "FORGED_SESSION_CAPABILITY: session_id mismatch (expected '{session_id}', found '{}')",
+            cap.session_id
+        ));
+    }
+    let recorded_mac = v
+        .get("record_mac")
+        .and_then(JsonValue::as_str)
+        .ok_or_else(|| {
+            format!("FORGED_SESSION_CAPABILITY: missing record_mac on session '{session_id}'")
+        })?;
+    let expected_mac = compute_capability_mac_hex(repo_root, &cap)?;
+    if recorded_mac != expected_mac {
+        return Err(format!(
+            "FORGED_SESSION_CAPABILITY: HMAC verification failed for session '{session_id}'"
+        ));
+    }
+
+    Ok(cap)
 }
 
 pub fn list_session_capabilities(repo_root: &Path) -> Result<Vec<SessionCapability>, String> {
@@ -299,36 +435,78 @@ pub fn list_session_capabilities(repo_root: &Path) -> Result<Vec<SessionCapabili
     Ok(out)
 }
 
-/// Resolves active `SwarmRole` and optional minted `SessionCapability` for a hook turn.
-/// When a minted capability exists for `session_id`, `AGENT_GUARD_ROLE` (if set) MUST
-/// match `cap.role`; attempts to downgrade or spoof a different role fail closed.
+/// Resolves active `SwarmRole` and optional minted `SessionCapability` for a hook turn:
+/// 1. Explicit Swarm `session_id` (`AGENT_GUARD_SESSION_ID` or `"swm_*"` hook ID) -> fail-closed HMAC check.
+/// 2. Active repo-scoped capability slot (`active_session.json`) -> enforces worker jail even when
+///    Claude Code / Gemini / Cursor pass their own UUID `session_id` without subagent env inheritance.
+/// 3. Ambient `AGENT_GUARD_ROLE`, defaulting to `StandardCoding` when no Swarm session is active.
 pub fn resolve_active_role(
     repo_root: &Path,
     session_id: &str,
 ) -> Result<(SwarmRole, Option<SessionCapability>), String> {
-    let cap = load_session_capability(repo_root, session_id).ok();
-    if let Ok(raw_role) = std::env::var("AGENT_GUARD_ROLE") {
-        let trimmed = raw_role.trim();
-        if !trimmed.is_empty() {
-            let env_role = SwarmRole::from_str_id(trimmed)
-                .ok_or_else(|| format!("unrecognized AGENT_GUARD_ROLE '{trimmed}'"))?;
-            if let Some(ref c) = cap {
-                if env_role != c.role {
-                    return Err(format!(
-                        "ROLE_CAPABILITY_MISMATCH: AGENT_GUARD_ROLE '{}' conflicts with minted session '{}' capability role '{}'",
-                        env_role.as_str_id(),
-                        c.session_id,
-                        c.role.as_str_id()
-                    ));
-                }
+    let env_role = match std::env::var("AGENT_GUARD_ROLE") {
+        Ok(raw_role) if !raw_role.trim().is_empty() => {
+            let trimmed = raw_role.trim();
+            Some(
+                SwarmRole::from_str_id(trimmed)
+                    .ok_or_else(|| format!("unrecognized AGENT_GUARD_ROLE '{trimmed}'"))?,
+            )
+        }
+        _ => None,
+    };
+
+    let explicit_sid = std::env::var("AGENT_GUARD_SESSION_ID")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            let hs = session_id.trim();
+            if hs.starts_with("swm_") {
+                Some(hs.to_string())
+            } else {
+                None
             }
-            return Ok((env_role, cap));
+        });
+
+    if let Some(sid) = explicit_sid {
+        let cap = load_session_capability(repo_root, &sid)?;
+        if let Some(er) = env_role {
+            if er != cap.role {
+                return Err(format!(
+                    "ROLE_CAPABILITY_MISMATCH: AGENT_GUARD_ROLE '{}' conflicts with minted session '{}' capability role '{}'",
+                    er.as_str_id(),
+                    c_id(&cap),
+                    cap.role.as_str_id()
+                ));
+            }
+        }
+        return Ok((cap.role, Some(cap)));
+    }
+
+    if let Some(slot_cap) = load_active_session_slot(repo_root)? {
+        match env_role {
+            None => return Ok((slot_cap.role, Some(slot_cap))),
+            Some(er) if er == slot_cap.role => return Ok((slot_cap.role, Some(slot_cap))),
+            Some(SwarmRole::Master) => return Ok((SwarmRole::Master, None)),
+            Some(er) => {
+                return Err(format!(
+                    "ROLE_CAPABILITY_MISMATCH: AGENT_GUARD_ROLE '{}' conflicts with active repo capability slot '{}' (role '{}')",
+                    er.as_str_id(),
+                    slot_cap.session_id,
+                    slot_cap.role.as_str_id()
+                ));
+            }
         }
     }
-    if let Some(c) = cap {
-        return Ok((c.role, Some(c)));
+
+    if let Some(er) = env_role {
+        return Ok((er, None));
     }
     Ok((SwarmRole::StandardCoding, None))
+}
+
+fn c_id(cap: &SessionCapability) -> &str {
+    &cap.session_id
 }
 
 /// Returns the permitted directory walk depth for `role` (`20` for `Investigator`, `2` otherwise).
@@ -368,6 +546,8 @@ pub fn enforce_role_pre_tool(
             | "replace_file_content"
             | "multi_replace_file_content"
             | "notebookedit"
+            | "apply_patch"
+            | "patch"
     );
     let is_search_tool = matches!(
         norm.as_str(),
@@ -388,6 +568,14 @@ pub fn enforce_role_pre_tool(
             | "beforeshellexecution"
     ) || (norm.is_empty()
         && (input.get("command").is_some() || input.get("CommandLine").is_some()));
+
+    if is_shell_tool {
+        if let Some(cmd) = extract_cmd_arg(input) {
+            if let Some(ns_denial) = check_role_swarm_tool_namespace(role, cmd) {
+                return Some(ns_denial);
+            }
+        }
+    }
 
     match role {
         SwarmRole::Master => {
@@ -428,7 +616,7 @@ pub fn enforce_role_pre_tool(
                     if !is_allowed_master_shell(cmd) {
                         return Some(Decision::deny(
                             "MASTER_SHELL_RESTRICTED",
-                            "Swarm Master shell access is restricted to `swarm-tool master ...` orchestration commands.",
+                            "Swarm Master shell access is restricted to single unchained `swarm-tool master ...`, `git status`, or `git log` commands.",
                             false,
                         ));
                     }
@@ -457,7 +645,15 @@ pub fn enforce_role_pre_tool(
 
         SwarmRole::QaEngineer => {
             if is_write_tool {
-                if let Some(raw_p) = extract_path_arg(input) {
+                let targets = extract_all_write_targets(&norm, input);
+                if targets.is_empty() {
+                    return Some(Decision::deny(
+                        "MISSING_WRITE_TARGETS",
+                        "QA Engineer write/patch invocation missing recognizable target file paths.",
+                        false,
+                    ));
+                }
+                for raw_p in &targets {
                     if let Ok(valid) =
                         validate_path_with_max_depth(repo_root, cwd, raw_p, PathAccess::Write, 2)
                     {
@@ -523,7 +719,15 @@ pub fn enforce_role_pre_tool(
                 }
             }
             if is_write_tool {
-                if let Some(raw_p) = extract_path_arg(input) {
+                let targets = extract_all_write_targets(&norm, input);
+                if targets.is_empty() {
+                    return Some(Decision::deny(
+                        "MISSING_WRITE_TARGETS",
+                        "Grunt write/patch invocation missing recognizable target file paths.",
+                        false,
+                    ));
+                }
+                for raw_p in &targets {
                     if let Ok(valid) =
                         validate_path_with_max_depth(repo_root, cwd, raw_p, PathAccess::Write, 2)
                     {
@@ -656,6 +860,61 @@ pub fn check_role_shell_write_scope(
             Ok(())
         }
         SwarmRole::StandardCoding => Ok(()),
+    }
+}
+
+pub fn check_role_shell_read_scope(
+    role: SwarmRole,
+    cap: Option<&SessionCapability>,
+    read_rel_paths: &[String],
+    repo_root: &Path,
+) -> Result<(), Decision> {
+    if read_rel_paths.is_empty() {
+        return Ok(());
+    }
+    match role {
+        SwarmRole::Master => {
+            for rel in read_rel_paths {
+                if !is_master_readable_doc_or_skill(rel) {
+                    return Err(Decision::deny(
+                        "MASTER_SOURCE_READ_FORBIDDEN",
+                        format!(
+                            "Swarm Master shell command attempted to read source file '{rel}'."
+                        ),
+                        false,
+                    ));
+                }
+            }
+            Ok(())
+        }
+        SwarmRole::Grunt => {
+            let Some(c) = cap else {
+                return Err(Decision::deny(
+                    "GRUNT_MISSING_CAPABILITY",
+                    "Swarm Grunt shell read requires a Master-minted SessionCapability.",
+                    true,
+                ));
+            };
+            for rel in read_rel_paths {
+                if !is_grunt_path_in_read_scope(rel, c) {
+                    bump_blocked_scope(repo_root, c);
+                    return Err(Decision::deny(
+                        "GRUNT_READ_OUT_OF_SCOPE",
+                        format!(
+                            "Grunt shell read '{rel}' is outside session '{}' assigned_read_paths.",
+                            c.session_id
+                        ),
+                        false,
+                    ));
+                }
+            }
+            Ok(())
+        }
+        SwarmRole::Investigator
+        | SwarmRole::QaEngineer
+        | SwarmRole::AdversarialReviewer
+        | SwarmRole::ForensicCoroner
+        | SwarmRole::StandardCoding => Ok(()),
     }
 }
 
@@ -1076,7 +1335,7 @@ pub fn is_qa_writable_path(repo_rel: &str) -> bool {
 fn is_grunt_path_in_read_scope(repo_rel: &str, cap: &SessionCapability) -> bool {
     if repo_rel == "AGENTS.md"
         || repo_rel == "skills/swarm-grunt/SKILL.md"
-        || repo_rel == "skills/swarm-grunt/README.md"
+        || repo_rel == "skills/swarm-grunt/ROLE_GUIDE.md"
     {
         return true;
     }
@@ -1112,13 +1371,207 @@ pub fn path_matches_any_scope(repo_rel: &str, patterns: &[String]) -> bool {
     false
 }
 
+fn tokenize_unchained_shell_words(cmd: &str) -> Option<Vec<String>> {
+    let mut words = Vec::new();
+    let mut cur = String::new();
+    let mut in_word = false;
+    let mut chars = cmd.chars().peekable();
+    let mut quote: Option<char> = None;
+
+    while let Some(ch) = chars.next() {
+        if ch == '\0' || ch == '\r' || ch == '\n' {
+            return None;
+        }
+        match quote {
+            Some('\'') => {
+                if ch == '\'' {
+                    quote = None;
+                } else {
+                    cur.push(ch);
+                }
+            }
+            Some('"') => {
+                if ch == '"' {
+                    quote = None;
+                } else if ch == '$' || ch == '`' {
+                    return None;
+                } else if ch == '\\' {
+                    let next = chars.next()?;
+                    cur.push(next);
+                } else {
+                    cur.push(ch);
+                }
+            }
+            Some(_) => return None,
+            None => match ch {
+                '\'' | '"' => {
+                    quote = Some(ch);
+                    in_word = true;
+                }
+                c if c.is_ascii_whitespace() => {
+                    if in_word {
+                        words.push(std::mem::take(&mut cur));
+                        in_word = false;
+                    }
+                }
+                ';' | '|' | '&' | '<' | '>' | '(' | ')' | '`' | '$' => return None,
+                '\\' => {
+                    let next = chars.next()?;
+                    if next == '\n' || next == '\r' {
+                        return None;
+                    }
+                    in_word = true;
+                    cur.push(next);
+                }
+                other => {
+                    in_word = true;
+                    cur.push(other);
+                }
+            },
+        }
+    }
+
+    if quote.is_some() {
+        return None;
+    }
+    if in_word {
+        words.push(cur);
+    }
+    if words.is_empty() { None } else { Some(words) }
+}
+
 fn is_allowed_master_shell(cmd: &str) -> bool {
-    let trimmed = cmd.trim();
-    trimmed.starts_with("swarm-tool master")
-        || trimmed.starts_with("cargo run -p swarm-tools -- master")
-        || trimmed.starts_with("cargo run --bin swarm-tool -- master")
-        || trimmed.starts_with("git status")
-        || trimmed.starts_with("git log")
+    let Some(tokens) = tokenize_unchained_shell_words(cmd.trim()) else {
+        return false;
+    };
+    let first_base = tokens[0].rsplit('/').next().unwrap_or(tokens[0].as_str());
+    if first_base == "swarm-tool" {
+        return tokens.get(1).is_some_and(|sub| sub == "master");
+    }
+    if tokens.len() >= 6
+        && tokens[0] == "cargo"
+        && tokens[1] == "run"
+        && ((tokens[2] == "-p" && tokens[3] == "swarm-tools")
+            || (tokens[2] == "--bin" && tokens[3] == "swarm-tool"))
+        && tokens[4] == "--"
+        && tokens[5] == "master"
+    {
+        return true;
+    }
+    if tokens[0] == "git" && tokens.get(1).is_some_and(|s| s == "status") {
+        return tokens[2..]
+            .iter()
+            .all(|t| t.starts_with('-') && !t.starts_with("--output"));
+    }
+    if tokens[0] == "git" && tokens.get(1).is_some_and(|s| s == "log") {
+        return tokens[2..].iter().all(|t| {
+            (t.starts_with('-') && !t.starts_with("--output"))
+                || t.chars().all(|c| c.is_ascii_digit())
+        });
+    }
+    false
+}
+
+fn check_role_swarm_tool_namespace(role: SwarmRole, cmd: &str) -> Option<Decision> {
+    let expected_ns = match role {
+        SwarmRole::Master => "master",
+        SwarmRole::Investigator => "investigator",
+        SwarmRole::QaEngineer => "qa",
+        SwarmRole::Grunt => "grunt",
+        SwarmRole::AdversarialReviewer => "reviewer",
+        SwarmRole::ForensicCoroner => "coroner",
+        SwarmRole::StandardCoding => return None,
+    };
+
+    for seg in cmd.split(['|', ';', '&', '\n', '(', '`']) {
+        let words: Vec<&str> = seg.split_whitespace().collect();
+        if words.is_empty() {
+            continue;
+        }
+        // Skip leading `env`, flags to `env`, or `KEY=VAL` assignments
+        let mut idx = 0usize;
+        while idx < words.len() {
+            let w = words[idx].trim_matches(['"', '\'']);
+            let base = w.rsplit('/').next().unwrap_or(w);
+            if base == "env" {
+                idx += 1;
+                while idx < words.len() {
+                    let ew = words[idx].trim_matches(['"', '\'']);
+                    if ew == "-u" || ew == "--unset" {
+                        idx += 2;
+                    } else if ew.starts_with('-') || ew.contains('=') {
+                        idx += 1;
+                    } else {
+                        break;
+                    }
+                }
+                continue;
+            }
+            if w.contains('=') && !w.starts_with('-') {
+                idx += 1;
+                continue;
+            }
+            break;
+        }
+        if idx >= words.len() {
+            continue;
+        }
+        let bin = words[idx].trim_matches(['"', '\'']);
+        let base = bin.rsplit('/').next().unwrap_or(bin);
+        let invoked_ns = if base == "swarm-tool" {
+            words.get(idx + 1).map(|s| s.trim_matches(['"', '\'']))
+        } else if base == "cargo"
+            && words.get(idx + 1).copied() == Some("run")
+            && seg.contains("swarm-tool")
+        {
+            words
+                .iter()
+                .skip(idx + 2)
+                .position(|&w| w == "--")
+                .and_then(|rel_sep| words.get(idx + 2 + rel_sep + 1))
+                .map(|s| s.trim_matches(['"', '\'']))
+        } else {
+            None
+        };
+
+        if let Some(ns) = invoked_ns {
+            if !matches!(ns, "--help" | "-h" | "help") && ns != expected_ns {
+                return Some(Decision::deny(
+                    "ROLE_NAMESPACE_ESCALATION_BLOCKED",
+                    format!(
+                        "Role '{}' cannot invoke `swarm-tool {ns}` (permitted namespace: `swarm-tool {expected_ns}`).",
+                        role.as_str_id()
+                    ),
+                    true,
+                ));
+            }
+        }
+    }
+    None
+}
+
+fn extract_all_write_targets(norm_tool: &str, v: &JsonValue) -> Vec<String> {
+    if matches!(norm_tool, "apply_patch" | "patch") {
+        for k in [
+            "patch",
+            "input",
+            "diff",
+            "content",
+            "raw_patch",
+            "patchText",
+        ] {
+            if let Some(body) = v.get(k).and_then(JsonValue::as_str) {
+                return crate::extract_patch_target_paths(body);
+            }
+        }
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    if let Some(p) = extract_path_arg(v) {
+        out.push(p.to_string());
+    }
+    crate::collect_nested_path_fields(v, &mut out);
+    out
 }
 
 fn shell_contains_search_binary(cmd: &str) -> bool {
