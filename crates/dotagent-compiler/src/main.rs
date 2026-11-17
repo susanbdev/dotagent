@@ -59,6 +59,7 @@ fn main() -> ExitCode {
 fn build_all(repo_root: &Path) -> Result<usize, String> {
     let skills_lock_json = validate_and_lock_skills(repo_root)?;
     validate_profiles(repo_root)?;
+    validate_workflows(repo_root)?;
 
     let skills_lock_path = repo_root.join("skills").join("manifest.lock.json");
     write_file_contained(repo_root, &skills_lock_path, &skills_lock_json)?;
@@ -90,6 +91,7 @@ fn build_all(repo_root: &Path) -> Result<usize, String> {
 fn verify_all(repo_root: &Path) -> Result<usize, String> {
     let expected_skills_lock = validate_and_lock_skills(repo_root)?;
     validate_profiles(repo_root)?;
+    validate_workflows(repo_root)?;
 
     let actual_skills_lock = read_contained_regular_file(
         repo_root,
@@ -299,6 +301,16 @@ fn validate_profiles(repo_root: &Path) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+fn validate_workflows(repo_root: &Path) -> Result<(), String> {
+    let mut failures = Vec::new();
+    agent_guard::audit_github_workflows(repo_root, &mut failures);
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(failures.join("; "))
+    }
 }
 
 /// Built-in deterministic policy gate matching `policy-hub/rego/dotagent_harness.rego`.
@@ -554,6 +566,11 @@ dist-packages/
 Pods/
 Carthage/
 .bundle/
+
+# Build artifact directories (Cargo uses target/ internally; agent read/search/index excluded)
+target/
+build/
+dist-build/
 target/debug/deps/
 target/release/deps/
 
@@ -627,6 +644,9 @@ fn render_claude_settings() -> String {
   "permissions": {
     "allow": [],
     "deny": [
+      "Task",
+      "Agent",
+      "Subagent",
       "Read(/tmp/**)",
       "Read(/var/tmp/**)",
       "Read(/dev/shm/**)",
@@ -645,6 +665,9 @@ fn render_claude_settings() -> String {
       "Read(**/.venv/**)",
       "Read(**/venv/**)",
       "Read(**/site-packages/**)",
+      "Read(**/target/**)",
+      "Read(**/build/**)",
+      "Read(**/dist-build/**)",
       "Read(.env)",
       "Read(.env.*)",
       "Read(.env*)",
@@ -695,7 +718,20 @@ fn render_claude_settings() -> String {
       "Bash(sudo *)",
       "Bash(mktemp*)",
       "Bash(npx *)",
+      "Bash(python*)",
+      "Bash(python3*)",
+      "Bash(uv run*)",
+      "Bash(uvx *)",
+      "Bash(node *)",
+      "Bash(bun *)",
+      "Bash(deno *)",
+      "Bash(perl *)",
+      "Bash(ruby *)",
+      "Bash(gh workflow run*)",
       "Bash(git push*)",
+      "Bash(git remote*)",
+      "Bash(git config*)",
+      "Bash(git -c *)",
       "Bash(git rebase*)",
       "Bash(git reset --hard*)",
       "Bash(git commit --amend*)",
@@ -993,6 +1029,15 @@ deny contains msg if {
 deny contains msg if {
     object.get(input, "autoMemoryEnabled", false) == true
     msg := "autoMemoryEnabled must be false to prevent cross-session cache bleed"
+}
+
+forbidden_workflow_triggers := {"workflow_run", "workflow_call", "repository_dispatch"}
+
+deny contains msg if {
+    some trigger in forbidden_workflow_triggers
+    on_cfg := object.get(object.get(input, "workflow", {}), "on", {})
+    object.get(on_cfg, trigger, null) != null
+    msg := sprintf("chained GitHub Actions trigger '%s' is strictly forbidden", [trigger])
 }
 "#
     .to_string()

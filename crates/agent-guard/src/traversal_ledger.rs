@@ -291,6 +291,27 @@ impl SessionLedger {
         }
     }
 
+    /// Checks that a search target (`Grep`, `rg`, `grep`) has not already been placed
+    /// beyond `MAX_REFERENCE_LEVEL` by an `A -> B -> C` file-read chain, without burning
+    /// `file_reads` budget or advancing instruction-traversal hop depth.
+    pub fn check_search_target(&self, rel_path: &str) -> Result<(), (&'static str, String)> {
+        if let Err(msg) = self.check_not_halted() {
+            return Err(("SESSION_CIRCUIT_BREAKER_HALTED", msg));
+        }
+        if let Some(existing) = self.nodes.get(rel_path) {
+            if existing.level > MAX_REFERENCE_LEVEL {
+                return Err((
+                    "TRANSITIVE_DEPTH_EXCEEDED",
+                    format!(
+                        "Transitive reference chain '{} -> {rel_path}' reaches level {} (> max {MAX_REFERENCE_LEVEL} levels: A -> B allowed, B -> C forbidden). Stop immediately and ask the user.",
+                        existing.chain, existing.level
+                    ),
+                ));
+            }
+        }
+        Ok(())
+    }
+
     /// Registers repository pointers discovered inside dynamic `PostToolUse` outputs
     /// (MCP responses, custom tools, etc.) so subsequent `Read` calls cannot bypass
     /// the `A -> B -> C` transitive hop ceiling.
@@ -308,12 +329,18 @@ impl SessionLedger {
                 | "run_shell_command"
                 | "execute_command"
                 | "grep"
-                | "glob"
-                | "ls"
                 | "grep_search"
+                | "rg"
+                | "ripgrep"
+                | "fd"
+                | "fdfind"
+                | "glob"
+                | "find"
                 | "find_by_name"
+                | "ls"
                 | "list_dir"
                 | "list_directory"
+                | "tree"
         );
         if is_local_discovery {
             for target in targets {

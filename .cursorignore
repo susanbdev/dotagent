@@ -46,12 +46,18 @@ dist-packages/
 Pods/
 Carthage/
 .bundle/
+
+# Build artifact directories (Cargo uses target/ internally; agent read/search/index excluded)
+target/
+build/
+dist-build/
 target/debug/deps/
 target/release/deps/
 
 # Secrets, credentials, & agent-guard internal state
 .env
 .env.*
+.env*
 *.pem
 *.key
 *.p12

@@ -138,6 +138,7 @@ pub fn validate_path(
         .or_else(|| lex_target.strip_prefix(&lex_repo).ok())
         .map(path_to_slash_string);
     if let Some(ref lex_rel) = lex_rel_opt {
+        check_repo_build_artifact_segments(lex_rel, trimmed)?;
         let lex_is_root = check_authority_file_policy(lex_rel, access)?;
         if lex_is_root {
             if let Ok(meta) = fs::symlink_metadata(&base_dir) {
@@ -177,6 +178,7 @@ pub fn validate_path(
         .unwrap_or(Path::new(""))
         .to_path_buf();
     let repo_rel = path_to_slash_string(&rel_path_buf);
+    check_repo_build_artifact_segments(&repo_rel, trimmed)?;
 
     // 5. Enforce Single Root Authority File (`<repo_root>/AGENTS.md` ONLY)
     let is_root_authority = check_authority_file_policy(&repo_rel, access)?;
@@ -205,6 +207,169 @@ pub fn validate_path(
         repo_rel,
         is_root_authority,
     })
+}
+
+/// Validates a `Glob` or search filter pattern (`**/*.rs`, `crates/**`, `a/b/c/*.rs`) so
+/// ergonomic workspace searches work smoothly while outside-repo paths, symlink escapes,
+/// brace-expanded forbidden zones (`node_modules`, `target`, `build`, `.cache`, `tmp`),
+/// and shadow instruction files are rejected deterministically.
+pub fn validate_workspace_glob_pattern(
+    repo_root: &Path,
+    cwd: &Path,
+    base_raw_path: &str,
+    pat: &str,
+) -> Result<(), PathViolation> {
+    let trimmed = pat.trim();
+    if trimmed.is_empty() {
+        return Ok(());
+    }
+    if trimmed.contains('\n') || trimmed.contains('\r') || trimmed.contains('\0') {
+        return Err(PathViolation {
+            code: "PATH_CONTROL_INJECTION",
+            detail: "Control or newline character inside glob pattern rejected".to_string(),
+            is_poisoned_zone: false,
+        });
+    }
+
+    let unicode_issues = scan_unicode(trimmed, ScanMode::StrictPathOrCommand);
+    if let Some(first) = unicode_issues.first() {
+        return Err(PathViolation {
+            code: first.code,
+            detail: format!(
+                "Glob pattern '{}' failed Unicode check: {}",
+                trimmed, first.detail
+            ),
+            is_poisoned_zone: false,
+        });
+    }
+
+    let expanded = expand_tilde(trimmed);
+    check_forbidden_zones_lexical(&expanded, trimmed)?;
+
+    let norm_slashes = expanded.replace('\\', "/");
+    for seg in norm_slashes.split('/').filter(|s| !s.is_empty()) {
+        if seg.contains('{') || seg.contains('}') {
+            for alt in seg
+                .split(['{', ',', '}'])
+                .map(str::trim)
+                .filter(|s| !s.is_empty() && *s != "*" && *s != "**")
+            {
+                check_forbidden_zones_lexical(alt, trimmed)?;
+            }
+        }
+    }
+
+    let base_dir = if Path::new(base_raw_path).is_absolute() {
+        PathBuf::from(base_raw_path)
+    } else {
+        cwd.join(base_raw_path)
+    };
+
+    let meta_pos = norm_slashes.find(['*', '?', '[', '{']);
+    let Some(pos) = meta_pos else {
+        validate_path(
+            repo_root,
+            &base_dir,
+            &expanded,
+            PathAccess::ReferencePointer,
+        )?;
+        return Ok(());
+    };
+
+    let after_meta = &norm_slashes[pos..];
+    if after_meta.split('/').any(|seg| seg == "..") {
+        return Err(PathViolation {
+            code: "MAX_TRAVERSAL_DEPTH_EXCEEDED",
+            detail: format!(
+                "Glob pattern '{trimmed}' contains parent-directory '..' traversal after wildcards"
+            ),
+            is_poisoned_zone: false,
+        });
+    }
+
+    let before_meta = &norm_slashes[..pos];
+    let canon_repo = fs::canonicalize(repo_root).unwrap_or_else(|_| lexical_normalize(repo_root));
+    let lex_repo = lexical_normalize(repo_root);
+
+    if norm_slashes.starts_with('/') {
+        let dir_prefix = match before_meta.rfind('/') {
+            Some(0) | None => "/",
+            Some(idx) => &before_meta[..idx],
+        };
+        validate_path(repo_root, cwd, dir_prefix, PathAccess::ReferencePointer)?;
+
+        let abs_pat = Path::new(&norm_slashes);
+        if let Some(rel_after_repo) = abs_pat
+            .strip_prefix(&canon_repo)
+            .ok()
+            .or_else(|| abs_pat.strip_prefix(&lex_repo).ok())
+            .map(path_to_slash_string)
+        {
+            check_repo_build_artifact_segments(&rel_after_repo, trimmed)?;
+            check_glob_shadow_authority(&rel_after_repo, true)?;
+        }
+    } else {
+        let dir_prefix = match before_meta.rfind('/') {
+            Some(idx) => &before_meta[..idx],
+            None => "",
+        };
+        if !dir_prefix.is_empty() {
+            let v = validate_path(
+                repo_root,
+                &base_dir,
+                dir_prefix,
+                PathAccess::ReferencePointer,
+            )?;
+            let has_concrete_subdir = !v.repo_rel.is_empty();
+            check_glob_shadow_authority(&norm_slashes, has_concrete_subdir)?;
+        } else {
+            let base_valid =
+                validate_path(repo_root, cwd, base_raw_path, PathAccess::ReferencePointer)?;
+            let has_concrete_subdir = !base_valid.repo_rel.is_empty();
+            check_glob_shadow_authority(&norm_slashes, has_concrete_subdir)?;
+        }
+    }
+
+    Ok(())
+}
+
+fn check_glob_shadow_authority(
+    pat_slashes: &str,
+    has_concrete_subdir: bool,
+) -> Result<(), PathViolation> {
+    let lower = pat_slashes.to_ascii_lowercase();
+    let tail = lower.rsplit('/').next().unwrap_or(&lower);
+    let is_shadow = matches!(
+        tail,
+        "agents.override.md"
+            | "claude.md"
+            | "claude.local.md"
+            | "gemini.md"
+            | ".cursorrules"
+            | ".windsurfrules"
+            | ".clinerules"
+            | ".roorules"
+            | "copilot-instructions.md"
+            | ".aider.conf.yml"
+    ) || tail.ends_with(".instructions.md")
+        || lower.starts_with(".cursor/rules/")
+        || lower.contains("/.cursor/rules/")
+        || lower.starts_with(".claude/rules/")
+        || lower.contains("/.claude/rules/")
+        || lower.starts_with(".github/instructions/")
+        || lower.contains("/.github/instructions/")
+        || (tail == "agents.md" && has_concrete_subdir);
+
+    if is_shadow {
+        return Err(PathViolation {
+            code: "UNAUTHORIZED_INSTRUCTION_FILE",
+            detail: format!(
+                "Glob pattern '{pat_slashes}' targets unauthorized shadow/nested instruction files."
+            ),
+            is_poisoned_zone: true,
+        });
+    }
+    Ok(())
 }
 
 fn expand_tilde(raw: &str) -> String {
@@ -355,6 +520,15 @@ pub fn check_forbidden_zones_lexical(
                 }
             }
         }
+        if !Path::new(&normalized_slashes).is_absolute() && is_build_artifact_segment(&seg_lower) {
+            return Err(PathViolation {
+                code: "FORBIDDEN_BUILD_ARTIFACT_PATH",
+                detail: format!(
+                    "Direct tool access inside build output directory '{seg}' ('{display_raw}') is forbidden; let build/test tools manage build artifacts."
+                ),
+                is_poisoned_zone: false,
+            });
+        }
 
         // Secret / credential directories & files
         if is_secret_segment(&seg_lower) {
@@ -425,6 +599,29 @@ pub fn check_forbidden_zones_lexical(
     }
 
     Ok(())
+}
+
+pub fn check_repo_build_artifact_segments(
+    repo_rel: &str,
+    display_raw: &str,
+) -> Result<(), PathViolation> {
+    for seg in repo_rel.split('/').filter(|s| !s.is_empty()) {
+        let seg_lower = seg.to_ascii_lowercase();
+        if is_build_artifact_segment(&seg_lower) {
+            return Err(PathViolation {
+                code: "FORBIDDEN_BUILD_ARTIFACT_PATH",
+                detail: format!(
+                    "Direct tool access inside build output directory '{seg}' ('{display_raw}') is forbidden; let build/test tools manage build artifacts."
+                ),
+                is_poisoned_zone: false,
+            });
+        }
+    }
+    Ok(())
+}
+
+pub fn is_build_artifact_segment(seg_lower: &str) -> bool {
+    matches!(seg_lower, "target" | "build" | "dist-build")
 }
 
 fn is_cache_segment(seg_lower: &str) -> bool {

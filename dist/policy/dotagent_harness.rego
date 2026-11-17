@@ -27,3 +27,12 @@ deny contains msg if {
     object.get(input, "autoMemoryEnabled", false) == true
     msg := "autoMemoryEnabled must be false to prevent cross-session cache bleed"
 }
+
+forbidden_workflow_triggers := {"workflow_run", "workflow_call", "repository_dispatch"}
+
+deny contains msg if {
+    some trigger in forbidden_workflow_triggers
+    on_cfg := object.get(object.get(input, "workflow", {}), "on", {})
+    object.get(on_cfg, trigger, null) != null
+    msg := sprintf("chained GitHub Actions trigger '%s' is strictly forbidden", [trigger])
+}

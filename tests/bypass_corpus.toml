@@ -292,8 +292,8 @@ vectors = [
   { kind = "cmd", payload = "rg TODO" },
   { kind = "cmd", payload = "rg --max-depth 3 TODO" },
   { kind = "cmd", payload = "rg -u TODO --max-depth 1" },
-  { kind = "glob", payload = "**/*.rs" },
-  { kind = "glob", payload = "a/b/c/*.rs" },
+  { kind = "glob", payload = "**/node_modules/**/*.js" },
+  { kind = "glob", payload = "**/target/**/*.rlib" },
 
   # --- 11. Build-Tool Config Traps, Gitattributes & Self-Blindness Violations (15) ---
   { kind = "write_path", payload = ".cargo/config.toml" },

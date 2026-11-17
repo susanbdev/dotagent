@@ -1171,10 +1171,18 @@ fn regression_deep_adversarial_pr1_findings() {
         );
     }
 
-    // Benign pipeline into `python3 -c` (code inspected via `-c`, stdin is data) remains allowed!
+    // Inline `python3 -c` is hard-blocked (`UNAPPROVED_INTERPRETER_BLOCKED`), while safe `jq | tr` text pipelines are allowed!
+    let py_err = evaluate_shell_command(
+        "echo '{\"a\":1}' | python3 -c 'import json, sys'",
+        &repo,
+        &repo,
+        false,
+    )
+    .expect_err("python3 -c must be blocked by default");
+    assert_eq!(py_err.code, "UNAPPROVED_INTERPRETER_BLOCKED");
     assert!(
         evaluate_shell_command(
-            "echo '{\"a\":1}' | python3 -c 'import json, sys'",
+            "echo '{\"a\":1}' | jq '.a' | tr -d '\\n'",
             &repo,
             &repo,
             false
@@ -1340,18 +1348,15 @@ fn regression_copilot_round2_pr1_findings() {
         fs::remove_file(repo.join(".npmrc")).expect("cleanup .npmrc");
     }
 
-    // PR1[2]: `npm/pnpm/yarn/bun run` and arbitrary script subcommands blocked!
-    for cmd in [
-        "npm run build",
-        "pnpm run lint",
-        "yarn build",
-        "bun run dev",
-        "npm test",
-    ] {
+    // PR1[2]: `npm/pnpm/yarn` script subcommands blocked (`PKG_EXEC_OR_PUBLISH_BLOCKED`) and `bun` blocked (`UNAPPROVED_INTERPRETER_BLOCKED`)!
+    for cmd in ["npm run build", "pnpm run lint", "yarn build", "npm test"] {
         let err = evaluate_shell_command(cmd, &repo, &repo, false)
             .expect_err("package.json script execution must be blocked");
         assert_eq!(err.code, "PKG_EXEC_OR_PUBLISH_BLOCKED", "cmd={cmd}");
     }
+    let bun_err = evaluate_shell_command("bun run dev", &repo, &repo, false)
+        .expect_err("bun interpreter/runner must be blocked");
+    assert_eq!(bun_err.code, "UNAPPROVED_INTERPRETER_BLOCKED");
 
     // PR1[3]: Inline interpreter file I/O & path literals blocked (`open(...)`, `fs.writeFileSync`, `pathlib`)!
     for cmd in [
@@ -1628,5 +1633,303 @@ fn regression_copilot_round2_pr1_findings() {
         String::from_utf8_lossy(&ro_out.stdout).contains("PROFILE_WRITE_TOOLS_DISABLED"),
         "research-readonly profile must block Write tool: {}",
         String::from_utf8_lossy(&ro_out.stdout)
+    );
+}
+
+#[test]
+fn regression_ergonomic_workflows_and_hard_escape_locks() {
+    let repo = test_sandbox_root("ergonomic_and_hard_locks");
+    let workspace_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(Path::parent)
+        .expect("workspace root")
+        .to_path_buf();
+    fs::copy(workspace_root.join("AGENTS.md"), repo.join("AGENTS.md")).expect("copy AGENTS.md");
+    fs::create_dir_all(repo.join("crates/demo/src")).expect("mkdir crates/demo/src");
+    fs::write(
+        repo.join("crates/demo/src/lib.rs"),
+        "pub fn demo() -> usize { 42 }\n",
+    )
+    .expect("write demo lib.rs");
+
+    let mut oversized = String::new();
+    for i in 0..800 {
+        oversized.push_str(&format!(
+            "pub const ITEM_{i:04}: &str = \"searchable_token_alpha\";\n"
+        ));
+    }
+    fs::write(repo.join("crates/demo/src/big.rs"), &oversized).expect("write big.rs");
+
+    let sid = "ergo_sess";
+    let reset = JsonValue::Object(vec![
+        ("session_id".to_string(), JsonValue::Str(sid.to_string())),
+        (
+            "cwd".to_string(),
+            JsonValue::Str(repo.to_string_lossy().into_owned()),
+        ),
+    ])
+    .to_json_string();
+    assert!(handle_user_prompt_hook(&reset, &repo).is_allow());
+
+    // 1. Ergonomic `Glob **` workspace searches are allowed while forbidden zones remain blocked!
+    for allowed_glob in ["**/*.rs", "crates/**", "crates/**/*.rs", "a/b/c/*.rs"] {
+        let req = JsonValue::Object(vec![
+            ("session_id".to_string(), JsonValue::Str(sid.to_string())),
+            (
+                "cwd".to_string(),
+                JsonValue::Str(repo.to_string_lossy().into_owned()),
+            ),
+            ("tool_name".to_string(), JsonValue::Str("Glob".to_string())),
+            (
+                "tool_input".to_string(),
+                JsonValue::Object(vec![(
+                    "pattern".to_string(),
+                    JsonValue::Str(allowed_glob.to_string()),
+                )]),
+            ),
+        ])
+        .to_json_string();
+        assert!(
+            handle_pre_tool_hook(&req, &repo).is_allow(),
+            "Workspace Glob `{allowed_glob}` must be allowed!"
+        );
+    }
+
+    for blocked_glob in [
+        "**/node_modules/**/*.js",
+        "**/target/**/*.rlib",
+        "build/**",
+        "dist-build/**",
+        "{src,node_modules}/**/*.rs",
+        "/**/*.rs",
+        "**/CLAUDE.md",
+    ] {
+        let req = JsonValue::Object(vec![
+            ("session_id".to_string(), JsonValue::Str(sid.to_string())),
+            (
+                "cwd".to_string(),
+                JsonValue::Str(repo.to_string_lossy().into_owned()),
+            ),
+            ("tool_name".to_string(), JsonValue::Str("Glob".to_string())),
+            (
+                "tool_input".to_string(),
+                JsonValue::Object(vec![(
+                    "pattern".to_string(),
+                    JsonValue::Str(blocked_glob.to_string()),
+                )]),
+            ),
+        ])
+        .to_json_string();
+        assert!(
+            !handle_pre_tool_hook(&req, &repo).is_allow(),
+            "Forbidden Glob `{blocked_glob}` must be denied!"
+        );
+    }
+
+    // Reset session after poisoned-zone globs (`node_modules`, `CLAUDE.md`) tripped circuit breaker!
+    assert!(handle_user_prompt_hook(&reset, &repo).is_allow());
+
+    // 2. Single-file `Grep` on a >24 KiB / >150-line file succeeds and NEVER burns hop depth!
+    let grep_big_req = JsonValue::Object(vec![
+        ("session_id".to_string(), JsonValue::Str(sid.to_string())),
+        (
+            "cwd".to_string(),
+            JsonValue::Str(repo.to_string_lossy().into_owned()),
+        ),
+        ("tool_name".to_string(), JsonValue::Str("Grep".to_string())),
+        (
+            "tool_input".to_string(),
+            JsonValue::Object(vec![
+                (
+                    "path".to_string(),
+                    JsonValue::Str("crates/demo/src/big.rs".to_string()),
+                ),
+                (
+                    "pattern".to_string(),
+                    JsonValue::Str("searchable_token_alpha".to_string()),
+                ),
+            ]),
+        ),
+    ])
+    .to_json_string();
+    assert!(
+        handle_pre_tool_hook(&grep_big_req, &repo).is_allow(),
+        "Grep on >24 KiB file must succeed without choking on read slice limits!"
+    );
+
+    // 3. Safe read-only shell pipelines (`rg | head`, `gh api | jq | tr`) & Cargo commands succeed,
+    //    and `find . -maxdepth 2` auto-prunes forbidden directories!
+    for ok_cmd in [
+        "rg --max-depth 2 -e demo crates | head -n 20",
+        "gh api graphql -f query='query { viewer { login } }' | jq '.data.viewer.login' | tr -d '\\n'",
+        "cargo fmt --all -- --check",
+        "cargo clippy --workspace --all-targets -- -D warnings",
+        "cargo test --workspace",
+        "cargo check",
+    ] {
+        assert!(
+            evaluate_shell_command(ok_cmd, &repo, &repo, false).is_ok(),
+            "Safe workflow command `{ok_cmd}` must be allowed!"
+        );
+    }
+
+    let find_plan = evaluate_shell_command("find . -maxdepth 2 -type f", &repo, &repo, false)
+        .expect("find . -maxdepth 2 must succeed");
+    let rewritten_find = find_plan
+        .rewritten_command
+        .expect("find must auto-inject POSIX -prune exclusions");
+    assert!(rewritten_find.contains("-prune"));
+    assert!(rewritten_find.contains("node_modules"));
+    assert!(rewritten_find.contains("target"));
+
+    // 4. Hard-block subagent / delegation tools unless AGENT_GUARD_ALLOW_SWARM=1!
+    for sub_tool in [
+        "Task",
+        "Agent",
+        "dispatch_agent",
+        "spawn_agent",
+        "subagent",
+        "invoke_subagent",
+        "define_subagent",
+        "manage_subagents",
+        "send_message",
+        "delegate",
+        "delegate_task",
+    ] {
+        let req = JsonValue::Object(vec![
+            ("session_id".to_string(), JsonValue::Str(sid.to_string())),
+            (
+                "cwd".to_string(),
+                JsonValue::Str(repo.to_string_lossy().into_owned()),
+            ),
+            (
+                "tool_name".to_string(),
+                JsonValue::Str(sub_tool.to_string()),
+            ),
+            ("tool_input".to_string(), JsonValue::Object(Vec::new())),
+        ])
+        .to_json_string();
+        match handle_pre_tool_hook(&req, &repo) {
+            Decision::Deny { code, .. } => {
+                assert_eq!(code, "SUBAGENT_DELEGATION_BLOCKED", "tool={sub_tool}")
+            }
+            other => panic!("Expected SUBAGENT_DELEGATION_BLOCKED for {sub_tool}, got {other:?}"),
+        }
+    }
+
+    // 5. Hard-block interpreters, AGENT_GUARD_* env tampering, compound `gh`, workflow dispatches,
+    //    multi-path `find`, `ls -L`, and `git push`/`remote`/`config`/`-c`/`reset --hard`/`--no-verify`!
+    let slash_tmp = concat!("/", "tmp");
+    let find_tmp_cmd = format!("find crates {slash_tmp} -maxdepth 1");
+    let hard_blocked_cmds: Vec<(&str, &str)> = vec![
+        ("python3 script.py", "UNAPPROVED_INTERPRETER_BLOCKED"),
+        ("python -c 'print(1)'", "UNAPPROVED_INTERPRETER_BLOCKED"),
+        ("python3.12 -V", "UNAPPROVED_INTERPRETER_BLOCKED"),
+        ("uv run pytest", "UNAPPROVED_INTERPRETER_BLOCKED"),
+        ("uvx ruff check", "UNAPPROVED_INTERPRETER_BLOCKED"),
+        ("node -e '1+1'", "UNAPPROVED_INTERPRETER_BLOCKED"),
+        ("deno run app.ts", "UNAPPROVED_INTERPRETER_BLOCKED"),
+        ("perl -e 'print 1'", "UNAPPROVED_INTERPRETER_BLOCKED"),
+        ("ruby -e 'puts 1'", "UNAPPROVED_INTERPRETER_BLOCKED"),
+        ("AGENT_GUARD_ALLOW_SWARM=1 ls", "DANGEROUS_ENV_OVERRIDE"),
+        (
+            "AGENT_GUARD_ALLOW_INTERPRETER=1 ls",
+            "DANGEROUS_ENV_OVERRIDE",
+        ),
+        ("export AGENT_GUARD_ALLOW_SWARM=1", "DANGEROUS_ENV_OVERRIDE"),
+        (
+            "declare -x AGENT_GUARD_STATE_DIR=/var",
+            "DANGEROUS_ENV_OVERRIDE",
+        ),
+        ("unset AGENT_GUARD_PROFILE", "DANGEROUS_ENV_OVERRIDE"),
+        ("env -i ls", "DANGEROUS_ENV_OVERRIDE"),
+        ("env -u AGENT_GUARD_PROFILE ls", "DANGEROUS_ENV_OVERRIDE"),
+        ("gh workflow run ci.yml", "GH_WORKFLOW_CHAIN_BLOCKED"),
+        (
+            "gh api repos/susanbdev/dotagent/actions/workflows/ci.yml/dispatches -X POST",
+            "GH_WORKFLOW_CHAIN_BLOCKED",
+        ),
+        ("gh pr list && gh pr view 1", "GH_COMPOUND_CHAIN_BLOCKED"),
+        ("gh pr list; ls", "GH_COMPOUND_CHAIN_BLOCKED"),
+        ("(gh pr list)", "GH_COMPOUND_CHAIN_BLOCKED"),
+        ("gh pr list | sed 's/a/b/'", "GH_COMPOUND_CHAIN_BLOCKED"),
+        (&find_tmp_cmd, "FORBIDDEN_TMP_PATH"),
+        (
+            "find crates node_modules -maxdepth 1",
+            "FORBIDDEN_DEPENDENCY_PATH",
+        ),
+        (
+            "find crates target -maxdepth 1",
+            "FORBIDDEN_BUILD_ARTIFACT_PATH",
+        ),
+        ("ls -L", "LS_SYMLINK_FOLLOW_BLOCKED"),
+        ("ls --dereference", "LS_SYMLINK_FOLLOW_BLOCKED"),
+        ("git push origin main", "CONFUSED_DEPUTY_GIT_PUSH"),
+        ("git remote -v", "GIT_REMOTE_MUTATION_BLOCKED"),
+        ("git config --get user.name", "GIT_CONFIG_MUTATION_BLOCKED"),
+        (
+            "git -c core.hooksPath=. status",
+            "GIT_CONFIG_OVERRIDE_BLOCKED",
+        ),
+        ("git reset --hard HEAD", "GIT_DESTRUCTIVE_RESET"),
+        ("git commit -m wip --no-verify", "GIT_NO_VERIFY_BLOCKED"),
+        ("git commit -nm wip", "GIT_NO_VERIFY_BLOCKED"),
+    ];
+    for (cmd, expected_code) in hard_blocked_cmds {
+        let err = evaluate_shell_command(cmd, &repo, &repo, false)
+            .expect_err("expected command to be blocked");
+        assert_eq!(err.code, expected_code, "cmd=`{cmd}`");
+    }
+
+    // 6. Native `Grep` / `Glob` ignore & symlink bypass flags blocked (`SEARCH_IGNORE_BYPASS_BLOCKED`),
+    //    and `Read` / `ls` on `target/` or `build/` blocked (`FORBIDDEN_BUILD_ARTIFACT_PATH`)!
+    let bypass_grep = JsonValue::Object(vec![
+        ("session_id".to_string(), JsonValue::Str(sid.to_string())),
+        (
+            "cwd".to_string(),
+            JsonValue::Str(repo.to_string_lossy().into_owned()),
+        ),
+        ("tool_name".to_string(), JsonValue::Str("Grep".to_string())),
+        (
+            "tool_input".to_string(),
+            JsonValue::Object(vec![
+                ("pattern".to_string(), JsonValue::Str("fn".to_string())),
+                ("no_ignore".to_string(), JsonValue::Bool(true)),
+            ]),
+        ),
+    ])
+    .to_json_string();
+    match handle_pre_tool_hook(&bypass_grep, &repo) {
+        Decision::Deny { code, .. } => assert_eq!(code, "SEARCH_IGNORE_BYPASS_BLOCKED"),
+        other => panic!("Expected SEARCH_IGNORE_BYPASS_BLOCKED, got {other:?}"),
+    }
+
+    for build_p in ["target/debug/app", "build/bundle.js", "dist-build/out.txt"] {
+        let pv = validate_path(&repo, &repo, build_p, PathAccess::Read)
+            .expect_err("build artifact path must be blocked for direct Read");
+        assert_eq!(pv.code, "FORBIDDEN_BUILD_ARTIFACT_PATH", "path={build_p}");
+    }
+
+    // 7. `.github/workflows/` chained triggers (`workflow_run`, `workflow_call`, `repository_dispatch`,
+    //    `gh workflow run`) fail `audit_github_workflows`!
+    fs::create_dir_all(repo.join(".github/workflows")).expect("mkdir workflows");
+    fs::write(
+        repo.join(".github/workflows/chained.yml"),
+        "name: Bad\non:\n  workflow_run:\n    workflows: [\"CI\"]\n    types: [completed]\njobs:\n  x:\n    runs-on: ubuntu-latest\n    steps:\n      - run: gh workflow run other.yml\n",
+    )
+    .expect("write chained.yml");
+    let mut wf_failures = Vec::new();
+    agent_guard::audit_github_workflows(&repo, &mut wf_failures);
+    assert!(
+        wf_failures
+            .iter()
+            .any(|f| f.contains("CHAINED_WORKFLOW_TRIGGER_FORBIDDEN")),
+        "Expected CHAINED_WORKFLOW_TRIGGER_FORBIDDEN, got {wf_failures:?}"
+    );
+    assert!(
+        wf_failures
+            .iter()
+            .any(|f| f.contains("CHAINED_WORKFLOW_DISPATCH_FORBIDDEN")),
+        "Expected CHAINED_WORKFLOW_DISPATCH_FORBIDDEN, got {wf_failures:?}"
     );
 }

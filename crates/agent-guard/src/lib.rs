@@ -29,16 +29,18 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use budget_guard::{
-    MAX_SLICE_LINES, MAX_TOOL_OUTPUT_BYTES, RuntimeProfile, STEP_SOFT_COMPACT_TOKENS,
-    analyze_text_budget, estimate_bpe_tokens, inspect_file_budget, inspect_file_on_disk_hygiene,
-    load_active_profile,
+    MAX_TOOL_OUTPUT_BYTES, RuntimeProfile, STEP_SOFT_COMPACT_TOKENS, analyze_text_budget,
+    estimate_bpe_tokens, inspect_file_budget, inspect_file_on_disk_hygiene, load_active_profile,
 };
 use cmd_policy::{
     evaluate_shell_command, inspect_repo_build_config_traps, inspect_repo_git_config_and_hooks,
 };
 use injection_scan::scan_untrusted_content;
 use json::JsonValue;
-use path_policy::{MAX_DIRECTORY_WALK_DEPTH, PathAccess, lexical_normalize, validate_path};
+use path_policy::{
+    MAX_DIRECTORY_WALK_DEPTH, PathAccess, lexical_normalize, validate_path,
+    validate_workspace_glob_pattern,
+};
 use sanitizer::{neuter_to_clean_ascii, wrap_spotlight_envelope};
 use traversal_ledger::{SessionLedger, append_audit_jsonl};
 use unicode_guard::{ScanMode, scan_unicode};
@@ -404,15 +406,29 @@ fn evaluate_tool_invocation(
             }
         }
 
+        for (rel, _abs_path) in &plan.search_files {
+            if let Err((code, msg)) = ledger.check_search_target(rel) {
+                return Decision::deny(code, msg, false);
+            }
+        }
+
+        let effective_cmd = plan.rewritten_command.as_deref().unwrap_or(cmd_str);
+
         // Pre-buffer Bash stdout/stderr sanitization + tight 120-line compaction is ON BY DEFAULT
         // unless `AGENT_GUARD_WRAP_BASH_ASCII=0` is explicitly set for bare-command unit harnesses.
         let wrap_ascii = std::env::var("AGENT_GUARD_WRAP_BASH_ASCII")
             .map(|v| v != "0")
             .unwrap_or(true);
-        if wrap_ascii && !cmd_str.contains("agent-guard sanitize-stream") {
+        if wrap_ascii && !effective_cmd.contains("agent-guard sanitize-stream") {
             return Decision::Allow {
                 advisory: None,
-                updated_bash_cmd: Some(wrap_bash_with_ascii_sanitizer(cmd_str)),
+                updated_bash_cmd: Some(wrap_bash_with_ascii_sanitizer(effective_cmd)),
+            };
+        }
+        if let Some(rewritten) = plan.rewritten_command {
+            return Decision::Allow {
+                advisory: None,
+                updated_bash_cmd: Some(rewritten),
             };
         }
 
@@ -593,19 +609,49 @@ fn evaluate_tool_invocation(
     }
 
     // 6. Search / Glob / Directory Listing tools (`Grep`, `Glob`, `LS`, `grep_search`, `find_by_name`, `list_dir`)
+    // 5b. Subagent & Delegation Tool Lockdown (`SUBAGENT_DELEGATION_BLOCKED` unless `AGENT_GUARD_ALLOW_SWARM=1`)
+    let is_subagent_tool = matches!(
+        norm_tool.as_str(),
+        "task"
+            | "agent"
+            | "dispatch_agent"
+            | "spawn_agent"
+            | "subagent"
+            | "invoke_subagent"
+            | "define_subagent"
+            | "manage_subagents"
+            | "send_message"
+            | "delegate"
+            | "delegate_task"
+    );
+    let swarm_allowed =
+        std::env::var("AGENT_GUARD_ALLOW_SWARM").ok().as_deref() == Some("1") && !ledger.tainted;
+    if is_subagent_tool && !swarm_allowed {
+        return Decision::deny(
+            "SUBAGENT_DELEGATION_BLOCKED",
+            format!(
+                "Subagent/delegation tool '{tool_name}' is hard-blocked by default; run work directly in the main session (or set AGENT_GUARD_ALLOW_SWARM=1 outside the shell when authorized)."
+            ),
+            false,
+        );
+    }
+
     if matches!(
         norm_tool.as_str(),
         "grep" | "glob" | "ls" | "grep_search" | "find_by_name" | "list_dir" | "list_directory"
     ) {
+        if let Some(reason) = detect_search_bypass_params(input, tool_name) {
+            return Decision::deny("SEARCH_IGNORE_BYPASS_BLOCKED", reason, false);
+        }
+
         let raw_path = extract_first_str(
             input,
             &["path", "SearchPath", "DirectoryPath", "dir", "directory"],
         )
         .unwrap_or(".");
+        let is_glob_tool = norm_tool.contains("glob") || norm_tool == "find_by_name";
 
-        // Enforce Glob / Search pattern depth <= 2 levels (block `**` deep snooping or > 2 `/` levels!)
-        if let Some(pat) = extract_first_str(input, &["pattern", "Pattern", "glob", "Query"]) {
-            let is_glob_tool = norm_tool.contains("glob") || norm_tool == "find_by_name";
+        if let Some(pat) = extract_first_str(input, &["pattern", "Pattern", "Query"]) {
             let scan_mode = if is_glob_tool {
                 ScanMode::StrictPathOrCommand
             } else {
@@ -616,25 +662,18 @@ fn evaluate_tool_invocation(
                 return Decision::deny(first.code, first.detail.clone(), true);
             }
             if is_glob_tool {
-                if pat.contains("**") {
-                    return Decision::deny(
-                        "UNBOUNDED_GLOB_DEPTH",
-                        format!(
-                            "Glob pattern '{pat}' uses unbounded `**` recursion; traversal is restricted to max {MAX_DIRECTORY_WALK_DEPTH} levels."
-                        ),
-                        false,
-                    );
+                if let Err(pv) = validate_workspace_glob_pattern(repo_root, cwd, raw_path, pat) {
+                    return Decision::deny(pv.code, pv.detail, pv.is_poisoned_zone);
                 }
-                let slash_depth = pat.trim_matches('/').chars().filter(|&c| c == '/').count();
-                if slash_depth >= MAX_DIRECTORY_WALK_DEPTH {
-                    return Decision::deny(
-                        "MAX_GLOB_DEPTH_EXCEEDED",
-                        format!(
-                            "Glob pattern '{pat}' traverses {} directory levels (> max {MAX_DIRECTORY_WALK_DEPTH} levels).",
-                            slash_depth + 1
-                        ),
-                        false,
-                    );
+            }
+        }
+
+        for filter_key in ["glob", "Glob", "include", "Include"] {
+            if let Some(filter_pat) = input.get(filter_key).and_then(JsonValue::as_str) {
+                if let Err(pv) =
+                    validate_workspace_glob_pattern(repo_root, cwd, raw_path, filter_pat)
+                {
+                    return Decision::deny(pv.code, pv.detail, pv.is_poisoned_zone);
                 }
             }
         }
@@ -650,18 +689,12 @@ fn evaluate_tool_invocation(
                 Ok(v) => v,
                 Err(pv) => return Decision::deny(pv.code, pv.detail, pv.is_poisoned_zone),
             };
-            if let Err(dec) = pre_inspect_file_for_ingestion_with_profile(
-                &valid.canonical_or_norm,
-                &valid.repo_rel,
-                valid.is_root_authority,
-                None,
-                Some(MAX_SLICE_LINES),
-                repo_root,
-                profile,
-                ledger,
-                false,
-            ) {
-                return dec;
+            if let Err((code, msg)) = ledger.check_search_target(&valid.repo_rel) {
+                return Decision::deny(code, msg, false);
+            }
+        } else if is_glob_tool {
+            if let Err(pv) = validate_path(repo_root, cwd, raw_path, PathAccess::ReferencePointer) {
+                return Decision::deny(pv.code, pv.detail, pv.is_poisoned_zone);
             }
         } else {
             let req_depth = extract_first_u64(input, &["max_depth", "MaxDepth", "depth"])
@@ -693,17 +726,13 @@ fn evaluate_tool_invocation(
             | "todo_read"
             | "askuserquestion"
             | "ask_question"
-            | "task"
-            | "invoke_subagent"
-            | "manage_subagents"
-            | "send_message"
             | "skill"
             | "lookup_skill"
             | "lookup_skills"
             | "list_skills"
             | "enterplanmode"
             | "exitplanmode"
-    );
+    ) || (is_subagent_tool && swarm_allowed);
     if is_approved_mcp || is_safe_harness_meta {
         if let Some(first) = find_first_unicode_violation_in_json(input) {
             return Decision::deny(
@@ -1283,7 +1312,7 @@ pub fn audit_repository(repo_root: &Path) -> Result<Vec<String>, Vec<String>> {
         },
     }
 
-    // 4. Walk up to depth 2 (skipping .git, target, node_modules, caches, tmp) to detect rogue instruction files
+    // 4. Walk up to depth 2 (skipping .git, target, build, node_modules, caches, tmp) to detect rogue instruction files
     let pinned_dist = load_pinned_dist_hashes(repo_root);
     audit_dir_depth_bounded(
         repo_root,
@@ -1296,11 +1325,198 @@ pub fn audit_repository(repo_root: &Path) -> Result<Vec<String>, Vec<String>> {
     checks_ok
         .push("Scanned depth <= 2 for unauthorized shadow/nested instruction files".to_string());
 
+    // 5. Audit `.github/workflows/` against chained workflow triggers and dispatch loops
+    let wf_failures_before = failures.len();
+    audit_github_workflows(repo_root, &mut failures);
+    if failures.len() == wf_failures_before {
+        checks_ok.push(
+            "Verified .github/workflows contains zero chained triggers (workflow_run/workflow_call/repository_dispatch/gh workflow run)"
+                .to_string(),
+        );
+    }
+
     if failures.is_empty() {
         Ok(checks_ok)
     } else {
         Err(failures)
     }
+}
+
+/// Audits `.github/workflows/*.{yml,yaml}` to reject chained GitHub Actions triggers
+/// (`workflow_run`, `workflow_call`, `repository_dispatch`), reusable workflow calls
+/// (`uses: .../.github/workflows/...`), and CLI/API workflow dispatch loops (`gh workflow run`, `/dispatches`).
+pub fn audit_github_workflows(repo_root: &Path, failures: &mut Vec<String>) {
+    let dot_github = repo_root.join(".github");
+    match fs::symlink_metadata(&dot_github) {
+        Err(_) => return,
+        Ok(meta) if meta.file_type().is_symlink() => {
+            failures
+                .push("WORKFLOW_SYMLINK_FORBIDDEN: '.github' must not be a symlink.".to_string());
+            return;
+        }
+        Ok(meta) if !meta.file_type().is_dir() => return,
+        Ok(_) => {}
+    }
+
+    let wf_dir = dot_github.join("workflows");
+    match fs::symlink_metadata(&wf_dir) {
+        Err(_) => return,
+        Ok(meta) if meta.file_type().is_symlink() => {
+            failures.push(
+                "WORKFLOW_SYMLINK_FORBIDDEN: '.github/workflows' must not be a symlink."
+                    .to_string(),
+            );
+            return;
+        }
+        Ok(meta) if !meta.file_type().is_dir() => return,
+        Ok(_) => {}
+    }
+
+    let entries = match fs::read_dir(&wf_dir) {
+        Ok(it) => it,
+        Err(e) => {
+            failures.push(format!(
+                "WORKFLOW_READ_DIR_ERROR: failed reading '{}': {e}",
+                wf_dir.display()
+            ));
+            return;
+        }
+    };
+
+    let mut paths = Vec::new();
+    for entry_res in entries {
+        match entry_res {
+            Ok(ent) => paths.push(ent.path()),
+            Err(e) => failures.push(format!(
+                "WORKFLOW_DIR_ENTRY_ERROR: failed reading entry in '{}': {e}",
+                wf_dir.display()
+            )),
+        }
+    }
+    paths.sort();
+
+    for path in paths {
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let rel = format!(".github/workflows/{name}");
+        let meta = match fs::symlink_metadata(&path) {
+            Ok(m) => m,
+            Err(e) => {
+                failures.push(format!(
+                    "WORKFLOW_METADATA_ERROR: failed stat on '{rel}': {e}"
+                ));
+                continue;
+            }
+        };
+        if meta.file_type().is_symlink() {
+            failures.push(format!(
+                "WORKFLOW_SYMLINK_FORBIDDEN: workflow file '{rel}' must not be a symlink."
+            ));
+            continue;
+        }
+        if !meta.file_type().is_file() {
+            continue;
+        }
+        let lower_name = name.to_ascii_lowercase();
+        if !(lower_name.ends_with(".yml") || lower_name.ends_with(".yaml")) {
+            continue;
+        }
+        let body = match fs::read_to_string(&path) {
+            Ok(s) => s,
+            Err(e) => {
+                failures.push(format!("WORKFLOW_READ_ERROR: failed reading '{rel}': {e}"));
+                continue;
+            }
+        };
+        for (idx, raw_line) in body.lines().enumerate() {
+            let ln = idx + 1;
+            let stripped = strip_yaml_comment(raw_line);
+            let trimmed = stripped.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let lower = trimmed.to_ascii_lowercase();
+            for forbidden_trigger in ["workflow_run", "workflow_call", "repository_dispatch"] {
+                if contains_yaml_identifier(&lower, forbidden_trigger) {
+                    failures.push(format!(
+                        "CHAINED_WORKFLOW_TRIGGER_FORBIDDEN: '{rel}' line {ln} uses forbidden chained GitHub Actions trigger '{forbidden_trigger}'."
+                    ));
+                }
+            }
+            let collapsed = lower.split_whitespace().collect::<Vec<_>>().join(" ");
+            if collapsed.contains("gh workflow run") {
+                failures.push(format!(
+                    "CHAINED_WORKFLOW_DISPATCH_FORBIDDEN: '{rel}' line {ln} invokes forbidden 'gh workflow run'."
+                ));
+            }
+            if lower.contains("/dispatches") {
+                failures.push(format!(
+                    "CHAINED_WORKFLOW_DISPATCH_FORBIDDEN: '{rel}' line {ln} invokes forbidden GitHub '/dispatches' endpoint."
+                ));
+            }
+            if (lower.starts_with("uses:") || lower.starts_with("- uses:"))
+                && lower.contains(".github/workflows/")
+            {
+                failures.push(format!(
+                    "CHAINED_WORKFLOW_CALL_FORBIDDEN: '{rel}' line {ln} chains into another workflow via 'uses:'."
+                ));
+            }
+        }
+    }
+}
+
+fn strip_yaml_comment(line: &str) -> &str {
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut prev_backslash = false;
+    for (idx, ch) in line.char_indices() {
+        if in_double {
+            if ch == '"' && !prev_backslash {
+                in_double = false;
+            }
+            prev_backslash = ch == '\\' && !prev_backslash;
+            continue;
+        }
+        if in_single {
+            if ch == '\'' {
+                in_single = false;
+            }
+            continue;
+        }
+        match ch {
+            '\'' => in_single = true,
+            '"' => in_double = true,
+            '#' if idx == 0 || line[..idx].ends_with(char::is_whitespace) => {
+                return &line[..idx];
+            }
+            _ => {}
+        }
+    }
+    line
+}
+
+fn contains_yaml_identifier(haystack_lower: &str, ident: &str) -> bool {
+    let bytes = haystack_lower.as_bytes();
+    let needle = ident.as_bytes();
+    if needle.is_empty() || bytes.len() < needle.len() {
+        return false;
+    }
+    let is_ident_byte = |b: u8| b.is_ascii_alphanumeric() || b == b'_' || b == b'-';
+    let mut pos = 0;
+    while pos + needle.len() <= bytes.len() {
+        if &bytes[pos..pos + needle.len()] == needle {
+            let left_ok = pos == 0 || !is_ident_byte(bytes[pos - 1]);
+            let right_pos = pos + needle.len();
+            let right_ok = right_pos == bytes.len() || !is_ident_byte(bytes[right_pos]);
+            if left_ok && right_ok {
+                return true;
+            }
+        }
+        pos += 1;
+    }
+    false
 }
 
 fn load_pinned_dist_hashes(repo_root: &Path) -> std::collections::BTreeMap<String, String> {
@@ -1386,11 +1602,13 @@ fn audit_dir_depth_bounded(
         let name_str = name.to_string_lossy();
         let lower = name_str.to_ascii_lowercase();
 
-        // Never descend into .git, caches, tmp, or dependencies!
+        // Never descend into .git, build outputs, caches, tmp, or dependencies!
         if matches!(
             lower.as_str(),
             ".git"
                 | "target"
+                | "build"
+                | "dist-build"
                 | "node_modules"
                 | "vendor"
                 | ".venv"
@@ -1806,4 +2024,105 @@ fn extract_first_u64(v: &JsonValue, keys: &[&str]) -> Option<u64> {
         }
     }
     None
+}
+
+fn detect_search_bypass_params(input: &JsonValue, tool_name: &str) -> Option<String> {
+    const BYPASS_BOOL_KEYS: &[&str] = &[
+        "unrestricted",
+        "no_ignore",
+        "noIgnore",
+        "ignore_files_disabled",
+        "follow_symlinks",
+        "followSymlinks",
+        "follow",
+        "dereference",
+        "include_ignored",
+        "includeIgnored",
+        "no_ignore_vcs",
+        "noIgnoreVcs",
+        "no_ignore_dot",
+        "noIgnoreDot",
+        "no_ignore_parent",
+        "noIgnoreParent",
+    ];
+    for key in BYPASS_BOOL_KEYS {
+        if let Some(val) = input.get(key) {
+            let is_truthy = match val {
+                JsonValue::Bool(b) => *b,
+                JsonValue::Number(n) => *n != 0.0,
+                JsonValue::Str(s) => matches!(
+                    s.trim().to_ascii_lowercase().as_str(),
+                    "true" | "1" | "yes" | "on"
+                ),
+                _ => false,
+            };
+            if is_truthy {
+                return Some(format!(
+                    "Tool '{tool_name}' parameter '{key}' is forbidden: disabling `.ignore` filters or following symlinks in search/list tools is hard-blocked."
+                ));
+            }
+        }
+    }
+
+    for key in ["flags", "args", "extra_args", "rg_flags", "options"] {
+        if let Some(val) = input.get(key) {
+            match val {
+                JsonValue::Str(s) => {
+                    for tok in s.split_whitespace() {
+                        if is_forbidden_search_flag(tok) {
+                            return Some(format!(
+                                "Tool '{tool_name}' flag '{tok}' in '{key}' is forbidden: `.ignore` bypass and symlink dereferencing are hard-blocked."
+                            ));
+                        }
+                    }
+                }
+                JsonValue::Array(items) => {
+                    for item in items {
+                        if let Some(s) = item.as_str() {
+                            for tok in s.split_whitespace() {
+                                if is_forbidden_search_flag(tok) {
+                                    return Some(format!(
+                                        "Tool '{tool_name}' flag '{tok}' in '{key}' is forbidden: `.ignore` bypass and symlink dereferencing are hard-blocked."
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    None
+}
+
+fn is_forbidden_search_flag(tok: &str) -> bool {
+    if matches!(
+        tok,
+        "-u" | "-uu"
+            | "-uuu"
+            | "--unrestricted"
+            | "--no-ignore"
+            | "--no-ignore-vcs"
+            | "--no-ignore-dot"
+            | "--no-ignore-parent"
+            | "--no-ignore-global"
+            | "--no-ignore-exclude"
+            | "--no-ignore-files"
+            | "-L"
+            | "--follow"
+            | "--dereference"
+            | "--dereference-command-line"
+    ) {
+        return true;
+    }
+    if tok.starts_with('-')
+        && !tok.starts_with("--")
+        && tok.len() > 2
+        && tok[1..].chars().all(|c| c.is_ascii_alphabetic())
+        && (tok[1..].contains('u') || tok[1..].contains('L'))
+    {
+        return true;
+    }
+    false
 }
