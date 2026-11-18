@@ -167,6 +167,9 @@ fn main() -> ExitCode {
                 }
             }
         }
+        "exec-sandbox" => agent_guard::exec_sandbox::run_exec_sandbox_cli(&args[1..], &cwd),
+        "sandbox-status" => agent_guard::exec_sandbox::run_sandbox_status_cli(),
+        "--probe-landlock-child" => agent_guard::exec_sandbox::run_probe_landlock_child(),
         "--version" | "-V" | "version" => {
             println!("agent-guard {}", env!("CARGO_PKG_VERSION"));
             ExitCode::SUCCESS
@@ -179,6 +182,8 @@ fn main() -> ExitCode {
                  \x20 post-tool             PostToolUse / AfterTool JSON output scanner (stdin)\n\
                  \x20 user-prompt           UserPromptSubmit turn-isolation reset hook (stdin)\n\
                  \x20 pre-compact           PreCompact / PreCompress step-budget reset & ASCII directive\n\
+                 \x20 exec-sandbox          Execute shell command inside OS Landlock/Seatbelt VFS sandbox\n\
+                 \x20 sandbox-status        Report active host kernel VFS sandbox enforcement mode\n\
                  \x20 sanitize-stream       Pre-buffer 7-bit ASCII sanitizer & 120-line stream compactor\n\
                  \x20 read-safe <path>      Read & neuter file into 128-bit spotlighted 7-bit ASCII\n\
                  \x20 post-edit <file>      Incremental post-edit Unicode/secret/immutability check\n\
@@ -263,6 +268,49 @@ fn run_read_safe(raw_path: &str, extra: &[String], cwd: &Path) -> ExitCode {
             ExitCode::SUCCESS
         }
         Err(dec) => {
+            let can_auto_page = limit_lines.is_none()
+                && matches!(
+                    &dec,
+                    Decision::Deny {
+                        code: "FILE_BYTE_BUDGET_EXCEEDED"
+                            | "FILE_BYTE_CAP_EXCEEDED"
+                            | "LINE_COUNT_BUDGET_EXCEEDED"
+                            | "TOKEN_ESTIMATE_EXCEEDED",
+                        halt_session: false,
+                        ..
+                    }
+                );
+            if can_auto_page {
+                let start = offset_line.unwrap_or(1).max(1);
+                for page_len in [150usize, 75usize] {
+                    if let Ok(clean_ascii) = pre_inspect_file_for_ingestion(
+                        &valid.canonical_or_norm,
+                        &valid.repo_rel,
+                        valid.is_root_authority,
+                        Some(start),
+                        Some(page_len),
+                        &repo_root,
+                        &mut ledger,
+                        false,
+                    ) {
+                        let _ = ledger.save(&repo_root);
+                        let end = start + page_len - 1;
+                        let next = end + 1;
+                        eprintln!(
+                            "[AGENT-GUARD AUTO-PAGINATED: showing lines {start}..={end}; pass `--offset {next} --limit {page_len}` for next page]"
+                        );
+                        println!(
+                            "{}",
+                            wrap_spotlight_envelope(
+                                &clean_ascii,
+                                &ledger.turn_nonce,
+                                &valid.repo_rel
+                            )
+                        );
+                        return ExitCode::SUCCESS;
+                    }
+                }
+            }
             let _ = ledger.save(&repo_root);
             emit_cli_decision(dec)
         }
@@ -294,8 +342,9 @@ fn emit_hook_decision(decision: Decision, phase: HookPhase) -> ExitCode {
         Decision::Allow {
             advisory,
             updated_bash_cmd,
+            updated_input_json,
         } => {
-            if advisory.is_some() || updated_bash_cmd.is_some() {
+            if advisory.is_some() || updated_bash_cmd.is_some() || updated_input_json.is_some() {
                 let mut fields = vec![(
                     "hookEventName".to_string(),
                     JsonValue::Str(phase.event_name().to_string()),
@@ -309,6 +358,14 @@ fn emit_hook_decision(decision: Decision, phase: HookPhase) -> ExitCode {
                         "updatedInput".to_string(),
                         JsonValue::Object(vec![("command".to_string(), JsonValue::Str(cmd))]),
                     ));
+                } else if let Some(raw_obj) = updated_input_json
+                    && let Ok(parsed_obj) = JsonValue::parse(&raw_obj)
+                {
+                    fields.push((
+                        "permissionDecision".to_string(),
+                        JsonValue::Str("allow".to_string()),
+                    ));
+                    fields.push(("updatedInput".to_string(), parsed_obj));
                 }
                 if let Some(note) = advisory {
                     fields.push(("additionalContext".to_string(), JsonValue::Str(note)));
@@ -326,10 +383,21 @@ fn emit_hook_decision(decision: Decision, phase: HookPhase) -> ExitCode {
             reason,
             halt_session,
         } => {
-            if phase == HookPhase::PostTool && code == "NON_ASCII_SANITIZED_PREBUFFER" {
-                let note = format!(
-                    "[AGENT-GUARD PRE-BUFFER ASCII SANITIZER] Tool output contained non-ASCII or escape bytes and was sanitized to 7-bit ASCII:\n{reason}"
-                );
+            if phase == HookPhase::PostTool
+                && matches!(
+                    code,
+                    "NON_ASCII_SANITIZED_PREBUFFER" | "TOOL_OUTPUT_FLOOD_BLOCKED"
+                )
+            {
+                let note = if code == "TOOL_OUTPUT_FLOOD_BLOCKED" {
+                    format!(
+                        "[AGENT-GUARD AUTO-COMPACTED] Benign oversized tool output exceeded the 16 KiB step ceiling and was head/tail-compacted to clean 7-bit ASCII:\n{reason}"
+                    )
+                } else {
+                    format!(
+                        "[AGENT-GUARD PRE-BUFFER ASCII SANITIZER] Tool output contained non-ASCII or escape bytes and was sanitized to 7-bit ASCII:\n{reason}"
+                    )
+                };
                 let out = JsonValue::Object(vec![(
                     "hookSpecificOutput".to_string(),
                     JsonValue::Object(vec![
@@ -351,9 +419,27 @@ fn emit_hook_decision(decision: Decision, phase: HookPhase) -> ExitCode {
 
 fn emit_hook_denial(code: &str, reason: &str, halt_session: bool) -> ExitCode {
     let is_sanitized_replacement = code == "NON_ASCII_SANITIZED_PREBUFFER";
+    let is_recoverable_bound = !halt_session
+        && matches!(
+            code,
+            "FILE_BYTE_BUDGET_EXCEEDED"
+                | "FILE_BYTE_CAP_EXCEEDED"
+                | "LINE_COUNT_BUDGET_EXCEEDED"
+                | "SLICE_LINE_CAP_EXCEEDED"
+                | "TOKEN_ESTIMATE_EXCEEDED"
+                | "TURN_TOKEN_BUDGET_EXCEEDED"
+                | "TURN_READ_COUNT_EXCEEDED"
+                | "TURN_TOOL_CALL_LIMIT_EXCEEDED"
+                | "UNBOUNDED_GIT_LOG"
+                | "MAX_DEPTH_EXCEEDED"
+        );
     let full_msg = if is_sanitized_replacement {
         format!(
             "[AGENT-GUARD PRE-BUFFER ASCII SANITIZER :: {code}] Untrusted input/output contained non-ASCII bytes or escape triggers and was neutered prior to entering your context buffer. Use ONLY the clean 7-bit ASCII payload below (do NOT re-read raw):\n{reason}"
+        )
+    } else if is_recoverable_bound {
+        format!(
+            "[AGENT-GUARD BOUND GUIDANCE :: {code}] {reason} — Adjust the call to stay within micro-window bounds (e.g. `offset`/`limit <= 150`, `--max-depth 2`, `git log -n 20`) or compact step context."
         )
     } else {
         format!(

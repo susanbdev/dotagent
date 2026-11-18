@@ -56,6 +56,23 @@ fn main() -> ExitCode {
     }
 }
 
+const ROOT_MIRROR_MAP: &[(&str, &str)] = &[
+    ("AGENTS.md", "AGENTS.md"),
+    (".ignore", ".ignore"),
+    (".cursorignore", "cursor/.cursorignore"),
+    (".claude/settings.json", "claude/settings.json"),
+    (
+        ".claude/agents/research-airlock.md",
+        "claude/agents/research-airlock.md",
+    ),
+    (".codex/config.toml", "codex/config.toml"),
+    (".cursor/hooks.json", "cursor/hooks.json"),
+];
+
+fn is_self_hosted_dotagent_repo(repo_root: &Path) -> bool {
+    repo_root.join("crates").join("dotagent-compiler").is_dir()
+}
+
 fn build_all(repo_root: &Path) -> Result<usize, String> {
     let skills_lock_json = validate_and_lock_skills(repo_root)?;
     validate_profiles(repo_root)?;
@@ -74,6 +91,18 @@ fn build_all(repo_root: &Path) -> Result<usize, String> {
         write_file_contained(repo_root, &out_path, content)?;
         let digest = sha256_hex(content.as_bytes());
         manifest_lines.push(format!("{digest}  dist/{rel_path}"));
+    }
+
+    if is_self_hosted_dotagent_repo(repo_root) {
+        for (root_rel, dist_rel) in ROOT_MIRROR_MAP {
+            let Some(content) = artifacts.get(*dist_rel) else {
+                return Err(format!(
+                    "missing bundle artifact '{dist_rel}' for root mirror"
+                ));
+            };
+            let root_target = repo_root.join(root_rel);
+            write_file_contained(repo_root, &root_target, content)?;
+        }
     }
 
     let skills_digest = sha256_hex(skills_lock_json.as_bytes());
@@ -120,6 +149,28 @@ fn verify_all(repo_root: &Path) -> Result<usize, String> {
         }
         let digest = sha256_hex(disk_content.as_bytes());
         expected_lines.push(format!("{digest}  dist/{rel_path}"));
+    }
+
+    if is_self_hosted_dotagent_repo(repo_root) {
+        for (root_rel, dist_rel) in ROOT_MIRROR_MAP {
+            let Some(expected_content) = artifacts.get(*dist_rel) else {
+                return Err(format!(
+                    "missing bundle artifact '{dist_rel}' for root mirror"
+                ));
+            };
+            let root_path = repo_root.join(root_rel);
+            let actual_root = read_contained_regular_file(repo_root, &root_path).map_err(|e| {
+                format!(
+                    "missing or invalid root harness mirror '{}': {e}",
+                    root_path.display()
+                )
+            })?;
+            if &actual_root != expected_content {
+                return Err(format!(
+                    "root harness file '{root_rel}' drifted from compiled 'dist/{dist_rel}' (run `dotagent-compiler build .`)"
+                ));
+            }
+        }
     }
 
     let skills_digest = sha256_hex(actual_skills_lock.as_bytes());
@@ -567,10 +618,10 @@ Pods/
 Carthage/
 .bundle/
 
-# Build artifact directories (Cargo uses target/ internally; agent read/search/index excluded)
-target/
-build/
-dist-build/
+# Build artifact directories (Cargo uses /target/ internally; interior src/build or src/target allowed)
+/target/
+/build/
+/dist-build/
 target/debug/deps/
 target/release/deps/
 
@@ -644,9 +695,6 @@ fn render_claude_settings() -> String {
   "permissions": {
     "allow": [],
     "deny": [
-      "Task",
-      "Agent",
-      "Subagent",
       "Read(/tmp/**)",
       "Read(/var/tmp/**)",
       "Read(/dev/shm/**)",
@@ -665,9 +713,9 @@ fn render_claude_settings() -> String {
       "Read(**/.venv/**)",
       "Read(**/venv/**)",
       "Read(**/site-packages/**)",
-      "Read(**/target/**)",
-      "Read(**/build/**)",
-      "Read(**/dist-build/**)",
+      "Read(target/**)",
+      "Read(build/**)",
+      "Read(dist-build/**)",
       "Read(.env)",
       "Read(.env.*)",
       "Read(.env*)",
@@ -718,15 +766,7 @@ fn render_claude_settings() -> String {
       "Bash(sudo *)",
       "Bash(mktemp*)",
       "Bash(npx *)",
-      "Bash(python*)",
-      "Bash(python3*)",
-      "Bash(uv run*)",
       "Bash(uvx *)",
-      "Bash(node *)",
-      "Bash(bun *)",
-      "Bash(deno *)",
-      "Bash(perl *)",
-      "Bash(ruby *)",
       "Bash(gh workflow run*)",
       "Bash(git push*)",
       "Bash(git remote*)",

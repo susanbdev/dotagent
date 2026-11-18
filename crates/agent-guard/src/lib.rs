@@ -16,6 +16,7 @@
 
 pub mod budget_guard;
 pub mod cmd_policy;
+pub mod exec_sandbox;
 pub mod injection_scan;
 pub mod json;
 pub mod path_policy;
@@ -29,8 +30,9 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use budget_guard::{
-    MAX_TOOL_OUTPUT_BYTES, RuntimeProfile, STEP_SOFT_COMPACT_TOKENS, analyze_text_budget,
-    estimate_bpe_tokens, inspect_file_budget, inspect_file_on_disk_hygiene, load_active_profile,
+    MAX_SLICED_FILE_BYTES, MAX_TOOL_OUTPUT_BYTES, RuntimeProfile, STEP_SOFT_COMPACT_TOKENS,
+    analyze_text_budget, estimate_bpe_tokens, inspect_file_budget, inspect_file_on_disk_hygiene,
+    load_active_profile,
 };
 use cmd_policy::{
     evaluate_shell_command, inspect_repo_build_config_traps, inspect_repo_git_config_and_hooks,
@@ -41,7 +43,10 @@ use path_policy::{
     MAX_DIRECTORY_WALK_DEPTH, PathAccess, lexical_normalize, validate_path,
     validate_workspace_glob_pattern,
 };
-use sanitizer::{neuter_to_clean_ascii, wrap_spotlight_envelope};
+use sanitizer::{
+    DEFAULT_COMPACT_STREAM_MAX_BYTES, DEFAULT_COMPACT_STREAM_MAX_LINES, neuter_to_clean_ascii,
+    sanitize_and_compact_bytes, wrap_spotlight_envelope,
+};
 use traversal_ledger::{SessionLedger, append_audit_jsonl};
 use unicode_guard::{ScanMode, scan_unicode};
 
@@ -57,6 +62,7 @@ pub enum Decision {
     Allow {
         advisory: Option<String>,
         updated_bash_cmd: Option<String>,
+        updated_input_json: Option<String>,
     },
     Deny {
         code: &'static str,
@@ -70,6 +76,7 @@ impl Decision {
         Self::Allow {
             advisory: None,
             updated_bash_cmd: None,
+            updated_input_json: None,
         }
     }
 
@@ -77,6 +84,7 @@ impl Decision {
         Self::Allow {
             advisory: Some(note.into()),
             updated_bash_cmd: None,
+            updated_input_json: None,
         }
     }
 
@@ -414,21 +422,29 @@ fn evaluate_tool_invocation(
 
         let effective_cmd = plan.rewritten_command.as_deref().unwrap_or(cmd_str);
 
-        // Pre-buffer Bash stdout/stderr sanitization + tight 120-line compaction is ON BY DEFAULT
-        // unless `AGENT_GUARD_WRAP_BASH_ASCII=0` is explicitly set for bare-command unit harnesses.
+        // Layer-1 OS/env/git sandbox (`exec-sandbox`) + pre-buffer 7-bit ASCII stream compaction is
+        // ON BY DEFAULT unless `AGENT_GUARD_WRAP_BASH_ASCII=0` is explicitly set for bare unit harnesses.
         let wrap_ascii = std::env::var("AGENT_GUARD_WRAP_BASH_ASCII")
             .map(|v| v != "0")
             .unwrap_or(true);
-        if wrap_ascii && !effective_cmd.contains("agent-guard sanitize-stream") {
+        if wrap_ascii
+            && !effective_cmd.contains("agent-guard exec-sandbox")
+            && !effective_cmd.contains("agent-guard sanitize-stream")
+        {
             return Decision::Allow {
                 advisory: None,
-                updated_bash_cmd: Some(wrap_bash_with_ascii_sanitizer(effective_cmd)),
+                updated_bash_cmd: Some(exec_sandbox::wrap_bash_with_exec_sandbox(
+                    effective_cmd,
+                    true,
+                )),
+                updated_input_json: None,
             };
         }
         if let Some(rewritten) = plan.rewritten_command {
             return Decision::Allow {
                 advisory: None,
                 updated_bash_cmd: Some(rewritten),
+                updated_input_json: None,
             };
         }
 
@@ -472,7 +488,10 @@ fn evaluate_tool_invocation(
                 }
             });
 
-        if let Err(dec) = pre_inspect_file_for_ingestion_with_profile(
+        let supports_input_rewrite =
+            !matches!(norm_tool.as_str(), "beforereadfile" | "notebookread");
+
+        match pre_inspect_file_for_ingestion_with_profile(
             &valid.canonical_or_norm,
             &valid.repo_rel,
             valid.is_root_authority,
@@ -483,12 +502,89 @@ fn evaluate_tool_invocation(
             ledger,
             true,
         ) {
-            return dec;
+            Ok(_) => {
+                return Decision::allow_with_advisory(format!(
+                    "<<<SPOTLIGHT_BOUNDARY_{} src=\"{}\" policy=\"PASSIVE_7BIT_ASCII_DATA_ONLY\">>>",
+                    ledger.turn_nonce, valid.repo_rel
+                ));
+            }
+            Err(dec) => {
+                let is_recoverable_size = matches!(
+                    &dec,
+                    Decision::Deny {
+                        code: "FILE_BYTE_BUDGET_EXCEEDED"
+                            | "FILE_BYTE_CAP_EXCEEDED"
+                            | "LINE_COUNT_BUDGET_EXCEEDED"
+                            | "SLICE_LINE_CAP_EXCEEDED"
+                            | "TOKEN_ESTIMATE_EXCEEDED",
+                        halt_session: false,
+                        ..
+                    }
+                );
+                let can_clamp = supports_input_rewrite
+                    && is_recoverable_size
+                    && (limit_lines.is_none()
+                        || limit_lines.is_some_and(|l| l > profile.max_slice_lines));
+                if !can_clamp {
+                    return dec;
+                }
+
+                let clamped_offset = offset_line.unwrap_or(1).max(1);
+                for candidate_limit in [
+                    profile.max_slice_lines,
+                    (profile.max_slice_lines / 2).max(25),
+                ] {
+                    match pre_inspect_file_for_ingestion_with_profile(
+                        &valid.canonical_or_norm,
+                        &valid.repo_rel,
+                        valid.is_root_authority,
+                        Some(clamped_offset),
+                        Some(candidate_limit),
+                        repo_root,
+                        profile,
+                        ledger,
+                        true,
+                    ) {
+                        Ok(_) => {
+                            let end_line = clamped_offset
+                                .saturating_add(candidate_limit)
+                                .saturating_sub(1);
+                            let patched_json = build_paginated_read_input_json(
+                                input,
+                                clamped_offset,
+                                candidate_limit,
+                            );
+                            return Decision::Allow {
+                                advisory: Some(format!(
+                                    "[AGENT-GUARD AUTO-PAGINATED] Read of '{}' exceeded micro-window cap and was clamped to lines {}..={} ({} lines). Pass explicit offset/limit for subsequent pages. <<<SPOTLIGHT_BOUNDARY_{} src=\"{}\" policy=\"PASSIVE_7BIT_ASCII_DATA_ONLY\">>>",
+                                    valid.repo_rel,
+                                    clamped_offset,
+                                    end_line,
+                                    candidate_limit,
+                                    ledger.turn_nonce,
+                                    valid.repo_rel
+                                )),
+                                updated_bash_cmd: None,
+                                updated_input_json: Some(patched_json),
+                            };
+                        }
+                        Err(
+                            non_ascii @ Decision::Deny {
+                                code: "NON_ASCII_SANITIZED_PREBUFFER",
+                                ..
+                            },
+                        ) => return non_ascii,
+                        Err(
+                            security_block @ Decision::Deny {
+                                halt_session: true, ..
+                            },
+                        ) => return security_block,
+                        Err(_) => continue,
+                    }
+                }
+                return dec;
+            }
         }
-        return Decision::allow_with_advisory(format!(
-            "<<<SPOTLIGHT_BOUNDARY_{} src=\"{}\" policy=\"PASSIVE_7BIT_ASCII_DATA_ONLY\">>>",
-            ledger.turn_nonce, valid.repo_rel
-        ));
     }
 
     // 4b. Patch tools (`apply_patch`, `patch`) — extract and validate every modified/added/deleted path!
@@ -609,7 +705,7 @@ fn evaluate_tool_invocation(
     }
 
     // 6. Search / Glob / Directory Listing tools (`Grep`, `Glob`, `LS`, `grep_search`, `find_by_name`, `list_dir`)
-    // 5b. Subagent & Delegation Tool Lockdown (`SUBAGENT_DELEGATION_BLOCKED` unless `AGENT_GUARD_ALLOW_SWARM=1`)
+    // 5b. Subagent & Delegation Tool Lockdown (`SUBAGENT_DELEGATION_BLOCKED` unless `research-airlock` or `AGENT_GUARD_ALLOW_SWARM=1`)
     let is_subagent_tool = matches!(
         norm_tool.as_str(),
         "task"
@@ -626,11 +722,13 @@ fn evaluate_tool_invocation(
     );
     let swarm_allowed =
         std::env::var("AGENT_GUARD_ALLOW_SWARM").ok().as_deref() == Some("1") && !ledger.tainted;
-    if is_subagent_tool && !swarm_allowed {
+    let is_research_airlock =
+        is_research_airlock_delegation(norm_tool.as_str(), input, ledger.tainted);
+    if is_subagent_tool && !swarm_allowed && !is_research_airlock {
         return Decision::deny(
             "SUBAGENT_DELEGATION_BLOCKED",
             format!(
-                "Subagent/delegation tool '{tool_name}' is hard-blocked by default; run work directly in the main session (or set AGENT_GUARD_ALLOW_SWARM=1 outside the shell when authorized)."
+                "Subagent/delegation tool '{tool_name}' is blocked unless explicitly targeting read-only `subagent_type: \"research-airlock\"` (or set AGENT_GUARD_ALLOW_SWARM=1 outside the shell when authorized)."
             ),
             false,
         );
@@ -732,7 +830,7 @@ fn evaluate_tool_invocation(
             | "list_skills"
             | "enterplanmode"
             | "exitplanmode"
-    ) || (is_subagent_tool && swarm_allowed);
+    ) || (is_subagent_tool && (swarm_allowed || is_research_airlock));
     if is_approved_mcp || is_safe_harness_meta {
         if let Some(first) = find_first_unicode_violation_in_json(input) {
             return Decision::deny(
@@ -747,7 +845,7 @@ fn evaluate_tool_invocation(
         let mut nested_paths = Vec::new();
         collect_nested_path_fields(input, &mut nested_paths);
         for raw_p in &nested_paths {
-            let access = if writes_disabled {
+            let access = if writes_disabled || is_research_airlock {
                 PathAccess::Read
             } else {
                 PathAccess::ReferencePointer
@@ -755,6 +853,19 @@ fn evaluate_tool_invocation(
             if let Err(pv) = validate_path(repo_root, cwd, raw_p, access) {
                 return Decision::deny(pv.code, pv.detail, pv.is_poisoned_zone);
             }
+        }
+        if is_research_airlock {
+            let mut strs = Vec::new();
+            collect_all_json_strings(input, &mut strs);
+            for s in strs {
+                let scan = scan_untrusted_content(s, repo_root, cwd, false);
+                if let Some(halt) = scan.first_halt() {
+                    return Decision::deny(halt.code, halt.detail.clone(), true);
+                }
+            }
+            return Decision::allow_with_advisory(
+                "[AGENT-GUARD RESEARCH-AIRLOCK] Read-only `research-airlock` subagent authorized. Subagent return summary MUST stay <= 200 pure 7-bit ASCII tokens (file paths, line ranges, symbol signatures only).",
+            );
         }
         if is_approved_mcp && ledger.tainted {
             let sub_action = &norm_tool[ALLOWED_MCP_SERVER_PREFIX.len()..];
@@ -791,9 +902,114 @@ fn evaluate_tool_invocation(
     )
 }
 
-fn wrap_bash_with_ascii_sanitizer(cmd_str: &str) -> String {
-    let escaped = cmd_str.replace('\'', "'\\''");
-    format!("bash -o pipefail -c '({escaped}) 2>&1 | agent-guard sanitize-stream'")
+fn json_contains_write_enable(val: &JsonValue) -> bool {
+    match val {
+        JsonValue::Object(entries) => entries.iter().any(|(k, v)| {
+            (k.eq_ignore_ascii_case("enable_write_tools") && v.as_bool() == Some(true))
+                || (k.eq_ignore_ascii_case("mode")
+                    && v.as_str().is_some_and(|s| {
+                        !s.eq_ignore_ascii_case("readonly")
+                            && !s.eq_ignore_ascii_case("read-only")
+                            && !s.eq_ignore_ascii_case("plan")
+                    }))
+                || json_contains_write_enable(v)
+        }),
+        JsonValue::Array(items) => items.iter().any(json_contains_write_enable),
+        _ => false,
+    }
+}
+
+fn is_research_airlock_delegation(
+    norm_tool: &str,
+    input: &JsonValue,
+    session_tainted: bool,
+) -> bool {
+    if session_tainted {
+        return false;
+    }
+    if !matches!(norm_tool, "task" | "agent" | "subagent" | "invoke_subagent") {
+        return false;
+    }
+    if json_contains_write_enable(input) {
+        return false;
+    }
+    if let Some(JsonValue::Array(subagents)) = input.get("Subagents") {
+        if subagents.is_empty() {
+            return false;
+        }
+        return subagents.iter().all(|entry| {
+            extract_first_str(entry, &["TypeName", "subagent_type", "agent_type"])
+                .is_some_and(|t| t.eq_ignore_ascii_case("research-airlock"))
+        });
+    }
+    extract_first_str(
+        input,
+        &["subagent_type", "agent_type", "TypeName", "subagent"],
+    )
+    .is_some_and(|t| t.eq_ignore_ascii_case("research-airlock"))
+}
+
+fn collect_all_json_strings<'a>(val: &'a JsonValue, out: &mut Vec<&'a str>) {
+    match val {
+        JsonValue::Str(s) => out.push(s.as_str()),
+        JsonValue::Array(items) => {
+            for item in items {
+                collect_all_json_strings(item, out);
+            }
+        }
+        JsonValue::Object(entries) => {
+            for (_, v) in entries {
+                collect_all_json_strings(v, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn build_paginated_read_input_json(
+    input: &JsonValue,
+    clamped_offset: usize,
+    clamped_limit: usize,
+) -> String {
+    let uses_start_end = input.get("AbsolutePath").is_some()
+        || input.get("StartLine").is_some()
+        || input.get("EndLine").is_some();
+    let mut fields: Vec<(String, JsonValue)> = match input {
+        JsonValue::Object(entries) => entries
+            .iter()
+            .filter(|(k, _)| {
+                !matches!(
+                    k.as_str(),
+                    "offset"
+                        | "limit"
+                        | "max_lines"
+                        | "StartLine"
+                        | "EndLine"
+                        | "start_line"
+                        | "end_line"
+                )
+            })
+            .cloned()
+            .collect(),
+        _ => Vec::new(),
+    };
+    if uses_start_end {
+        let end_line = clamped_offset
+            .saturating_add(clamped_limit)
+            .saturating_sub(1);
+        fields.push((
+            "StartLine".to_string(),
+            JsonValue::Number(clamped_offset as f64),
+        ));
+        fields.push(("EndLine".to_string(), JsonValue::Number(end_line as f64)));
+    } else {
+        fields.push((
+            "offset".to_string(),
+            JsonValue::Number(clamped_offset as f64),
+        ));
+        fields.push(("limit".to_string(), JsonValue::Number(clamped_limit as f64)));
+    }
+    JsonValue::Object(fields).to_json_string()
 }
 
 /// Core pre-ingestion file gate: runs BEFORE the LLM sees the file!
@@ -974,24 +1190,87 @@ pub fn handle_post_tool_hook(raw_json: &str, fallback_cwd: &Path) -> Decision {
         return Decision::allow();
     }
 
-    // 1. Dynamic output byte/token flood guard
+    let raw_tool_name = extract_tool_name(&parsed);
+    let tool_label = if raw_tool_name.is_empty() {
+        "PostToolUse"
+    } else {
+        raw_tool_name.as_str()
+    };
+
+    // 1. Dynamic output byte/token flood guard: scan bounded window for smuggling/injection FIRST,
+    // then head/tail-compact benign floods without tainting the session!
     if output_text.len() > MAX_TOOL_OUTPUT_BYTES {
-        ledger.mark_tainted("oversized tool output".to_string());
+        let max_scan = (MAX_SLICED_FILE_BYTES as usize).min(output_text.len());
+        let mut scan_end = max_scan;
+        while scan_end > 0 && !output_text.is_char_boundary(scan_end) {
+            scan_end -= 1;
+        }
+        let inspect_slice = &output_text[..scan_end];
+
+        let uni = scan_unicode(inspect_slice, ScanMode::UntrustedContent);
+        if let Some(first) = uni.first() {
+            ledger.trip_circuit_breaker(format!("{}: {}", first.code, first.detail));
+            let _ = ledger.save(&repo_root);
+            append_audit_jsonl(
+                &repo_root,
+                &session_id,
+                "PostToolUse",
+                first.code,
+                &first.detail,
+                true,
+            );
+            return Decision::deny(
+                first.code,
+                format!(
+                    "Dynamic tool output contained Unicode smuggling: {}",
+                    first.detail
+                ),
+                true,
+            );
+        }
+
+        let scan = scan_untrusted_content(inspect_slice, &repo_root, &cwd, false);
+        if let Some(halt) = scan.first_halt() {
+            ledger.trip_circuit_breaker(format!("{}: {}", halt.code, halt.detail));
+            let _ = ledger.save(&repo_root);
+            append_audit_jsonl(
+                &repo_root,
+                &session_id,
+                "PostToolUse",
+                halt.code,
+                &halt.detail,
+                true,
+            );
+            return Decision::deny(halt.code, halt.detail.clone(), true);
+        }
+
+        ledger.register_dynamic_tool_pointers(tool_label, &scan.valid_repo_pointers);
+        let compacted = sanitize_and_compact_bytes(
+            inspect_slice.as_bytes(),
+            DEFAULT_COMPACT_STREAM_MAX_LINES,
+            DEFAULT_COMPACT_STREAM_MAX_BYTES,
+        );
+        let compacted_tokens = estimate_bpe_tokens(&compacted.clean_ascii);
+        ledger.cumulative_tokens = ledger.cumulative_tokens.saturating_add(compacted_tokens);
         let _ = ledger.save(&repo_root);
-        let detail = format!(
-            "Tool output is {} bytes (> {MAX_TOOL_OUTPUT_BYTES} byte step ceiling for profile '{}') — blocked to keep context window tiny.",
+
+        let wrapped =
+            wrap_spotlight_envelope(&compacted.clean_ascii, &ledger.turn_nonce, tool_label);
+        let audit_detail = format!(
+            "Tool output {} bytes (> {MAX_TOOL_OUTPUT_BYTES} byte step ceiling for profile '{}') auto-compacted to {} bytes.",
             output_text.len(),
-            profile.profile_id
+            profile.profile_id,
+            compacted.clean_ascii.len()
         );
         append_audit_jsonl(
             &repo_root,
             &session_id,
             "PostToolUse",
             "TOOL_OUTPUT_FLOOD_BLOCKED",
-            &detail,
+            &audit_detail,
             false,
         );
-        return Decision::deny("TOOL_OUTPUT_FLOOD_BLOCKED", detail, false);
+        return Decision::deny("TOOL_OUTPUT_FLOOD_BLOCKED", wrapped, false);
     }
 
     if let Err(bv) = analyze_text_budget(&output_text, false) {
@@ -1047,27 +1326,26 @@ pub fn handle_post_tool_hook(raw_json: &str, fallback_cwd: &Path) -> Decision {
     }
 
     // 4. Register outgoing repository pointers discovered in dynamic tool output (`A -> B -> C`)
-    let raw_tool_name = extract_tool_name(&parsed);
-    let tool_label = if raw_tool_name.is_empty() {
-        "PostToolUse"
-    } else {
-        raw_tool_name.as_str()
-    };
     ledger.register_dynamic_tool_pointers(tool_label, &scan.valid_repo_pointers);
 
     // 5. Pre-buffer 7-bit ASCII sanitization + active profile per-step token ceiling check
     let sanitized = neuter_to_clean_ascii(&output_text);
     let out_tokens = estimate_bpe_tokens(&sanitized.clean_ascii);
-    if let Some(summary_cap) = profile.max_return_summary_ascii_tokens
+    let swarm_allowed =
+        std::env::var("AGENT_GUARD_ALLOW_SWARM").ok().as_deref() == Some("1") && !ledger.tainted;
+    let effective_subagent_cap = profile
+        .max_return_summary_ascii_tokens
+        .or(if swarm_allowed { None } else { Some(200) });
+    if let Some(summary_cap) = effective_subagent_cap
         && matches!(
             raw_tool_name.to_ascii_lowercase().as_str(),
-            "task" | "invoke_subagent" | "subagent"
+            "task" | "agent" | "invoke_subagent" | "subagent"
         )
         && out_tokens > summary_cap
     {
         let _ = ledger.save(&repo_root);
         let detail = format!(
-            "Subagent return summary ({out_tokens} est. tokens) exceeds profile '{}' airlock cap ({summary_cap} ASCII tokens).",
+            "Subagent return summary ({out_tokens} est. tokens) exceeds airlock cap ({summary_cap} ASCII tokens for profile '{}').",
             profile.profile_id
         );
         append_audit_jsonl(

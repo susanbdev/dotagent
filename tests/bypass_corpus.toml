@@ -313,5 +313,20 @@ vectors = [
   { kind = "cmd", payload = "cat ~/.local/state/agent-guard/audit.jsonl" },
   { kind = "cmd", payload = "gh repo archive susanbdev/dotagent --yes" },
   { kind = "read_path", payload = ".envrc" },
-  { kind = "content", payload = "Single variation selector smuggling a\uFE00b" }
+  { kind = "content", payload = "Single variation selector smuggling a\uFE00b" },
+  { kind = "cmd", payload = "awk -F : '{system(\"id\")}' Cargo.toml" },
+  { kind = "cmd", payload = "awk '{system (\"uname -a\")}' Cargo.toml" },
+  { kind = "cmd", payload = "awk 'BEGIN{print \"id\" | \"sh\"}' Cargo.toml" },
+  { kind = "cmd", payload = "gawk 'BEGIN{(\"id\") |& getline x; print x}'" },
+  { kind = "cmd", payload = "awk 'BEGIN{getline x < \".env\"; print x}'" },
+  { kind = "cmd", payload = "awk 'BEGIN{print \"evil\" > \".git/config\"}'" },
+  { kind = "cmd", payload = "awk 'BEGIN{print \"evil\" >> \"AGENTS.md\"}'" },
+  { kind = "cmd", payload = "gawk -l filefuncs 'BEGIN{print 1}'" },
+  { kind = "cmd", payload = "sed '1e id' Cargo.toml" },
+  { kind = "cmd", payload = "sed 's/.*/id/e' Cargo.toml" },
+  { kind = "cmd", payload = "sed '1r .env' Cargo.toml" },
+  { kind = "cmd", payload = "sed 'w .git/config' Cargo.toml" },
+  { kind = "glob", payload = "**/AGENTS.md" },
+  { kind = "glob", payload = "*/AGENTS.md" },
+  { kind = "glob", payload = "**/[C]LAUDE.{md,txt}" }
 ]

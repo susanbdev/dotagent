@@ -47,10 +47,10 @@ Pods/
 Carthage/
 .bundle/
 
-# Build artifact directories (Cargo uses target/ internally; agent read/search/index excluded)
-target/
-build/
-dist-build/
+# Build artifact directories (Cargo uses /target/ internally; interior src/build or src/target allowed)
+/target/
+/build/
+/dist-build/
 target/debug/deps/
 target/release/deps/
 

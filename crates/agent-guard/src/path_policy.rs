@@ -138,7 +138,7 @@ pub fn validate_path(
         .or_else(|| lex_target.strip_prefix(&lex_repo).ok())
         .map(path_to_slash_string);
     if let Some(ref lex_rel) = lex_rel_opt {
-        check_repo_build_artifact_segments(lex_rel, trimmed)?;
+        check_repo_build_artifact_segments(&canon_repo, lex_rel, trimmed)?;
         let lex_is_root = check_authority_file_policy(lex_rel, access)?;
         if lex_is_root {
             if let Ok(meta) = fs::symlink_metadata(&base_dir) {
@@ -178,7 +178,7 @@ pub fn validate_path(
         .unwrap_or(Path::new(""))
         .to_path_buf();
     let repo_rel = path_to_slash_string(&rel_path_buf);
-    check_repo_build_artifact_segments(&repo_rel, trimmed)?;
+    check_repo_build_artifact_segments(&canon_repo, &repo_rel, trimmed)?;
 
     // 5. Enforce Single Root Authority File (`<repo_root>/AGENTS.md` ONLY)
     let is_root_authority = check_authority_file_policy(&repo_rel, access)?;
@@ -305,7 +305,7 @@ pub fn validate_workspace_glob_pattern(
             .or_else(|| abs_pat.strip_prefix(&lex_repo).ok())
             .map(path_to_slash_string)
         {
-            check_repo_build_artifact_segments(&rel_after_repo, trimmed)?;
+            check_repo_build_artifact_segments(&canon_repo, &rel_after_repo, trimmed)?;
             check_glob_shadow_authority(&rel_after_repo, true)?;
         }
     } else {
@@ -320,13 +320,25 @@ pub fn validate_workspace_glob_pattern(
                 dir_prefix,
                 PathAccess::ReferencePointer,
             )?;
-            let has_concrete_subdir = !v.repo_rel.is_empty();
-            check_glob_shadow_authority(&norm_slashes, has_concrete_subdir)?;
+            let eff_rel = if v.repo_rel.is_empty() {
+                norm_slashes.clone()
+            } else {
+                format!("{}/{}", v.repo_rel, &norm_slashes[pos..])
+            };
+            check_repo_build_artifact_segments(&canon_repo, &eff_rel, trimmed)?;
+            let has_subdir_or_slash = !v.repo_rel.is_empty() || norm_slashes.contains('/');
+            check_glob_shadow_authority(&norm_slashes, has_subdir_or_slash)?;
         } else {
             let base_valid =
                 validate_path(repo_root, cwd, base_raw_path, PathAccess::ReferencePointer)?;
-            let has_concrete_subdir = !base_valid.repo_rel.is_empty();
-            check_glob_shadow_authority(&norm_slashes, has_concrete_subdir)?;
+            let eff_rel = if base_valid.repo_rel.is_empty() {
+                norm_slashes.clone()
+            } else {
+                format!("{}/{}", base_valid.repo_rel, norm_slashes)
+            };
+            check_repo_build_artifact_segments(&canon_repo, &eff_rel, trimmed)?;
+            let has_subdir_or_slash = !base_valid.repo_rel.is_empty() || norm_slashes.contains('/');
+            check_glob_shadow_authority(&norm_slashes, has_subdir_or_slash)?;
         }
     }
 
@@ -335,30 +347,69 @@ pub fn validate_workspace_glob_pattern(
 
 fn check_glob_shadow_authority(
     pat_slashes: &str,
-    has_concrete_subdir: bool,
+    has_subdir_or_slash: bool,
 ) -> Result<(), PathViolation> {
     let lower = pat_slashes.to_ascii_lowercase();
-    let tail = lower.rsplit('/').next().unwrap_or(&lower);
-    let is_shadow = matches!(
-        tail,
-        "agents.override.md"
-            | "claude.md"
-            | "claude.local.md"
-            | "gemini.md"
-            | ".cursorrules"
-            | ".windsurfrules"
-            | ".clinerules"
-            | ".roorules"
-            | "copilot-instructions.md"
-            | ".aider.conf.yml"
-    ) || tail.ends_with(".instructions.md")
-        || lower.starts_with(".cursor/rules/")
-        || lower.contains("/.cursor/rules/")
-        || lower.starts_with(".claude/rules/")
-        || lower.contains("/.claude/rules/")
-        || lower.starts_with(".github/instructions/")
-        || lower.contains("/.github/instructions/")
-        || (tail == "agents.md" && has_concrete_subdir);
+    let debracketed = lower.replace(['[', ']'], "");
+    let raw_tail = debracketed.rsplit('/').next().unwrap_or(&debracketed);
+
+    // Expand brace alternatives in tail (e.g. `claude.{md,txt}` -> `claude.md`, `claude.txt`)
+    let tail_candidates: Vec<String> = if let (Some(open), Some(close)) =
+        (raw_tail.find('{'), raw_tail.rfind('}'))
+        && open < close
+    {
+        let prefix = &raw_tail[..open];
+        let suffix = &raw_tail[close + 1..];
+        raw_tail[open + 1..close]
+            .split(',')
+            .map(|alt| format!("{prefix}{}{suffix}", alt.trim()))
+            .collect()
+    } else {
+        vec![raw_tail.to_string()]
+    };
+
+    let path_targets_rules_dir = debracketed.starts_with(".cursor/rules/")
+        || debracketed.contains("/.cursor/rules/")
+        || debracketed.starts_with(".claude/rules/")
+        || debracketed.contains("/.claude/rules/")
+        || debracketed.starts_with(".github/instructions/")
+        || debracketed.contains("/.github/instructions/");
+
+    let is_shadow = path_targets_rules_dir
+        || tail_candidates.iter().any(|cand| {
+            let stripped = cand.trim_matches(['*', '?']);
+            matches!(
+                cand.as_str(),
+                "agents.override.md"
+                    | "claude.md"
+                    | "claude.local.md"
+                    | "gemini.md"
+                    | ".cursorrules"
+                    | ".windsurfrules"
+                    | ".clinerules"
+                    | ".roorules"
+                    | "copilot-instructions.md"
+                    | ".aider.conf.yml"
+            ) || matches!(
+                stripped,
+                "agents.override.md"
+                    | "agents.override"
+                    | "claude.md"
+                    | "claude.local.md"
+                    | "claude.local"
+                    | "gemini.md"
+                    | ".cursorrules"
+                    | ".windsurfrules"
+                    | ".clinerules"
+                    | ".roorules"
+                    | "copilot-instructions.md"
+                    | "copilot-instructions"
+                    | ".aider.conf.yml"
+                    | ".aider.conf"
+            ) || cand.ends_with(".instructions.md")
+                || (cand == "agents.md" && has_subdir_or_slash)
+                || (stripped == "agents.md" && (has_subdir_or_slash || cand != "agents.md"))
+        });
 
     if is_shadow {
         return Err(PathViolation {
@@ -520,7 +571,10 @@ pub fn check_forbidden_zones_lexical(
                 }
             }
         }
-        if !Path::new(&normalized_slashes).is_absolute() && is_build_artifact_segment(&seg_lower) {
+        if !Path::new(&normalized_slashes).is_absolute()
+            && is_build_artifact_segment(&seg_lower)
+            && (idx == 0 || (idx == 1 && segments[0] == "**"))
+        {
             return Err(PathViolation {
                 code: "FORBIDDEN_BUILD_ARTIFACT_PATH",
                 detail: format!(
@@ -602,19 +656,30 @@ pub fn check_forbidden_zones_lexical(
 }
 
 pub fn check_repo_build_artifact_segments(
+    repo_root: &Path,
     repo_rel: &str,
     display_raw: &str,
 ) -> Result<(), PathViolation> {
-    for seg in repo_rel.split('/').filter(|s| !s.is_empty()) {
+    let segs: Vec<&str> = repo_rel.split('/').filter(|s| !s.is_empty()).collect();
+    let mut cur = repo_root.to_path_buf();
+    for (idx, seg) in segs.iter().enumerate() {
         let seg_lower = seg.to_ascii_lowercase();
+        if !seg.contains(['*', '?', '[', '{']) {
+            cur.push(seg);
+        }
         if is_build_artifact_segment(&seg_lower) {
-            return Err(PathViolation {
-                code: "FORBIDDEN_BUILD_ARTIFACT_PATH",
-                detail: format!(
-                    "Direct tool access inside build output directory '{seg}' ('{display_raw}') is forbidden; let build/test tools manage build artifacts."
-                ),
-                is_poisoned_zone: false,
-            });
+            let is_root_build_dir = idx == 0 || (idx == 1 && segs[0] == "**");
+            let has_build_marker = !seg.contains(['*', '?', '[', '{'])
+                && (cur.join("CACHEDIR.TAG").is_file() || cur.join(".rustc_info.json").is_file());
+            if is_root_build_dir || has_build_marker {
+                return Err(PathViolation {
+                    code: "FORBIDDEN_BUILD_ARTIFACT_PATH",
+                    detail: format!(
+                        "Direct tool access inside build output directory '{seg}' ('{display_raw}') is forbidden; let build/test tools manage build artifacts."
+                    ),
+                    is_poisoned_zone: false,
+                });
+            }
         }
     }
     Ok(())
