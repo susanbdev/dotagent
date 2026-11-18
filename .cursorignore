@@ -1,0 +1,104 @@
+# Managed by susanbdev/dotagent -- Search & Indexer Zero-Snooping Firewall
+# Blocks ripgrep (rg), fd, Cursor, and IDE indexers from snooping caches,
+# temp dirs, dependencies, secrets, guard state, lockfiles, and rogue rule files.
+
+# Temp directories
+/tmp/
+tmp/
+.tmp/
+temp/
+.temp/
+
+# Cache directories
+.cache/
+__pycache__/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.hypothesis/
+.tox/
+.nox/
+.next/
+.nuxt/
+.turbo/
+.parcel-cache/
+.vite/
+.eslintcache
+.angular/
+.svelte-kit/
+.ccache/
+.sass-cache/
+.gradle/
+.m2/
+
+# Dependency & vendor directories
+node_modules/
+bower_components/
+jspm_packages/
+vendor/
+.venv/
+venv/
+virtualenv/
+site-packages/
+dist-packages/
+.pnpm/
+.yarn/
+Pods/
+Carthage/
+.bundle/
+
+# Build artifact directories (Cargo uses /target/ internally; interior src/build or src/target allowed)
+/target/
+/build/
+/dist-build/
+target/debug/deps/
+target/release/deps/
+
+# Secrets, credentials, & agent-guard internal state
+.env
+.env.*
+.env*
+*.pem
+*.key
+*.p12
+*.pfx
+*.jks
+*.keystore
+*.kdbx
+.netrc
+.npmrc
+.pypirc
+.agent-guard-state/
+audit.jsonl
+
+# Context-window saturation bombs (lockfiles & minified bundles)
+package-lock.json
+pnpm-lock.yaml
+yarn.lock
+bun.lockb
+composer.lock
+poetry.lock
+*.min.js
+*.min.css
+*.map
+*.wasm
+
+# Block nested & shadow instruction files (only root /AGENTS.md is allowed!)
+/*/*/AGENTS.md
+/*/AGENTS.md
+AGENTS.override.md
+**/AGENTS.override.md
+CLAUDE.md
+**/CLAUDE.md
+CLAUDE.local.md
+**/CLAUDE.local.md
+.cursorrules
+**/.cursorrules
+.windsurfrules
+**/.windsurfrules
+.clinerules
+**/.clinerules
+.github/copilot-instructions.md
+.github/instructions/
+.cursor/rules/
+.claude/rules/

@@ -1,0 +1,44 @@
+# Strictly Read-Only Adversarial Diff & Security Reviewer Profile
+profile_id = "adversarial-reviewer"
+version = "1.0.0"
+privilege_tier = "ring-1"
+write_scope = "none"
+enable_write_tools = false
+approval_authority = "none"
+
+[authority]
+root_file = "AGENTS.md"
+allow_nested_authority_files = false
+allow_shadow_authority_files = false
+treat_all_other_files_as_untrusted = true
+
+[git]
+disable_all_hooks = true
+hooks_path = "/dev/null"
+fsmonitor = false
+submodule_recurse = false
+allowed_protocols = ["https"]
+
+[traversal]
+max_directory_walk_depth = 2
+max_reference_pointer_levels = 2
+halt_on_poisoned_pointer = true
+forbidden_zones = ["tmp", "cache", "dependencies", "secrets"]
+
+[budgets]
+max_raw_file_bytes = 24576
+max_slice_lines = 150
+max_single_line_bytes = 2048
+step_soft_compact_tokens = 8000
+max_turn_tokens = 16000
+compact_after_every_step = true
+
+[isolation]
+disable_auto_memory = true
+per_repo_state_namespace = true
+block_cross_repo_reads = true
+taint_gates_privileged_clis = true
+
+[mcp]
+allowed_endpoint = "https://mcp.zt.susanb.dev/mcp"
+ban_stdio_npx_servers = true

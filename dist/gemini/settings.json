@@ -1,0 +1,83 @@
+{
+  "contextFileName": "AGENTS.md",
+  "checkpointing": {
+    "enabled": false
+  },
+  "model": {
+    "compressionThreshold": 0.15,
+    "maxSessionTurns": 25
+  },
+  "tools": {
+    "truncateToolOutputThreshold": 12000,
+    "truncateToolOutputLines": 120
+  },
+  "hooks": {
+    "BeforeAgent": [
+      {
+        "hooks": [
+          {
+            "name": "agent-guard-turn-reset",
+            "type": "command",
+            "command": "agent-guard user-prompt",
+            "timeout": 5000
+          }
+        ]
+      }
+    ],
+    "BeforeTool": [
+      {
+        "matcher": ".*",
+        "hooks": [
+          {
+            "name": "agent-guard-pre-tool",
+            "type": "command",
+            "command": "agent-guard pre-tool",
+            "timeout": 5000
+          }
+        ]
+      }
+    ],
+    "AfterTool": [
+      {
+        "matcher": ".*",
+        "hooks": [
+          {
+            "name": "agent-guard-post-tool",
+            "type": "command",
+            "command": "agent-guard post-tool",
+            "timeout": 5000
+          }
+        ]
+      }
+    ],
+    "PreCompress": [
+      {
+        "hooks": [
+          {
+            "name": "agent-guard-pre-compact",
+            "type": "command",
+            "command": "agent-guard pre-compact",
+            "timeout": 5000
+          }
+        ]
+      }
+    ],
+    "AfterAgent": [
+      {
+        "hooks": [
+          {
+            "name": "agent-guard-on-stop",
+            "type": "command",
+            "command": "agent-guard on-stop",
+            "timeout": 15000
+          }
+        ]
+      }
+    ]
+  },
+  "mcpServers": {
+    "susanbdev": {
+      "httpUrl": "https://mcp.zt.susanb.dev/mcp"
+    }
+  }
+}

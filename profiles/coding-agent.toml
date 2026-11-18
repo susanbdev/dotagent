@@ -1,0 +1,61 @@
+# Canonical Zero-Trust Implementation Agent Profile
+profile_id = "coding-agent"
+version = "1.0.0"
+privilege_tier = "ring-1"
+write_scope = "repo-bounded-non-control-plane"
+approval_authority = "none"
+
+[authority]
+root_file = "AGENTS.md"
+allow_nested_authority_files = false
+allow_shadow_authority_files = false
+treat_all_other_files_as_untrusted = true
+
+[git]
+disable_all_hooks = true
+hooks_path = "/dev/null"
+attributes_file = "/dev/null"
+fsmonitor = false
+protect_hfs = true
+protect_ntfs = true
+gc_auto = 0
+submodule_recurse = false
+allowed_protocols = ["https"]
+allow_force_push = false
+allow_history_rewrite = false
+allow_autonomous_push = false
+
+[traversal]
+max_directory_walk_depth = 2
+max_reference_pointer_levels = 2
+halt_on_poisoned_pointer = true
+forbidden_zones = ["tmp", "cache", "dependencies", "secrets", "agent-guard-state"]
+
+[sanitization]
+pre_buffer_ascii_only = true
+defang_escape_sequences = true
+strip_ansi_and_cr = true
+per_step_spotlight_nonce_bits = 128
+
+[budgets]
+max_raw_file_bytes = 24576
+max_slice_lines = 150
+max_unsliced_lines = 300
+max_single_line_bytes = 2048
+step_soft_compact_tokens = 8000
+max_turn_tokens = 16000
+max_turn_file_reads = 18
+max_turn_tool_calls = 28
+auto_compact_pct_override = 15
+compact_after_every_step = true
+
+[isolation]
+disable_auto_memory = true
+per_repo_state_namespace = true
+block_cross_repo_reads = true
+taint_gates_privileged_clis = true
+subagent_airlock_max_tokens = 200
+
+[mcp]
+allowed_endpoint = "https://mcp.zt.susanb.dev/mcp"
+ban_stdio_npx_servers = true

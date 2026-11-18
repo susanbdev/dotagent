@@ -1,0 +1,51 @@
+# Managed by susanbdev/dotagent -- Zero-Trust Global Git Hardening
+# Eliminates malicious .git/hooks, .gitattributes filter/diff RCE, fsmonitor RCE,
+# HFS+/NTFS .git path spoofing, auto-gc background hooks, submodule traversal traps,
+# and local/ext protocol confused-deputy attacks.
+
+[core]
+	hooksPath = /dev/null
+	attributesFile = /dev/null
+	fsmonitor = false
+	pager = cat
+	symlinks = false
+	autocrlf = input
+	protectHFS = true
+	protectNTFS = true
+
+[gc]
+	auto = 0
+
+[protocol]
+	allow = never
+
+[protocol "https"]
+	allow = always
+
+[protocol "file"]
+	allow = never
+
+[protocol "ext"]
+	allow = never
+
+[protocol "git"]
+	allow = never
+
+[submodule]
+	recurse = false
+	fetchJobs = 0
+
+[transfer]
+	fsckObjects = true
+
+[fetch]
+	fsckObjects = true
+
+[receive]
+	fsckObjects = true
+
+[filter "lfs"]
+	process =
+	clean =
+	smudge =
+	required = false

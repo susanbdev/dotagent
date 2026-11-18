@@ -1,0 +1,30 @@
+{
+  "version": 1,
+  "hooks": {
+    "beforeSubmitPrompt": [
+      {
+        "command": "agent-guard user-prompt"
+      }
+    ],
+    "beforeShellExecution": [
+      {
+        "command": "agent-guard pre-tool"
+      }
+    ],
+    "beforeReadFile": [
+      {
+        "command": "agent-guard pre-tool"
+      }
+    ],
+    "beforeMCPExecution": [
+      {
+        "command": "agent-guard pre-tool"
+      }
+    ],
+    "stop": [
+      {
+        "command": "agent-guard on-stop"
+      }
+    ]
+  }
+}
