@@ -56,8 +56,22 @@ audit_prebuild_traps() {
 
 audit_prebuild_traps
 
+# Scrub untrusted compiler/wrapper/linker/dynamic-loader/git env overrides BEFORE invoking Cargo
+unset RUSTC RUSTC_WRAPPER RUSTC_WORKSPACE_WRAPPER RUSTDOC RUSTDOCFLAGS \
+    RUSTFLAGS CARGO_ENCODED_RUSTFLAGS CARGO_INCREMENTAL \
+    LD_PRELOAD LD_LIBRARY_PATH DYLD_INSERT_LIBRARIES DYLD_LIBRARY_PATH \
+    GIT_CONFIG_PARAMETERS GIT_CONFIG_COUNT GIT_CONFIG_GLOBAL GIT_CONFIG_SYSTEM
+while IFS= read -r env_name; do
+    case "${env_name}" in
+        CARGO_BUILD_*|CARGO_TARGET_*|CARGO_ALIAS_*|CARGO_REGISTRIES_*|CARGO_SOURCE_*)
+            unset "${env_name}"
+            ;;
+    esac
+done < <(compgen -e)
+
 # 1. Build static release binaries and install with read-execute-only VFS mode (0555)
-cargo build --release --manifest-path "${DOTAGENT_ROOT}/Cargo.toml"
+cargo build --release --manifest-path "${DOTAGENT_ROOT}/Cargo.toml" --offline 2>/dev/null \
+    || cargo build --release --manifest-path "${DOTAGENT_ROOT}/Cargo.toml"
 for bin_name in agent-guard dotagent-compiler swarm-tool; do
     if [[ -e "${BIN_DIR}/${bin_name}" ]]; then
         chmod u+w "${BIN_DIR}/${bin_name}" 2>/dev/null || true

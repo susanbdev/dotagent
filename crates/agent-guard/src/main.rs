@@ -167,6 +167,9 @@ fn main() -> ExitCode {
                 }
             }
         }
+        "exec-sandbox" => agent_guard::exec_sandbox::run_exec_sandbox_cli(&args[1..], &cwd),
+        "sandbox-status" => agent_guard::exec_sandbox::run_sandbox_status_cli(),
+        "--probe-landlock-child" => agent_guard::exec_sandbox::run_probe_landlock_child(),
         "--version" | "-V" | "version" => {
             println!("agent-guard {}", env!("CARGO_PKG_VERSION"));
             ExitCode::SUCCESS
@@ -179,6 +182,8 @@ fn main() -> ExitCode {
                  \x20 post-tool             PostToolUse / AfterTool JSON output scanner (stdin)\n\
                  \x20 user-prompt           UserPromptSubmit turn-isolation reset hook (stdin)\n\
                  \x20 pre-compact           PreCompact / PreCompress step-budget reset & ASCII directive\n\
+                 \x20 exec-sandbox          Execute shell command inside OS Landlock/Seatbelt VFS sandbox\n\
+                 \x20 sandbox-status        Report active host kernel VFS sandbox enforcement mode\n\
                  \x20 sanitize-stream       Pre-buffer 7-bit ASCII sanitizer & 120-line stream compactor\n\
                  \x20 read-safe <path>      Read & neuter file into 128-bit spotlighted 7-bit ASCII\n\
                  \x20 post-edit <file>      Incremental post-edit Unicode/secret/immutability check\n\
@@ -263,6 +268,49 @@ fn run_read_safe(raw_path: &str, extra: &[String], cwd: &Path) -> ExitCode {
             ExitCode::SUCCESS
         }
         Err(dec) => {
+            let can_auto_page = limit_lines.is_none()
+                && matches!(
+                    &dec,
+                    Decision::Deny {
+                        code: "FILE_BYTE_BUDGET_EXCEEDED"
+                            | "FILE_BYTE_CAP_EXCEEDED"
+                            | "LINE_COUNT_BUDGET_EXCEEDED"
+                            | "TOKEN_ESTIMATE_EXCEEDED",
+                        halt_session: false,
+                        ..
+                    }
+                );
+            if can_auto_page {
+                let start = offset_line.unwrap_or(1).max(1);
+                for page_len in [150usize, 75usize] {
+                    if let Ok(clean_ascii) = pre_inspect_file_for_ingestion(
+                        &valid.canonical_or_norm,
+                        &valid.repo_rel,
+                        valid.is_root_authority,
+                        Some(start),
+                        Some(page_len),
+                        &repo_root,
+                        &mut ledger,
+                        false,
+                    ) {
+                        let _ = ledger.save(&repo_root);
+                        let end = start + page_len - 1;
+                        let next = end + 1;
+                        eprintln!(
+                            "[AGENT-GUARD AUTO-PAGINATED: showing lines {start}..={end}; pass `--offset {next} --limit {page_len}` for next page]"
+                        );
+                        println!(
+                            "{}",
+                            wrap_spotlight_envelope(
+                                &clean_ascii,
+                                &ledger.turn_nonce,
+                                &valid.repo_rel
+                            )
+                        );
+                        return ExitCode::SUCCESS;
+                    }
+                }
+            }
             let _ = ledger.save(&repo_root);
             emit_cli_decision(dec)
         }
@@ -294,8 +342,9 @@ fn emit_hook_decision(decision: Decision, phase: HookPhase) -> ExitCode {
         Decision::Allow {
             advisory,
             updated_bash_cmd,
+            updated_input_json,
         } => {
-            if advisory.is_some() || updated_bash_cmd.is_some() {
+            if advisory.is_some() || updated_bash_cmd.is_some() || updated_input_json.is_some() {
                 let mut fields = vec![(
                     "hookEventName".to_string(),
                     JsonValue::Str(phase.event_name().to_string()),
@@ -309,6 +358,14 @@ fn emit_hook_decision(decision: Decision, phase: HookPhase) -> ExitCode {
                         "updatedInput".to_string(),
                         JsonValue::Object(vec![("command".to_string(), JsonValue::Str(cmd))]),
                     ));
+                } else if let Some(raw_obj) = updated_input_json
+                    && let Ok(parsed_obj) = JsonValue::parse(&raw_obj)
+                {
+                    fields.push((
+                        "permissionDecision".to_string(),
+                        JsonValue::Str("allow".to_string()),
+                    ));
+                    fields.push(("updatedInput".to_string(), parsed_obj));
                 }
                 if let Some(note) = advisory {
                     fields.push(("additionalContext".to_string(), JsonValue::Str(note)));
@@ -326,10 +383,21 @@ fn emit_hook_decision(decision: Decision, phase: HookPhase) -> ExitCode {
             reason,
             halt_session,
         } => {
-            if phase == HookPhase::PostTool && code == "NON_ASCII_SANITIZED_PREBUFFER" {
-                let note = format!(
-                    "[AGENT-GUARD PRE-BUFFER ASCII SANITIZER] Tool output contained non-ASCII or escape bytes and was sanitized to 7-bit ASCII:\n{reason}"
-                );
+            if phase == HookPhase::PostTool
+                && matches!(
+                    code,
+                    "NON_ASCII_SANITIZED_PREBUFFER" | "TOOL_OUTPUT_FLOOD_BLOCKED"
+                )
+            {
+                let note = if code == "TOOL_OUTPUT_FLOOD_BLOCKED" {
+                    format!(
+                        "[AGENT-GUARD AUTO-COMPACTED] Benign oversized tool output exceeded the 16 KiB step ceiling and was head/tail-compacted to clean 7-bit ASCII:\n{reason}"
+                    )
+                } else {
+                    format!(
+                        "[AGENT-GUARD PRE-BUFFER ASCII SANITIZER] Tool output contained non-ASCII or escape bytes and was sanitized to 7-bit ASCII:\n{reason}"
+                    )
+                };
                 let out = JsonValue::Object(vec![(
                     "hookSpecificOutput".to_string(),
                     JsonValue::Object(vec![
@@ -351,9 +419,27 @@ fn emit_hook_decision(decision: Decision, phase: HookPhase) -> ExitCode {
 
 fn emit_hook_denial(code: &str, reason: &str, halt_session: bool) -> ExitCode {
     let is_sanitized_replacement = code == "NON_ASCII_SANITIZED_PREBUFFER";
+    let is_recoverable_bound = !halt_session
+        && matches!(
+            code,
+            "FILE_BYTE_BUDGET_EXCEEDED"
+                | "FILE_BYTE_CAP_EXCEEDED"
+                | "LINE_COUNT_BUDGET_EXCEEDED"
+                | "SLICE_LINE_CAP_EXCEEDED"
+                | "TOKEN_ESTIMATE_EXCEEDED"
+                | "TURN_TOKEN_BUDGET_EXCEEDED"
+                | "TURN_READ_COUNT_EXCEEDED"
+                | "TURN_TOOL_CALL_LIMIT_EXCEEDED"
+                | "UNBOUNDED_GIT_LOG"
+                | "MAX_DEPTH_EXCEEDED"
+        );
     let full_msg = if is_sanitized_replacement {
         format!(
             "[AGENT-GUARD PRE-BUFFER ASCII SANITIZER :: {code}] Untrusted input/output contained non-ASCII bytes or escape triggers and was neutered prior to entering your context buffer. Use ONLY the clean 7-bit ASCII payload below (do NOT re-read raw):\n{reason}"
+        )
+    } else if is_recoverable_bound {
+        format!(
+            "[AGENT-GUARD BOUND GUIDANCE :: {code}] {reason} — Adjust the call to stay within micro-window bounds (e.g. `offset`/`limit <= 150`, `--max-depth 2`, `git log -n 20`) or compact step context."
         )
     } else {
         format!(
@@ -406,28 +492,84 @@ fn emit_cli_decision(decision: Decision) -> ExitCode {
     }
 }
 
-fn is_pinned_dist_bundle_artifact(repo_root: &Path, raw_path: &str) -> Option<(PathBuf, String)> {
-    let cand = if Path::new(raw_path).is_absolute() {
+fn resolve_nonsymlink_dist_bundle_artifact(
+    repo_root: &Path,
+    cwd: &Path,
+    raw_path: &str,
+) -> Option<(PathBuf, String, bool)> {
+    let canon_repo = std::fs::canonicalize(repo_root).ok()?;
+    let joined = if Path::new(raw_path).is_absolute() {
         PathBuf::from(raw_path)
     } else {
-        repo_root.join(raw_path)
+        let canon_cwd = std::fs::canonicalize(cwd).ok()?;
+        if !canon_cwd.starts_with(&canon_repo) {
+            return None;
+        }
+        canon_cwd.join(raw_path)
     };
-    let canon = std::fs::canonicalize(&cand).ok()?;
-    let canon_repo = std::fs::canonicalize(repo_root).ok()?;
-    if !canon.starts_with(&canon_repo) {
+    let rel_raw = joined.strip_prefix(&canon_repo).ok()?;
+
+    // Walk every relative path component from `canon_repo` WITHOUT following symlinks or `..`!
+    let mut cur = canon_repo.clone();
+    let mut rel_parts = Vec::new();
+    for comp in rel_raw.components() {
+        match comp {
+            std::path::Component::CurDir => continue,
+            std::path::Component::Normal(seg) => {
+                let seg_str = seg.to_str()?;
+                cur.push(seg);
+                let meta = std::fs::symlink_metadata(&cur).ok()?;
+                if meta.file_type().is_symlink() {
+                    return None;
+                }
+                rel_parts.push(seg_str.to_string());
+            }
+            _ => return None,
+        }
+    }
+    let final_meta = std::fs::symlink_metadata(&cur).ok()?;
+    if final_meta.file_type().is_symlink() || !final_meta.file_type().is_file() {
         return None;
     }
-    let rel = canon
-        .strip_prefix(&canon_repo)
-        .ok()?
-        .to_string_lossy()
-        .replace('\\', "/");
+
+    let rel = rel_parts.join("/");
     if !rel.starts_with("dist/") {
         return None;
     }
-    let manifest = std::fs::read_to_string(canon_repo.join("dist-verify/manifest.sha256")).ok()?;
-    let bytes = std::fs::read(&canon).ok()?;
+
+    let bytes = std::fs::read(&cur).ok()?;
     let actual_hex = agent_guard::sha256::sha256_hex(&bytes);
+
+    // ONLY `dist/AGENTS.md` (matching non-symlink root `AGENTS.md`) and `dist/gemini/GEMINI.md`
+    // (matching the compiled-in `CANONICAL_DIST_GEMINI_SHA256` constant) may receive
+    // `is_trusted_authority = true`. Mutable `manifest.sha256` can NEVER grant authority exemption!
+    if rel == "dist/AGENTS.md" {
+        let root_agents = canon_repo.join("AGENTS.md");
+        let rmeta = std::fs::symlink_metadata(&root_agents).ok()?;
+        if rmeta.file_type().is_symlink() || !rmeta.file_type().is_file() {
+            return None;
+        }
+        let root_bytes = std::fs::read(&root_agents).ok()?;
+        if agent_guard::sha256::sha256_hex(&root_bytes) == actual_hex {
+            return Some((cur, rel, true));
+        }
+        return None;
+    }
+    if rel == "dist/gemini/GEMINI.md" {
+        if actual_hex == agent_guard::CANONICAL_DIST_GEMINI_SHA256 {
+            return Some((cur, rel, true));
+        }
+        return None;
+    }
+
+    // Any other `dist/*` artifact matching non-symlink `dist-verify/manifest.sha256` is scanned
+    // strictly as UNTRUSTED passive data (`is_trusted_authority = false`).
+    let manifest_path = canon_repo.join("dist-verify/manifest.sha256");
+    let mmeta = std::fs::symlink_metadata(&manifest_path).ok()?;
+    if mmeta.file_type().is_symlink() || !mmeta.file_type().is_file() {
+        return None;
+    }
+    let manifest = std::fs::read_to_string(&manifest_path).ok()?;
     for line in manifest.lines() {
         let mut parts = line.split_whitespace();
         let Some(expected_hex) = parts.next() else {
@@ -437,7 +579,7 @@ fn is_pinned_dist_bundle_artifact(repo_root: &Path, raw_path: &str) -> Option<(P
             continue;
         };
         if path_col == rel && expected_hex == actual_hex {
-            return Some((canon, rel));
+            return Some((cur, rel, false));
         }
     }
     None
@@ -450,9 +592,10 @@ fn run_scan_file(raw_path: &str, cwd: &Path) -> ExitCode {
             Ok(v) => (v.canonical_or_norm, v.repo_rel, v.is_root_authority),
             Err(pv) => {
                 if pv.code == "UNAUTHORIZED_INSTRUCTION_FILE" {
-                    if let Some((canon, rel)) = is_pinned_dist_bundle_artifact(&repo_root, raw_path)
+                    if let Some((canon, rel, trusted)) =
+                        resolve_nonsymlink_dist_bundle_artifact(&repo_root, cwd, raw_path)
                     {
-                        (canon, rel, true)
+                        (canon, rel, trusted)
                     } else {
                         return emit_cli_decision(Decision::deny(
                             pv.code,

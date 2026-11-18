@@ -25,8 +25,12 @@ pub struct CommandViolation {
 pub struct CommandPlan {
     /// Repo-relative + canonical file paths read by this command (checked against budget + A->B->C ledger!)
     pub read_files: Vec<(String, std::path::PathBuf, bool)>,
+    /// Repo-relative + canonical file paths searched by grep/rg (checked against existing >2 hop block without burning read budget!)
+    pub search_files: Vec<(String, std::path::PathBuf)>,
     /// Repo-relative + canonical file paths mutated by this command
     pub write_files: Vec<(String, std::path::PathBuf)>,
+    /// Optional safe command rewrite (e.g. injecting POSIX `-prune` exclusions on standalone `find`)
+    pub rewritten_command: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -99,7 +103,7 @@ fn analyze_recursive(
     }
 
     let mut subscripts = Vec::new();
-    let commands = parse_shell_script(script, &mut subscripts)?;
+    let (commands, has_compound_list_op) = parse_shell_script(script, &mut subscripts)?;
 
     // Inspect nested `$(...)`, backticks, `<(...)`, subshells `(...)` first
     for sub in &subscripts {
@@ -118,11 +122,145 @@ fn analyze_recursive(
         });
     }
 
-    for cmd in &commands {
+    // Compound `gh` lockdown: `gh` may ONLY run at top level (no subshells/command substitutions),
+    // with zero compound list operators (`&&`, `||`, `;`, `&`, multi-line), either standalone or
+    // as the first stage of a pipeline piped strictly to `jq`, `tr`, `head`, or `tail`.
+    let has_gh = commands.iter().any(|c| command_invokes_bin(c, "gh"));
+    if has_gh {
+        if depth > 0 || !subscripts.is_empty() {
+            return Err(CommandViolation {
+                code: "GH_COMPOUND_CHAIN_BLOCKED",
+                detail:
+                    "Subshells and command substitutions inside or wrapping `gh` are forbidden; run a single atomic `gh` command."
+                        .to_string(),
+                halt_session: false,
+            });
+        }
+        if has_compound_list_op || commands.iter().skip(1).any(|c| !c.piped_stdin) {
+            return Err(CommandViolation {
+                code: "GH_COMPOUND_CHAIN_BLOCKED",
+                detail:
+                    "Compound `gh` command chaining (`&&`, `||`, `;`, `&`, multi-line) is forbidden; run a single atomic `gh` command."
+                        .to_string(),
+                halt_session: false,
+            });
+        }
+        let first_is_direct_gh = commands
+            .first()
+            .and_then(|c| c.argv.first())
+            .is_some_and(|b| basename(b) == "gh")
+            && commands[0].redirs.is_empty();
+        if !first_is_direct_gh {
+            return Err(CommandViolation {
+                code: "GH_COMPOUND_CHAIN_BLOCKED",
+                detail:
+                    "`gh` must be invoked directly as the leading command without shell wrappers or redirections."
+                        .to_string(),
+                halt_session: false,
+            });
+        }
+        for stage in &commands[1..] {
+            let stage_bin = stage.argv.first().map(|b| basename(b)).unwrap_or("");
+            if !stage.env_vars.is_empty()
+                || !stage.redirs.is_empty()
+                || !matches!(
+                    stage_bin,
+                    "jq" | "tr" | "head" | "tail" | "wc" | "sort" | "uniq" | "cut" | "grep" | "rg"
+                )
+            {
+                return Err(CommandViolation {
+                    code: "GH_COMPOUND_CHAIN_BLOCKED",
+                    detail: format!(
+                        "`gh` may only be piped strictly to pure stdin filters (`jq`, `tr`, `head`, `tail`, `wc`, `sort`, `uniq`, `cut`, `grep`, `rg`; got `{stage_bin}` or redirection)."
+                    ),
+                    halt_session: false,
+                });
+            }
+        }
+    }
+
+    for (idx, cmd) in commands.iter().enumerate() {
+        let reads_before = plan.read_files.len();
+        let writes_before = plan.write_files.len();
+        let searches_before = plan.search_files.len();
         check_single_command(cmd, repo_root, cwd, session_tainted, depth, plan)?;
+        if has_gh
+            && idx > 0
+            && (plan.read_files.len() > reads_before
+                || plan.write_files.len() > writes_before
+                || plan.search_files.len() > searches_before)
+        {
+            return Err(CommandViolation {
+                code: "GH_COMPOUND_CHAIN_BLOCKED",
+                detail:
+                    "Downstream filters in a `gh` pipeline may only filter stdin, not read/search/write files."
+                        .to_string(),
+                halt_session: false,
+            });
+        }
+    }
+
+    // If top-level script is a standalone `find` or `find ... | filter` pipeline, auto-inject
+    // POSIX `-prune` exclusions on forbidden directories so `find . -maxdepth 2` never descends
+    // into `node_modules/`, `target/`, `build/`, `.cache/`, or `tmp/`.
+    if depth == 0 && !has_compound_list_op && subscripts.is_empty() {
+        if let Some(rewritten) = maybe_rewrite_top_level_find(script, &commands) {
+            plan.rewritten_command = Some(rewritten);
+        }
     }
 
     Ok(())
+}
+
+fn command_invokes_bin(cmd: &ParsedCommand, target: &str) -> bool {
+    let mut i = 0usize;
+    while i < cmd.argv.len() {
+        let tok = basename(&cmd.argv[i]);
+        if tok == target {
+            return true;
+        }
+        match tok {
+            "command" | "builtin" | "exec" | "nohup" => {
+                i += 1;
+                while i < cmd.argv.len() && cmd.argv[i].starts_with('-') {
+                    if cmd.argv[i] == "--" {
+                        i += 1;
+                        break;
+                    }
+                    i += 1;
+                }
+            }
+            "env" => {
+                i += 1;
+                while i < cmd.argv.len() {
+                    let a = &cmd.argv[i];
+                    if a == "-u" || a == "--unset" {
+                        i += 2;
+                    } else if a.starts_with('-') || a.contains('=') {
+                        i += 1;
+                    } else {
+                        break;
+                    }
+                }
+            }
+            "timeout" | "nice" => {
+                let is_timeout = tok == "timeout";
+                i += 1;
+                while i < cmd.argv.len() && cmd.argv[i].starts_with('-') {
+                    if matches!(cmd.argv[i].as_str(), "-k" | "-s" | "-n") {
+                        i += 2;
+                    } else {
+                        i += 1;
+                    }
+                }
+                if is_timeout && i < cmd.argv.len() {
+                    i += 1;
+                }
+            }
+            _ => return false,
+        }
+    }
+    false
 }
 
 fn is_payload_decoder(cmd: &ParsedCommand) -> bool {
@@ -146,21 +284,8 @@ fn is_shell_or_interpreter(cmd: &ParsedCommand) -> bool {
     };
     matches!(
         bin,
-        "sh" | "bash"
-            | "dash"
-            | "zsh"
-            | "ksh"
-            | "eval"
-            | "source"
-            | "."
-            | "python"
-            | "python3"
-            | "node"
-            | "perl"
-            | "ruby"
-            | "php"
-            | "lua"
-    )
+        "sh" | "bash" | "dash" | "zsh" | "ksh" | "eval" | "source" | "."
+    ) || is_interpreter_binary(bin)
 }
 
 fn check_single_command(
@@ -185,6 +310,7 @@ fn check_single_command(
         if target == "/dev/null" {
             continue;
         }
+        reject_shell_glob_in_operand("redirection", target)?;
         let access = match kind {
             RedirKind::Read => PathAccess::Read,
             RedirKind::Write => PathAccess::Write,
@@ -312,9 +438,26 @@ fn check_single_command(
             while idx < args.len() {
                 let a = &args[idx];
                 if a == "-i" || a == "--ignore-environment" {
-                    idx += 1;
+                    return Err(CommandViolation {
+                        code: "DANGEROUS_ENV_OVERRIDE",
+                        detail:
+                            "`env -i` / `--ignore-environment` strips active security guard and proxy environment controls and is forbidden."
+                                .to_string(),
+                        halt_session: true,
+                    });
                 } else if a == "-u" || a == "--unset" {
+                    let Some(var_name) = args.get(idx + 1) else {
+                        return Err(CommandViolation {
+                            code: "ENV_FLAG_BLOCKED",
+                            detail: format!("`env {a}` missing variable name."),
+                            halt_session: false,
+                        });
+                    };
+                    check_env_assignment(var_name, "", repo_root, cwd)?;
                     idx += 2;
+                } else if let Some(var_name) = a.strip_prefix("--unset=") {
+                    check_env_assignment(var_name, "", repo_root, cwd)?;
+                    idx += 1;
                 } else if let Some((k, v)) = a.split_once('=') {
                     check_env_assignment(k, v, repo_root, cwd)?;
                     idx += 1;
@@ -411,6 +554,7 @@ fn check_single_command(
                     });
                 }
                 if !a.starts_with('-') {
+                    reject_shell_glob_in_operand(bin, a)?;
                     let valid =
                         validate_path(repo_root, cwd, a, PathAccess::Read).map_err(|pv| {
                             CommandViolation {
@@ -444,6 +588,7 @@ fn check_single_command(
         }
         "source" | "." => {
             if let Some(script_path) = args.first() {
+                reject_shell_glob_in_operand(bin, script_path)?;
                 let valid =
                     validate_path(repo_root, cwd, script_path, PathAccess::Read).map_err(|pv| {
                         CommandViolation {
@@ -469,6 +614,7 @@ fn check_single_command(
                 ) {
                     if args[idx] == "-a" {
                         if let Some(f) = args.get(idx + 1) {
+                            reject_shell_glob_in_operand("xargs -a", f)?;
                             let valid = validate_path(repo_root, cwd, f, PathAccess::Read)
                                 .map_err(|pv| CommandViolation {
                                     code: pv.code,
@@ -569,14 +715,28 @@ fn check_single_command(
             halt_session: false,
         });
     }
-    if (bin == "export" && args.iter().any(|a| a == "-p"))
-        || (bin == "declare" && args.iter().any(|a| a == "-x" || a == "-p"))
-    {
-        return Err(CommandViolation {
-            code: "SECRET_ENV_DUMP_BLOCKED",
-            detail: "Dumping exported shell environment variables is forbidden.".to_string(),
-            halt_session: false,
-        });
+    if matches!(bin, "export" | "declare" | "typeset" | "local" | "readonly") {
+        let non_flags: Vec<&String> = args.iter().filter(|a| !a.starts_with('-')).collect();
+        if (matches!(bin, "export" | "declare" | "typeset") && non_flags.is_empty())
+            || args.iter().any(|a| a == "-p")
+        {
+            return Err(CommandViolation {
+                code: "SECRET_ENV_DUMP_BLOCKED",
+                detail: "Dumping exported shell environment variables is forbidden.".to_string(),
+                halt_session: false,
+            });
+        }
+        for entry in non_flags {
+            let (k, v) = entry.split_once('=').unwrap_or((entry.as_str(), ""));
+            check_env_assignment(k, v, repo_root, cwd)?;
+        }
+        return Ok(());
+    }
+    if bin == "unset" {
+        for entry in args.iter().filter(|a| !a.starts_with('-')) {
+            check_env_assignment(entry, "", repo_root, cwd)?;
+        }
+        return Ok(());
     }
 
     // Prevent agent from invoking `agent-guard` state-reset, user-prompt, or pre-compact hooks directly
@@ -606,8 +766,103 @@ fn check_single_command(
                 }
                 return Ok(());
             }
-            if sub == "sanitize-stream" {
+            if matches!(sub, "sanitize-stream" | "sandbox-status") {
                 return Ok(());
+            }
+            if sub == "exec-sandbox" {
+                let mut idx = 1usize;
+                let mut custom_cwd: Option<&str> = None;
+                let mut after_sep = false;
+                let mut inner_argv: Vec<String> = Vec::new();
+                while idx < args.len() {
+                    if after_sep {
+                        inner_argv.push(args[idx].clone());
+                        idx += 1;
+                        continue;
+                    }
+                    match args[idx].as_str() {
+                        "--" => {
+                            after_sep = true;
+                            idx += 1;
+                        }
+                        "--sanitize-stream" | "--require-kernel" => {
+                            idx += 1;
+                        }
+                        "--cwd" => {
+                            let Some(dir) = args.get(idx + 1) else {
+                                return Err(CommandViolation {
+                                    code: "MALFORMED_SUBSHELL",
+                                    detail: "`agent-guard exec-sandbox --cwd` missing directory."
+                                        .to_string(),
+                                    halt_session: false,
+                                });
+                            };
+                            validate_path(repo_root, cwd, dir, PathAccess::Read).map_err(|pv| {
+                                CommandViolation {
+                                    code: pv.code,
+                                    detail: pv.detail,
+                                    halt_session: pv.is_poisoned_zone,
+                                }
+                            })?;
+                            custom_cwd = Some(dir.as_str());
+                            idx += 2;
+                        }
+                        other if !other.starts_with('-') => {
+                            inner_argv.push(other.to_string());
+                            after_sep = true;
+                            idx += 1;
+                        }
+                        other => {
+                            return Err(CommandViolation {
+                                code: "MALFORMED_SUBSHELL",
+                                detail: format!(
+                                    "Unrecognized `agent-guard exec-sandbox` flag `{other}`."
+                                ),
+                                halt_session: false,
+                            });
+                        }
+                    }
+                }
+                if inner_argv.is_empty() {
+                    return Err(CommandViolation {
+                        code: "MALFORMED_SUBSHELL",
+                        detail: "`agent-guard exec-sandbox` missing command.".to_string(),
+                        halt_session: false,
+                    });
+                }
+                let effective_cwd = custom_cwd
+                    .map(|d| {
+                        if Path::new(d).is_absolute() {
+                            std::path::PathBuf::from(d)
+                        } else {
+                            cwd.join(d)
+                        }
+                    })
+                    .unwrap_or_else(|| cwd.to_path_buf());
+                if inner_argv.len() == 1 {
+                    return analyze_recursive(
+                        &inner_argv[0],
+                        repo_root,
+                        &effective_cwd,
+                        session_tainted,
+                        depth + 1,
+                        plan,
+                    );
+                }
+                let inner = ParsedCommand {
+                    env_vars: Vec::new(),
+                    argv: inner_argv,
+                    redirs: cmd.redirs.clone(),
+                    piped_stdin: cmd.piped_stdin,
+                };
+                return check_single_command(
+                    &inner,
+                    repo_root,
+                    &effective_cwd,
+                    session_tainted,
+                    depth + 1,
+                    plan,
+                );
             }
         }
     }
@@ -656,31 +911,27 @@ fn check_single_command(
         return Ok(());
     }
 
-    // 8. Package Manager Lifecycle Script, Build-Config Trap, & Publish Lockdown
-    if matches!(bin, "npm" | "pnpm" | "yarn" | "bun" | "npx" | "bunx") {
+    // 8. Hard Interpreter & Runtime Lockdown (`python`, `python3`, `uvx`, `node`, `bun`, `deno`, `perl`, `ruby`, `php`, `lua`)
+    if is_interpreter_binary(bin) {
+        check_interpreter_command(bin, args, repo_root, cwd, session_tainted, plan)?;
+        return Ok(());
+    }
+    if matches!(bin, "pytest" | "py.test") {
+        check_pytest_command(bin, args, repo_root, cwd, plan)?;
+        return Ok(());
+    }
+
+    // 9. Package Manager Lifecycle Script, Build-Config Trap, & Publish Lockdown
+    if matches!(bin, "npm" | "pnpm" | "yarn" | "npx" | "bunx") {
         check_node_pkg_manager(bin, args, repo_root, cwd)?;
         return Ok(());
     }
     if matches!(bin, "pip" | "pip3" | "uv") {
-        check_python_pkg_manager(bin, args)?;
+        check_python_pkg_manager(bin, args, repo_root, cwd, session_tainted, plan)?;
         return Ok(());
     }
     if bin == "cargo" {
         check_cargo_command(args, repo_root, cwd)?;
-        return Ok(());
-    }
-
-    // 9. Inline Interpreter One-Liner & Stdin Script Inspection (`python -c`, `node -e`, `| python3`, `<<EOF`)
-    if matches!(
-        bin,
-        "python" | "python3" | "node" | "perl" | "ruby" | "php" | "lua"
-    ) {
-        let has_code_stdin = cmd.piped_stdin
-            || cmd
-                .redirs
-                .iter()
-                .any(|(k, _)| matches!(k, RedirKind::Heredoc | RedirKind::Read));
-        check_interpreter_command(bin, args, has_code_stdin, repo_root, cwd, plan)?;
         return Ok(());
     }
 
@@ -689,7 +940,7 @@ fn check_single_command(
         bin,
         "find" | "rg" | "ripgrep" | "fd" | "fdfind" | "tree" | "ls" | "grep" | "egrep" | "fgrep"
     ) {
-        check_search_or_walk_command(bin, args, repo_root, cwd, plan)?;
+        check_search_or_walk_command(bin, args, repo_root, cwd, cmd.piped_stdin, plan)?;
         return Ok(());
     }
 
@@ -848,29 +1099,57 @@ fn check_ambient_authority_cli(
         });
     }
 
-    if sub1 == "api" {
-        let mutates = args.iter().any(|a| {
-            let u = a.to_ascii_uppercase();
-            u == "POST"
-                || u == "PUT"
-                || u == "PATCH"
-                || u == "DELETE"
-                || a == "-f"
-                || a == "-F"
-                || a.starts_with("--field")
-                || a.starts_with("--raw-field")
-                || a.starts_with("--input")
-                || a == "--method"
-                || a == "-X"
-                || a.starts_with("-X")
-                    && matches!(
-                        a.strip_prefix("-X")
-                            .unwrap_or("")
-                            .to_ascii_uppercase()
-                            .as_str(),
-                        "POST" | "PUT" | "PATCH" | "DELETE"
-                    )
+    // Chained GitHub Actions workflow dispatch is unconditionally forbidden (even with deputy override)
+    if sub1 == "workflow" && sub2 == "run" {
+        return Err(CommandViolation {
+            code: "GH_WORKFLOW_CHAIN_BLOCKED",
+            detail: "`gh workflow run` chained workflow triggering is unconditionally forbidden."
+                .to_string(),
+            halt_session: true,
         });
+    }
+
+    if sub1 == "api" {
+        let joined_lower = args.join(" ").to_ascii_lowercase();
+        if joined_lower.contains("/dispatches")
+            || joined_lower.contains("workflow_dispatch")
+            || joined_lower.contains("repository_dispatch")
+        {
+            return Err(CommandViolation {
+                code: "GH_WORKFLOW_CHAIN_BLOCKED",
+                detail:
+                    "Triggering GitHub workflow/repository dispatches via `gh api` is unconditionally forbidden."
+                        .to_string(),
+                halt_session: true,
+            });
+        }
+
+        let mutates = if sub2.eq_ignore_ascii_case("graphql") {
+            is_mutating_gh_graphql(args)
+        } else {
+            args.iter().any(|a| {
+                let u = a.to_ascii_uppercase();
+                u == "POST"
+                    || u == "PUT"
+                    || u == "PATCH"
+                    || u == "DELETE"
+                    || a == "-f"
+                    || a == "-F"
+                    || a.starts_with("--field")
+                    || a.starts_with("--raw-field")
+                    || a.starts_with("--input")
+                    || a == "--method"
+                    || a == "-X"
+                    || a.starts_with("-X")
+                        && matches!(
+                            a.strip_prefix("-X")
+                                .unwrap_or("")
+                                .to_ascii_uppercase()
+                                .as_str(),
+                            "POST" | "PUT" | "PATCH" | "DELETE"
+                        )
+            })
+        };
         if mutates && !allow_deputy {
             return Err(CommandViolation {
                 code: "CONFUSED_DEPUTY_GH_MUTATION",
@@ -894,7 +1173,7 @@ fn check_ambient_authority_cli(
             "repo",
             "create" | "delete" | "archive" | "edit" | "fork" | "rename"
         ) | ("release", _)
-            | ("workflow", "run" | "enable" | "disable")
+            | ("workflow", "enable" | "disable")
             | ("gist", _)
     );
 
@@ -911,29 +1190,91 @@ fn check_ambient_authority_cli(
     Ok(())
 }
 
+fn is_mutating_gh_graphql(args: &[String]) -> bool {
+    let mut query_doc: Option<&str> = None;
+    let mut i = 0usize;
+    while i < args.len() {
+        let a = args[i].as_str();
+        if a.starts_with("--input") {
+            return true;
+        }
+        if a == "-X" || a == "--method" {
+            let m = args.get(i + 1).map(String::as_str).unwrap_or("");
+            if !m.eq_ignore_ascii_case("POST") {
+                return true;
+            }
+            i += 2;
+            continue;
+        }
+        if matches!(a, "-f" | "-F" | "--field" | "--raw-field") {
+            let Some(kv) = args.get(i + 1) else {
+                return true;
+            };
+            if let Some(q) = kv.strip_prefix("query=") {
+                query_doc = Some(q);
+            } else if kv.contains('@') {
+                return true;
+            }
+            i += 2;
+            continue;
+        }
+        if let Some(kv) = a
+            .strip_prefix("--field=")
+            .or_else(|| a.strip_prefix("--raw-field="))
+            .or_else(|| a.strip_prefix("-f").filter(|s| !s.is_empty()))
+            .or_else(|| a.strip_prefix("-F").filter(|s| !s.is_empty()))
+        {
+            if let Some(q) = kv.strip_prefix("query=") {
+                query_doc = Some(q);
+            } else if kv.contains('@') {
+                return true;
+            }
+            i += 1;
+            continue;
+        }
+        i += 1;
+    }
+    let Some(q) = query_doc else {
+        return true;
+    };
+    let trimmed = q.trim_start();
+    let lower = trimmed.to_ascii_lowercase();
+    let starts_readonly = lower.starts_with('{')
+        || lower.starts_with("query ")
+        || lower.starts_with("query(")
+        || lower.starts_with("query{")
+        || lower.starts_with("query\n")
+        || lower.starts_with("query\t");
+    !starts_readonly || lower.contains("mutation") || lower.contains("subscription")
+}
+
 fn check_git_command(
     args: &[String],
     repo_root: &Path,
     cwd: &Path,
     session_tainted: bool,
 ) -> Result<(), CommandViolation> {
+    if args.iter().any(|x| x == "--no-verify") {
+        return Err(CommandViolation {
+            code: "GIT_NO_VERIFY_BLOCKED",
+            detail: "Passing `--no-verify` is unconditionally forbidden.".to_string(),
+            halt_session: false,
+        });
+    }
+
     let mut idx = 0usize;
     let mut target_dir: Option<&str> = None;
 
-    // Inspect global git flags before subcommand (`-c`, `-C`, `--git-dir`, `--upload-pack`, `--no-verify`)
+    // Inspect global git flags before subcommand (`-c`, `--config-env`, `-C`, `--git-dir`, `--upload-pack`)
     while idx < args.len() {
         let a = args[idx].as_str();
-        if a == "-c" {
-            let kv = args.get(idx + 1).map(String::as_str).unwrap_or("");
-            check_git_inline_config(kv)?;
-            idx += 2;
-            continue;
+        if a == "-c" || a.starts_with("--config-env") {
+            let kv = args.get(idx + 1).map(String::as_str).unwrap_or(a);
+            return check_git_inline_config(kv);
         }
         if let Some(kv) = a.strip_prefix("-c") {
             if !kv.is_empty() {
-                check_git_inline_config(kv)?;
-                idx += 1;
-                continue;
+                return check_git_inline_config(kv);
             }
         }
         if a == "-C" {
@@ -974,16 +1315,34 @@ fn check_git_command(
         idx += 1;
     }
 
-    let _ = target_dir;
+    inspect_repo_git_config_and_hooks(repo_root)?;
+    if let Some(dir_str) = target_dir {
+        let sub_dir = if Path::new(dir_str).is_absolute() {
+            std::path::PathBuf::from(dir_str)
+        } else {
+            cwd.join(dir_str)
+        };
+        if sub_dir != repo_root {
+            inspect_repo_git_config_and_hooks(&sub_dir)?;
+        }
+    }
+
     let Some(sub) = args.get(idx).map(String::as_str) else {
         return Ok(());
     };
     let sub_args = &args[idx + 1..];
 
-    // Hard-block `--no-verify` anywhere
-    if sub_args
-        .iter()
-        .any(|x| x == "--no-verify" || x == "-n" && sub == "commit")
+    // Hard-block `--no-verify` (and `-n` shorthand on `git commit`)
+    if sub == "commit"
+        && sub_args.iter().any(|x| {
+            x == "-n"
+                || (x.starts_with('-')
+                    && !x.starts_with("--")
+                    && x.chars()
+                        .skip(1)
+                        .take_while(|&c| !matches!(c, 'm' | 'F' | 'C' | 'c'))
+                        .any(|c| c == 'n'))
+        })
     {
         return Err(CommandViolation {
             code: "GIT_NO_VERIFY_BLOCKED",
@@ -1002,18 +1361,12 @@ fn check_git_command(
             });
         }
         "config" => {
-            // Allow read-only `--get` of non-secret keys? No — block `git config` mutations and global dumps
-            let is_read_only = sub_args
-                .iter()
-                .all(|x| x == "--get" || x == "core.hooksPath" || x == "core.fsmonitor");
-            if !is_read_only {
-                return Err(CommandViolation {
-                    code: "GIT_CONFIG_MUTATION_BLOCKED",
-                    detail: "`git config` inspection/mutation is blocked to protect global git hardening and identity."
-                        .to_string(),
-                    halt_session: false,
-                });
-            }
+            return Err(CommandViolation {
+                code: "GIT_CONFIG_MUTATION_BLOCKED",
+                detail: "`git config` is hard-blocked in PreToolUse to protect global git hardening and identity."
+                    .to_string(),
+                halt_session: false,
+            });
         }
         "commit" => {
             if sub_args
@@ -1093,17 +1446,15 @@ fn check_git_command(
             }
         }
         "remote" => {
-            if let Some(op) = sub_args.first().map(String::as_str) {
-                if op != "-v" && op != "--verbose" {
-                    return Err(CommandViolation {
-                        code: "GIT_REMOTE_MUTATION_BLOCKED",
-                        detail: format!(
-                            "`git remote {op}` mutation is forbidden (prevents push-redirect exfiltration)."
-                        ),
-                        halt_session: true,
-                    });
-                }
-            }
+            let is_mut = sub_args
+                .first()
+                .is_some_and(|op| op != "-v" && op != "--verbose");
+            return Err(CommandViolation {
+                code: "GIT_REMOTE_MUTATION_BLOCKED",
+                detail: "`git remote` is hard-blocked in PreToolUse (prevents remote inspection/push-redirect exfiltration)."
+                    .to_string(),
+                halt_session: is_mut,
+            });
         }
         "submodule" | "worktree" | "clone" | "fetch" | "pull" => {
             if matches!(sub, "submodule" | "clone") {
@@ -1158,34 +1509,13 @@ fn check_git_command(
 }
 
 fn check_git_inline_config(kv: &str) -> Result<(), CommandViolation> {
-    let lower = kv.to_ascii_lowercase();
-    let key = lower.split('=').next().unwrap_or("").trim();
-
-    // Allow explicitly confirming `core.hookspath=/dev/null` or `core.fsmonitor=false`, block everything else dangerous!
-    if lower == "core.hookspath=/dev/null" || lower == "core.fsmonitor=false" {
-        return Ok(());
-    }
-
-    if key.starts_with("core.")
-        || key.starts_with("filter.")
-        || key.starts_with("diff.")
-        || key.starts_with("merge.")
-        || key.starts_with("protocol.")
-        || key.starts_with("alias.")
-        || key.starts_with("credential.")
-        || key.starts_with("http.")
-        || key.starts_with("remote.")
-        || key.starts_with("user.")
-        || key.starts_with("gpg.")
-        || key.starts_with("ssh.")
-    {
-        return Err(CommandViolation {
-            code: "GIT_CONFIG_OVERRIDE_BLOCKED",
-            detail: format!("Inline `git -c {kv}` security override is forbidden."),
-            halt_session: true,
-        });
-    }
-    Ok(())
+    Err(CommandViolation {
+        code: "GIT_CONFIG_OVERRIDE_BLOCKED",
+        detail: format!(
+            "Inline `git -c {kv}` configuration override is unconditionally forbidden."
+        ),
+        halt_session: true,
+    })
 }
 
 fn check_node_pkg_manager(
@@ -1205,12 +1535,10 @@ fn check_node_pkg_manager(
     }
 
     let check_dir_traps = |dir: &Path| -> Result<(), CommandViolation> {
-        for rel in [".yarnrc.yml", ".yarnrc"] {
-            let p = dir.join(rel);
-            if let Ok(raw) = std::fs::read_to_string(&p) {
-                let lower = raw.to_ascii_lowercase();
-                for bad in ["yarnpath", "plugins:"] {
-                    if lower.contains(bad) {
+        for rel in [".yarnrc.yml", ".yarnrc.yaml", ".yarnrc"] {
+            if let Some(keys) = read_bounded_nonsymlink_config_keys(dir, rel)? {
+                for bad in ["yarnpath", "plugins"] {
+                    if keys.iter().any(|k| k.contains(bad)) {
                         return Err(CommandViolation {
                             code: "YARN_CONFIG_EXEC_TRAP",
                             detail: format!(
@@ -1222,11 +1550,9 @@ fn check_node_pkg_manager(
                 }
             }
         }
-        let npmrc = dir.join(".npmrc");
-        if let Ok(raw) = std::fs::read_to_string(&npmrc) {
-            let lower = raw.to_ascii_lowercase();
+        if let Some(keys) = read_bounded_nonsymlink_config_keys(dir, ".npmrc")? {
             for bad in ["script-shell", "onload-script"] {
-                if lower.contains(bad) {
+                if keys.iter().any(|k| k.contains(bad)) {
                     return Err(CommandViolation {
                         code: "NPMRC_SCRIPT_TRAP",
                         detail: format!(
@@ -1318,16 +1644,41 @@ fn check_node_pkg_manager(
 
     if matches!(
         sub,
-        "dlx" | "exec" | "create" | "publish" | "login" | "adduser" | "token"
+        "dlx"
+            | "exec"
+            | "x"
+            | "create"
+            | "init"
+            | "publish"
+            | "login"
+            | "adduser"
+            | "token"
+            | "run"
+            | "run-script"
+            | "rum"
+            | "urn"
+            | "start"
+            | "restart"
+            | "stop"
+            | "rebuild"
+            | "rb"
+            | "link"
+            | "ln"
+            | "pack"
     ) {
         return Err(CommandViolation {
             code: "PKG_EXEC_OR_PUBLISH_BLOCKED",
-            detail: format!("`{bin} {sub}` is hard-blocked."),
+            detail: format!(
+                "`{bin} {sub}` executes arbitrary package scripts or publishes externally and is hard-blocked."
+            ),
             halt_session: false,
         });
     }
-    if matches!(sub, "" | "install" | "i" | "add" | "ci" | "update" | "up") {
-        let has_ignore_scripts = args.iter().any(|a| a == "--ignore-scripts");
+    let has_ignore_scripts = args.iter().any(|a| a == "--ignore-scripts");
+    if matches!(
+        sub,
+        "" | "install" | "i" | "add" | "ci" | "update" | "up" | "remove" | "rm" | "uninstall"
+    ) {
         if !has_ignore_scripts {
             return Err(CommandViolation {
                 code: "LIFECYCLE_SCRIPTS_NOT_DISABLED",
@@ -1338,11 +1689,54 @@ fn check_node_pkg_manager(
                 halt_session: false,
             });
         }
+        return Ok(());
     }
-    Ok(())
+    if matches!(sub, "test" | "t" | "tst") {
+        if bin == "bun" && sub == "test" {
+            return Ok(());
+        }
+        return Err(CommandViolation {
+            code: "PKG_EXEC_OR_PUBLISH_BLOCKED",
+            detail: format!(
+                "`{bin} {sub}` executes arbitrary `package.json` test scripts and is blocked (invoke the test runner directly)."
+            ),
+            halt_session: false,
+        });
+    }
+    if matches!(sub, "list" | "ls" | "why" | "outdated" | "audit") {
+        return Ok(());
+    }
+    Err(CommandViolation {
+        code: "PKG_EXEC_OR_PUBLISH_BLOCKED",
+        detail: format!(
+            "Unapproved `{bin}` subcommand '{sub}' blocked (prevents shorthand package.json script execution)."
+        ),
+        halt_session: false,
+    })
 }
 
-fn check_python_pkg_manager(bin: &str, args: &[String]) -> Result<(), CommandViolation> {
+fn check_python_pkg_manager(
+    bin: &str,
+    args: &[String],
+    repo_root: &Path,
+    cwd: &Path,
+    session_tainted: bool,
+    plan: &mut CommandPlan,
+) -> Result<(), CommandViolation> {
+    if bin == "uv" {
+        let first_sub = args
+            .iter()
+            .find(|a| !a.starts_with('-'))
+            .map(String::as_str)
+            .unwrap_or("");
+        if first_sub == "tool" || first_sub == "x" || args.iter().any(|a| a == "tool") {
+            return check_interpreter_command("uvx", args, repo_root, cwd, session_tainted, plan);
+        }
+        if first_sub != "pip" || args.iter().any(|a| matches!(a.as_str(), "run" | "python")) {
+            check_interpreter_command("uv run", args, repo_root, cwd, session_tainted, plan)?;
+            return Ok(());
+        }
+    }
     let joined = args.join(" ").to_ascii_lowercase();
     if joined.contains("git+http") || joined.contains("git+ssh") || joined.contains("http://") {
         return Err(CommandViolation {
@@ -1372,24 +1766,22 @@ fn check_cargo_command(
     repo_root: &Path,
     cwd: &Path,
 ) -> Result<(), CommandViolation> {
-    // Inspect `.cargo/config.toml` and `.cargo/config` for `rustc-wrapper` / `linker` / `runner` RCE traps!
+    // Inspect `.cargo/config.toml` and `.cargo/config` (no-symlink, bounded, key-only) for RCE traps!
     for rel in [".cargo/config.toml", ".cargo/config"] {
-        let cfg_path = repo_root.join(rel);
-        if let Ok(raw) = std::fs::read_to_string(&cfg_path) {
-            let lower = raw.to_ascii_lowercase();
+        if let Some(keys) = read_bounded_nonsymlink_config_keys(repo_root, rel)? {
             for bad in [
                 "rustc-wrapper",
                 "rustc_wrapper",
                 "workspace-wrapper",
-                "linker =",
-                "linker=",
-                "runner =",
-                "runner=",
+                "linker",
+                "runner",
                 "[alias]",
-                "rustc =",
-                "rustc=",
+                "rustc",
             ] {
-                if lower.contains(bad) {
+                if keys
+                    .iter()
+                    .any(|k| k == bad || (bad != "rustc" && k.contains(bad)))
+                {
                     return Err(CommandViolation {
                         code: "CARGO_CONFIG_EXEC_TRAP",
                         detail: format!(
@@ -1492,196 +1884,439 @@ fn check_cargo_command(
     Ok(())
 }
 
+/// Reads a config file inside `base_dir` up to 16 KiB without following symlinks on any path
+/// component, returning ONLY normalized lowercase section headers and key names (stripping all
+/// RHS values so credentials/tokens inside `.npmrc`/`.yarnrc*` are never retained in memory).
+fn read_bounded_nonsymlink_config_keys(
+    base_dir: &Path,
+    rel: &str,
+) -> Result<Option<Vec<String>>, CommandViolation> {
+    let raw_opt = read_bounded_nonsymlink_raw(base_dir, rel, 16_384)?;
+    let Some(raw) = raw_opt else {
+        return Ok(None);
+    };
+    let mut keys = Vec::new();
+    for line in raw.lines() {
+        let trimmed = line
+            .split('#')
+            .next()
+            .unwrap_or("")
+            .split(';')
+            .next()
+            .unwrap_or("")
+            .trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if trimmed.starts_with('[') && trimmed.ends_with(']') {
+            keys.push(trimmed.to_ascii_lowercase());
+            continue;
+        }
+        if let Some((lhs, _rhs)) = trimmed.split_once('=').or_else(|| trimmed.split_once(':')) {
+            let k = lhs
+                .trim()
+                .trim_matches('"')
+                .trim_matches('\'')
+                .to_ascii_lowercase();
+            if !k.is_empty() {
+                keys.push(k);
+            }
+        }
+    }
+    Ok(Some(keys))
+}
+
+fn read_bounded_nonsymlink_raw(
+    base_dir: &Path,
+    rel: &str,
+    max_bytes: u64,
+) -> Result<Option<String>, CommandViolation> {
+    use std::io::Read;
+    let mut cur = base_dir.to_path_buf();
+    let parts: Vec<&str> = rel.split('/').filter(|s| !s.is_empty()).collect();
+    for (idx, seg) in parts.iter().enumerate() {
+        cur.push(seg);
+        let is_last = idx + 1 == parts.len();
+        match std::fs::symlink_metadata(&cur) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => {
+                return Err(CommandViolation {
+                    code: "CONFIG_STAT_ERROR",
+                    detail: format!("Cannot stat '{rel}': {e}"),
+                    halt_session: true,
+                });
+            }
+            Ok(meta) => {
+                if meta.file_type().is_symlink() {
+                    return Err(CommandViolation {
+                        code: "SYMLINKED_BUILD_CONFIG_BLOCKED",
+                        detail: format!(
+                            "Configuration path '{rel}' contains a symlink component and is blocked."
+                        ),
+                        halt_session: true,
+                    });
+                }
+                if is_last {
+                    if !meta.file_type().is_file() {
+                        return Ok(None);
+                    }
+                    if meta.len() > max_bytes {
+                        return Err(CommandViolation {
+                            code: "OVERSIZED_BUILD_CONFIG_BLOCKED",
+                            detail: format!(
+                                "Configuration file '{rel}' exceeds {max_bytes}-byte inspection ceiling."
+                            ),
+                            halt_session: true,
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    let file = std::fs::File::open(&cur).map_err(|e| CommandViolation {
+        code: "CONFIG_OPEN_ERROR",
+        detail: format!("Cannot open '{rel}': {e}"),
+        halt_session: true,
+    })?;
+    let mut buf = Vec::new();
+    file.take(max_bytes + 1)
+        .read_to_end(&mut buf)
+        .map_err(|e| CommandViolation {
+            code: "CONFIG_READ_ERROR",
+            detail: format!("Cannot read '{rel}': {e}"),
+            halt_session: true,
+        })?;
+    if buf.len() as u64 > max_bytes {
+        return Err(CommandViolation {
+            code: "OVERSIZED_BUILD_CONFIG_BLOCKED",
+            detail: format!("Configuration file '{rel}' exceeds {max_bytes} bytes."),
+            halt_session: true,
+        });
+    }
+    String::from_utf8(buf)
+        .map(Some)
+        .map_err(|_| CommandViolation {
+            code: "INVALID_BUILD_CONFIG_UTF8",
+            detail: format!("Configuration file '{rel}' contains non-UTF-8 bytes."),
+            halt_session: true,
+        })
+}
+
+/// Fail-closed pre-tool and static-audit inspector for repo-local `.git/config` and `.git/hooks`.
+pub fn inspect_repo_git_config_and_hooks(repo_root: &Path) -> Result<(), CommandViolation> {
+    let git_dir = repo_root.join(".git");
+    if let Ok(gmeta) = std::fs::symlink_metadata(&git_dir)
+        && gmeta.file_type().is_symlink()
+    {
+        return Err(CommandViolation {
+            code: "SYMLINKED_GIT_DIR_BLOCKED",
+            detail: "Repository '.git' is a symlink, which is forbidden.".to_string(),
+            halt_session: true,
+        });
+    }
+
+    if let Some(cfg_text) = read_bounded_nonsymlink_raw(repo_root, ".git/config", 65_536)? {
+        let mut section = String::new();
+        for raw_line in cfg_text.lines() {
+            let line = raw_line
+                .split('#')
+                .next()
+                .unwrap_or("")
+                .split(';')
+                .next()
+                .unwrap_or("")
+                .trim();
+            if line.is_empty() {
+                continue;
+            }
+            if line.starts_with('[') && line.ends_with(']') {
+                section = line.to_ascii_lowercase();
+                if section.starts_with("[filter ") && !section.contains("\"lfs\"") {
+                    return Err(CommandViolation {
+                        code: "REPO_GIT_CONFIG_TRAP",
+                        detail: format!(
+                            "Repository '.git/config' defines custom filter driver {section}."
+                        ),
+                        halt_session: true,
+                    });
+                }
+                continue;
+            }
+            let lower = line.to_ascii_lowercase();
+            if let Some((raw_k, raw_v)) = lower.split_once('=') {
+                let k = raw_k.trim();
+                let v = raw_v.trim().trim_matches('"');
+                let is_bad = match k {
+                    "hookspath" => v != "/dev/null",
+                    "attributesfile" => v != "/dev/null",
+                    "fsmonitor" => v != "false" && !v.is_empty(),
+                    "symlinks" => v == "true",
+                    "sshcommand" | "gitproxy" | "askpass" | "editor" | "external" | "textconv"
+                    | "uploadpack" | "receivepack" => !v.is_empty(),
+                    "pager" => !v.is_empty() && v != "cat",
+                    "smudge" | "clean" | "process" if section.starts_with("[filter ") => {
+                        !v.is_empty()
+                    }
+                    _ if section == "[alias]" && v.starts_with('!') => true,
+                    _ => false,
+                };
+                if is_bad {
+                    return Err(CommandViolation {
+                        code: "REPO_GIT_CONFIG_TRAP",
+                        detail: format!(
+                            "Repository '.git/config' overrides hardened setting `{k}` in {section}."
+                        ),
+                        halt_session: true,
+                    });
+                }
+            }
+        }
+    }
+
+    let hooks_dir = git_dir.join("hooks");
+    if let Ok(hmeta) = std::fs::symlink_metadata(&hooks_dir)
+        && hmeta.file_type().is_symlink()
+    {
+        return Err(CommandViolation {
+            code: "SYMLINKED_GIT_HOOKS_BLOCKED",
+            detail: "Repository '.git/hooks' is a symlink.".to_string(),
+            halt_session: true,
+        });
+    }
+    Ok(())
+}
+
 /// Static audit helper checking repository build-tool and `.gitattributes` execution traps.
 pub fn inspect_repo_build_config_traps(repo_root: &Path) -> Vec<String> {
     let mut findings = Vec::new();
     for rel in [".cargo/config.toml", ".cargo/config"] {
-        let p = repo_root.join(rel);
-        if let Ok(raw) = std::fs::read_to_string(&p) {
-            let lower = raw.to_ascii_lowercase();
-            for bad in [
-                "rustc-wrapper",
-                "rustc_wrapper",
-                "workspace-wrapper",
-                "linker =",
-                "linker=",
-                "runner =",
-                "runner=",
-                "[alias]",
-            ] {
-                if lower.contains(bad) {
-                    findings.push(format!("CARGO_CONFIG_EXEC_TRAP: '{rel}' contains `{bad}`"));
+        match read_bounded_nonsymlink_config_keys(repo_root, rel) {
+            Err(cv) => findings.push(format!("{}: {}", cv.code, cv.detail)),
+            Ok(Some(keys)) => {
+                for bad in [
+                    "rustc-wrapper",
+                    "rustc_wrapper",
+                    "workspace-wrapper",
+                    "linker",
+                    "runner",
+                    "[alias]",
+                    "rustc",
+                ] {
+                    if keys
+                        .iter()
+                        .any(|k| k == bad || (bad != "rustc" && k.contains(bad)))
+                    {
+                        findings.push(format!("CARGO_CONFIG_EXEC_TRAP: '{rel}' contains `{bad}`"));
+                    }
+                }
+            }
+            Ok(None) => {}
+        }
+    }
+    for rel in [".yarnrc.yml", ".yarnrc.yaml", ".yarnrc"] {
+        match read_bounded_nonsymlink_config_keys(repo_root, rel) {
+            Err(cv) => findings.push(format!("{}: {}", cv.code, cv.detail)),
+            Ok(Some(keys)) => {
+                for bad in ["yarnpath", "plugins"] {
+                    if keys.iter().any(|k| k.contains(bad)) {
+                        findings.push(format!("YARN_CONFIG_EXEC_TRAP: '{rel}' contains `{bad}`"));
+                    }
+                }
+            }
+            Ok(None) => {}
+        }
+    }
+    if let Err(cv) = read_bounded_nonsymlink_config_keys(repo_root, ".npmrc").and_then(|opt| {
+        if let Some(keys) = opt {
+            for bad in ["script-shell", "onload-script"] {
+                if keys.iter().any(|k| k.contains(bad)) {
+                    return Err(CommandViolation {
+                        code: "NPMRC_SCRIPT_TRAP",
+                        detail: format!("'.npmrc' contains `{bad}`"),
+                        halt_session: true,
+                    });
                 }
             }
         }
+        Ok(())
+    }) {
+        findings.push(format!("{}: {}", cv.code, cv.detail));
     }
-    for rel in [".yarnrc.yml", ".yarnrc"] {
-        let p = repo_root.join(rel);
-        if let Ok(raw) = std::fs::read_to_string(&p) {
+    match read_bounded_nonsymlink_raw(repo_root, ".gitattributes", 16_384) {
+        Err(cv) => findings.push(format!("{}: {}", cv.code, cv.detail)),
+        Ok(Some(raw)) => {
             let lower = raw.to_ascii_lowercase();
-            for bad in ["yarnpath", "plugins:"] {
+            for bad in ["filter=", "diff=", "merge=", "textconv"] {
                 if lower.contains(bad) {
-                    findings.push(format!("YARN_CONFIG_EXEC_TRAP: '{rel}' contains `{bad}`"));
+                    findings.push(format!(
+                        "GITATTRIBUTES_DRIVER_TRAP: '.gitattributes' contains `{bad}`"
+                    ));
                 }
             }
         }
-    }
-    let gitattributes = repo_root.join(".gitattributes");
-    if let Ok(raw) = std::fs::read_to_string(&gitattributes) {
-        let lower = raw.to_ascii_lowercase();
-        for bad in ["filter=", "diff=", "merge=", "textconv"] {
-            if lower.contains(bad) {
-                findings.push(format!(
-                    "GITATTRIBUTES_DRIVER_TRAP: '.gitattributes' contains `{bad}`"
-                ));
-            }
-        }
+        Ok(None) => {}
     }
     findings
+}
+
+fn is_interpreter_binary(bin: &str) -> bool {
+    let lower = bin.to_ascii_lowercase();
+    matches!(
+        lower.as_str(),
+        "python"
+            | "python2"
+            | "python3"
+            | "pypy"
+            | "pypy3"
+            | "uvx"
+            | "pipx"
+            | "node"
+            | "nodejs"
+            | "bun"
+            | "deno"
+            | "tsx"
+            | "ts-node"
+            | "perl"
+            | "ruby"
+            | "irb"
+            | "php"
+            | "lua"
+            | "luajit"
+    ) || lower.starts_with("python2.")
+        || lower.starts_with("python3.")
+        || lower.starts_with("perl5.")
+        || lower.starts_with("ruby2.")
+        || lower.starts_with("ruby3.")
+        || lower.starts_with("php7")
+        || lower.starts_with("php8")
+        || lower.starts_with("lua5")
 }
 
 fn check_interpreter_command(
     bin: &str,
     args: &[String],
-    has_code_stdin: bool,
     repo_root: &Path,
     cwd: &Path,
+    session_tainted: bool,
     plan: &mut CommandPlan,
 ) -> Result<(), CommandViolation> {
-    let inspect_inline_code = |flag_desc: &str, code: &str| -> Result<(), CommandViolation> {
-        let lower = code.to_ascii_lowercase();
-        const FORBIDDEN_SNIPPETS: &[&str] = &[
-            "/tmp",
-            "/var/tmp",
-            "/dev/shm",
-            ".cache",
-            "__pycache__",
-            "node_modules",
-            "site-packages",
-            ".venv",
-            "vendor/",
-            ".env",
-            ".ssh",
-            "os.environ",
-            "process.env",
-            "subprocess",
-            "child_process",
-            "os.system",
-            "os.popen",
-            "pty.spawn",
-            "socket",
-            "urllib",
-            "http.client",
-            "fetch(",
-            "base64",
-            "os.walk",
-            "rglob(",
-            "agents.md",
-            "claude.md",
-        ];
-        for needle in FORBIDDEN_SNIPPETS {
-            if lower.contains(needle) {
+    let allow_interpreter = std::env::var("AGENT_GUARD_ALLOW_INTERPRETER")
+        .map(|v| v == "1")
+        .unwrap_or(false);
+    if session_tainted || !allow_interpreter {
+        return Err(CommandViolation {
+            code: "UNAPPROVED_INTERPRETER_BLOCKED",
+            detail: format!(
+                "Execution runtime `{bin}` is hard-blocked in PreToolUse (no Python/Node/Bun/Deno/Perl/Ruby/PHP/Lua/uv run without explicit host `AGENT_GUARD_ALLOW_INTERPRETER=1` approval; use raw coreutils `jq`, `tr`, `awk`, `sed`, `rg`)."
+            ),
+            halt_session: false,
+        });
+    }
+
+    let lower_bin = bin.to_ascii_lowercase();
+    if matches!(lower_bin.as_str(), "uvx" | "pipx") {
+        return Err(CommandViolation {
+            code: "UNVETTED_URL_PACKAGE_BLOCKED",
+            detail: format!(
+                "`{bin}` ephemeral remote package execution remains blocked even when `AGENT_GUARD_ALLOW_INTERPRETER=1`."
+            ),
+            halt_session: true,
+        });
+    }
+
+    // Even when `AGENT_GUARD_ALLOW_INTERPRETER=1` is opted in (alongside Layer-1 `exec-sandbox`),
+    // inspect all inline scripts, URLs, network primitives, and file operands so interpreter opt-in
+    // is never an all-or-nothing security cliff!
+    const BLOCKED_INTERP_CAPABILITIES: &[&str] = &[
+        "urllib",
+        "http.client",
+        "requests.",
+        "httpx",
+        "aiohttp",
+        "socket.",
+        "subprocess",
+        "os.system",
+        "pty.spawn",
+        "child_process",
+        "fetch(",
+        "net.connect",
+        "websocket",
+        "io::socket",
+        "net::http",
+        "lwp::",
+        "fsockopen",
+        "curl_init",
+    ];
+
+    let mut i = 0usize;
+    while i < args.len() {
+        let a = args[i].as_str();
+        let lower_a = a.to_ascii_lowercase();
+        if lower_a.starts_with("http://") || lower_a.starts_with("https://") {
+            return Err(CommandViolation {
+                code: "UNVETTED_URL_PACKAGE_BLOCKED",
+                detail: format!("Remote URL execution (`{a}`) in `{bin}` is forbidden."),
+                halt_session: true,
+            });
+        }
+        check_embedded_path_literals(bin, a)?;
+        for cap in BLOCKED_INTERP_CAPABILITIES {
+            if lower_a.contains(cap) {
                 return Err(CommandViolation {
-                    code: "INTERPRETER_BYPASS_BLOCKED",
+                    code: "INTERPRETER_DANGEROUS_CAPABILITY_BLOCKED",
                     detail: format!(
-                        "Inline `{bin} {flag_desc}` script references forbidden API or path '{needle}'."
+                        "`{bin}` inline argument invokes restricted network/subprocess capability `{cap}`."
                     ),
                     halt_session: true,
                 });
             }
         }
-        Ok(())
-    };
 
-    for (i, a) in args.iter().enumerate() {
-        let s = a.as_str();
-        // Exact flag (`-c <code>`, `-e <code>`, `--eval <code>`, `-p <code>`, `--print <code>`, `-r <code>`)
-        let is_exact_inline = matches!(
-            (bin, s),
-            ("python" | "python3", "-c")
-                | ("node", "-e" | "--eval" | "-p" | "--print")
-                | ("perl" | "ruby" | "lua", "-e")
-                | ("php", "-r")
-        );
-        if is_exact_inline {
-            let code = args.get(i + 1).map(String::as_str).unwrap_or("");
-            return inspect_inline_code(s, code);
-        }
-
-        // Attached inline code (`python3 -c"..."`, `node -e"..."`, `node --eval="..."`, `php -r"..."`)
-        let attached_code = match bin {
-            "python" | "python3" => s.strip_prefix("-c").filter(|rest| !rest.is_empty()),
-            "node" => s
-                .strip_prefix("--eval=")
-                .or_else(|| s.strip_prefix("--print="))
-                .or_else(|| s.strip_prefix("-e").filter(|rest| !rest.is_empty()))
-                .or_else(|| s.strip_prefix("-p").filter(|rest| !rest.is_empty())),
-            "perl" | "ruby" | "lua" => s.strip_prefix("-e").filter(|rest| !rest.is_empty()),
-            "php" => s.strip_prefix("-r").filter(|rest| !rest.is_empty()),
-            _ => None,
-        };
-        if let Some(code) = attached_code {
-            return inspect_inline_code(&s[..2.min(s.len())], code);
-        }
-
-        // Python `-m <module>` / `-m<module>`
-        if matches!(bin, "python" | "python3") {
-            let module_opt = if s == "-m" {
-                args.get(i + 1).map(|m| (m.as_str(), i + 2))
-            } else {
-                s.strip_prefix("-m")
-                    .filter(|rest| !rest.is_empty())
-                    .map(|m| (m, i + 1))
-            };
-            if let Some((mod_name, rest_idx)) = module_opt {
-                if mod_name == "pip" {
-                    return check_python_pkg_manager("pip", &args[rest_idx..]);
-                }
-                if matches!(
-                    mod_name,
-                    "http.server" | "code" | "pdb" | "webbrowser" | "smtpd"
-                ) {
-                    return Err(CommandViolation {
-                        code: "INTERPRETER_MODULE_BLOCKED",
-                        detail: format!("`{bin} -m {mod_name}` is forbidden."),
-                        halt_session: true,
-                    });
-                }
-                if mod_name == "venv" {
-                    for p in &args[rest_idx..] {
-                        if !p.starts_with('-') {
-                            validate_path(repo_root, cwd, p, PathAccess::Write).map_err(|pv| {
-                                CommandViolation {
-                                    code: pv.code,
-                                    detail: pv.detail,
-                                    halt_session: pv.is_poisoned_zone,
-                                }
-                            })?;
-                        }
+        if matches!(a, "-c" | "-e" | "-p" | "--eval" | "--print" | "-E") {
+            if let Some(code_arg) = args.get(i + 1) {
+                check_embedded_path_literals(bin, code_arg)?;
+                let lc = code_arg.to_ascii_lowercase();
+                for cap in BLOCKED_INTERP_CAPABILITIES {
+                    if lc.contains(cap) {
+                        return Err(CommandViolation {
+                            code: "INTERPRETER_DANGEROUS_CAPABILITY_BLOCKED",
+                            detail: format!(
+                                "`{bin} {a}` inline code invokes restricted network/subprocess capability `{cap}`."
+                            ),
+                            halt_session: true,
+                        });
                     }
                 }
-                return Ok(());
             }
+            i += 2;
+            continue;
         }
-    }
+        if a == "-m" {
+            i += 2;
+            continue;
+        }
+        if a.starts_with('-') {
+            i += 1;
+            continue;
+        }
 
-    // Script file execution: validate script path (or block `-` / stdin script execution!)
-    let mut found_script_file = false;
-    for a in args {
-        if a == "-" {
-            return Err(CommandViolation {
-                code: "STDIN_SCRIPT_EXECUTION_BLOCKED",
-                detail: format!(
-                    "Executing uninspected script code from stdin via `{bin} -` is forbidden."
-                ),
-                halt_session: true,
-            });
-        }
-        if !a.starts_with('-') {
+        let looks_like_path = a.contains('/')
+            || a.starts_with('.')
+            || a.starts_with('~')
+            || [
+                ".py", ".js", ".mjs", ".cjs", ".ts", ".tsx", ".rb", ".pl", ".php", ".lua", ".json",
+                ".toml", ".yaml", ".yml", ".md",
+            ]
+            .iter()
+            .any(|ext| lower_a.ends_with(ext));
+
+        if looks_like_path {
+            reject_shell_glob_in_operand(bin, a)?;
             let valid = validate_path(repo_root, cwd, a, PathAccess::Read).map_err(|pv| {
                 CommandViolation {
                     code: pv.code,
-                    detail: format!("`{bin}` target '{a}' denied: {}", pv.detail),
+                    detail: pv.detail,
                     halt_session: pv.is_poisoned_zone,
                 }
             })?;
@@ -1690,19 +2325,70 @@ fn check_interpreter_command(
                 valid.canonical_or_norm,
                 valid.is_root_authority,
             ));
-            found_script_file = true;
-            break;
         }
+        i += 1;
     }
 
-    if !found_script_file && has_code_stdin {
-        return Err(CommandViolation {
-            code: "STDIN_SCRIPT_EXECUTION_BLOCKED",
-            detail: format!(
-                "Piping or redirecting executable script code into `{bin}` stdin is forbidden."
-            ),
-            halt_session: true,
-        });
+    Ok(())
+}
+
+fn check_pytest_command(
+    bin: &str,
+    args: &[String],
+    repo_root: &Path,
+    cwd: &Path,
+    plan: &mut CommandPlan,
+) -> Result<(), CommandViolation> {
+    let mut i = 0usize;
+    while i < args.len() {
+        let a = args[i].as_str();
+        check_embedded_path_literals(bin, a)?;
+        if matches!(
+            a,
+            "-k" | "-m"
+                | "-o"
+                | "--override-ini"
+                | "--maxfail"
+                | "-n"
+                | "--basetemp"
+                | "-c"
+                | "--rootdir"
+                | "--confcutdir"
+                | "--ignore"
+                | "--deselect"
+        ) {
+            if let Some(val) = args.get(i + 1) {
+                check_embedded_path_literals(bin, val)?;
+                if matches!(a, "--basetemp" | "-c" | "--rootdir" | "--confcutdir") {
+                    validate_path(repo_root, cwd, val, PathAccess::Read).map_err(|pv| {
+                        CommandViolation {
+                            code: pv.code,
+                            detail: pv.detail,
+                            halt_session: pv.is_poisoned_zone,
+                        }
+                    })?;
+                }
+            }
+            i += 2;
+            continue;
+        }
+        if a.starts_with('-') {
+            i += 1;
+            continue;
+        }
+        // Pytest node IDs may take the form `tests/test_foo.py::test_bar`
+        let file_part = a.split("::").next().unwrap_or(a);
+        reject_shell_glob_in_operand(bin, file_part)?;
+        let valid = validate_path(repo_root, cwd, file_part, PathAccess::Read).map_err(|pv| {
+            CommandViolation {
+                code: pv.code,
+                detail: pv.detail,
+                halt_session: pv.is_poisoned_zone,
+            }
+        })?;
+        plan.search_files
+            .push((valid.repo_rel, valid.canonical_or_norm));
+        i += 1;
     }
     Ok(())
 }
@@ -1712,6 +2398,7 @@ fn check_search_or_walk_command(
     args: &[String],
     repo_root: &Path,
     cwd: &Path,
+    piped_stdin: bool,
     plan: &mut CommandPlan,
 ) -> Result<(), CommandViolation> {
     match bin {
@@ -1727,8 +2414,24 @@ fn check_search_or_walk_command(
                         halt_session: false,
                     });
                 }
+                if a == "--dereference"
+                    || a == "--dereference-command-line"
+                    || a == "--dereference-command-line-symlink-to-dir"
+                    || (a.starts_with('-')
+                        && !a.starts_with("--")
+                        && (a.contains('L') || a.contains('H')))
+                {
+                    return Err(CommandViolation {
+                        code: "LS_SYMLINK_FOLLOW_BLOCKED",
+                        detail:
+                            "`ls -L` / `--dereference` symlink following is forbidden in PreToolUse."
+                                .to_string(),
+                        halt_session: false,
+                    });
+                }
             }
             for a in args.iter().filter(|a| !a.starts_with('-')) {
+                reject_shell_glob_in_operand(bin, a)?;
                 validate_path(
                     repo_root,
                     cwd,
@@ -1760,16 +2463,48 @@ fn check_search_or_walk_command(
                     });
                 }
             }
-            // Non-flag operands after pattern are files
-            let mut skipped_pattern = false;
-            for a in args {
+            // Non-flag operands after pattern are searched files (do not burn read hop depth!)
+            let mut skipped_pattern = args.iter().any(|a| {
+                a == "-e" || a.starts_with("--regexp=") || a == "-f" || a.starts_with("--file=")
+            });
+            let mut i = 0usize;
+            while i < args.len() {
+                let a = &args[i];
                 if a.starts_with('-') {
+                    if matches!(
+                        a.as_str(),
+                        "-e" | "--regexp" | "-A" | "-B" | "-C" | "-m" | "--max-count" | "--label"
+                    ) {
+                        i += 2;
+                        continue;
+                    }
+                    if a == "-f" || a == "--file" {
+                        if let Some(fp) = args.get(i + 1) {
+                            reject_shell_glob_in_operand(bin, fp)?;
+                            let valid = validate_path(repo_root, cwd, fp, PathAccess::Read)
+                                .map_err(|pv| CommandViolation {
+                                    code: pv.code,
+                                    detail: pv.detail,
+                                    halt_session: pv.is_poisoned_zone,
+                                })?;
+                            plan.read_files.push((
+                                valid.repo_rel,
+                                valid.canonical_or_norm,
+                                valid.is_root_authority,
+                            ));
+                        }
+                        i += 2;
+                        continue;
+                    }
+                    i += 1;
                     continue;
                 }
                 if !skipped_pattern {
                     skipped_pattern = true;
+                    i += 1;
                     continue;
                 }
+                reject_shell_glob_in_operand(bin, a)?;
                 let valid = validate_path(repo_root, cwd, a, PathAccess::Read).map_err(|pv| {
                     CommandViolation {
                         code: pv.code,
@@ -1777,22 +2512,53 @@ fn check_search_or_walk_command(
                         halt_session: pv.is_poisoned_zone,
                     }
                 })?;
-                plan.read_files.push((
-                    valid.repo_rel,
-                    valid.canonical_or_norm,
-                    valid.is_root_authority,
-                ));
+                plan.search_files
+                    .push((valid.repo_rel, valid.canonical_or_norm));
+                i += 1;
             }
         }
         "find" => {
             let mut max_depth: Option<usize> = None;
-            let mut paths = Vec::new();
-            let mut i = 0;
+            let mut paths: Vec<&str> = Vec::new();
+            let mut in_predicates = false;
+            let mut i = 0usize;
             while i < args.len() {
                 let a = args[i].as_str();
+                if !in_predicates {
+                    if a == "-L" || a == "-H" || a == "-follow" {
+                        return Err(CommandViolation {
+                            code: "FIND_SYMLINK_FOLLOW_BLOCKED",
+                            detail: format!("`find {a}` symlink following is forbidden."),
+                            halt_session: false,
+                        });
+                    }
+                    if a == "-P" || a.starts_with("-O") {
+                        i += 1;
+                        continue;
+                    }
+                    if a == "-D" {
+                        i += 2;
+                        continue;
+                    }
+                    if !a.starts_with('-') && !matches!(a, "!" | "(" | ")" | ",") {
+                        paths.push(a);
+                        i += 1;
+                        continue;
+                    }
+                    in_predicates = true;
+                }
+
                 if matches!(
                     a,
-                    "-exec" | "-execdir" | "-ok" | "-okdir" | "-delete" | "-fls" | "-fprint"
+                    "-exec"
+                        | "-execdir"
+                        | "-ok"
+                        | "-okdir"
+                        | "-delete"
+                        | "-fls"
+                        | "-fprint"
+                        | "-fprint0"
+                        | "-fprintf"
                 ) {
                     return Err(CommandViolation {
                         code: "FIND_EXEC_OR_DELETE_BLOCKED",
@@ -1800,10 +2566,19 @@ fn check_search_or_walk_command(
                         halt_session: false,
                     });
                 }
-                if a == "-L" || a == "-follow" {
+                if a == "-L" || a == "-follow" || a == "-H" {
                     return Err(CommandViolation {
                         code: "FIND_SYMLINK_FOLLOW_BLOCKED",
-                        detail: "`find -L` symlink following is forbidden.".to_string(),
+                        detail: format!("`find {a}` symlink following is forbidden."),
+                        halt_session: false,
+                    });
+                }
+                if a == "-depth" || a == "-d" {
+                    return Err(CommandViolation {
+                        code: "FIND_DEPTH_BYPASS_BLOCKED",
+                        detail:
+                            "`find -depth` disables `-prune` directory exclusion and is forbidden."
+                                .to_string(),
                         halt_session: false,
                     });
                 }
@@ -1812,21 +2587,70 @@ fn check_search_or_walk_command(
                     i += 2;
                     continue;
                 }
-                if !a.starts_with('-')
-                    && a != "!"
-                    && a != "("
-                    && a != ")"
-                    && max_depth.is_none()
-                    && paths.is_empty()
-                {
-                    paths.push(a);
+                if matches!(
+                    a,
+                    "-mindepth"
+                        | "-name"
+                        | "-iname"
+                        | "-path"
+                        | "-ipath"
+                        | "-wholename"
+                        | "-iwholename"
+                        | "-lname"
+                        | "-ilname"
+                        | "-regex"
+                        | "-iregex"
+                        | "-regextype"
+                        | "-type"
+                        | "-xtype"
+                        | "-perm"
+                        | "-user"
+                        | "-group"
+                        | "-uid"
+                        | "-gid"
+                        | "-size"
+                        | "-mtime"
+                        | "-mmin"
+                        | "-ctime"
+                        | "-cmin"
+                        | "-atime"
+                        | "-amin"
+                        | "-newer"
+                        | "-anewer"
+                        | "-cnewer"
+                        | "-links"
+                        | "-inum"
+                        | "-samefile"
+                        | "-printf"
+                        | "-fstype"
+                ) {
+                    if args.get(i + 1).is_none() {
+                        return Err(CommandViolation {
+                            code: "MALFORMED_FIND_COMMAND",
+                            detail: format!("`find {a}` missing predicate argument."),
+                            halt_session: false,
+                        });
+                    }
+                    i += 2;
+                    continue;
                 }
-                i += 1;
+                if a.starts_with('-') || matches!(a, "!" | "(" | ")" | ",") {
+                    i += 1;
+                    continue;
+                }
+                return Err(CommandViolation {
+                    code: "MALFORMED_FIND_COMMAND",
+                    detail: format!(
+                        "Unexpected path or bare token '{a}' after `find` predicates; place all search paths before `-maxdepth`."
+                    ),
+                    halt_session: false,
+                });
             }
             if paths.is_empty() {
                 paths.push(".");
             }
             for p in paths {
+                reject_shell_glob_in_operand(bin, p)?;
                 validate_path(
                     repo_root,
                     cwd,
@@ -1900,6 +2724,7 @@ fn check_search_or_walk_command(
                         explicit_pattern_or_no_pattern = true;
                     }
                     if let Some(fp) = args.get(i + 1) {
+                        reject_shell_glob_in_operand(bin, fp)?;
                         let valid =
                             validate_path(repo_root, cwd, fp, PathAccess::Read).map_err(|pv| {
                                 CommandViolation {
@@ -1931,6 +2756,7 @@ fn check_search_or_walk_command(
                     if !a.starts_with("--ignore-file=") {
                         explicit_pattern_or_no_pattern = true;
                     }
+                    reject_shell_glob_in_operand(bin, fp)?;
                     let valid =
                         validate_path(repo_root, cwd, fp, PathAccess::Read).map_err(|pv| {
                             CommandViolation {
@@ -1975,22 +2801,29 @@ fn check_search_or_walk_command(
                 target_paths.push(sp.as_str());
             }
 
+            let is_piped_rg_stdin = piped_stdin
+                && matches!(bin, "rg" | "ripgrep")
+                && !args.iter().any(|a| a == "--files");
+
             if target_paths.is_empty() {
-                validate_path(
-                    repo_root,
-                    cwd,
-                    ".",
-                    PathAccess::ListSearch {
-                        requested_depth: max_depth,
-                    },
-                )
-                .map_err(|pv| CommandViolation {
-                    code: pv.code,
-                    detail: pv.detail,
-                    halt_session: pv.is_poisoned_zone,
-                })?;
+                if !is_piped_rg_stdin {
+                    validate_path(
+                        repo_root,
+                        cwd,
+                        ".",
+                        PathAccess::ListSearch {
+                            requested_depth: max_depth,
+                        },
+                    )
+                    .map_err(|pv| CommandViolation {
+                        code: pv.code,
+                        detail: pv.detail,
+                        halt_session: pv.is_poisoned_zone,
+                    })?;
+                }
             } else {
                 for p in target_paths {
+                    reject_shell_glob_in_operand(bin, p)?;
                     // Single explicit file target is allowed if `Read` passes; directory target requires `max_depth <= 2`
                     let candidate = if Path::new(p).is_absolute() {
                         std::path::PathBuf::from(p)
@@ -2006,11 +2839,8 @@ fn check_search_or_walk_command(
                                     halt_session: pv.is_poisoned_zone,
                                 }
                             })?;
-                        plan.read_files.push((
-                            valid.repo_rel,
-                            valid.canonical_or_norm,
-                            valid.is_root_authority,
-                        ));
+                        plan.search_files
+                            .push((valid.repo_rel, valid.canonical_or_norm));
                     } else {
                         validate_path(
                             repo_root,
@@ -2053,6 +2883,7 @@ fn check_search_or_walk_command(
                 }
                 if !after_double_dash && a == "-o" {
                     if let Some(out_p) = args.get(i + 1) {
+                        reject_shell_glob_in_operand(bin, out_p)?;
                         let valid = validate_path(repo_root, cwd, out_p, PathAccess::Write)
                             .map_err(|pv| CommandViolation {
                                 code: pv.code,
@@ -2092,6 +2923,7 @@ fn check_search_or_walk_command(
                 paths.push(".");
             }
             for p in paths {
+                reject_shell_glob_in_operand(bin, p)?;
                 validate_path(
                     repo_root,
                     cwd,
@@ -2166,104 +2998,530 @@ fn check_file_utility_paths(
     cwd: &Path,
     plan: &mut CommandPlan,
 ) -> Result<(), CommandViolation> {
-    let is_reader = matches!(
-        bin,
-        "cat"
-            | "head"
-            | "tail"
-            | "less"
-            | "more"
-            | "nl"
-            | "wc"
-            | "stat"
-            | "file"
-            | "sort"
-            | "uniq"
-            | "cut"
-            | "jq"
-            | "sha256sum"
-            | "md5sum"
-            | "diff"
-            | "awk"
-            | "sed"
-    );
-    let is_writer = matches!(bin, "rm" | "rmdir" | "mkdir" | "touch" | "truncate");
-    let is_src_dst = matches!(bin, "cp" | "mv" | "ln");
-
-    if bin == "awk" {
-        if let Some(prog) = args.iter().find(|a| !a.starts_with('-')) {
-            if prog.contains("system(") || prog.contains("| getline") {
-                return Err(CommandViolation {
-                    code: "AWK_SYSTEM_EXEC_BLOCKED",
-                    detail: "`awk` `system(...)` command execution is forbidden.".to_string(),
-                    halt_session: true,
-                });
-            }
-        }
+    // `tr` operates strictly on stdin -> stdout character sets and never accepts file path operands.
+    if bin == "tr" {
+        return Ok(());
     }
 
-    let sed_in_place = bin == "sed"
-        && args
-            .iter()
-            .any(|a| a == "-i" || a.starts_with("-i") || a.starts_with("--in-place"));
+    let mut push_read = |target: &str, plan: &mut CommandPlan| -> Result<(), CommandViolation> {
+        reject_shell_glob_in_operand(bin, target)?;
+        let valid = validate_path(repo_root, cwd, target, PathAccess::Read).map_err(|pv| {
+            CommandViolation {
+                code: pv.code,
+                detail: format!("`{bin}` operand '{target}' denied: {}", pv.detail),
+                halt_session: pv.is_poisoned_zone,
+            }
+        })?;
+        plan.read_files.push((
+            valid.repo_rel,
+            valid.canonical_or_norm,
+            valid.is_root_authority,
+        ));
+        Ok(())
+    };
 
-    if is_reader {
-        let mut skip_first_expr =
-            matches!(bin, "jq" | "awk" | "sed") && !args.iter().any(|a| a == "-e" || a == "-f");
-        let mut i = 0;
-        while i < args.len() {
-            let a = &args[i];
-            if a.starts_with('-') {
-                if matches!(
-                    a.as_str(),
-                    "-n" | "-c" | "-e" | "-f" | "-d" | "-F" | "--arg"
-                ) {
-                    if a == "-f" {
-                        if let Some(script_f) = args.get(i + 1) {
-                            let valid = validate_path(repo_root, cwd, script_f, PathAccess::Read)
-                                .map_err(|pv| CommandViolation {
+    let push_write = |target: &str, plan: &mut CommandPlan| -> Result<(), CommandViolation> {
+        reject_shell_glob_in_operand(bin, target)?;
+        let valid = validate_path(repo_root, cwd, target, PathAccess::Write).map_err(|pv| {
+            CommandViolation {
+                code: pv.code,
+                detail: format!("`{bin}` target '{target}' denied: {}", pv.detail),
+                halt_session: pv.is_poisoned_zone,
+            }
+        })?;
+        plan.write_files
+            .push((valid.repo_rel, valid.canonical_or_norm));
+        Ok(())
+    };
+
+    match bin {
+        "jq" => {
+            let mut has_filter_file = false;
+            let mut seen_inline_filter = false;
+            let mut after_double_dash = false;
+            let mut i = 0usize;
+            while i < args.len() {
+                let a = args[i].as_str();
+                if !after_double_dash && (a == "--args" || a == "--jsonargs") {
+                    // All remaining tokens are scalar/JSON values, not files
+                    return Ok(());
+                }
+                if !after_double_dash && a == "--" {
+                    after_double_dash = true;
+                    i += 1;
+                    continue;
+                }
+                if !after_double_dash && a.starts_with('-') && a != "-" {
+                    if a == "-f" || a == "--from-file" {
+                        has_filter_file = true;
+                        if let Some(fp) = args.get(i + 1) {
+                            push_read(fp, plan)?;
+                        }
+                        i += 2;
+                        continue;
+                    }
+                    if matches!(a, "--slurpfile" | "--rawfile") {
+                        if let Some(fp) = args.get(i + 2) {
+                            push_read(fp, plan)?;
+                        }
+                        i += 3;
+                        continue;
+                    }
+                    if a == "-L" {
+                        if let Some(dir) = args.get(i + 1) {
+                            reject_shell_glob_in_operand(bin, dir)?;
+                            validate_path(
+                                repo_root,
+                                cwd,
+                                dir,
+                                PathAccess::ListSearch {
+                                    requested_depth: Some(1),
+                                },
+                            )
+                            .map_err(|pv| CommandViolation {
                                 code: pv.code,
                                 detail: pv.detail,
                                 halt_session: pv.is_poisoned_zone,
                             })?;
-                            plan.read_files.push((
-                                valid.repo_rel,
-                                valid.canonical_or_norm,
-                                valid.is_root_authority,
-                            ));
                         }
+                        i += 2;
+                        continue;
                     }
-                    i += 2;
-                } else {
+                    if matches!(a, "--arg" | "--argjson") {
+                        i += 3;
+                        continue;
+                    }
+                    if a == "--indent" {
+                        i += 2;
+                        continue;
+                    }
                     i += 1;
+                    continue;
                 }
-                continue;
+                if !has_filter_file && !seen_inline_filter {
+                    seen_inline_filter = true;
+                    i += 1;
+                    continue;
+                }
+                if a != "-" {
+                    push_read(a, plan)?;
+                }
+                i += 1;
             }
-            if skip_first_expr {
-                skip_first_expr = false;
+            return Ok(());
+        }
+        "head" | "tail" => {
+            let mut after_double_dash = false;
+            let mut i = 0usize;
+            while i < args.len() {
+                let a = args[i].as_str();
+                if !after_double_dash && a == "--" {
+                    after_double_dash = true;
+                    i += 1;
+                    continue;
+                }
+                if !after_double_dash && a.starts_with('-') && a != "-" {
+                    if matches!(
+                        a,
+                        "-n" | "--lines" | "-c" | "--bytes" | "-s" | "--sleep-interval" | "--pid"
+                    ) {
+                        i += 2;
+                    } else {
+                        i += 1;
+                    }
+                    continue;
+                }
+                if a != "-" {
+                    push_read(a, plan)?;
+                }
+                i += 1;
+            }
+            return Ok(());
+        }
+        "cut" => {
+            let mut after_double_dash = false;
+            let mut i = 0usize;
+            while i < args.len() {
+                let a = args[i].as_str();
+                if !after_double_dash && a == "--" {
+                    after_double_dash = true;
+                    i += 1;
+                    continue;
+                }
+                if !after_double_dash && a.starts_with('-') && a != "-" {
+                    if matches!(
+                        a,
+                        "-b" | "--bytes"
+                            | "-c"
+                            | "--characters"
+                            | "-d"
+                            | "--delimiter"
+                            | "-f"
+                            | "--fields"
+                            | "--output-delimiter"
+                    ) {
+                        i += 2;
+                    } else {
+                        i += 1;
+                    }
+                    continue;
+                }
+                if a != "-" {
+                    push_read(a, plan)?;
+                }
+                i += 1;
+            }
+            return Ok(());
+        }
+        "sort" => {
+            let mut after_double_dash = false;
+            let mut i = 0usize;
+            while i < args.len() {
+                let a = args[i].as_str();
+                if !after_double_dash && a == "--" {
+                    after_double_dash = true;
+                    i += 1;
+                    continue;
+                }
+                if !after_double_dash && a.starts_with('-') && a != "-" {
+                    if a.starts_with("--compress-program") {
+                        return Err(CommandViolation {
+                            code: "SORT_COMPRESS_EXEC_BLOCKED",
+                            detail: "`sort --compress-program` executes arbitrary external binaries and is forbidden."
+                                .to_string(),
+                            halt_session: true,
+                        });
+                    }
+                    if a.starts_with("--files0-from") {
+                        return Err(CommandViolation {
+                            code: "DYNAMIC_FILES0_BLOCKED",
+                            detail: "`sort --files0-from` dynamic path loading is forbidden."
+                                .to_string(),
+                            halt_session: true,
+                        });
+                    }
+                    if a == "-o" || a == "--output" || a == "-T" || a == "--temporary-directory" {
+                        if let Some(p) = args.get(i + 1) {
+                            push_write(p, plan)?;
+                        }
+                        i += 2;
+                        continue;
+                    }
+                    if let Some(p) = a
+                        .strip_prefix("--output=")
+                        .or_else(|| a.strip_prefix("--temporary-directory="))
+                        .or_else(|| a.strip_prefix("-o").filter(|s| !s.is_empty()))
+                        .or_else(|| a.strip_prefix("-T").filter(|s| !s.is_empty()))
+                    {
+                        push_write(p, plan)?;
+                        i += 1;
+                        continue;
+                    }
+                    if matches!(
+                        a,
+                        "-k" | "--key"
+                            | "-t"
+                            | "--field-separator"
+                            | "-S"
+                            | "--buffer-size"
+                            | "--parallel"
+                            | "--batch-size"
+                    ) {
+                        i += 2;
+                    } else {
+                        i += 1;
+                    }
+                    continue;
+                }
+                if a != "-" {
+                    push_read(a, plan)?;
+                }
+                i += 1;
+            }
+            return Ok(());
+        }
+        "uniq" => {
+            let mut after_double_dash = false;
+            let mut pos_idx = 0usize;
+            let mut i = 0usize;
+            while i < args.len() {
+                let a = args[i].as_str();
+                if !after_double_dash && a == "--" {
+                    after_double_dash = true;
+                    i += 1;
+                    continue;
+                }
+                if !after_double_dash && a.starts_with('-') && a != "-" {
+                    if matches!(
+                        a,
+                        "-f" | "--skip-fields" | "-s" | "--skip-chars" | "-w" | "--check-chars"
+                    ) {
+                        i += 2;
+                    } else {
+                        i += 1;
+                    }
+                    continue;
+                }
+                if a != "-" {
+                    if pos_idx == 0 {
+                        push_read(a, plan)?;
+                    } else {
+                        push_write(a, plan)?;
+                    }
+                }
+                pos_idx += 1;
+                i += 1;
+            }
+            return Ok(());
+        }
+        "wc" => {
+            let mut after_double_dash = false;
+            for a in args {
+                let s = a.as_str();
+                if !after_double_dash && s == "--" {
+                    after_double_dash = true;
+                    continue;
+                }
+                if !after_double_dash && s.starts_with('-') && s != "-" {
+                    if s.starts_with("--files0-from") {
+                        return Err(CommandViolation {
+                            code: "DYNAMIC_FILES0_BLOCKED",
+                            detail: "`wc --files0-from` dynamic path loading is forbidden."
+                                .to_string(),
+                            halt_session: true,
+                        });
+                    }
+                    continue;
+                }
+                if s != "-" {
+                    push_read(s, plan)?;
+                }
+            }
+            return Ok(());
+        }
+        _ => {}
+    }
+
+    if matches!(bin, "awk" | "gawk" | "mawk" | "nawk") {
+        let mut has_explicit_prog = false;
+        let mut after_double_dash = false;
+        let mut i = 0usize;
+        while i < args.len() {
+            let a = args[i].as_str();
+            if !after_double_dash && a == "--" {
+                after_double_dash = true;
                 i += 1;
                 continue;
             }
-            let access = if sed_in_place {
-                PathAccess::Write
-            } else {
-                PathAccess::Read
-            };
-            let valid =
-                validate_path(repo_root, cwd, a, access).map_err(|pv| CommandViolation {
-                    code: pv.code,
-                    detail: format!("`{bin}` operand '{a}' denied: {}", pv.detail),
-                    halt_session: pv.is_poisoned_zone,
-                })?;
-            if sed_in_place {
-                plan.write_files
-                    .push((valid.repo_rel.clone(), valid.canonical_or_norm.clone()));
+            if !after_double_dash && a.starts_with('-') && a != "-" {
+                if a == "-l" || a == "--load" || a.starts_with("-l") || a.starts_with("--load=") {
+                    return Err(CommandViolation {
+                        code: "AWK_SYSTEM_EXEC_BLOCKED",
+                        detail: format!("`{bin} {a}` dynamic extension loading is forbidden."),
+                        halt_session: true,
+                    });
+                }
+                if a == "-o"
+                    || a.starts_with("-o")
+                    || a.starts_with("--pretty-print")
+                    || a.starts_with("--dump-variables")
+                    || a.starts_with("--profile")
+                {
+                    return Err(CommandViolation {
+                        code: "AWK_FILE_REDIR_BLOCKED",
+                        detail: format!("`{bin} {a}` file output flag is forbidden."),
+                        halt_session: true,
+                    });
+                }
+                if a == "-e" || a == "--source" {
+                    let Some(prog) = args.get(i + 1) else {
+                        return Err(CommandViolation {
+                            code: "MALFORMED_AWK_COMMAND",
+                            detail: format!("`{bin} {a}` missing program text."),
+                            halt_session: false,
+                        });
+                    };
+                    inspect_awk_program(prog)?;
+                    has_explicit_prog = true;
+                    i += 2;
+                    continue;
+                }
+                if let Some(prog) = a
+                    .strip_prefix("--source=")
+                    .or_else(|| a.strip_prefix("-e").filter(|s| !s.is_empty()))
+                {
+                    inspect_awk_program(prog)?;
+                    has_explicit_prog = true;
+                    i += 1;
+                    continue;
+                }
+                if a == "-f" || a == "--file" {
+                    let Some(script_f) = args.get(i + 1) else {
+                        return Err(CommandViolation {
+                            code: "MALFORMED_AWK_COMMAND",
+                            detail: format!("`{bin} {a}` missing script file operand."),
+                            halt_session: false,
+                        });
+                    };
+                    push_read(script_f, plan)?;
+                    inspect_awk_or_sed_script_file(repo_root, cwd, script_f, true)?;
+                    has_explicit_prog = true;
+                    i += 2;
+                    continue;
+                }
+                if let Some(script_f) = a
+                    .strip_prefix("--file=")
+                    .or_else(|| a.strip_prefix("-f").filter(|s| !s.is_empty()))
+                {
+                    push_read(script_f, plan)?;
+                    inspect_awk_or_sed_script_file(repo_root, cwd, script_f, true)?;
+                    has_explicit_prog = true;
+                    i += 1;
+                    continue;
+                }
+                if a == "-F" || a == "--field-separator" || a == "-W" {
+                    i += 2;
+                    continue;
+                }
+                if a == "-v" || a == "--assign" {
+                    if let Some(assign) = args.get(i + 1) {
+                        inspect_awk_assignment(assign, &mut push_read, plan)?;
+                    }
+                    i += 2;
+                    continue;
+                }
+                if let Some(assign) = a
+                    .strip_prefix("--assign=")
+                    .or_else(|| a.strip_prefix("-v").filter(|s| !s.is_empty()))
+                {
+                    inspect_awk_assignment(assign, &mut push_read, plan)?;
+                    i += 1;
+                    continue;
+                }
+                i += 1;
+                continue;
             }
-            plan.read_files.push((
-                valid.repo_rel,
-                valid.canonical_or_norm,
-                valid.is_root_authority,
-            ));
+            if !has_explicit_prog {
+                inspect_awk_program(a)?;
+                has_explicit_prog = true;
+                i += 1;
+                continue;
+            }
+            if a != "-" {
+                if a.contains('=') && !Path::new(a).exists() {
+                    inspect_awk_assignment(a, &mut push_read, plan)?;
+                } else {
+                    push_read(a, plan)?;
+                }
+            }
+            i += 1;
+        }
+        return Ok(());
+    }
+
+    if matches!(bin, "sed" | "gsed") {
+        let sed_in_place = args
+            .iter()
+            .any(|a| a == "-i" || a.starts_with("-i") || a.starts_with("--in-place"));
+        let mut has_explicit_expr = false;
+        let mut after_double_dash = false;
+        let mut i = 0usize;
+        while i < args.len() {
+            let a = args[i].as_str();
+            if !after_double_dash && a == "--" {
+                after_double_dash = true;
+                i += 1;
+                continue;
+            }
+            if !after_double_dash && a.starts_with('-') && a != "-" {
+                if a == "-e" || a == "--expression" {
+                    let Some(expr) = args.get(i + 1) else {
+                        return Err(CommandViolation {
+                            code: "MALFORMED_SED_COMMAND",
+                            detail: format!("`{bin} {a}` missing script expression."),
+                            halt_session: false,
+                        });
+                    };
+                    inspect_sed_script(expr)?;
+                    has_explicit_expr = true;
+                    i += 2;
+                    continue;
+                }
+                if let Some(expr) = a
+                    .strip_prefix("--expression=")
+                    .or_else(|| a.strip_prefix("-e").filter(|s| !s.is_empty()))
+                {
+                    inspect_sed_script(expr)?;
+                    has_explicit_expr = true;
+                    i += 1;
+                    continue;
+                }
+                if a == "-f" || a == "--file" {
+                    let Some(script_f) = args.get(i + 1) else {
+                        return Err(CommandViolation {
+                            code: "MALFORMED_SED_COMMAND",
+                            detail: format!("`{bin} {a}` missing script file."),
+                            halt_session: false,
+                        });
+                    };
+                    push_read(script_f, plan)?;
+                    inspect_awk_or_sed_script_file(repo_root, cwd, script_f, false)?;
+                    has_explicit_expr = true;
+                    i += 2;
+                    continue;
+                }
+                if let Some(script_f) = a
+                    .strip_prefix("--file=")
+                    .or_else(|| a.strip_prefix("-f").filter(|s| !s.is_empty()))
+                {
+                    push_read(script_f, plan)?;
+                    inspect_awk_or_sed_script_file(repo_root, cwd, script_f, false)?;
+                    has_explicit_expr = true;
+                    i += 1;
+                    continue;
+                }
+                if a == "-l" || a == "--line-length" {
+                    i += 2;
+                    continue;
+                }
+                i += 1;
+                continue;
+            }
+            if !has_explicit_expr {
+                inspect_sed_script(a)?;
+                has_explicit_expr = true;
+                i += 1;
+                continue;
+            }
+            if a != "-" {
+                if sed_in_place {
+                    push_write(a, plan)?;
+                }
+                push_read(a, plan)?;
+            }
+            i += 1;
+        }
+        return Ok(());
+    }
+
+    let is_reader = matches!(
+        bin,
+        "cat" | "less" | "more" | "nl" | "stat" | "file" | "sha256sum" | "md5sum" | "diff"
+    );
+    let is_writer = matches!(bin, "rm" | "rmdir" | "mkdir" | "touch" | "truncate");
+    let is_src_dst = matches!(bin, "cp" | "mv" | "ln");
+
+    if is_reader {
+        let mut i = 0;
+        while i < args.len() {
+            let a = &args[i];
+            if a.starts_with('-') && a != "-" {
+                i += 1;
+                continue;
+            }
+            if a != "-" {
+                push_read(a, plan)?;
+            }
             i += 1;
         }
         return Ok(());
@@ -2271,15 +3529,7 @@ fn check_file_utility_paths(
 
     if is_writer {
         for a in args.iter().filter(|a| !a.starts_with('-')) {
-            let valid = validate_path(repo_root, cwd, a, PathAccess::Write).map_err(|pv| {
-                CommandViolation {
-                    code: pv.code,
-                    detail: format!("`{bin}` target '{a}' denied: {}", pv.detail),
-                    halt_session: pv.is_poisoned_zone,
-                }
-            })?;
-            plan.write_files
-                .push((valid.repo_rel, valid.canonical_or_norm));
+            push_write(a, plan)?;
         }
         return Ok(());
     }
@@ -2288,41 +3538,25 @@ fn check_file_utility_paths(
         let operands: Vec<&String> = args.iter().filter(|a| !a.starts_with('-')).collect();
         if operands.len() >= 2 {
             for src in &operands[..operands.len() - 1] {
-                let valid = validate_path(repo_root, cwd, src, PathAccess::Read).map_err(|pv| {
-                    CommandViolation {
-                        code: pv.code,
-                        detail: format!("`{bin}` source '{src}' denied: {}", pv.detail),
-                        halt_session: pv.is_poisoned_zone,
-                    }
-                })?;
-                plan.read_files.push((
-                    valid.repo_rel,
-                    valid.canonical_or_norm,
-                    valid.is_root_authority,
-                ));
+                push_read(src, plan)?;
             }
             let dst = operands[operands.len() - 1];
-            let valid_dst =
-                validate_path(repo_root, cwd, dst, PathAccess::Write).map_err(|pv| {
-                    CommandViolation {
-                        code: pv.code,
-                        detail: format!("`{bin}` destination '{dst}' denied: {}", pv.detail),
-                        halt_session: pv.is_poisoned_zone,
-                    }
-                })?;
-            plan.write_files
-                .push((valid_dst.repo_rel, valid_dst.canonical_or_norm));
+            push_write(dst, plan)?;
         }
         return Ok(());
     }
 
-    // Fallback check for any other command: inspect path-looking arguments for forbidden zones!
+    // Fallback check for any other command: inspect path-looking arguments for globs and forbidden zones!
     for a in args {
+        if a.starts_with(".*") || a.starts_with(".?") || a.starts_with(".[") {
+            reject_shell_glob_in_operand(bin, a)?;
+        }
         if a.contains('/') || a.starts_with('~') || a == ".env" || a.starts_with(".env.") {
             let cleaned = a.split('=').next_back().unwrap_or(a.as_str());
             if cleaned == "/dev/null" {
                 continue;
             }
+            reject_shell_glob_in_operand(bin, cleaned)?;
             if let Err(pv) = check_forbidden_zones_lexical(cleaned, a) {
                 return Err(CommandViolation {
                     code: pv.code,
@@ -2334,6 +3568,615 @@ fn check_file_utility_paths(
     }
 
     Ok(())
+}
+
+fn inspect_awk_or_sed_script_file(
+    repo_root: &Path,
+    cwd: &Path,
+    script_f: &str,
+    is_awk: bool,
+) -> Result<(), CommandViolation> {
+    let candidate = if Path::new(script_f).is_absolute() {
+        std::path::PathBuf::from(script_f)
+    } else {
+        cwd.join(script_f)
+    };
+    let _ = repo_root;
+    if let Ok(meta) = std::fs::symlink_metadata(&candidate) {
+        if meta.file_type().is_file() && meta.len() <= 65_536 {
+            if let Ok(text) = std::fs::read_to_string(&candidate) {
+                if is_awk {
+                    inspect_awk_program(&text)?;
+                } else {
+                    inspect_sed_script(&text)?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn inspect_awk_assignment<F>(
+    assign: &str,
+    push_read: &mut F,
+    plan: &mut CommandPlan,
+) -> Result<(), CommandViolation>
+where
+    F: FnMut(&str, &mut CommandPlan) -> Result<(), CommandViolation>,
+{
+    let val = assign.split_once('=').map(|(_, v)| v).unwrap_or(assign);
+    check_embedded_path_literals("awk -v", val)?;
+    if (val.contains('/') || val.starts_with('.') || val.starts_with('~'))
+        && val != "."
+        && val != "/dev/null"
+    {
+        let candidate = Path::new(val);
+        if candidate.exists() {
+            push_read(val, plan)?;
+        } else if let Err(pv) = check_forbidden_zones_lexical(val, assign) {
+            return Err(CommandViolation {
+                code: pv.code,
+                detail: pv.detail,
+                halt_session: pv.is_poisoned_zone,
+            });
+        }
+    }
+    Ok(())
+}
+
+fn check_embedded_path_literals(ctx: &str, text: &str) -> Result<(), CommandViolation> {
+    let lower = text.to_ascii_lowercase();
+    const PROTECTED_LITERALS: &[&str] = &[
+        ".env",
+        ".ssh",
+        ".aws",
+        ".gnupg",
+        ".netrc",
+        ".git/config",
+        ".git/hooks",
+        "agents.md",
+        "claude.md",
+        ".cursorrules",
+        ".windsurfrules",
+        ".clinerules",
+        "copilot-instructions.md",
+        ".claude/",
+        ".codex/",
+        ".cursor/",
+        ".agent-guard",
+        "audit.jsonl",
+        "/tmp",
+        "/var/tmp",
+        "/dev/shm",
+        "/proc/",
+        "node_modules",
+    ];
+    for needle in PROTECTED_LITERALS {
+        if lower.contains(needle) {
+            return Err(CommandViolation {
+                code: "EMBEDDED_FORBIDDEN_PATH_BLOCKED",
+                detail: format!(
+                    "`{ctx}` embeds protected or forbidden path literal matching `{needle}`."
+                ),
+                halt_session: true,
+            });
+        }
+    }
+    Ok(())
+}
+
+fn inspect_awk_program(prog: &str) -> Result<(), CommandViolation> {
+    check_embedded_path_literals("awk", prog)?;
+
+    let bytes = prog.as_bytes();
+    let mut i = 0usize;
+    let mut in_str = false;
+    let mut in_regex = false;
+    let mut can_start_regex = true;
+    let mut in_print_stmt = false;
+    let mut in_getline_stmt = false;
+    let mut paren_depth = 0usize;
+
+    while i < bytes.len() {
+        let b = bytes[i];
+        if in_str {
+            if b == b'\\' {
+                i += 2;
+                continue;
+            }
+            if b == b'"' {
+                in_str = false;
+                can_start_regex = false;
+            }
+            i += 1;
+            continue;
+        }
+        if in_regex {
+            if b == b'\\' {
+                i += 2;
+                continue;
+            }
+            if b == b'/' {
+                in_regex = false;
+                can_start_regex = false;
+            }
+            i += 1;
+            continue;
+        }
+        if b == b'#' {
+            while i < bytes.len() && bytes[i] != b'\n' {
+                i += 1;
+            }
+            continue;
+        }
+        if b == b'"' {
+            in_str = true;
+            i += 1;
+            continue;
+        }
+        if b == b'/' && can_start_regex {
+            in_regex = true;
+            i += 1;
+            continue;
+        }
+        if b.is_ascii_whitespace() {
+            if b == b'\n' && paren_depth == 0 {
+                in_print_stmt = false;
+                in_getline_stmt = false;
+                can_start_regex = true;
+            }
+            i += 1;
+            continue;
+        }
+
+        // Identifiers (`system`, `print`, `printf`, `getline`)
+        if b.is_ascii_alphabetic() || b == b'_' {
+            let start = i;
+            while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
+                i += 1;
+            }
+            let ident = &prog[start..i];
+            if ident == "system" {
+                let mut k = i;
+                while k < bytes.len() && bytes[k].is_ascii_whitespace() {
+                    k += 1;
+                }
+                if k < bytes.len() && bytes[k] == b'(' {
+                    return Err(CommandViolation {
+                        code: "AWK_SYSTEM_EXEC_BLOCKED",
+                        detail: "`awk` `system(...)` command execution is forbidden.".to_string(),
+                        halt_session: true,
+                    });
+                }
+            } else if ident == "print" || ident == "printf" {
+                in_print_stmt = true;
+                can_start_regex = true;
+                continue;
+            } else if ident == "getline" {
+                in_getline_stmt = true;
+                can_start_regex = false;
+                continue;
+            }
+            can_start_regex = matches!(ident, "return" | "case" | "delete" | "in");
+            continue;
+        }
+
+        match b {
+            b'(' => {
+                paren_depth += 1;
+                can_start_regex = true;
+            }
+            b')' => {
+                paren_depth = paren_depth.saturating_sub(1);
+                can_start_regex = false;
+            }
+            b';' | b'{' | b'}' => {
+                in_print_stmt = false;
+                in_getline_stmt = false;
+                can_start_regex = true;
+            }
+            b'|' => {
+                // `||` is logical OR; single `|` or `|&` outside strings/regexes is a shell pipe!
+                if bytes.get(i + 1) == Some(&b'|') {
+                    can_start_regex = true;
+                    i += 2;
+                    continue;
+                }
+                return Err(CommandViolation {
+                    code: "AWK_SYSTEM_EXEC_BLOCKED",
+                    detail: "`awk` shell command pipe (`|` / `|&`) is forbidden.".to_string(),
+                    halt_session: true,
+                });
+            }
+            b'>' => {
+                // `>>` in awk is exclusively file append redirection; unparenthesized `>` inside
+                // `print`/`printf` is POSIX awk file output redirection.
+                if bytes.get(i + 1) == Some(&b'>') || (in_print_stmt && paren_depth == 0) {
+                    return Err(CommandViolation {
+                        code: "AWK_FILE_REDIR_BLOCKED",
+                        detail: "`awk` `>` / `>>` internal file redirection is forbidden."
+                            .to_string(),
+                        halt_session: true,
+                    });
+                }
+                if bytes.get(i + 1) == Some(&b'=') {
+                    i += 2;
+                    can_start_regex = true;
+                    continue;
+                }
+                can_start_regex = true;
+            }
+            b'<' => {
+                if bytes.get(i + 1) == Some(&b'=') {
+                    i += 2;
+                    can_start_regex = true;
+                    continue;
+                }
+                if in_getline_stmt && paren_depth == 0 {
+                    return Err(CommandViolation {
+                        code: "AWK_FILE_REDIR_BLOCKED",
+                        detail:
+                            "`awk` `getline < file` unvalidated file input redirection is forbidden; pass files as CLI operands."
+                                .to_string(),
+                        halt_session: true,
+                    });
+                }
+                can_start_regex = true;
+            }
+            b'~' | b'!' | b',' | b'=' | b'?' | b':' | b'&' | b'+' | b'-' | b'*' | b'%' | b'^'
+            | b'[' => {
+                can_start_regex = true;
+            }
+            _ => {
+                can_start_regex = false;
+            }
+        }
+        i += 1;
+    }
+
+    Ok(())
+}
+
+fn inspect_sed_script(script: &str) -> Result<(), CommandViolation> {
+    let bytes = script.as_bytes();
+    let mut i = 0usize;
+
+    while i < bytes.len() {
+        while i < bytes.len()
+            && (bytes[i].is_ascii_whitespace() || matches!(bytes[i], b';' | b'{' | b'}'))
+        {
+            i += 1;
+        }
+        if i >= bytes.len() {
+            break;
+        }
+        if bytes[i] == b'#' {
+            while i < bytes.len() && bytes[i] != b'\n' {
+                i += 1;
+            }
+            continue;
+        }
+
+        // Skip zero, one, or two sed addresses (`1`, `$`, `/re/`, `\crec`, `,`, `~`, `+`, `!`)
+        loop {
+            while i < bytes.len() && bytes[i].is_ascii_whitespace() && bytes[i] != b'\n' {
+                i += 1;
+            }
+            if i >= bytes.len() {
+                break;
+            }
+            let c = bytes[i];
+            if c.is_ascii_digit() || matches!(c, b'$' | b',' | b'~' | b'+' | b'!') {
+                i += 1;
+                continue;
+            }
+            if c == b'/' {
+                i += 1;
+                while i < bytes.len() && bytes[i] != b'/' {
+                    if bytes[i] == b'\\' {
+                        i += 1;
+                    }
+                    i += 1;
+                }
+                i += 1; // closing `/`
+                // Optional GNU sed address modifiers `I` or `M`
+                while i < bytes.len() && matches!(bytes[i], b'I' | b'M') {
+                    i += 1;
+                }
+                continue;
+            }
+            if c == b'\\' && i + 1 < bytes.len() {
+                let delim = bytes[i + 1];
+                i += 2;
+                while i < bytes.len() && bytes[i] != delim {
+                    if bytes[i] == b'\\' {
+                        i += 1;
+                    }
+                    i += 1;
+                }
+                i += 1;
+                continue;
+            }
+            break;
+        }
+
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() && bytes[i] != b'\n' {
+            i += 1;
+        }
+        if i >= bytes.len() || matches!(bytes[i], b';' | b'\n' | b'{' | b'}') {
+            continue;
+        }
+
+        let cmd = bytes[i];
+        i += 1;
+        match cmd {
+            b'e' => {
+                return Err(CommandViolation {
+                    code: "SED_EXEC_OR_FILE_IO_BLOCKED",
+                    detail: "`sed` `e` shell execution command is forbidden.".to_string(),
+                    halt_session: true,
+                });
+            }
+            b'r' | b'R' | b'w' | b'W' => {
+                return Err(CommandViolation {
+                    code: "SED_EXEC_OR_FILE_IO_BLOCKED",
+                    detail: format!(
+                        "`sed` `{}` external file read/write command is forbidden.",
+                        cmd as char
+                    ),
+                    halt_session: true,
+                });
+            }
+            b's' | b'y' => {
+                if i < bytes.len() {
+                    let delim = bytes[i];
+                    i += 1;
+                    // Skip pattern + replacement separated by `delim`
+                    for _ in 0..2 {
+                        while i < bytes.len() && bytes[i] != delim {
+                            if bytes[i] == b'\\' {
+                                i += 1;
+                            }
+                            i += 1;
+                        }
+                        if i < bytes.len() {
+                            i += 1;
+                        }
+                    }
+                    if cmd == b's' {
+                        while i < bytes.len()
+                            && !bytes[i].is_ascii_whitespace()
+                            && !matches!(bytes[i], b';' | b'}')
+                        {
+                            let fl = bytes[i];
+                            if fl == b'e' {
+                                return Err(CommandViolation {
+                                    code: "SED_EXEC_OR_FILE_IO_BLOCKED",
+                                    detail: "`sed` `s///e` shell execution flag is forbidden."
+                                        .to_string(),
+                                    halt_session: true,
+                                });
+                            }
+                            if fl == b'w' {
+                                return Err(CommandViolation {
+                                    code: "SED_EXEC_OR_FILE_IO_BLOCKED",
+                                    detail:
+                                        "`sed` `s///w` unvalidated file write flag is forbidden."
+                                            .to_string(),
+                                    halt_session: true,
+                                });
+                            }
+                            i += 1;
+                        }
+                    }
+                }
+            }
+            b'a' | b'i' | b'c' | b':' | b'b' | b't' | b'T' => {
+                while i < bytes.len() && bytes[i] != b'\n' && bytes[i] != b';' {
+                    if bytes[i] == b'\\' && i + 1 < bytes.len() {
+                        i += 2;
+                        continue;
+                    }
+                    i += 1;
+                }
+            }
+            _ => {
+                while i < bytes.len() && bytes[i] != b'\n' && bytes[i] != b';' && bytes[i] != b'}' {
+                    i += 1;
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn reject_shell_glob_in_operand(ctx: &str, operand: &str) -> Result<(), CommandViolation> {
+    if operand.contains('*') || operand.contains('?') || operand.contains('[') {
+        return Err(CommandViolation {
+            code: "SHELL_GLOB_OPERAND_BLOCKED",
+            detail: format!(
+                "`{ctx}` file/path operand '{operand}' contains shell glob metacharacters (`*`, `?`, `[`), which expand unpredictably across protected files at runtime."
+            ),
+            halt_session: false,
+        });
+    }
+    Ok(())
+}
+
+fn shell_quote_single(arg: &str) -> String {
+    if !arg.is_empty()
+        && arg
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.' | b'/'))
+    {
+        return arg.to_string();
+    }
+    format!("'{}'", arg.replace('\'', "'\\''"))
+}
+
+fn maybe_rewrite_top_level_find(_raw_script: &str, commands: &[ParsedCommand]) -> Option<String> {
+    let first = commands.first()?;
+    if !first.env_vars.is_empty() || !first.redirs.is_empty() {
+        return None;
+    }
+    if first.argv.first().map(|s| basename(s)) != Some("find") {
+        return None;
+    }
+    for stage in &commands[1..] {
+        if !stage.piped_stdin || !stage.env_vars.is_empty() || !stage.redirs.is_empty() {
+            return None;
+        }
+    }
+
+    let args = &first.argv[1..];
+    if args.iter().any(|a| a == "-prune") {
+        return None;
+    }
+
+    let mut leading_opts: Vec<&str> = Vec::new();
+    let mut start_paths: Vec<&str> = Vec::new();
+    let mut idx = 0usize;
+    while idx < args.len() {
+        let a = args[idx].as_str();
+        if a == "-P" || a.starts_with("-O") {
+            leading_opts.push(a);
+            idx += 1;
+            continue;
+        }
+        if a == "-D" {
+            leading_opts.push(a);
+            if let Some(opt) = args.get(idx + 1) {
+                leading_opts.push(opt.as_str());
+            }
+            idx += 2;
+            continue;
+        }
+        if !a.starts_with('-') && !matches!(a, "!" | "(" | ")" | ",") {
+            start_paths.push(a);
+            idx += 1;
+            continue;
+        }
+        break;
+    }
+    if start_paths.is_empty() {
+        start_paths.push(".");
+    }
+
+    let mut global_opts: Vec<&str> = Vec::new();
+    while idx < args.len() {
+        let a = args[idx].as_str();
+        if a == "-maxdepth" || a == "-mindepth" {
+            global_opts.push(a);
+            if let Some(val) = args.get(idx + 1) {
+                global_opts.push(val.as_str());
+            }
+            idx += 2;
+            continue;
+        }
+        if a == "-xdev" || a == "-mount" {
+            global_opts.push(a);
+            idx += 1;
+            continue;
+        }
+        break;
+    }
+
+    let user_expr = &args[idx..];
+    const ROOT_PRUNED_PATHS: &[&str] = &[
+        "./target",
+        "target",
+        "./build",
+        "build",
+        "./dist-build",
+        "dist-build",
+    ];
+    const PRUNED_NAMES: &[&str] = &[
+        ".git",
+        "node_modules",
+        "vendor",
+        ".venv",
+        "venv",
+        ".cache",
+        "__pycache__",
+        ".pytest_cache",
+        ".mypy_cache",
+        ".ruff_cache",
+        ".next",
+        ".turbo",
+        "tmp",
+        ".tmp",
+        "temp",
+        ".temp",
+        ".agent-guard-state",
+        ".env",
+        ".env.*",
+        "*.pem",
+        "*.key",
+        "audit.jsonl",
+    ];
+
+    let mut out = String::from("find");
+    for opt in leading_opts {
+        out.push(' ');
+        out.push_str(&shell_quote_single(opt));
+    }
+    for p in start_paths {
+        out.push(' ');
+        out.push_str(&shell_quote_single(p));
+    }
+    for g in global_opts {
+        out.push(' ');
+        out.push_str(&shell_quote_single(g));
+    }
+    out.push_str(" '(' ");
+    let mut first_pred = true;
+    for rp in ROOT_PRUNED_PATHS {
+        if !first_pred {
+            out.push_str(" -o ");
+        }
+        first_pred = false;
+        out.push_str("-path ");
+        out.push_str(&shell_quote_single(rp));
+    }
+    for d in PRUNED_NAMES {
+        if !first_pred {
+            out.push_str(" -o ");
+        }
+        first_pred = false;
+        out.push_str("-name ");
+        out.push_str(&shell_quote_single(d));
+    }
+    out.push_str(" ')' -prune -o");
+
+    if user_expr.is_empty() {
+        out.push_str(" -print");
+    } else {
+        let has_explicit_action = user_expr
+            .iter()
+            .any(|t| matches!(t.as_str(), "-print" | "-print0" | "-ls" | "-printf"));
+        out.push_str(" '('");
+        for tok in user_expr {
+            out.push(' ');
+            out.push_str(&shell_quote_single(tok));
+        }
+        out.push_str(" ')'");
+        if !has_explicit_action {
+            out.push_str(" -print");
+        }
+    }
+
+    for stage in &commands[1..] {
+        out.push_str(" | ");
+        for (ti, tok) in stage.argv.iter().enumerate() {
+            if ti > 0 {
+                out.push(' ');
+            }
+            out.push_str(&shell_quote_single(tok));
+        }
+    }
+
+    Some(out)
 }
 
 fn basename(s: &str) -> &str {
@@ -2361,7 +4204,7 @@ fn strip_leading_flags(args: &[String]) -> &[String] {
 fn parse_shell_script(
     script: &str,
     subscripts: &mut Vec<String>,
-) -> Result<Vec<ParsedCommand>, CommandViolation> {
+) -> Result<(Vec<ParsedCommand>, bool), CommandViolation> {
     let bytes = script.as_bytes();
     let mut i = 0usize;
     let mut commands = Vec::new();
@@ -2369,6 +4212,7 @@ fn parse_shell_script(
     let mut cur_argv = Vec::new();
     let mut cur_redirs = Vec::new();
     let mut cur_piped_stdin = false;
+    let mut has_compound_list_op = false;
     let mut pending_heredocs: Vec<(String, bool)> = Vec::new();
 
     let flush = |env: &mut Vec<(String, String)>,
@@ -2403,7 +4247,13 @@ fn parse_shell_script(
         }
         // Command separators `;`, `\n`, `|`, `|&`, `&&`, `||`, `&`
         if matches!(b, b';' | b'\n' | b'|' | b'&') {
-            let is_pipe = b == b'|' && bytes.get(i + 1) != Some(&b'|');
+            let is_plain_pipe =
+                b == b'|' && bytes.get(i + 1) != Some(&b'|') && bytes.get(i + 1) != Some(&b'&');
+            if matches!(b, b';' | b'&')
+                || (b == b'|' && matches!(bytes.get(i + 1), Some(b'|' | b'&')))
+            {
+                has_compound_list_op = true;
+            }
             flush(
                 &mut cur_env,
                 &mut cur_argv,
@@ -2411,7 +4261,7 @@ fn parse_shell_script(
                 &mut cur_piped_stdin,
                 &mut commands,
             );
-            cur_piped_stdin = is_pipe;
+            cur_piped_stdin = is_plain_pipe;
             if ((b == b'|' || b == b'&') && bytes.get(i + 1) == Some(&b))
                 || (b == b'|' && bytes.get(i + 1) == Some(&b'&'))
             {
@@ -2460,6 +4310,7 @@ fn parse_shell_script(
         }
         // Brace group `{ ...; }`
         if b == b'{' || b == b'}' {
+            has_compound_list_op = true;
             flush(
                 &mut cur_env,
                 &mut cur_argv,
@@ -2546,7 +4397,7 @@ fn parse_shell_script(
         &mut cur_piped_stdin,
         &mut commands,
     );
-    Ok(commands)
+    Ok((commands, has_compound_list_op))
 }
 
 fn split_valid_env_assignment(word: &str) -> Option<(&str, &str)> {

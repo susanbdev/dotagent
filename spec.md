@@ -46,13 +46,15 @@ dotagent/
 ├── AGENTS.md                       # Root-only repository security authority
 ├── Cargo.toml                      # Minimal vetted-dependency Rust 2024 workspace (#![forbid(unsafe_code)])
 ├── crates/
-│   ├── agent-guard/                # Static Rust policy & hook engine (pre-tool, post-tool, user-prompt, post-edit, on-stop)
+│   ├── agent-guard/                # Static Rust policy, sandbox & hook engine (pre-tool, post-tool, user-prompt, post-edit, on-stop)
 │   │   └── src/
 │   │       ├── main.rs             # CLI entrypoint (< 1 ms cold start)
 │   │       ├── lib.rs              # Multi-harness lifecycle coordinator & repository auditor
+│   │       ├── exec_sandbox.rs     # Layer-1 Linux Landlock LSM / macOS Seatbelt / env & git sandbox wrapper
 │   │       ├── cmd_policy.rs       # Recursive-descent shell AST parser blocking quote/subshell/git/deputy bypasses
 │   │       ├── path_policy.rs      # Lexical + symlink-resolved path, forbidden-zone & root-AGENTS.md engine
 │   │       ├── injection_scan.rs   # Prompt-injection, delimiter, Markdown-exfil & poisoned-pointer detector
+│   │       ├── sanitizer.rs        # Pre-buffer 7-bit ASCII sanitizer, head/tail compactor & spotlight wrapper
 │   │       ├── traversal_ledger.rs # Per-repo SHA-256 isolated A->B->C hop ledger, taint & circuit breaker
 │   │       ├── unicode_guard.rs    # Bidi, Unicode Tag, Variation Selector, escape & homoglyph guard
 │   │       ├── budget_guard.rs     # File byte/line, single-line bomb, BPE splitter & turn-token guard
@@ -60,6 +62,7 @@ dotagent/
 │   │       └── sha256.rs           # Pure-Rust FIPS 180-4 SHA-256 implementation
 │   └── dotagent-compiler/          # Compiles & SHA-256 verifies .claude, .codex, .cursor, gemini & gitconfig bundles
 ├── skills/                         # Vetted, deterministic, zero-network-side-effect SKILL.md library
+│   ├── manifest.lock.json          # Deterministic SHA-256 skill lockfile
 │   ├── zero-trust-guardrails/      # Enforces root AGENTS.md, untrusted data, depth<=2, & deputy blocks
 │   ├── vespoli-ui-authoring/       # Enforces vespoli-ui 7 Laws (0 SVG, 0 runtime CSS, 1-tag-1-DOM, transitions)
 │   ├── rust-cloudflare-workers/    # workers-rs Wasm, SQLite DO append-only triggers, If-None-Match: * R2 patterns
@@ -75,21 +78,25 @@ dotagent/
 
 ---
 
-## 2. `agent-guard` Hook Lifecycle
+## 3. `agent-guard` Hook & Sandbox Lifecycle
 
-1. **`agent-guard pre-tool`**:
-   * Parses candidate shell strings with `Command::validate()` (`tree-sitter-bash` across `|`, `&&`, `$(...)`, `<(...)`, `xargs`, `find -exec`, `sh -c`) and resolves file arguments via `SafePath::resolve()`.
-   * Blocks reads of credential paths (`.env*`, `*.pem`, `*.key`, `~/.ssh`, `~/.aws`, `~/.netrc`), writes to control paths (`.guard/`, `.agent-guard/`, `.claude/`, `.codex/`, `.cursor/`, `.github/`, `AGENTS.md`, `CLAUDE.md`, `REVIEW.md`), destructive `git` flags (`--amend`, `rebase`, `reset --hard`, `--force*`, `--no-verify`), and lifecycle-script package installs.
-   * Exits with code **`2`** and a structured denial message instructing the harness to halt and surface the denial verbatim without retrying via alternate encodings or tools.
-2. **`agent-guard post-edit <file>`**:
-   * Runs `< 200 ms` incremental AST checks (`Hygiene::inspectFile()`) on the modified file—rejecting `policy-hub` Noun/Verb naming violations, duplicated `susanbdev/shared` primitives, `<svg>` / inline `style` in UI code, `unsafe` in Rust, and `SecretFinding::scan()` hits before the agent touches another file.
-3. **`agent-guard on-stop`**:
-   * Executes `.guard/checks/on-stop` (the target repo's full test, typecheck, and Rego suite) and emits a signed `StopReceipt` bound to the working tree `Digest` so completion cannot be claimed without passing checks.
+`agent-guard pre-tool` (`< 2 ms`) and `post-edit` (`< 200 ms`) enforce deterministic pre-flight command, path, and content hygiene inside the harness, while **hard OS containment** against native subprocesses executed during allowed build/test runs (`cargo test`, `pytest`, `git`) is enforced by `agent-guard exec-sandbox` (Linux Landlock LSM / macOS Seatbelt + scrubbed environment + hermetic `GIT_CONFIG_COUNT` + isolated ephemeral `TMPDIR`) and `env-agent`'s kernel mount-namespace / network-namespace proxy (`0` credentials or signing keys ever exist inside `UID 65532`).
+
+1. **`agent-guard pre-tool` & `agent-guard exec-sandbox`** (`< 2 ms`):
+   * Parses candidate shell strings via recursive-descent AST inspection (`cmd_policy.rs`) across `|`, `&&`, `$(...)`, `<(...)`, `xargs`, `find`, `awk`, `sed`, and subshells, and resolves file arguments via symlink-safe `path_policy.rs`.
+   * Rewrites approved shell commands to execute inside `agent-guard exec-sandbox --sanitize-stream`, blocking reads of credential/cache/temp paths (`.env*`, `*.pem`, `*.key`, `/tmp`, `~/.ssh`, `~/.aws`, `~/.netrc`, `~/.local/state/agent-guard`, `audit.jsonl`) and locking control paths (`.guard/`, `.agent-guard*`, `.claude/`, `.codex/`, `.cursor/`, `.github/`, `.cargo/`, `.git/config`, `.git/hooks`, `AGENTS.md`) read-only at the OS kernel layer where supported.
+   * Auto-paginates recoverable unsliced `Read` requests into `<= 150`-line micro-window slices via `updatedInput`, reserving exit-code **`2`** hard denials strictly for security violations (which halt immediately without retry).
+2. **`agent-guard post-tool`**:
+   * Enforces pre-buffer 7-bit ASCII sanitization, head/tail stream compaction on benign oversized outputs, `128`-bit spotlighting boundaries, and `<= 200` ASCII token return caps on read-only `research-airlock` subagents while tripping the session circuit breaker on Unicode smuggling or prompt injection.
+3. **`agent-guard post-edit <file>`** (`< 200 ms`):
+   * Verifies modified files are regular UTF-8 files (`<= 1 MiB`), free of Trojan Source / Tag / Variation Selector smuggling, single-line bombs, control-path writes, and raw secret literals before the agent proceeds.
+4. **`agent-guard on-stop`** *(Repository Hygiene & External `StopReceipt` Verification)*:
+   * Verifies repository control-plane cleanliness (`core.hooksPath=/dev/null`, zero rogue instruction files, clean `.git/config` and build configs, untripped circuit breaker). In `env-agent`, `StopReceipt` verification submits `(repo_id, work_tree_digest)` over a read-only Unix domain socket to the **external host/`env-ci` coordinator** (outside `UID 65532`), which independently executes `.guard/checks/on-stop` in a clean read-only snapshot and signs `StopReceipt`—ensuring processes inside `env-agent` never hold signing keys.
 
 ---
 
-## 3. `HarnessBundle` Compiler & Skill Rules
+## 4. `dotagent-compiler` Bundle & Skill Rules
 
-* **`HarnessBundle::compile(profile)`**: Consumes `policy-hub/constitution/{AGENTS,REVIEW}.md`, `profiles/*.toml`, and `skills/*` to emit deterministic harness trees wiring MCP exclusively to `https://mcp.zt.susanb.dev/mcp`.
-* **Skill Constraints**: Every `SKILL.md` is `<= 3,072` bytes, fetches zero remote content at runtime, and pins any helper script's `SHA-256` in `skills/manifest.lock.json` (verified by `agent-guard` prior to execution).
-* **Corpus Gate**: `cargo test` runs all `250+` entries in `tests/bypasses.toml` (base64 subshells, `python -c` file reads, symlinked `.env` targets, `+HEAD:main` refspecs) requiring a `100%` block rate.
+* **`dotagent-compiler <build|verify>`**: Compiles `profiles/*.toml`, `skills/*`, and canonical templates into `dist/*` (and verifies zero drift across root-mirrored harness files), wiring MCP exclusively to `https://mcp.zt.susanb.dev/mcp` on personal WARP endpoints (or `https://origin-mcp.susanb.dev/mcp` via the host `tunnel-ca` mTLS proxy for remote `env-agent` profiles).
+* **Skill Constraints**: Every `SKILL.md` is `<= 3,072` bytes, strict 7-bit clean Unicode, fetches zero remote content at runtime, and pins its `SHA-256` in `skills/manifest.lock.json`.
+* **Adversarial Corpus Gate**: `cargo test` runs every adversarial bypass vector in `tests/bypass_corpus.toml` and `crates/agent-guard/tests/adversarial_suite.rs` requiring a `100%` block rate.
