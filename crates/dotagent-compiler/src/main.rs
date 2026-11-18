@@ -172,6 +172,36 @@ fn verify_all(repo_root: &Path) -> Result<usize, String> {
                 ));
             }
         }
+        for (rel_path, expected_content) in &artifacts {
+            let maybe_agent_mirror = rel_path
+                .strip_prefix("claude/agents/")
+                .map(|f| repo_root.join(".claude").join("agents").join(f))
+                .or_else(|| {
+                    rel_path
+                        .strip_prefix("cursor/agents/")
+                        .map(|f| repo_root.join(".cursor").join("agents").join(f))
+                })
+                .or_else(|| {
+                    rel_path
+                        .strip_prefix("codex/agents/")
+                        .map(|f| repo_root.join(".codex").join("agents").join(f))
+                });
+            if let Some(mirror_path) = maybe_agent_mirror {
+                let actual_mirror =
+                    read_contained_regular_file(repo_root, &mirror_path).map_err(|e| {
+                        format!(
+                            "missing or invalid root agent mirror '{}': {e}",
+                            mirror_path.display()
+                        )
+                    })?;
+                if &actual_mirror != expected_content {
+                    return Err(format!(
+                        "root agent mirror '{}' drifted from compiled 'dist/{rel_path}' (run `dotagent-compiler build .`)",
+                        mirror_path.display()
+                    ));
+                }
+            }
+        }
     }
 
     let skills_digest = sha256_hex(actual_skills_lock.as_bytes());

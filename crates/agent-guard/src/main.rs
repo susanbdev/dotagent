@@ -167,6 +167,7 @@ fn main() -> ExitCode {
                 }
             }
         }
+        "coordinator" => agent_guard::coordinator::run_coordinator_cli(&args[1..], &cwd),
         "exec-sandbox" => agent_guard::exec_sandbox::run_exec_sandbox_cli(&args[1..], &cwd),
         "sandbox-status" => agent_guard::exec_sandbox::run_sandbox_status_cli(),
         "--probe-landlock-child" => agent_guard::exec_sandbox::run_probe_landlock_child(),

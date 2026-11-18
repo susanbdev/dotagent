@@ -458,7 +458,32 @@ fn f18_f32_f33_work_ledger_two_plus_two_tree_oid_and_smell_badges() {
     .expect_err("unverified edit after green checkpoint must block ledger submit");
     assert!(post_edit_err.contains("EDIT_AFTER_LAST_GREEN_TEST"));
 
-    // Re-checkpoint green -> submit succeeds with 0 risky drift badges!
+    // Re-checkpoint green WITHOUT recording an authenticated FileEdit breadcrumb -> must fail with LEDGER_MISSING_EDIT_PROVENANCE!
+    record_test_checkpoint(&repo, &cap.session_id, true).unwrap();
+    let missing_prov_err = submit_work_ledger_entry(
+        &repo,
+        &cap.session_id,
+        "Implemented checked addition in src/lib.rs. Added overflow guard for negative bounds.",
+        "Locked task T1 required deterministic arithmetic. Upfront QA suite verifies boundary cases.",
+    )
+    .expect_err("green checkpoint without FileEdit provenance must be rejected");
+    assert!(
+        missing_prov_err.contains("LEDGER_MISSING_EDIT_PROVENANCE"),
+        "expected LEDGER_MISSING_EDIT_PROVENANCE, got: {missing_prov_err}"
+    );
+
+    // Record authenticated FileEdit breadcrumb matching on-disk bytes + re-checkpoint green -> submit succeeds!
+    append_breadcrumb_for_path(
+        &repo,
+        &cap.session_id,
+        "T1",
+        [0x11; 32],
+        EventOp::FileEdit,
+        "src/lib.rs",
+        Some((1, 1)),
+        sha256_digest(b"pub fn add(a: i32, b: i32) -> i32 { a - b }\n"),
+    )
+    .unwrap();
     record_test_checkpoint(&repo, &cap.session_id, true).unwrap();
     let entry = submit_work_ledger_entry(
         &repo,
@@ -466,7 +491,7 @@ fn f18_f32_f33_work_ledger_two_plus_two_tree_oid_and_smell_badges() {
         "Implemented checked addition in src/lib.rs. Added overflow guard for negative bounds.",
         "Locked task T1 required deterministic arithmetic. Upfront QA suite verifies boundary cases.",
     )
-    .expect("ledger submit succeeds after re-checkpoint");
+    .expect("ledger submit succeeds after FileEdit provenance + green checkpoint");
     assert!(entry.smell_badges.is_empty());
 }
 
@@ -612,6 +637,7 @@ fn pr2_review_regressions_role_sandbox_spool_and_ledger_pins() {
         sha256_digest(b"pub fn v() -> u32 { 1 }\n"),
     )
     .unwrap();
+    fs::write(repo.join("src/lib.rs"), "pub fn v() -> u32 { 2 }\n").unwrap();
     let b2 = append_breadcrumb_for_path(
         &repo,
         &cap.session_id,
@@ -791,4 +817,276 @@ fn pr2_deep_adversarial_capability_slot_hmac_shell_and_patch_regressions() {
     let load_err = agent_guard::role_sandbox::load_session_capability(&repo, &cap.session_id)
         .expect_err("tampered capability JSON must fail HMAC verification");
     assert!(load_err.contains("FORGED_SESSION_CAPABILITY"));
+}
+
+#[test]
+fn pr6_round2_all_twelve_security_and_concurrency_regressions() {
+    let (repo, _) = isolated_sandbox("pr6_round2_regressions");
+    fs::create_dir_all(repo.join("src")).unwrap();
+    fs::create_dir_all(repo.join("docs")).unwrap();
+    fs::create_dir_all(repo.join("skills/swarm-master")).unwrap();
+    fs::create_dir_all(repo.join("profiles")).unwrap();
+
+    fs::write(repo.join("AGENTS.md"), "# Canonical Root AGENTS.md\n").unwrap();
+    fs::write(repo.join("README.md"), "# Untrusted repo README\n").unwrap();
+    fs::write(repo.join("spec.md"), "# Untrusted spec\n").unwrap();
+    fs::write(repo.join("profiles/default.toml"), "profile_id = \"x\"\n").unwrap();
+    fs::write(repo.join("docs/arch.md"), "Trusted Swarm docs\n").unwrap();
+    fs::write(
+        repo.join("skills/swarm-master/SKILL.md"),
+        "Master skill instructions\n",
+    )
+    .unwrap();
+    fs::write(repo.join("src/a.rs"), "pub fn a() -> u32 { 1 }\n").unwrap();
+    fs::write(repo.join("src/b.rs"), "pub fn b() -> u32 { 2 }\n").unwrap();
+
+    // 1. Finding #5: Master Read allowlist denies README.md, spec.md, and profiles/* while allowing AGENTS.md, docs/*, skills/*
+    for denied_rel in ["README.md", "spec.md", "profiles/default.toml"] {
+        let dec = enforce_role_pre_tool(
+            SwarmRole::Master,
+            None,
+            "Read",
+            &JsonValue::parse(&format!(r#"{{"file_path":"{denied_rel}"}}"#)).unwrap(),
+            &repo,
+            &repo,
+        )
+        .expect("Master Read on non-doc/skill path must return Deny");
+        assert!(
+            !dec.is_allow(),
+            "Master must be denied reading {denied_rel}"
+        );
+    }
+    for allowed_rel in ["AGENTS.md", "docs/arch.md", "skills/swarm-master/SKILL.md"] {
+        let dec = enforce_role_pre_tool(
+            SwarmRole::Master,
+            None,
+            "Read",
+            &JsonValue::parse(&format!(r#"{{"file_path":"{allowed_rel}"}}"#)).unwrap(),
+            &repo,
+            &repo,
+        );
+        assert!(
+            dec.is_none(),
+            "Master must be allowed reading {allowed_rel}"
+        );
+    }
+
+    // 2. Finding #2: PLAN.lock.json HMAC & plan_sha256 integrity
+    let dag = r#"{
+      "plan_id": "PR6-WAVE-CONCURRENT",
+      "tasks": [
+        {
+          "id": "TASK-A",
+          "wave": "W1",
+          "depends_on": [],
+          "domain_risk": "security_critical",
+          "assigned_read_paths": ["src/a.rs"],
+          "allowed_write_paths": ["src/a.rs"],
+          "assigned_tests": []
+        },
+        {
+          "id": "TASK-B",
+          "wave": "W1",
+          "depends_on": [],
+          "domain_risk": "core_logic",
+          "assigned_read_paths": ["src/b.rs"],
+          "allowed_write_paths": ["src/b.rs"],
+          "assigned_tests": []
+        }
+      ]
+    }"#;
+    let plan = parse_and_validate_dag_json(dag).unwrap();
+    let plan_lock_path = save_locked_plan(&repo, &plan, false).unwrap();
+    assert!(
+        plan_lock_path.starts_with(swarm_state_dir(&repo).unwrap()),
+        "PLAN.lock.json must live inside protected swarm_state_dir/ledger"
+    );
+    let orig_lock_raw = fs::read_to_string(&plan_lock_path).unwrap();
+    let tampered_lock = orig_lock_raw.replace("src/a.rs", "src/b.rs");
+    fs::write(&plan_lock_path, tampered_lock).unwrap();
+    let lock_err = agent_guard::qa_suspects::load_locked_plan(&repo)
+        .expect_err("mutated PLAN.lock.json must fail HMAC + SHA-256 verification");
+    assert!(
+        lock_err.contains("PLAN_LOCK_TAMPERED"),
+        "expected PLAN_LOCK_TAMPERED, got: {lock_err}"
+    );
+    fs::write(&plan_lock_path, &orig_lock_raw).unwrap();
+    assert!(agent_guard::qa_suspects::load_locked_plan(&repo).is_ok());
+
+    // 3. Finding #3: Concurrent parallel-wave capabilities (Grunt A + Grunt B) without clobbering
+    let cap_a = mint_session_capability(&repo, SwarmRole::Grunt, "TASK-A", 1).unwrap();
+    let cap_b = mint_session_capability(&repo, SwarmRole::Grunt, "TASK-B", 1).unwrap();
+    let open_caps = agent_guard::role_sandbox::load_open_session_capabilities(&repo).unwrap();
+    assert_eq!(open_caps.len(), 2);
+
+    // Unbound hook UUID fails closed when >=2 sessions are open concurrently
+    let ambig_err = agent_guard::role_sandbox::resolve_active_role(&repo, "unbound-hook-uuid")
+        .expect_err("env-less hook call with 2 open sessions must fail closed");
+    assert!(
+        ambig_err.contains("AMBIGUOUS_CONCURRENT_SWARM_SESSIONS"),
+        "expected AMBIGUOUS_CONCURRENT_SWARM_SESSIONS, got: {ambig_err}"
+    );
+    // Explicit swm_* session IDs resolve deterministically to each isolated Grunt jail
+    let (role_a, resolved_a) =
+        agent_guard::role_sandbox::resolve_active_role(&repo, &cap_a.session_id).unwrap();
+    assert_eq!(role_a, SwarmRole::Grunt);
+    assert_eq!(resolved_a.unwrap().task_id, "TASK-A");
+
+    // Closing Grunt A leaves Grunt B open and actively enforced even without env vars!
+    agent_guard::role_sandbox::close_open_session(&repo, Some(&cap_a.session_id)).unwrap();
+    let (role_b, resolved_b) =
+        agent_guard::role_sandbox::resolve_active_role(&repo, "unbound-hook-uuid").unwrap();
+    assert_eq!(role_b, SwarmRole::Grunt);
+    assert_eq!(resolved_b.unwrap().session_id, cap_b.session_id);
+
+    // 4. Finding #1: Multi-threaded concurrent spool appends maintain strict monotonic seq_no + hash chain
+    let mut handles = Vec::new();
+    for t_idx in 0..8u8 {
+        let repo_clone = repo.clone();
+        let sid_clone = cap_b.session_id.clone();
+        handles.push(std::thread::spawn(move || {
+            for iter in 0..10u8 {
+                append_breadcrumb_for_path(
+                    &repo_clone,
+                    &sid_clone,
+                    "TASK-B",
+                    [0x42; 32],
+                    EventOp::FileEdit,
+                    "src/b.rs",
+                    Some((1, 1)),
+                    [t_idx.wrapping_mul(16).wrapping_add(iter); 32],
+                )
+                .expect("concurrent append_breadcrumb_for_path");
+            }
+        }));
+    }
+    for h in handles {
+        h.join().expect("join thread");
+    }
+    let spool_report = recover_spool_frames(&spool_file_path(&repo, &cap_b.session_id).unwrap())
+        .expect("recover concurrent spool");
+    assert_eq!(spool_report.quarantined_tail_bytes, 0);
+    // 1 SessionMint + 80 concurrent FileEdit events = 81 contiguous frames
+    assert_eq!(spool_report.valid_records.len(), 81);
+    for (idx, rec) in spool_report.valid_records.iter().enumerate() {
+        assert_eq!(rec.event.seq_no, (idx as u64) + 1);
+    }
+
+    // 5. Findings #6 & #7: Stale FileEdit provenance rejected, valid FileEdit accepted, forged ledger line rejected on read
+    // Right now the last concurrent FileEdit had synthetic doc_sha256 != on-disk src/b.rs -> must fail LEDGER_STALE_EDIT_PROVENANCE!
+    record_test_checkpoint(&repo, &cap_b.session_id, true).unwrap();
+    let stale_err = submit_work_ledger_entry(
+        &repo,
+        &cap_b.session_id,
+        "Updated b function in src/b.rs. Verified concurrent spool integrity.",
+        "Task B required deterministic concurrency verification. Green checkpoint recorded on workspace.",
+    )
+    .expect_err("mismatched FileEdit doc_sha256 must fail LEDGER_STALE_EDIT_PROVENANCE");
+    assert!(
+        stale_err.contains("LEDGER_STALE_EDIT_PROVENANCE"),
+        "expected LEDGER_STALE_EDIT_PROVENANCE, got: {stale_err}"
+    );
+
+    // Record accurate FileEdit matching on-disk src/b.rs + checkpoint -> submit succeeds & load_work_ledger_entries authenticates!
+    append_breadcrumb_for_path(
+        &repo,
+        &cap_b.session_id,
+        "TASK-B",
+        [0x42; 32],
+        EventOp::FileEdit,
+        "src/b.rs",
+        Some((1, 1)),
+        sha256_digest(b"pub fn b() -> u32 { 2 }\n"),
+    )
+    .unwrap();
+    record_test_checkpoint(&repo, &cap_b.session_id, true).unwrap();
+    submit_work_ledger_entry(
+        &repo,
+        &cap_b.session_id,
+        "Updated b function in src/b.rs. Verified concurrent spool integrity.",
+        "Task B required deterministic concurrency verification. Green checkpoint recorded on workspace.",
+    )
+    .unwrap();
+    assert_eq!(
+        agent_guard::work_ledger::load_work_ledger_entries(&repo)
+            .unwrap()
+            .len(),
+        1
+    );
+
+    // Appending an unauthenticated JSON line to WORK_LEDGER.jsonl must fail load_work_ledger_entries!
+    let ledger_file = work_ledger_state_path(&repo).unwrap();
+    {
+        let mut f = OpenOptions::new().append(true).open(&ledger_file).unwrap();
+        writeln!(
+            f,
+            r#"{{"session_id":"{}","task_id":"TASK-B","attempt":1,"git_tree_oid":"deadbeef","event_ids":["00"],"what_changed":"Fake one. Fake two.","why_changed":"Why one. Why two.","smell_badges":[],"record_mac":"0000000000000000000000000000000000000000000000000000000000000000"}}"#,
+            cap_b.session_id
+        )
+        .unwrap();
+    }
+    let forged_ledger_err = agent_guard::work_ledger::load_work_ledger_entries(&repo)
+        .expect_err("forged WORK_LEDGER.jsonl entry must fail load_work_ledger_entries");
+    assert!(
+        forged_ledger_err.contains("FORGED_WORK_LEDGER_ENTRY"),
+        "expected FORGED_WORK_LEDGER_ENTRY, got: {forged_ledger_err}"
+    );
+
+    // 6. Finding #4: npm exact-pin verification in package.json & package-lock.json
+    fs::write(
+        repo.join("package.json"),
+        r#"{
+  "name": "demo-app",
+  "version": "5.3.0",
+  "dependencies": {
+    "lodash": "^4.17.21",
+    "zod": "3.23.8"
+  }
+}"#,
+    )
+    .unwrap();
+    let caret_err = lookup_pinned_package_doc(&repo, "npm", "lodash", "4.17.21", None)
+        .expect_err("loose caret range in package.json without lockfile must be rejected");
+    assert!(caret_err.contains("UNPINNED_DEPENDENCY"));
+    let cross_ver_err = lookup_pinned_package_doc(&repo, "npm", "zod", "5.3.0", None)
+        .expect_err("root package version 5.3.0 must not satisfy zod version check");
+    assert!(cross_ver_err.contains("LOCKFILE_VERSION_MISMATCH"));
+    assert!(lookup_pinned_package_doc(&repo, "npm", "zod", "3.23.8", None).is_ok());
+
+    fs::write(
+        repo.join("package-lock.json"),
+        r#"{
+  "name": "demo-app",
+  "lockfileVersion": 3,
+  "packages": {
+    "node_modules/lodash": { "version": "4.17.21" }
+  }
+}"#,
+    )
+    .unwrap();
+    assert!(lookup_pinned_package_doc(&repo, "npm", "lodash", "4.17.21", None).is_ok());
+    assert!(
+        lookup_pinned_package_doc(&repo, "npm", "lodash", "4.17.20", None)
+            .unwrap_err()
+            .contains("LOCKFILE_VERSION_MISMATCH")
+    );
+
+    // 7. Finding #12: walk_scout_dir safely bounds oversized source files (>256 KiB / >2,000 lines)
+    let mut huge_rs = String::from("pub fn early_scout_sig() -> usize { 1 }\n");
+    for _ in 0..3_200 {
+        huge_rs.push_str("// filler comment padding line to exceed two thousand lines and 256 KiB safely0123456789\n");
+    }
+    huge_rs.push_str("pub fn beyond_scout_cap_sig() -> usize { 2 }\n");
+    fs::write(repo.join("src/huge_gen.rs"), huge_rs).unwrap();
+    let scout_hits = scout_repo_signatures(&repo, "src", 4, Some("scout")).unwrap();
+    assert!(
+        scout_hits.iter().any(|h| h.contains("early_scout_sig")),
+        "scout must capture signatures within bounded prefix"
+    );
+    assert!(
+        !scout_hits
+            .iter()
+            .any(|h| h.contains("beyond_scout_cap_sig")),
+        "scout must stop reading beyond 256 KiB / 2,000 lines"
+    );
 }

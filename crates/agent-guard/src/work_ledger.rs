@@ -4,22 +4,23 @@
 //! `CONFUSED`, `RISKY`), `2+2` pure-ASCII sentence `WORK_LEDGER.jsonl` receipt
 //! engine, and fail-closed `Grunt` `on-stop` tree-OID verifier (`F18`, `F32`, `F33`).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use crate::breadcrumbs::{
-    append_breadcrumb_for_path, compute_arbitrary_hmac_hex, flush_records_idempotent,
-    load_or_init_hmac_key, recover_spool_frames, sha256_digest, spool_file_path, swarm_state_dir,
-    trail_path_for_rel_path, verify_breadcrumbs_file, verify_event_mac,
+    ExclusiveFileLockGuard, append_breadcrumb_for_path, compute_arbitrary_hmac_hex,
+    flush_records_idempotent, recover_spool_frames, sha256_digest, spool_file_path,
+    swarm_state_dir, trail_path_for_rel_path, verify_arbitrary_hmac_hex, verify_breadcrumbs_file,
+    verify_event_mac_for_repo,
 };
 use crate::json::JsonValue;
 use crate::path_policy::{PathAccess, validate_path_with_max_depth};
 use crate::role_sandbox::{
-    clear_active_session_slot, load_active_session_slot, load_session_capability,
-    path_matches_any_scope, resolve_active_role, save_session_capability,
+    close_open_session, load_session_capability, path_matches_any_scope, resolve_active_role,
+    save_session_capability,
 };
 use crate::swarm_contracts::{
     EventOp, SessionCapability, SmellBadge, SmellBucket, SwarmRole, WorkLedgerEntry, hex_decode_32,
@@ -30,7 +31,17 @@ use crate::unicode_guard::{ScanMode, scan_unicode};
 const LEDGER_HMAC_DOMAIN: &[u8] = b"DOTAGENT_SWARM_V2_WORK_LEDGER_V1";
 
 pub fn work_ledger_state_path(repo_root: &Path) -> Result<PathBuf, String> {
-    Ok(swarm_state_dir(repo_root)?.join("WORK_LEDGER.jsonl"))
+    let dir = swarm_state_dir(repo_root)?.join("ledger");
+    if !dir.is_dir() {
+        fs::create_dir_all(&dir)
+            .map_err(|e| format!("failed creating swarm ledger dir '{}': {e}", dir.display()))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = fs::set_permissions(&dir, fs::Permissions::from_mode(0o700));
+        }
+    }
+    Ok(dir.join("WORK_LEDGER.jsonl"))
 }
 
 /// Computes a deterministic scoped Git-blob `SHA-256` tree digest (`git_tree_oid`) over all
@@ -320,12 +331,17 @@ pub fn classify_session_smells(
 
 type TrailRecordsMap = BTreeMap<PathBuf, Vec<crate::breadcrumbs::SignedBreadcrumbRecord>>;
 
+struct VerifiedSessionEvents {
+    ids: Vec<String>,
+    by_trail: TrailRecordsMap,
+    latest_edit_sha_by_rel: BTreeMap<String, [u8; 32]>,
+}
+
 fn collect_verified_session_event_ids(
     repo_root: &Path,
     session_id: &str,
     task_id: &str,
-) -> Result<(Vec<String>, TrailRecordsMap), String> {
-    let key = load_or_init_hmac_key(repo_root)?;
+) -> Result<VerifiedSessionEvents, String> {
     let spool_path = spool_file_path(repo_root, session_id)?;
     if !spool_path.exists() {
         return Err(format!(
@@ -335,18 +351,41 @@ fn collect_verified_session_event_ids(
     let report = recover_spool_frames(&spool_path)?;
     let mut ids = Vec::new();
     let mut by_trail: TrailRecordsMap = BTreeMap::new();
+    let mut latest_edit_sha_by_rel: BTreeMap<String, [u8; 32]> = BTreeMap::new();
     let mut has_green = false;
+    let mut expected_prev_mac = [0u8; 32];
 
-    for rec in report.valid_records {
-        verify_event_mac(&key, &rec.event, &rec.record_mac)?;
+    for (idx, rec) in report.valid_records.into_iter().enumerate() {
+        verify_event_mac_for_repo(repo_root, &rec.event, &rec.record_mac)?;
+        let expected_seq = (idx as u64) + 1;
+        if rec.event.seq_no != expected_seq {
+            return Err(format!(
+                "LEDGER_BROKEN_EVENT_CHAIN: session '{session_id}' expected seq_no {expected_seq}, got {}",
+                rec.event.seq_no
+            ));
+        }
+        if rec.event.prev_event_mac != expected_prev_mac {
+            return Err(format!(
+                "LEDGER_BROKEN_EVENT_CHAIN: session '{session_id}' prev_event_mac mismatch at seq_no {expected_seq}"
+            ));
+        }
+        expected_prev_mac = rec.record_mac;
+
         if rec.event.session_id != session_id || rec.event.task_id != task_id {
             return Err(format!(
                 "LEDGER_FOREIGN_EVENT: spool event belongs to ({}, {}), expected ({session_id}, {task_id})",
                 rec.event.session_id, rec.event.task_id
             ));
         }
-        if rec.event.op == EventOp::TestGreen {
-            has_green = true;
+        match rec.event.op {
+            EventOp::TestGreen => {
+                has_green = true;
+            }
+            EventOp::FileEdit => {
+                latest_edit_sha_by_rel
+                    .insert(rec.event.canonical_rel_path.clone(), rec.event.doc_sha256);
+            }
+            _ => {}
         }
         ids.push(rec.event_id_hex());
         let trail = trail_path_for_rel_path(repo_root, &rec.event.canonical_rel_path)?;
@@ -358,12 +397,18 @@ fn collect_verified_session_event_ids(
             "LEDGER_MISSING_PINNED_EVENTS: session '{session_id}' has no verified green-checkpoint breadcrumb events"
         ));
     }
-    Ok((ids, by_trail))
+    Ok(VerifiedSessionEvents {
+        ids,
+        by_trail,
+        latest_edit_sha_by_rel,
+    })
 }
 
-/// Appends an authenticated `2+2`-sentence `WorkLedgerEntry` ONLY if the workspace
-/// tree OID matches `last_green_tree_oid` (`F18`) and pins all authenticated session
-/// `event_ids` into the HMAC-authenticated ledger receipt.
+/// Appends an authenticated `2+2`-sentence `WorkLedgerEntry` ONLY if:
+/// 1. Workspace tree OID matches `last_green_tree_oid` (`F18`),
+/// 2. Session recorded >=1 authenticated `EventOp::FileEdit` breadcrumb in `allowed_write_paths`
+///    whose `doc_sha256` matches the current on-disk file bytes (Finding #6), and
+/// 3. All authenticated session `event_ids` are pinned into the HMAC-authenticated receipt.
 pub fn submit_work_ledger_entry(
     repo_root: &Path,
     session_id: &str,
@@ -392,14 +437,57 @@ pub fn submit_work_ledger_entry(
         );
     }
 
-    let (event_ids, by_trail) =
-        collect_verified_session_event_ids(repo_root, &cap.session_id, &cap.task_id)?;
-    for (trail_path, records) in &by_trail {
-        flush_records_idempotent(trail_path, records)?;
+    let verified = collect_verified_session_event_ids(repo_root, &cap.session_id, &cap.task_id)?;
+    if verified.latest_edit_sha_by_rel.is_empty() {
+        return Err(format!(
+            "LEDGER_MISSING_EDIT_PROVENANCE: session '{}' recorded zero authenticated FileEdit breadcrumbs; edit provenance is required before submitting WORK_LEDGER.jsonl",
+            cap.session_id
+        ));
+    }
+
+    let canon_repo = fs::canonicalize(repo_root).unwrap_or_else(|_| repo_root.to_path_buf());
+    for (rel_path, recorded_sha) in &verified.latest_edit_sha_by_rel {
+        if !path_matches_any_scope(rel_path, &cap.allowed_write_paths) {
+            return Err(format!(
+                "LEDGER_OUT_OF_SCOPE_EDIT_PROVENANCE: FileEdit breadcrumb path '{rel_path}' is outside allowed_write_paths {:?}",
+                cap.allowed_write_paths
+            ));
+        }
+        let disk_path = canon_repo.join(rel_path);
+        if disk_path.exists() {
+            let bytes = fs::read(&disk_path).map_err(|e| {
+                format!(
+                    "LEDGER_STALE_EDIT_PROVENANCE: failed reading edited file '{rel_path}': {e}"
+                )
+            })?;
+            let current_sha = sha256_digest(&bytes);
+            if &current_sha != recorded_sha {
+                return Err(format!(
+                    "LEDGER_STALE_EDIT_PROVENANCE: on-disk SHA-256 of '{rel_path}' ({}) does not match latest authenticated FileEdit breadcrumb ({})",
+                    &hex_encode(&current_sha)[..12],
+                    &hex_encode(recorded_sha)[..12]
+                ));
+            }
+        } else if *recorded_sha != [0u8; 32] {
+            return Err(format!(
+                "LEDGER_STALE_EDIT_PROVENANCE: edited file '{rel_path}' was removed on disk without matching deletion provenance"
+            ));
+        }
+    }
+
+    for (trail_path, records) in &verified.by_trail {
+        if let Err(e) = flush_records_idempotent(trail_path, records) {
+            if std::env::var("AGENT_GUARD_IN_SANDBOX").ok().as_deref() == Some("1") {
+                let root_trail = repo_root.join(".breadcrumbs.jsonl");
+                flush_records_idempotent(&root_trail, records)?;
+            } else {
+                return Err(e);
+            }
+        }
     }
 
     let smell_badges = classify_session_smells(repo_root, &cap)?;
-    let events_csv = event_ids.join(",");
+    let events_csv = verified.ids.join(",");
     let mac_payload = format!(
         "{}|{}|{}|{}|{}|{}|{}",
         cap.session_id,
@@ -418,7 +506,7 @@ pub fn submit_work_ledger_entry(
         task_id: cap.task_id.clone(),
         attempt: cap.attempt,
         git_tree_oid: current_oid.clone(),
-        event_ids,
+        event_ids: verified.ids,
         what_changed: what_changed.trim().to_string(),
         why_changed: why_changed.trim().to_string(),
         smell_badges,
@@ -426,15 +514,18 @@ pub fn submit_work_ledger_entry(
     };
 
     let ledger_path = work_ledger_state_path(repo_root)?;
-    let mut file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&ledger_path)
-        .map_err(|e| format!("failed opening WORK_LEDGER.jsonl: {e}"))?;
-    writeln!(file, "{}", entry.to_json_value().to_json_string())
-        .map_err(|e| format!("failed writing WORK_LEDGER.jsonl: {e}"))?;
-    file.sync_data()
-        .map_err(|e| format!("failed fsyncing WORK_LEDGER.jsonl: {e}"))?;
+    {
+        let _ledger_lock = ExclusiveFileLockGuard::acquire(&ledger_path)?;
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&ledger_path)
+            .map_err(|e| format!("failed opening WORK_LEDGER.jsonl: {e}"))?;
+        writeln!(file, "{}", entry.to_json_value().to_json_string())
+            .map_err(|e| format!("failed writing WORK_LEDGER.jsonl: {e}"))?;
+        file.sync_data()
+            .map_err(|e| format!("failed fsyncing WORK_LEDGER.jsonl: {e}"))?;
+    }
 
     let plan_bytes = hex_decode_32(&cap.plan_sha256).unwrap_or([0u8; 32]);
     let tree_bytes = hex_decode_32(&current_oid).unwrap_or([0u8; 32]);
@@ -452,6 +543,8 @@ pub fn submit_work_ledger_entry(
     Ok(entry)
 }
 
+/// Loads and authenticates every entry in `WORK_LEDGER.jsonl` (`2+2` sentence schema,
+/// `LEDGER_HMAC_DOMAIN` signature, and pinned session `event_ids` provenance).
 pub fn load_work_ledger_entries(repo_root: &Path) -> Result<Vec<WorkLedgerEntry>, String> {
     let path = work_ledger_state_path(repo_root)?;
     if !path.exists() {
@@ -459,12 +552,17 @@ pub fn load_work_ledger_entries(repo_root: &Path) -> Result<Vec<WorkLedgerEntry>
     }
     let raw = fs::read_to_string(&path).map_err(|e| e.to_string())?;
     let mut out = Vec::new();
-    for line in raw.lines() {
+    for (line_idx, line) in raw.lines().enumerate() {
         let t = line.trim();
         if t.is_empty() {
             continue;
         }
-        let v = JsonValue::parse(t).map_err(|e| format!("corrupt ledger JSON: {e}"))?;
+        let v = JsonValue::parse(t).map_err(|e| {
+            format!(
+                "FORGED_WORK_LEDGER_ENTRY: corrupt ledger JSON at line {}: {e}",
+                line_idx + 1
+            )
+        })?;
         let badges = v
             .get("smell_badges")
             .and_then(JsonValue::as_array)
@@ -488,7 +586,7 @@ pub fn load_work_ledger_entries(repo_root: &Path) -> Result<Vec<WorkLedgerEntry>
                     .collect()
             })
             .unwrap_or_default();
-        let event_ids = v
+        let event_ids: Vec<String> = v
             .get("event_ids")
             .and_then(JsonValue::as_array)
             .map(|arr| {
@@ -499,7 +597,7 @@ pub fn load_work_ledger_entries(repo_root: &Path) -> Result<Vec<WorkLedgerEntry>
             })
             .unwrap_or_default();
 
-        out.push(WorkLedgerEntry {
+        let entry = WorkLedgerEntry {
             session_id: v
                 .get("session_id")
                 .and_then(JsonValue::as_str)
@@ -533,7 +631,73 @@ pub fn load_work_ledger_entries(repo_root: &Path) -> Result<Vec<WorkLedgerEntry>
                 .and_then(JsonValue::as_str)
                 .unwrap_or("")
                 .to_string(),
-        });
+        };
+
+        if entry.session_id.is_empty()
+            || entry.task_id.is_empty()
+            || entry.git_tree_oid.is_empty()
+            || entry.event_ids.is_empty()
+            || entry.record_mac_hex.is_empty()
+        {
+            return Err(format!(
+                "FORGED_WORK_LEDGER_ENTRY: missing required fields or empty event_ids at line {}",
+                line_idx + 1
+            ));
+        }
+        validate_two_plus_two_sentences(&entry.what_changed, &entry.why_changed).map_err(|e| {
+            format!(
+                "FORGED_WORK_LEDGER_ENTRY: invalid 2+2 sentences at line {}: {e}",
+                line_idx + 1
+            )
+        })?;
+
+        let events_csv = entry.event_ids.join(",");
+        let expected_payload = format!(
+            "{}|{}|{}|{}|{}|{}|{}",
+            entry.session_id,
+            entry.task_id,
+            entry.attempt,
+            entry.git_tree_oid,
+            events_csv,
+            entry.what_changed,
+            entry.why_changed
+        );
+        verify_arbitrary_hmac_hex(
+            repo_root,
+            LEDGER_HMAC_DOMAIN,
+            expected_payload.as_bytes(),
+            &entry.record_mac_hex,
+        )
+        .map_err(|e| {
+            format!(
+                "FORGED_WORK_LEDGER_ENTRY: HMAC verification failed for session '{}' at line {}: {e}",
+                entry.session_id,
+                line_idx + 1
+            )
+        })?;
+
+        let verified = collect_verified_session_event_ids(
+            repo_root,
+            &entry.session_id,
+            &entry.task_id,
+        )
+        .map_err(|e| {
+            format!(
+                "FORGED_WORK_LEDGER_ENTRY: unverified event provenance for session '{}': {e}",
+                entry.session_id
+            )
+        })?;
+        let verified_set: BTreeSet<&str> = verified.ids.iter().map(String::as_str).collect();
+        for pinned in &entry.event_ids {
+            if !verified_set.contains(pinned.as_str()) {
+                return Err(format!(
+                    "FORGED_WORK_LEDGER_ENTRY: pinned event_id '{pinned}' not found in authenticated session '{}' breadcrumbs",
+                    entry.session_id
+                ));
+            }
+        }
+
+        out.push(entry);
     }
     Ok(out)
 }
@@ -550,16 +714,15 @@ pub fn verify_on_stop_swarm_gates(repo_root: &Path) -> Result<(), String> {
         .arg(repo_root)
         .args(["diff", "--cached", "--name-only"])
         .output()
+        && out.status.success()
     {
-        if out.status.success() {
-            let staged = String::from_utf8_lossy(&out.stdout);
-            for line in staged.lines() {
-                if line.trim().ends_with(".breadcrumbs.jsonl") {
-                    return Err(format!(
-                        "STAGED_BREADCRUMBS_FORBIDDEN: local flight-recorder file '{}' is staged in git index",
-                        line.trim()
-                    ));
-                }
+        let staged = String::from_utf8_lossy(&out.stdout);
+        for line in staged.lines() {
+            if line.trim().ends_with(".breadcrumbs.jsonl") {
+                return Err(format!(
+                    "STAGED_BREADCRUMBS_FORBIDDEN: local flight-recorder file '{}' is staged in git index",
+                    line.trim()
+                ));
             }
         }
     }
@@ -590,13 +753,6 @@ pub fn verify_on_stop_swarm_gates(repo_root: &Path) -> Result<(), String> {
             ));
         };
 
-        if latest.event_ids.is_empty() {
-            return Err(format!(
-                "GRUNT_UNPINNED_WORK_LEDGER: WORK_LEDGER.jsonl receipt for '{}' has empty event_ids",
-                cap.session_id
-            ));
-        }
-
         let current_oid = compute_scoped_tree_oid(repo_root, &cap.allowed_write_paths)?;
         if latest.git_tree_oid != current_oid {
             return Err(format!(
@@ -606,50 +762,17 @@ pub fn verify_on_stop_swarm_gates(repo_root: &Path) -> Result<(), String> {
             ));
         }
 
-        let events_csv = latest.event_ids.join(",");
-        let expected_payload = format!(
-            "{}|{}|{}|{}|{}|{}|{}",
-            latest.session_id,
-            latest.task_id,
-            latest.attempt,
-            latest.git_tree_oid,
-            events_csv,
-            latest.what_changed,
-            latest.why_changed
-        );
-        let expected_mac =
-            compute_arbitrary_hmac_hex(repo_root, LEDGER_HMAC_DOMAIN, expected_payload.as_bytes())?;
-        if expected_mac != latest.record_mac_hex {
-            return Err(
-                "GRUNT_FORGED_WORK_LEDGER: WORK_LEDGER.jsonl HMAC tag verification failed"
-                    .to_string(),
-            );
-        }
-
-        // Verify every pinned event_id exists in authenticated session breadcrumbs & trails!
-        let (verified_ids, by_trail) =
+        let verified =
             collect_verified_session_event_ids(repo_root, &cap.session_id, &cap.task_id)?;
-        let verified_set: std::collections::BTreeSet<&str> =
-            verified_ids.iter().map(String::as_str).collect();
-        for pinned in &latest.event_ids {
-            if !verified_set.contains(pinned.as_str()) {
-                return Err(format!(
-                    "GRUNT_UNVERIFIED_EVENT_PIN: pinned event_id '{pinned}' not found in authenticated session '{}' breadcrumbs",
-                    cap.session_id
-                ));
+        for trail_path in verified.by_trail.keys() {
+            if trail_path.exists() {
+                verify_breadcrumbs_file(repo_root, trail_path)?;
             }
-        }
-        for trail_path in by_trail.keys() {
-            verify_breadcrumbs_file(repo_root, trail_path)?;
         }
     }
 
     if let Some(ref finished_cap) = cap_opt {
-        if let Ok(Some(slot_cap)) = load_active_session_slot(repo_root) {
-            if slot_cap.session_id == finished_cap.session_id {
-                let _ = clear_active_session_slot(repo_root);
-            }
-        }
+        let _ = close_open_session(repo_root, Some(&finished_cap.session_id));
     }
 
     Ok(())

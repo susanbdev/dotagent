@@ -14,12 +14,15 @@
 //!   worker prose cannot silently mutate `PLAN.lock.json`.
 //! - `F21`: `MAX_ADVERSARIAL_ROUNDS = 2` enforced as an immutable Rust constant.
 
-use std::fs;
+use std::collections::BTreeMap;
+use std::fs::{self, File};
+use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 
 use crate::Decision;
 use crate::breadcrumbs::{
-    append_breadcrumb_for_path, compute_arbitrary_hmac_hex, sha256_digest, swarm_state_dir,
+    ExclusiveFileLockGuard, append_breadcrumb_for_path, compute_arbitrary_hmac_hex, sha256_digest,
+    swarm_state_dir, verify_arbitrary_hmac_hex,
 };
 use crate::budget_guard::estimate_bpe_tokens;
 use crate::json::JsonValue;
@@ -33,7 +36,30 @@ use crate::swarm_contracts::{
 use crate::unicode_guard::{ScanMode, scan_unicode};
 
 const CAPABILITY_HMAC_DOMAIN: &[u8] = b"DOTAGENT_SESSION_CAPABILITY_V1";
-const ACTIVE_SLOT_HMAC_DOMAIN: &[u8] = b"DOTAGENT_ACTIVE_SESSION_SLOT_V1";
+const ACTIVE_SLOT_HMAC_DOMAIN: &[u8] = b"DOTAGENT_ACTIVE_SESSIONS_REGISTRY_V2";
+
+#[derive(Debug, Clone, Default)]
+struct ActiveSessionRegistry {
+    open_sessions: Vec<String>,
+    hook_bindings: BTreeMap<String, String>,
+}
+
+fn encode_registry_mac_payload(reg: &ActiveSessionRegistry) -> Vec<u8> {
+    let mut buf = Vec::new();
+    buf.extend_from_slice(&(reg.open_sessions.len() as u32).to_be_bytes());
+    for sid in &reg.open_sessions {
+        buf.extend_from_slice(&(sid.len() as u32).to_be_bytes());
+        buf.extend_from_slice(sid.as_bytes());
+    }
+    buf.extend_from_slice(&(reg.hook_bindings.len() as u32).to_be_bytes());
+    for (k, v) in &reg.hook_bindings {
+        buf.extend_from_slice(&(k.len() as u32).to_be_bytes());
+        buf.extend_from_slice(k.as_bytes());
+        buf.extend_from_slice(&(v.len() as u32).to_be_bytes());
+        buf.extend_from_slice(v.as_bytes());
+    }
+    buf
+}
 
 fn compute_capability_mac_hex(repo_root: &Path, cap: &SessionCapability) -> Result<String, String> {
     let mut payload = Vec::with_capacity(256);
@@ -72,83 +98,226 @@ fn compute_capability_mac_hex(repo_root: &Path, cap: &SessionCapability) -> Resu
     compute_arbitrary_hmac_hex(repo_root, CAPABILITY_HMAC_DOMAIN, &payload)
 }
 
+pub fn sessions_dir(repo_root: &Path) -> Result<PathBuf, String> {
+    let dir = swarm_state_dir(repo_root)?.join("sessions");
+    if !dir.is_dir() {
+        fs::create_dir_all(&dir).map_err(|e| format!("failed creating swarm sessions dir: {e}"))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = fs::set_permissions(&dir, fs::Permissions::from_mode(0o700));
+        }
+    }
+    Ok(dir)
+}
+
 pub fn active_session_slot_path(repo_root: &Path) -> Result<PathBuf, String> {
-    Ok(swarm_state_dir(repo_root)?.join("active_session.json"))
+    Ok(sessions_dir(repo_root)?.join("active_sessions.json"))
 }
 
-pub fn set_active_session_slot(repo_root: &Path, session_id: &str) -> Result<(), String> {
-    let path = active_session_slot_path(repo_root)?;
-    let mac =
-        compute_arbitrary_hmac_hex(repo_root, ACTIVE_SLOT_HMAC_DOMAIN, session_id.as_bytes())?;
-    let obj = JsonValue::Object(vec![
-        (
-            "active_session_id".to_string(),
-            JsonValue::Str(session_id.to_string()),
-        ),
-        ("record_mac".to_string(), JsonValue::Str(mac)),
-    ]);
-    fs::write(&path, format!("{}\n", obj.to_json_string()))
-        .map_err(|e| format!("failed writing active_session.json: {e}"))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = fs::set_permissions(&path, fs::Permissions::from_mode(0o600));
-    }
-    Ok(())
-}
-
-pub fn clear_active_session_slot(repo_root: &Path) -> Result<(), String> {
-    let path = active_session_slot_path(repo_root)?;
-    if path.exists() {
-        fs::remove_file(&path).map_err(|e| format!("failed clearing active_session.json: {e}"))?;
-    }
-    Ok(())
-}
-
-pub fn load_active_session_slot(repo_root: &Path) -> Result<Option<SessionCapability>, String> {
-    let path = active_session_slot_path(repo_root)?;
+fn load_registry_unlocked(repo_root: &Path, path: &Path) -> Result<ActiveSessionRegistry, String> {
     if !path.exists() {
-        return Ok(None);
+        return Ok(ActiveSessionRegistry::default());
     }
-    let raw = fs::read_to_string(&path)
-        .map_err(|e| format!("FORGED_ACTIVE_SESSION_SLOT: cannot read active_session.json: {e}"))?;
+    let raw = fs::read_to_string(path).map_err(|e| {
+        format!("FORGED_ACTIVE_SESSION_SLOT: cannot read active_sessions.json: {e}")
+    })?;
+    if raw.trim().is_empty() {
+        return Ok(ActiveSessionRegistry::default());
+    }
     let v = JsonValue::parse(&raw)
-        .map_err(|e| format!("FORGED_ACTIVE_SESSION_SLOT: corrupt active_session.json: {e}"))?;
-    let sid = v
-        .get("active_session_id")
-        .and_then(JsonValue::as_str)
-        .filter(|s| !s.trim().is_empty())
+        .map_err(|e| format!("FORGED_ACTIVE_SESSION_SLOT: corrupt active_sessions.json: {e}"))?;
+    let open_arr = v
+        .get("open_sessions")
+        .and_then(JsonValue::as_array)
         .ok_or_else(|| {
-            "FORGED_ACTIVE_SESSION_SLOT: missing active_session_id in active_session.json"
+            "FORGED_ACTIVE_SESSION_SLOT: missing open_sessions array in active_sessions.json"
                 .to_string()
         })?;
+    let mut open_sessions = Vec::with_capacity(open_arr.len());
+    for item in open_arr {
+        let s = item
+            .as_str()
+            .filter(|x| !x.trim().is_empty())
+            .ok_or_else(|| {
+                "FORGED_ACTIVE_SESSION_SLOT: invalid session_id in open_sessions".to_string()
+            })?;
+        open_sessions.push(s.to_string());
+    }
+
+    let mut hook_bindings = BTreeMap::new();
+    if let Some(JsonValue::Object(entries)) = v.get("hook_bindings") {
+        for (k, val) in entries {
+            let target = val.as_str().ok_or_else(|| {
+                "FORGED_ACTIVE_SESSION_SLOT: invalid hook_bindings target".to_string()
+            })?;
+            hook_bindings.insert(k.clone(), target.to_string());
+        }
+    }
+
     let recorded_mac = v
         .get("record_mac")
         .and_then(JsonValue::as_str)
         .ok_or_else(|| {
-            "FORGED_ACTIVE_SESSION_SLOT: missing record_mac in active_session.json".to_string()
+            "FORGED_ACTIVE_SESSION_SLOT: missing record_mac in active_sessions.json".to_string()
         })?;
-    let expected_mac =
-        compute_arbitrary_hmac_hex(repo_root, ACTIVE_SLOT_HMAC_DOMAIN, sid.as_bytes())?;
-    if recorded_mac != expected_mac {
-        return Err(
-            "FORGED_ACTIVE_SESSION_SLOT: active_session.json HMAC authentication failed"
-                .to_string(),
-        );
-    }
-    let cap = load_session_capability(repo_root, sid)?;
-    Ok(Some(cap))
+    let reg = ActiveSessionRegistry {
+        open_sessions,
+        hook_bindings,
+    };
+    let payload = encode_registry_mac_payload(&reg);
+    verify_arbitrary_hmac_hex(repo_root, ACTIVE_SLOT_HMAC_DOMAIN, &payload, recorded_mac).map_err(
+        |_| {
+            "FORGED_ACTIVE_SESSION_SLOT: active_sessions.json HMAC authentication failed"
+                .to_string()
+        },
+    )?;
+    Ok(reg)
 }
 
-pub fn sessions_dir(repo_root: &Path) -> Result<PathBuf, String> {
-    let dir = swarm_state_dir(repo_root)?.join("sessions");
-    fs::create_dir_all(&dir).map_err(|e| format!("failed creating swarm sessions dir: {e}"))?;
+fn save_registry_unlocked(
+    repo_root: &Path,
+    path: &Path,
+    reg: &ActiveSessionRegistry,
+) -> Result<(), String> {
+    let payload = encode_registry_mac_payload(reg);
+    let mac = compute_arbitrary_hmac_hex(repo_root, ACTIVE_SLOT_HMAC_DOMAIN, &payload)?;
+    let bindings_obj = JsonValue::Object(
+        reg.hook_bindings
+            .iter()
+            .map(|(k, v)| (k.clone(), JsonValue::Str(v.clone())))
+            .collect(),
+    );
+    let obj = JsonValue::Object(vec![
+        (
+            "open_sessions".to_string(),
+            JsonValue::Array(
+                reg.open_sessions
+                    .iter()
+                    .cloned()
+                    .map(JsonValue::Str)
+                    .collect(),
+            ),
+        ),
+        ("hook_bindings".to_string(), bindings_obj),
+        ("record_mac".to_string(), JsonValue::Str(mac)),
+    ]);
+    fs::write(path, format!("{}\n", obj.to_json_string()))
+        .map_err(|e| format!("failed writing active_sessions.json: {e}"))?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let _ = fs::set_permissions(&dir, fs::Permissions::from_mode(0o700));
+        let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o600));
     }
-    Ok(dir)
+    Ok(())
+}
+
+/// Registers an open non-Master session capability WITHOUT clobbering concurrent parallel-wave sessions.
+pub fn set_active_session_slot(repo_root: &Path, session_id: &str) -> Result<(), String> {
+    let path = active_session_slot_path(repo_root)?;
+    let _guard = ExclusiveFileLockGuard::acquire(&path)?;
+    let mut reg = load_registry_unlocked(repo_root, &path)?;
+    if !reg.open_sessions.iter().any(|s| s == session_id) {
+        reg.open_sessions.push(session_id.to_string());
+    }
+    save_registry_unlocked(repo_root, &path, &reg)
+}
+
+/// Closes a single open session (`Some(sid)`) or all open sessions (`None`), preserving concurrent siblings.
+pub fn close_open_session(repo_root: &Path, session_id: Option<&str>) -> Result<(), String> {
+    let path = active_session_slot_path(repo_root)?;
+    let _guard = ExclusiveFileLockGuard::acquire(&path)?;
+    if !path.exists() {
+        return Ok(());
+    }
+    let mut reg = load_registry_unlocked(repo_root, &path)?;
+    match session_id {
+        Some(sid) => {
+            reg.open_sessions.retain(|s| s != sid);
+            reg.hook_bindings.retain(|_, v| v != sid);
+        }
+        None => {
+            reg.open_sessions.clear();
+            reg.hook_bindings.clear();
+        }
+    }
+    save_registry_unlocked(repo_root, &path, &reg)
+}
+
+pub fn clear_active_session_slot(repo_root: &Path) -> Result<(), String> {
+    close_open_session(repo_root, None)
+}
+
+pub fn bind_hook_session_to_swarm_session(
+    repo_root: &Path,
+    hook_session_id: &str,
+    swarm_session_id: &str,
+) -> Result<(), String> {
+    let hs = hook_session_id.trim();
+    if hs.is_empty() || hs == "default" || hs.starts_with("swm_") {
+        return Ok(());
+    }
+    let path = active_session_slot_path(repo_root)?;
+    let _guard = ExclusiveFileLockGuard::acquire(&path)?;
+    let mut reg = load_registry_unlocked(repo_root, &path)?;
+    if reg.open_sessions.iter().any(|s| s == swarm_session_id)
+        && reg.hook_bindings.get(hs).map(String::as_str) != Some(swarm_session_id)
+    {
+        reg.hook_bindings
+            .insert(hs.to_string(), swarm_session_id.to_string());
+        save_registry_unlocked(repo_root, &path, &reg)?;
+    }
+    Ok(())
+}
+
+/// Loads all currently open non-Master session capabilities in deterministic registration order.
+pub fn load_open_session_capabilities(repo_root: &Path) -> Result<Vec<SessionCapability>, String> {
+    let path = active_session_slot_path(repo_root)?;
+    let _guard = ExclusiveFileLockGuard::acquire(&path)?;
+    let reg = load_registry_unlocked(repo_root, &path)?;
+    let mut out = Vec::with_capacity(reg.open_sessions.len());
+    for sid in &reg.open_sessions {
+        out.push(load_session_capability(repo_root, sid)?);
+    }
+    Ok(out)
+}
+
+fn lookup_bound_hook_capability(
+    repo_root: &Path,
+    hook_session_id: &str,
+) -> Result<Option<SessionCapability>, String> {
+    let hs = hook_session_id.trim();
+    if hs.is_empty() || hs == "default" || hs.starts_with("swm_") {
+        return Ok(None);
+    }
+    let path = active_session_slot_path(repo_root)?;
+    let _guard = ExclusiveFileLockGuard::acquire(&path)?;
+    let reg = load_registry_unlocked(repo_root, &path)?;
+    if let Some(target_sid) = reg.hook_bindings.get(hs)
+        && reg.open_sessions.iter().any(|s| s == target_sid)
+    {
+        return Ok(Some(load_session_capability(repo_root, target_sid)?));
+    }
+    Ok(None)
+}
+
+/// Returns `Ok(None)` when 0 worker sessions are open, `Ok(Some(cap))` when exactly 1 is open,
+/// and fails closed (`AMBIGUOUS_CONCURRENT_SWARM_SESSIONS`) when `>= 2` sessions are open concurrently
+/// without an explicit `session_id`.
+pub fn load_active_session_slot(repo_root: &Path) -> Result<Option<SessionCapability>, String> {
+    let mut open = load_open_session_capabilities(repo_root)?;
+    match open.len() {
+        0 => Ok(None),
+        1 => Ok(open.pop()),
+        _ => {
+            let ids: Vec<&str> = open.iter().map(|c| c.session_id.as_str()).collect();
+            Err(format!(
+                "AMBIGUOUS_CONCURRENT_SWARM_SESSIONS: {} concurrent worker sessions [{}] are open; pass --session <swm_id> or set AGENT_GUARD_SESSION_ID",
+                open.len(),
+                ids.join(", ")
+            ))
+        }
+    }
 }
 
 pub fn session_capability_path(repo_root: &Path, session_id: &str) -> Result<PathBuf, String> {
@@ -423,12 +592,11 @@ pub fn list_session_capabilities(repo_root: &Path) -> Result<Vec<SessionCapabili
     let entries = fs::read_dir(&dir).map_err(|e| e.to_string())?;
     for entry in entries.flatten() {
         let p = entry.path();
-        if p.extension().is_some_and(|e| e == "json") {
-            if let Some(stem) = p.file_stem().and_then(|s| s.to_str()) {
-                if let Ok(cap) = load_session_capability(repo_root, stem) {
-                    out.push(cap);
-                }
-            }
+        if p.extension().is_some_and(|e| e == "json")
+            && let Some(stem) = p.file_stem().and_then(|s| s.to_str())
+            && stem.starts_with("swm_")
+        {
+            out.push(load_session_capability(repo_root, stem)?);
         }
     }
     out.sort_by(|a, b| a.session_id.cmp(&b.session_id));
@@ -436,10 +604,14 @@ pub fn list_session_capabilities(repo_root: &Path) -> Result<Vec<SessionCapabili
 }
 
 /// Resolves active `SwarmRole` and optional minted `SessionCapability` for a hook turn:
-/// 1. Explicit Swarm `session_id` (`AGENT_GUARD_SESSION_ID` or `"swm_*"` hook ID) -> fail-closed HMAC check.
-/// 2. Active repo-scoped capability slot (`active_session.json`) -> enforces worker jail even when
-///    Claude Code / Gemini / Cursor pass their own UUID `session_id` without subagent env inheritance.
-/// 3. Ambient `AGENT_GUARD_ROLE`, defaulting to `StandardCoding` when no Swarm session is active.
+/// 1. Explicit Swarm `session_id` (`AGENT_GUARD_SESSION_ID` or `"swm_*"` hook ID) -> fail-closed HMAC check
+///    (and binds non-default hook UUID `session_id` to that Swarm session).
+/// 2. Explicit hook-UUID binding in `active_sessions.json` (`lookup_bound_hook_capability`).
+/// 3. Active repo-scoped capability registry (`active_sessions.json`):
+///    - Supervising `AGENT_GUARD_ROLE=master` remains operational even when `>= 2` parallel-wave workers are open.
+///    - Exactly `1` open worker session -> enforces worker jail automatically with zero env friction.
+///    - `>= 2` open worker sessions without explicit `session_id` -> fails closed (`AMBIGUOUS_CONCURRENT_SWARM_SESSIONS`).
+/// 4. Ambient `AGENT_GUARD_ROLE`, defaulting to `StandardCoding` when no Swarm session is active.
 pub fn resolve_active_role(
     repo_root: &Path,
     session_id: &str,
@@ -470,17 +642,39 @@ pub fn resolve_active_role(
 
     if let Some(sid) = explicit_sid {
         let cap = load_session_capability(repo_root, &sid)?;
-        if let Some(er) = env_role {
-            if er != cap.role {
+        if let Some(er) = env_role
+            && er != cap.role
+        {
+            return Err(format!(
+                "ROLE_CAPABILITY_MISMATCH: AGENT_GUARD_ROLE '{}' conflicts with minted session '{}' capability role '{}'",
+                er.as_str_id(),
+                c_id(&cap),
+                cap.role.as_str_id()
+            ));
+        }
+        let _ = bind_hook_session_to_swarm_session(repo_root, session_id, &cap.session_id);
+        return Ok((cap.role, Some(cap)));
+    }
+
+    if let Some(bound_cap) = lookup_bound_hook_capability(repo_root, session_id)? {
+        match env_role {
+            None => return Ok((bound_cap.role, Some(bound_cap))),
+            Some(er) if er == bound_cap.role => return Ok((bound_cap.role, Some(bound_cap))),
+            Some(SwarmRole::Master) => return Ok((SwarmRole::Master, None)),
+            Some(er) => {
                 return Err(format!(
-                    "ROLE_CAPABILITY_MISMATCH: AGENT_GUARD_ROLE '{}' conflicts with minted session '{}' capability role '{}'",
+                    "ROLE_CAPABILITY_MISMATCH: AGENT_GUARD_ROLE '{}' conflicts with bound session '{}' capability role '{}'",
                     er.as_str_id(),
-                    c_id(&cap),
-                    cap.role.as_str_id()
+                    bound_cap.session_id,
+                    bound_cap.role.as_str_id()
                 ));
             }
         }
-        return Ok((cap.role, Some(cap)));
+    }
+
+    if env_role == Some(SwarmRole::Master) {
+        let _ = load_open_session_capabilities(repo_root)?;
+        return Ok((SwarmRole::Master, None));
     }
 
     if let Some(slot_cap) = load_active_session_slot(repo_root)? {
@@ -1131,19 +1325,26 @@ fn walk_scout_dir(
                 walk_scout_dir(canon_repo, &canon_child, depth + 1, max_depth, filter, hits)?;
             }
         } else if ft.is_file() && is_source_ext(&name_str) {
+            const MAX_SCOUT_FILE_BYTES: u64 = 256 * 1024;
+            const MAX_SCOUT_FILE_LINES: usize = 2_000;
             let rel = canon_child
                 .strip_prefix(canon_repo)
                 .unwrap_or(&canon_child)
                 .to_string_lossy()
                 .replace('\\', "/");
-            if let Ok(content) = fs::read_to_string(&canon_child) {
-                for (idx, line) in content.lines().enumerate() {
+            if let Ok(file) = File::open(&canon_child) {
+                let reader = BufReader::new(file.take(MAX_SCOUT_FILE_BYTES));
+                for (idx, line_res) in reader.lines().take(MAX_SCOUT_FILE_LINES).enumerate() {
+                    let Ok(line) = line_res else {
+                        break;
+                    };
                     let trimmed = line.trim();
                     if is_signature_line(trimmed) {
-                        if let Some(pat) = filter {
-                            if !trimmed.contains(pat) && !rel.contains(pat) {
-                                continue;
-                            }
+                        if let Some(pat) = filter
+                            && !trimmed.contains(pat)
+                            && !rel.contains(pat)
+                        {
+                            continue;
                         }
                         let clean_sig: String = trimmed
                             .chars()
@@ -1160,6 +1361,19 @@ fn walk_scout_dir(
         }
     }
     Ok(())
+}
+
+fn is_exact_semver_pin(ver: &str) -> bool {
+    let trimmed = ver.trim();
+    if trimmed.is_empty() || !trimmed.as_bytes()[0].is_ascii_digit() {
+        return false;
+    }
+    let core = trimmed.split(['-', '+']).next().unwrap_or("");
+    let parts: Vec<&str> = core.split('.').collect();
+    parts.len() == 3
+        && parts
+            .iter()
+            .all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()))
 }
 
 /// Offline lockfile-verified package check for `AdversarialReviewer` (`F08` fix:
@@ -1202,6 +1416,17 @@ pub fn lookup_pinned_package_doc(
         }
     }
 
+    if !is_exact_semver_pin(version) {
+        return Err(format!(
+            "UNPINNED_DEPENDENCY: requested version '{version}' for '{package}' is not an exact X.Y.Z semver pin"
+        ));
+    }
+
+    let sym_note = symbol
+        .filter(|s| !s.is_empty())
+        .map(|s| format!(" (symbol query: {s})"))
+        .unwrap_or_default();
+
     let eco = ecosystem.to_ascii_lowercase();
     match eco.as_str() {
         "cargo" | "rust" => {
@@ -1219,19 +1444,15 @@ pub fn lookup_pinned_package_doc(
                     }
                     for line in block.lines() {
                         let t = line.trim();
-                        if let Some(rest) = t.strip_prefix("version = \"") {
-                            if let Some(v) = rest.strip_suffix('"') {
-                                found_versions.push(v.to_string());
-                            }
+                        if let Some(rest) = t.strip_prefix("version = \"")
+                            && let Some(v) = rest.strip_suffix('"')
+                        {
+                            found_versions.push(v.to_string());
                         }
                     }
                 }
             }
             if found_exact {
-                let sym_note = symbol
-                    .filter(|s| !s.is_empty())
-                    .map(|s| format!(" (symbol query: {s})"))
-                    .unwrap_or_default();
                 Ok(format!(
                     "VERIFIED_LOCKFILE_PIN: cargo crate '{package}' v{version} is pinned in Cargo.lock{sym_note}."
                 ))
@@ -1247,16 +1468,90 @@ pub fn lookup_pinned_package_doc(
             }
         }
         "npm" | "node" => {
+            let lock_path = repo_root.join("package-lock.json");
+            if lock_path.exists() {
+                let lock_raw = fs::read_to_string(&lock_path)
+                    .map_err(|e| format!("failed reading package-lock.json: {e}"))?;
+                let lock_json = JsonValue::parse(&lock_raw)
+                    .map_err(|e| format!("invalid package-lock.json JSON: {e}"))?;
+                let mut found_versions = Vec::new();
+                let direct_key = format!("node_modules/{package}");
+                let nested_suffix = format!("/node_modules/{package}");
+                if let Some(pkgs) = lock_json.get("packages").and_then(JsonValue::as_object) {
+                    for (k, entry) in pkgs {
+                        if (k == &direct_key || k.ends_with(&nested_suffix))
+                            && let Some(v) = entry.get("version").and_then(JsonValue::as_str)
+                            && !found_versions.iter().any(|existing| existing == v)
+                        {
+                            found_versions.push(v.to_string());
+                        }
+                    }
+                }
+                if let Some(deps) = lock_json.get("dependencies").and_then(JsonValue::as_object)
+                    && let Some((_, entry)) = deps.iter().find(|(k, _)| k == package)
+                    && let Some(v) = entry.get("version").and_then(JsonValue::as_str)
+                    && !found_versions.iter().any(|existing| existing == v)
+                {
+                    found_versions.push(v.to_string());
+                }
+                if found_versions.iter().any(|v| v == version) {
+                    return Ok(format!(
+                        "VERIFIED_LOCKFILE_PIN: npm package '{package}' v{version} is pinned in package-lock.json{sym_note}."
+                    ));
+                } else if !found_versions.is_empty() {
+                    return Err(format!(
+                        "LOCKFILE_VERSION_MISMATCH: npm package '{package}' is pinned at [{}], not '{version}'",
+                        found_versions.join(", ")
+                    ));
+                } else {
+                    return Err(format!(
+                        "UNPINNED_DEPENDENCY: npm package '{package}' does not exist in package-lock.json"
+                    ));
+                }
+            }
+
             let pkg_path = repo_root.join("package.json");
             let raw = fs::read_to_string(&pkg_path)
                 .map_err(|_| "package.json not present in repository root".to_string())?;
-            if raw.contains(&format!("\"{package}\"")) && raw.contains(version) {
+            let pkg_json =
+                JsonValue::parse(&raw).map_err(|e| format!("invalid package.json JSON: {e}"))?;
+
+            let mut declared_specs: Vec<String> = Vec::new();
+            for section in [
+                "dependencies",
+                "devDependencies",
+                "peerDependencies",
+                "optionalDependencies",
+            ] {
+                if let Some(spec) = pkg_json
+                    .get(section)
+                    .and_then(|sec| sec.get(package))
+                    .and_then(JsonValue::as_str)
+                {
+                    declared_specs.push(spec.trim().to_string());
+                }
+            }
+
+            if declared_specs.is_empty() {
+                return Err(format!(
+                    "UNPINNED_DEPENDENCY: npm package '{package}' not declared in package.json dependencies"
+                ));
+            }
+            for spec in &declared_specs {
+                if !is_exact_semver_pin(spec) {
+                    return Err(format!(
+                        "UNPINNED_DEPENDENCY: npm package '{package}' uses non-exact range '{spec}' in package.json (exact pin or package-lock.json required)"
+                    ));
+                }
+            }
+            if declared_specs.iter().any(|spec| spec == version) {
                 Ok(format!(
-                    "VERIFIED_PACKAGE_PIN: npm package '{package}' ({version}) declared in package.json."
+                    "VERIFIED_PACKAGE_PIN: npm package '{package}' ({version}) is pinned in package.json{sym_note}."
                 ))
             } else {
                 Err(format!(
-                    "UNPINNED_DEPENDENCY: npm package '{package}' ({version}) not found in package.json"
+                    "LOCKFILE_VERSION_MISMATCH: npm package '{package}' is pinned at [{}] in package.json, not '{version}'",
+                    declared_specs.join(", ")
                 ))
             }
         }
@@ -1301,13 +1596,10 @@ pub fn evaluate_reviewer_verdict(
 
 fn is_master_readable_doc_or_skill(repo_rel: &str) -> bool {
     repo_rel == "AGENTS.md"
-        || repo_rel == "README.md"
-        || repo_rel == "spec.md"
         || repo_rel == "PLAN.lock.json"
         || repo_rel == "WORK_LEDGER.jsonl"
         || repo_rel.starts_with("docs/")
         || repo_rel.starts_with("skills/")
-        || repo_rel.starts_with("profiles/")
 }
 
 pub fn is_qa_writable_path(repo_rel: &str) -> bool {

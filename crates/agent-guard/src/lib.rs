@@ -17,6 +17,7 @@
 pub mod breadcrumbs;
 pub mod budget_guard;
 pub mod cmd_policy;
+pub mod coordinator;
 pub mod exec_sandbox;
 pub mod injection_scan;
 pub mod json;
@@ -287,8 +288,7 @@ pub fn handle_pre_tool_hook(raw_json: &str, fallback_cwd: &Path) -> Decision {
             &cwd,
             &profile,
             &mut ledger,
-            role,
-            cap_opt.as_ref(),
+            (role, cap_opt.as_ref()),
         )
     };
     if let Decision::Deny {
@@ -328,8 +328,10 @@ fn evaluate_tool_invocation(
     cwd: &Path,
     profile: &RuntimeProfile,
     ledger: &mut SessionLedger,
-    role: swarm_contracts::SwarmRole,
-    cap: Option<&swarm_contracts::SessionCapability>,
+    (role, cap): (
+        swarm_contracts::SwarmRole,
+        Option<&swarm_contracts::SessionCapability>,
+    ),
 ) -> Decision {
     let norm_tool = tool_name.to_ascii_lowercase();
     let writes_disabled = !profile.enable_write_tools || profile.write_scope_none;
@@ -1507,25 +1509,19 @@ pub fn handle_post_edit(file_path: &str, cwd: &Path) -> Decision {
         );
     }
 
-    if let Ok(sid) = std::env::var("AGENT_GUARD_SESSION_ID") {
-        let trimmed = sid.trim();
-        if !trimmed.is_empty() {
-            if let Ok(cap) = role_sandbox::load_session_capability(&repo_root, trimmed) {
-                let doc_digest = breadcrumbs::sha256_digest(content.as_bytes());
-                let plan_bytes =
-                    swarm_contracts::hex_decode_32(&cap.plan_sha256).unwrap_or([0u8; 32]);
-                let _ = breadcrumbs::append_breadcrumb_for_path(
-                    &repo_root,
-                    &cap.session_id,
-                    &cap.task_id,
-                    plan_bytes,
-                    swarm_contracts::EventOp::FileEdit,
-                    &valid.repo_rel,
-                    None,
-                    doc_digest,
-                );
-            }
-        }
+    if let Ok((_role, Some(cap))) = role_sandbox::resolve_active_role(&repo_root, "") {
+        let doc_digest = breadcrumbs::sha256_digest(content.as_bytes());
+        let plan_bytes = swarm_contracts::hex_decode_32(&cap.plan_sha256).unwrap_or([0u8; 32]);
+        let _ = breadcrumbs::append_breadcrumb_for_path(
+            &repo_root,
+            &cap.session_id,
+            &cap.task_id,
+            plan_bytes,
+            swarm_contracts::EventOp::FileEdit,
+            &valid.repo_rel,
+            None,
+            doc_digest,
+        );
     }
 
     Decision::allow()

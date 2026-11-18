@@ -7,12 +7,17 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use crate::breadcrumbs::{sha256_digest, swarm_state_dir};
+use crate::breadcrumbs::{
+    ExclusiveFileLockGuard, compute_arbitrary_hmac_hex, sha256_digest, swarm_state_dir,
+    verify_arbitrary_hmac_hex,
+};
 use crate::json::JsonValue;
 use crate::swarm_contracts::{
     DagTaskSpec, DomainRisk, LockedPlan, SuspectVerdict, TestAttributionRule, hex_encode,
 };
 use crate::unicode_guard::{ScanMode, scan_unicode};
+
+const PLAN_LOCK_HMAC_DOMAIN: &[u8] = b"dotagent-plan-lock-v1";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TaskCoverageTarget {
@@ -23,7 +28,17 @@ pub struct TaskCoverageTarget {
 }
 
 pub fn plan_lock_state_path(repo_root: &Path) -> Result<PathBuf, String> {
-    Ok(swarm_state_dir(repo_root)?.join("PLAN.lock.json"))
+    let dir = swarm_state_dir(repo_root)?.join("ledger");
+    if !dir.is_dir() {
+        fs::create_dir_all(&dir)
+            .map_err(|e| format!("failed creating swarm ledger dir '{}': {e}", dir.display()))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = fs::set_permissions(&dir, fs::Permissions::from_mode(0o700));
+        }
+    }
+    Ok(dir.join("PLAN.lock.json"))
 }
 
 /// Parses a wave DAG JSON document (supporting both `{ "waves": [ { "wave_id", "tasks": [...] } ] }`
@@ -314,8 +329,13 @@ pub fn save_locked_plan(
     allow_amend_with_human_approval: bool,
 ) -> Result<PathBuf, String> {
     let lock_path = plan_lock_state_path(repo_root)?;
-    if lock_path.exists() && !allow_amend_with_human_approval {
-        let existing = load_locked_plan(repo_root)?;
+    let _guard = ExclusiveFileLockGuard::acquire(&lock_path)?;
+
+    if lock_path.exists()
+        && fs::metadata(&lock_path).is_ok_and(|m| m.len() > 0)
+        && !allow_amend_with_human_approval
+    {
+        let existing = load_locked_plan_unlocked(repo_root, &lock_path)?;
         if existing.plan_sha256 != plan.plan_sha256 {
             return Err(format!(
                 "PLAN_LOCK_IMMUTABLE: PLAN.lock.json already pinned at {}; pass --amend --human-approved to re-lock",
@@ -325,6 +345,15 @@ pub fn save_locked_plan(
     }
 
     let canonical = serialize_locked_tasks_canonical(&plan.plan_id, &plan.tasks);
+    let recomputed_sha = hex_encode(&sha256_digest(canonical.as_bytes()));
+    if recomputed_sha != plan.plan_sha256 {
+        return Err(format!(
+            "PLAN_LOCK_TAMPERED: in-memory plan_sha256 '{}' does not match canonical digest '{recomputed_sha}'",
+            plan.plan_sha256
+        ));
+    }
+    let record_mac =
+        compute_arbitrary_hmac_hex(repo_root, PLAN_LOCK_HMAC_DOMAIN, canonical.as_bytes())?;
     let parsed_tasks = JsonValue::parse(&canonical).map_err(|e| e.to_string())?;
     let wrapper = JsonValue::Object(vec![
         ("plan_id".to_string(), JsonValue::Str(plan.plan_id.clone())),
@@ -339,17 +368,65 @@ pub fn save_locked_plan(
                 .cloned()
                 .unwrap_or(JsonValue::Array(Vec::new())),
         ),
+        ("record_mac".to_string(), JsonValue::Str(record_mac)),
     ]);
     fs::write(&lock_path, format!("{}\n", wrapper.to_json_string()))
         .map_err(|e| format!("failed writing PLAN.lock.json: {e}"))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(&lock_path, fs::Permissions::from_mode(0o600));
+    }
     Ok(lock_path)
 }
 
 pub fn load_locked_plan(repo_root: &Path) -> Result<LockedPlan, String> {
     let lock_path = plan_lock_state_path(repo_root)?;
-    let raw = fs::read_to_string(&lock_path)
+    let _guard = ExclusiveFileLockGuard::acquire(&lock_path)?;
+    load_locked_plan_unlocked(repo_root, &lock_path)
+}
+
+fn load_locked_plan_unlocked(repo_root: &Path, lock_path: &Path) -> Result<LockedPlan, String> {
+    let raw = fs::read_to_string(lock_path)
         .map_err(|e| format!("no locked plan found at '{}': {e}", lock_path.display()))?;
-    parse_and_validate_dag_json(&raw)
+    if raw.trim().is_empty() {
+        return Err(format!(
+            "no locked plan found at '{}': PLAN.lock.json is empty",
+            lock_path.display()
+        ));
+    }
+    let root = JsonValue::parse(&raw)
+        .map_err(|e| format!("PLAN_LOCK_TAMPERED: corrupt PLAN.lock.json JSON: {e}"))?;
+    let persisted_sha = root
+        .get("plan_sha256")
+        .and_then(JsonValue::as_str)
+        .filter(|s| !s.trim().is_empty())
+        .ok_or_else(|| "PLAN_LOCK_TAMPERED: missing plan_sha256 in PLAN.lock.json".to_string())?;
+    let recorded_mac = root
+        .get("record_mac")
+        .and_then(JsonValue::as_str)
+        .filter(|s| !s.trim().is_empty())
+        .ok_or_else(|| "PLAN_LOCK_TAMPERED: missing record_mac in PLAN.lock.json".to_string())?;
+
+    let recomputed =
+        parse_and_validate_dag_json(&raw).map_err(|e| format!("PLAN_LOCK_TAMPERED: {e}"))?;
+    if recomputed.plan_sha256 != persisted_sha {
+        return Err(format!(
+            "PLAN_LOCK_TAMPERED: persisted plan_sha256 '{}' does not match canonical task graph digest '{}'",
+            persisted_sha, recomputed.plan_sha256
+        ));
+    }
+
+    let canonical = serialize_locked_tasks_canonical(&recomputed.plan_id, &recomputed.tasks);
+    verify_arbitrary_hmac_hex(
+        repo_root,
+        PLAN_LOCK_HMAC_DOMAIN,
+        canonical.as_bytes(),
+        recorded_mac,
+    )
+    .map_err(|e| format!("PLAN_LOCK_TAMPERED: PLAN.lock.json HMAC verification failed: {e}"))?;
+
+    Ok(recomputed)
 }
 
 /// Computes `max(domain_risk_floor, dag_fanout)` bounded to `50%..95%` (`F20`).

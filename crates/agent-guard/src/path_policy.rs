@@ -44,14 +44,19 @@ pub struct ValidatedPath {
     pub is_root_authority: bool,
 }
 
-pub fn effective_max_walk_depth() -> usize {
-    if let Ok(role) = std::env::var("AGENT_GUARD_ROLE") {
-        let r = role.trim().to_ascii_lowercase();
-        if r == "investigator" || r == "swarm-investigator" || r == "scout" {
-            return crate::swarm_contracts::INVESTIGATOR_MAX_WALK_DEPTH;
-        }
+pub fn effective_max_walk_depth_for_repo(repo_root: &Path) -> usize {
+    if let Ok((crate::swarm_contracts::SwarmRole::Investigator, Some(_))) =
+        crate::role_sandbox::resolve_active_role(repo_root, "")
+    {
+        return crate::swarm_contracts::INVESTIGATOR_MAX_WALK_DEPTH;
     }
     MAX_DIRECTORY_WALK_DEPTH
+}
+
+pub fn effective_max_walk_depth() -> usize {
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let repo_root = crate::resolve_repo_root(&cwd);
+    effective_max_walk_depth_for_repo(&repo_root)
 }
 
 pub fn validate_path(
@@ -60,7 +65,13 @@ pub fn validate_path(
     raw_path: &str,
     access: PathAccess,
 ) -> Result<ValidatedPath, PathViolation> {
-    validate_path_with_max_depth(repo_root, cwd, raw_path, access, effective_max_walk_depth())
+    validate_path_with_max_depth(
+        repo_root,
+        cwd,
+        raw_path,
+        access,
+        effective_max_walk_depth_for_repo(repo_root),
+    )
 }
 
 pub fn validate_path_with_max_depth(
