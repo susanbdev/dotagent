@@ -126,19 +126,43 @@ done
 
 # 4. Install Gemini / Antigravity global constitution, hook wiring, & Swarm role subagents
 # Use `cp -f` so FUSE/virtiofs persistent ~/.gemini mounts that disallow chmod succeed cleanly.
+for gpath in "${HOME}/.gemini" "${HOME}/.gemini/agents" "${HOME}/.gemini/GEMINI.md" "${HOME}/.gemini/settings.json"; do
+    if [[ -L "${gpath}" ]]; then
+        echo "[activate-local] HARD DENY: refusing symlinked Gemini path '${gpath}'" >&2
+        exit 2
+    fi
+done
 mkdir -p "${HOME}/.gemini/agents"
-cp -f "${DOTAGENT_ROOT}/dist/gemini/GEMINI.md" "${HOME}/.gemini/GEMINI.md"
-cp -f "${DOTAGENT_ROOT}/dist/gemini/settings.json" "${HOME}/.gemini/settings.json"
 for af in research-airlock.md swarm-master.md swarm-investigator.md swarm-qa-engineer.md swarm-grunt.md swarm-adversarial-reviewer.md swarm-forensic-coroner.md; do
+    if [[ -L "${HOME}/.gemini/agents/${af}" ]]; then
+        echo "[activate-local] HARD DENY: refusing symlinked Gemini agent '${HOME}/.gemini/agents/${af}'" >&2
+        exit 2
+    fi
     cp -f "${DOTAGENT_ROOT}/dist/gemini/agents/${af}" "${HOME}/.gemini/agents/${af}"
 done
+cp -f "${DOTAGENT_ROOT}/dist/gemini/GEMINI.md" "${HOME}/.gemini/GEMINI.md"
+cp -f "${DOTAGENT_ROOT}/dist/gemini/settings.json" "${HOME}/.gemini/settings.json"
 
 # 5. Deploy root AGENTS.md + harness hooks + research-airlock & 6 Swarm role subagents across Claude, Cursor, and Codex
 #    Source repo keeps 0644 for git workflows; deployed runtime workspace gets VFS read-only 0444!
 deploy_harness_bundle() {
     local root="$1"
     local mode="$2"
-    mkdir -p "${root}/.claude/agents" "${root}/.cursor/agents" "${root}/.codex/agents"
+    local dirs=(
+        "${root}"
+        "${root}/.claude"
+        "${root}/.claude/agents"
+        "${root}/.cursor"
+        "${root}/.cursor/agents"
+        "${root}/.codex"
+        "${root}/.codex/agents"
+    )
+    for d in "${dirs[@]}"; do
+        if [[ -L "${d}" ]]; then
+            echo "[activate-local] HARD DENY: refusing symlinked harness directory '${d}'" >&2
+            exit 2
+        fi
+    done
     local agent_files=(
         "research-airlock.md"
         "swarm-master.md"
@@ -164,8 +188,16 @@ deploy_harness_bundle() {
         )
     done
     for t in "${targets[@]}"; do
+        if [[ -L "${t}" ]]; then
+            echo "[activate-local] HARD DENY: refusing symlinked harness target '${t}'" >&2
+            exit 2
+        fi
+    done
+    mkdir -p "${root}/.claude/agents" "${root}/.cursor/agents" "${root}/.codex/agents"
+    for t in "${targets[@]}"; do
         if [[ -e "${t}" ]]; then
             chmod u+w "${t}" 2>/dev/null || true
+            rm -f "${t}"
         fi
     done
     install -m "${mode}" "${DOTAGENT_ROOT}/dist/AGENTS.md" "${root}/AGENTS.md"

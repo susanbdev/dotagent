@@ -647,39 +647,65 @@ pub fn check_forbidden_zones_lexical(
                 is_poisoned_zone: true,
             });
         }
-        // Self-blindness: block reading or modifying agent-guard's own state ledger, turn_nonce, or audit.jsonl
+        // Self-blindness: block reading or modifying agent-guard's own state ledger, swarm vault, hmac.key, spools, or audit.jsonl
+        let next_seg = segments.get(idx + 1).copied().unwrap_or("");
         if seg_lower == ".agent-guard-state"
-            || (seg_lower == "state"
-                && segments
-                    .get(idx + 1)
-                    .is_some_and(|n| n.eq_ignore_ascii_case("agent-guard")))
+            || (seg_lower == "state" && next_seg.eq_ignore_ascii_case("agent-guard"))
+            || (seg_lower == "agent-guard"
+                && (next_seg.eq_ignore_ascii_case("swarm")
+                    || next_seg.eq_ignore_ascii_case("sessions")
+                    || next_seg.eq_ignore_ascii_case("vault")))
+            || (seg_lower == "swarm"
+                && (next_seg.eq_ignore_ascii_case("vault")
+                    || next_seg.eq_ignore_ascii_case("sessions")
+                    || next_seg.eq_ignore_ascii_case("spools")
+                    || next_seg.eq_ignore_ascii_case("ipc")
+                    || next_seg.eq_ignore_ascii_case("locks")))
+            || seg_lower == "hmac.key"
+            || seg_lower == "coord.sock"
+            || seg_lower.ends_with(".spool")
+            || seg_lower.ends_with(".spool.quarantine")
             || seg_lower == "audit.jsonl"
         {
             return Err(PathViolation {
                 code: "FORBIDDEN_GUARD_STATE_PATH",
                 detail: format!(
-                    "Access to agent-guard internal state/audit path '{display_raw}' is strictly forbidden (self-blindness enforcement)."
+                    "Access to agent-guard internal state/vault/audit path '{display_raw}' is strictly forbidden (self-blindness enforcement)."
                 ),
                 is_poisoned_zone: true,
             });
         }
     }
 
-    // Dynamic self-blindness on active `state_base_dir()` (including validated overrides)
+    // Dynamic self-blindness on active `state_base_dir()` AND any enclosing `agent-guard`/`swarm` parent root
     let active_state = crate::traversal_ledger::state_base_dir();
     if active_state.is_absolute() {
-        let state_slash = active_state.to_string_lossy().replace('\\', "/");
-        let state_lower = state_slash.trim_end_matches('/').to_ascii_lowercase();
-        if !state_lower.is_empty()
-            && (lower == state_lower || lower.starts_with(&format!("{state_lower}/")))
-        {
-            return Err(PathViolation {
-                code: "FORBIDDEN_GUARD_STATE_PATH",
-                detail: format!(
-                    "Access to active agent-guard state directory '{display_raw}' is strictly forbidden (self-blindness enforcement)."
-                ),
-                is_poisoned_zone: true,
-            });
+        let mut protected_roots = vec![active_state.clone()];
+        let mut anc = active_state.parent();
+        while let Some(p) = anc {
+            if let Some(name) = p.file_name().and_then(|s| s.to_str())
+                && (name.eq_ignore_ascii_case("agent-guard")
+                    || name.eq_ignore_ascii_case("swarm")
+                    || name.eq_ignore_ascii_case(".agent-guard-state"))
+            {
+                protected_roots.push(p.to_path_buf());
+            }
+            anc = p.parent();
+        }
+        for root_dir in protected_roots {
+            let state_slash = root_dir.to_string_lossy().replace('\\', "/");
+            let state_lower = state_slash.trim_end_matches('/').to_ascii_lowercase();
+            if !state_lower.is_empty()
+                && (lower == state_lower || lower.starts_with(&format!("{state_lower}/")))
+            {
+                return Err(PathViolation {
+                    code: "FORBIDDEN_GUARD_STATE_PATH",
+                    detail: format!(
+                        "Access to active agent-guard state directory '{display_raw}' is strictly forbidden (self-blindness enforcement)."
+                    ),
+                    is_poisoned_zone: true,
+                });
+            }
         }
     }
 
@@ -1025,14 +1051,20 @@ fn check_lockfile_or_bundle(repo_rel: &str) -> Result<(), PathViolation> {
     let file_name = lower.rsplit('/').next().unwrap_or(&lower);
     if matches!(
         file_name,
-        "package-lock.json"
+        "cargo.lock"
+            | "package-lock.json"
             | "pnpm-lock.yaml"
             | "yarn.lock"
             | "bun.lockb"
             | "composer.lock"
             | "gemfile.lock"
             | "poetry.lock"
-    ) || file_name.ends_with(".min.js")
+            | "uv.lock"
+            | "pipfile.lock"
+            | "flake.lock"
+            | "go.sum"
+    ) || (file_name != "plan.lock.json" && file_name.ends_with(".lock.json"))
+        || file_name.ends_with(".min.js")
         || file_name.ends_with(".min.css")
         || file_name.ends_with(".js.map")
         || file_name.ends_with(".css.map")

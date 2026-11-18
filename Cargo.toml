@@ -3,6 +3,7 @@ resolver = "3"
 members = [
     "crates/agent-guard",
     "crates/dotagent-compiler",
+    "crates/dotagent-harness",
     "crates/swarm-tools",
 ]
 

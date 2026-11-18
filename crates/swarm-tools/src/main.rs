@@ -11,8 +11,10 @@ use std::process::{Command, ExitCode};
 
 use agent_guard::Decision;
 use agent_guard::breadcrumbs::{
-    append_breadcrumb_for_path, flush_records_idempotent, recover_spool_frames, sha256_digest,
-    spool_file_path, trail_path_for_rel_path, verify_breadcrumbs_file, verify_event_mac_for_repo,
+    ExclusiveFileLockGuard, append_breadcrumb_for_path, compute_arbitrary_hmac_hex,
+    flush_records_idempotent, load_or_init_vault_hmac_key, recover_spool_frames, sha256_digest,
+    spool_file_path, swarm_state_dir, trail_path_for_rel_path, verify_arbitrary_hmac_hex,
+    verify_breadcrumbs_file, verify_event_mac_for_repo,
 };
 use agent_guard::cmd_policy::evaluate_shell_command;
 use agent_guard::json::JsonValue;
@@ -35,8 +37,8 @@ use agent_guard::swarm_contracts::{
     hex_decode_32,
 };
 use agent_guard::work_ledger::{
-    classify_session_smells, load_work_ledger_entries, record_test_checkpoint,
-    submit_work_ledger_entry,
+    classify_session_smells, compute_scoped_tree_oid, load_work_ledger_entries,
+    record_test_checkpoint, submit_work_ledger_entry,
 };
 
 fn main() -> ExitCode {
@@ -132,28 +134,51 @@ fn enforce_ambient_role_namespace(
     let open_sessions = load_open_session_capabilities(repo_root)?;
 
     if expected_role == SwarmRole::Master {
+        if std::env::var("AGENT_GUARD_WORKER_LOCK").as_deref() == Ok("1") {
+            return Err(
+                "ROLE_CAPABILITY_MISMATCH: locked worker test subprocess cannot invoke 'swarm-tool master'"
+                    .to_string(),
+            );
+        }
         let master_flag_cap = flag_val(sub_args, "--master-session")
             .map(|sid| load_capability_for_role(repo_root, &sid, SwarmRole::Master, "master"))
             .transpose()?;
-        let has_master_auth = explicit_env_role == Some(SwarmRole::Master)
-            || env_cap.is_some()
-            || master_flag_cap.is_some();
+        let has_signed_master_cap = env_cap.is_some() || master_flag_cap.is_some();
 
-        // Block cross-namespace escalation whenever ANY non-Master worker session is open unless
-        // caller holds explicit supervisor credentials (`AGENT_GUARD_ROLE=master` or Master capability).
-        if let Some(worker_cap) = open_sessions.iter().find(|c| c.role != SwarmRole::Master)
-            && !has_master_auth
-        {
-            return Err(format!(
-                "ROLE_CAPABILITY_MISMATCH: active '{}' session '{}' is open; cannot invoke 'swarm-tool master' before session closes",
-                worker_cap.role.as_str_id(),
-                worker_cap.session_id
-            ));
-        }
-
-        if !has_master_auth {
+        if !has_signed_master_cap {
+            if std::env::var("AGENT_GUARD_IN_SANDBOX").as_deref() == Ok("1") {
+                return Err(
+                    "ROLE_CAPABILITY_MISMATCH: sandboxed subprocess cannot authenticate to 'swarm-tool master' via bare AGENT_GUARD_ROLE=master; present a signed Master capability"
+                        .to_string(),
+                );
+            }
+            if list_session_capabilities(repo_root)?
+                .iter()
+                .any(|c| c.role == SwarmRole::Master)
+            {
+                return Err(
+                    "ROLE_CAPABILITY_MISMATCH: a signed Master capability is active; 'swarm-tool master' requires --master-session or AGENT_GUARD_SESSION_ID"
+                        .to_string(),
+                );
+            }
+            if explicit_env_role == Some(SwarmRole::Master) {
+                // Verify direct host vault possession so a Landlocked/Seatbelted worker that stripped
+                // `AGENT_GUARD_IN_SANDBOX` via `env -u` still fails closed (`EACCES` on `vault/hmac.key`).
+                let _ = load_or_init_vault_hmac_key(repo_root).map_err(|_| {
+                    "ROLE_CAPABILITY_MISMATCH: sandboxed process lacks vault authority and cannot invoke 'swarm-tool master' without a signed Master capability"
+                        .to_string()
+                })?;
+                return Ok(());
+            }
+            if let Some(worker_cap) = open_sessions.iter().find(|c| c.role != SwarmRole::Master) {
+                return Err(format!(
+                    "ROLE_CAPABILITY_MISMATCH: active '{}' session '{}' is open; cannot invoke 'swarm-tool master' before session closes",
+                    worker_cap.role.as_str_id(),
+                    worker_cap.session_id
+                ));
+            }
             return Err(
-                "MISSING_SWARM_CAPABILITY: invoking 'swarm-tool master' requires AGENT_GUARD_ROLE=master or a minted Master session capability"
+                "MISSING_SWARM_CAPABILITY: invoking 'swarm-tool master' requires host vault authority or a minted Master session capability"
                     .to_string(),
             );
         }
@@ -691,27 +716,102 @@ fn run_qa(repo_root: &Path, cwd: &Path, args: &[String]) -> Result<(), String> {
     }
 }
 
-fn validate_grunt_test_runner_command(cmd_tokens: &[String]) -> Result<(), String> {
+fn validate_grunt_test_runner_command(
+    cmd_tokens: &[String],
+    assigned_tests: &[String],
+) -> Result<(), String> {
     let Some(first) = cmd_tokens.first() else {
         return Err("missing test command after `--`".to_string());
     };
-    let base = first.rsplit('/').next().unwrap_or(first.as_str());
+    if first.contains('/') || first.contains('\\') {
+        return Err(format!(
+            "INVALID_TEST_RUNNER_COMMAND: path-qualified binary '{}' is forbidden in `checkpoint-green`; invoke bare canonical test runner (`cargo`, `pytest`, `python3`, `npm`, `go`)",
+            first
+        ));
+    }
+    let base = first.as_str();
     let rest = &cmd_tokens[1..];
 
+    for tok in rest {
+        let lower = tok.to_ascii_lowercase();
+        if matches!(
+            lower.as_str(),
+            "--no-run"
+                | "--collect-only"
+                | "--co"
+                | "--setup-only"
+                | "--list"
+                | "--version"
+                | "-v"
+                | "--help"
+                | "-h"
+                | "--fixtures"
+        ) && !(tok == "-v"
+            && matches!(
+                base,
+                "pytest" | "py.test" | "python" | "python3" | "uv" | "go"
+            ))
+        {
+            return Err(format!(
+                "INVALID_TEST_RUNNER_COMMAND: non-executing flag '{tok}' is forbidden in `checkpoint-green`"
+            ));
+        }
+        if tok == "-V" || lower.starts_with("--no-run=") {
+            return Err(format!(
+                "INVALID_TEST_RUNNER_COMMAND: non-executing flag '{tok}' is forbidden in `checkpoint-green`"
+            ));
+        }
+    }
+
+    let mut narrowed_filters: Vec<String> = Vec::new();
     let is_valid_runner = match base {
         "cargo" => {
             let mut idx = 0usize;
             while idx < rest.len() && rest[idx].starts_with('+') {
                 idx += 1;
             }
-            rest.get(idx)
-                .is_some_and(|sub| matches!(sub.as_str(), "test" | "nextest"))
+            match rest.get(idx).map(String::as_str) {
+                Some("test") => {
+                    collect_cargo_test_filters(&rest[idx + 1..], &mut narrowed_filters);
+                    true
+                }
+                Some("nextest") if rest.get(idx + 1).map(String::as_str) == Some("run") => {
+                    collect_cargo_test_filters(&rest[idx + 2..], &mut narrowed_filters);
+                    true
+                }
+                _ => false,
+            }
         }
-        "pytest" | "py.test" | "ctest" => true,
+        "pytest" | "py.test" => {
+            collect_pytest_filters(rest, &mut narrowed_filters);
+            true
+        }
+        "ctest" => true,
         "python" | "python3" => {
-            rest.len() >= 2 && rest[0] == "-m" && matches!(rest[1].as_str(), "pytest" | "unittest")
+            if rest.len() >= 2 && rest[0] == "-m" {
+                match rest[1].as_str() {
+                    "pytest" => {
+                        collect_pytest_filters(&rest[2..], &mut narrowed_filters);
+                        true
+                    }
+                    "unittest" => {
+                        collect_unittest_filters(&rest[2..], &mut narrowed_filters);
+                        true
+                    }
+                    _ => false,
+                }
+            } else {
+                false
+            }
         }
-        "uv" => rest.len() >= 2 && rest[0] == "run" && rest[1] == "pytest",
+        "uv" => {
+            if rest.len() >= 2 && rest[0] == "run" && rest[1] == "pytest" {
+                collect_pytest_filters(&rest[2..], &mut narrowed_filters);
+                true
+            } else {
+                false
+            }
+        }
         "npm" | "pnpm" | "yarn" | "bun" => match rest.first().map(String::as_str) {
             Some("test" | "vitest" | "jest") => true,
             Some("run") => rest
@@ -729,7 +829,159 @@ fn validate_grunt_test_runner_command(cmd_tokens: &[String]) -> Result<(), Strin
             cmd_tokens.join(" ")
         ));
     }
+
+    if !narrowed_filters.is_empty() && !assigned_tests.is_empty() {
+        for assigned in assigned_tests {
+            let norm_assigned = normalize_test_identifier(assigned);
+            if norm_assigned.is_empty() {
+                continue;
+            }
+            let covered = narrowed_filters.iter().any(|flt| {
+                let norm_flt = normalize_test_identifier(flt);
+                norm_flt == norm_assigned || norm_flt.contains(&norm_assigned)
+            });
+            if !covered {
+                return Err(format!(
+                    "ASSIGNED_TESTS_OMITTED: narrowed test command `{}` omits required assigned test '{}' (run the full suite or include all `assigned_tests`)",
+                    cmd_tokens.join(" "),
+                    assigned
+                ));
+            }
+        }
+    }
     Ok(())
+}
+
+fn normalize_test_identifier(raw: &str) -> String {
+    let trimmed = raw.trim().trim_start_matches("./").trim_end_matches('/');
+    let no_prefix = trimmed.strip_prefix("tests/").unwrap_or(trimmed);
+    for ext in [".rs", ".py", ".ts", ".tsx", ".js", ".go"] {
+        if let Some(stem) = no_prefix.strip_suffix(ext) {
+            return stem.to_string();
+        }
+    }
+    no_prefix.to_string()
+}
+
+fn collect_cargo_test_filters(args: &[String], out: &mut Vec<String>) {
+    let mut i = 0usize;
+    let mut after_sep = false;
+    while i < args.len() {
+        let tok = args[i].as_str();
+        if !after_sep && tok == "--" {
+            after_sep = true;
+            i += 1;
+            continue;
+        }
+        if !after_sep {
+            if tok == "--test" {
+                if let Some(val) = args.get(i + 1) {
+                    out.push(val.clone());
+                }
+                i += 2;
+                continue;
+            }
+            if matches!(
+                tok,
+                "-p" | "--package"
+                    | "--bin"
+                    | "--example"
+                    | "--bench"
+                    | "--features"
+                    | "--manifest-path"
+                    | "--target"
+                    | "--target-dir"
+                    | "--profile"
+                    | "-j"
+                    | "--jobs"
+            ) {
+                i += 2;
+                continue;
+            }
+        } else if matches!(tok, "--skip" | "--test-threads") {
+            if tok == "--skip" {
+                out.push("__HAS_SKIP_FILTER__".to_string());
+            }
+            i += 2;
+            continue;
+        }
+        if tok.starts_with('-') {
+            i += 1;
+            continue;
+        }
+        out.push(tok.to_string());
+        i += 1;
+    }
+}
+
+fn collect_pytest_filters(args: &[String], out: &mut Vec<String>) {
+    let mut i = 0usize;
+    while i < args.len() {
+        let tok = args[i].as_str();
+        if tok == "-k" || tok == "-m" {
+            if let Some(val) = args.get(i + 1) {
+                out.push(val.clone());
+            }
+            i += 2;
+            continue;
+        }
+        if matches!(
+            tok,
+            "-c" | "-o" | "--rootdir" | "--confcutdir" | "--maxfail"
+        ) {
+            i += 2;
+            continue;
+        }
+        if tok.starts_with('-') {
+            i += 1;
+            continue;
+        }
+        let trimmed = tok.trim_end_matches('/');
+        if !matches!(trimmed, "." | "tests") {
+            out.push(tok.to_string());
+        }
+        i += 1;
+    }
+}
+
+fn collect_unittest_filters(args: &[String], out: &mut Vec<String>) {
+    let is_discover = args.first().map(String::as_str) == Some("discover");
+    let mut i = if is_discover { 1usize } else { 0usize };
+    while i < args.len() {
+        let tok = args[i].as_str();
+        if tok == "-k" {
+            if let Some(val) = args.get(i + 1) {
+                out.push(val.clone());
+            }
+            i += 2;
+            continue;
+        }
+        if matches!(
+            tok,
+            "-s" | "--start-directory" | "-t" | "--top-level-directory"
+        ) {
+            i += 2;
+            continue;
+        }
+        if tok == "-p" || tok == "--pattern" {
+            if let Some(pat) = args.get(i + 1)
+                && pat != "test*.py"
+                && pat != "test_*.py"
+            {
+                out.push(pat.clone());
+            }
+            i += 2;
+            continue;
+        }
+        if tok.starts_with('-') {
+            i += 1;
+            continue;
+        }
+        if !is_discover {
+            out.push(tok.to_string());
+        }
+        i += 1;
+    }
 }
 
 fn format_role_denial(dec: Decision) -> String {
@@ -833,7 +1085,7 @@ fn run_grunt(repo_root: &Path, cwd: &Path, args: &[String]) -> Result<(), String
                 .position(|a| a == "--")
                 .ok_or_else(|| "usage: swarm-tool grunt checkpoint-green --session <sid> -- <test_cmd...>".to_string())?;
             let cmd_tokens = &args[sep_idx + 1..];
-            validate_grunt_test_runner_command(cmd_tokens)?;
+            validate_grunt_test_runner_command(cmd_tokens, &cap.assigned_tests)?;
             let joined_cmd = cmd_tokens.join(" ");
             let plan = evaluate_shell_command(&joined_cmd, repo_root, cwd, false)
                 .map_err(|cv| format!("{}: {}", cv.code, cv.detail))?;
@@ -859,6 +1111,7 @@ fn run_grunt(repo_root: &Path, cwd: &Path, args: &[String]) -> Result<(), String
                     .env_remove("AGENT_GUARD_ROLE")
                     .env_remove("AGENT_GUARD_SESSION_ID")
                     .env_remove("AGENT_GUARD_COORDINATOR_SOCK")
+                    .env("AGENT_GUARD_WORKER_LOCK", "1")
                     .env("PYTHONDONTWRITEBYTECODE", "1");
                 c.status()
                     .map_err(|e| format!("failed spawning sandboxed test command '{}': {e}", cmd_tokens[0]))?
@@ -869,6 +1122,7 @@ fn run_grunt(repo_root: &Path, cwd: &Path, args: &[String]) -> Result<(), String
                     .env_remove("AGENT_GUARD_ROLE")
                     .env_remove("AGENT_GUARD_SESSION_ID")
                     .env_remove("AGENT_GUARD_COORDINATOR_SOCK")
+                    .env("AGENT_GUARD_WORKER_LOCK", "1")
                     .env("PYTHONDONTWRITEBYTECODE", "1")
                     .status()
                     .map_err(|e| format!("failed spawning test command '{}': {e}", cmd_tokens[0]))?
@@ -927,8 +1181,216 @@ fn run_grunt(repo_root: &Path, cwd: &Path, args: &[String]) -> Result<(), String
     }
 }
 
+const REVIEW_STATE_HMAC_DOMAIN: &[u8] = b"DOTAGENT_SWARM_V2_REVIEW_STATE_V1";
+
+fn encode_review_state_mac_payload(
+    plan_sha256: &str,
+    task_id: &str,
+    last_round: u8,
+    min_next_attempt: u32,
+    finalized: bool,
+) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(128);
+    let push_str = |out: &mut Vec<u8>, s: &str| {
+        out.extend_from_slice(&(s.len() as u32).to_be_bytes());
+        out.extend_from_slice(s.as_bytes());
+    };
+    push_str(&mut buf, plan_sha256);
+    push_str(&mut buf, task_id);
+    buf.push(last_round);
+    buf.extend_from_slice(&min_next_attempt.to_be_bytes());
+    buf.push(u8::from(finalized));
+    buf
+}
+
+fn review_state_file_path(repo_root: &Path, task_id: &str) -> Result<PathBuf, String> {
+    let dir = swarm_state_dir(repo_root)?.join("ledger");
+    fs::create_dir_all(&dir)
+        .map_err(|e| format!("failed creating review ledger dir '{}': {e}", dir.display()))?;
+    let safe_task: String = task_id
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    Ok(dir.join(format!("review_{safe_task}.json")))
+}
+
+fn record_and_evaluate_reviewer_verdict(
+    repo_root: &Path,
+    cap: &SessionCapability,
+    task_id: &str,
+    round: u8,
+    approved: bool,
+    attempt: u32,
+) -> Result<ReviewVerdictOutcome, String> {
+    if cap.task_id != task_id {
+        return Err(format!(
+            "ROLE_CAPABILITY_MISMATCH: reviewer session '{}' is scoped to task '{}', cannot issue verdict for task '{task_id}'",
+            cap.session_id, cap.task_id
+        ));
+    }
+    let plan = load_locked_plan(repo_root)?;
+    let task_spec = plan
+        .tasks
+        .iter()
+        .find(|t| t.task_id == task_id)
+        .ok_or_else(|| {
+            format!("UNKNOWN_TASK_ID: task '{task_id}' does not exist in locked PLAN.lock.json")
+        })?;
+    let plan_sha_hex = plan.plan_sha256.clone();
+
+    if approved {
+        let entries = load_work_ledger_entries(repo_root)?;
+        let matching_entry = entries
+            .iter()
+            .rev()
+            .find(|e| e.task_id == task_id && e.attempt == attempt)
+            .ok_or_else(|| {
+                format!(
+                    "MISSING_VERIFIED_WORK_LEDGER: cannot approve task '{task_id}' attempt {attempt} without an HMAC-verified green WORK_LEDGER.jsonl receipt"
+                )
+            })?;
+        let current_oid = compute_scoped_tree_oid(repo_root, &task_spec.allowed_write_paths)?;
+        if current_oid != matching_entry.git_tree_oid {
+            return Err(format!(
+                "STALE_WORK_LEDGER_TREE_OID: workspace tree '{current_oid}' drifted from green WORK_LEDGER.jsonl tree '{}' for task '{task_id}'",
+                matching_entry.git_tree_oid
+            ));
+        }
+    }
+
+    let state_path = review_state_file_path(repo_root, task_id)?;
+    let _lock = ExclusiveFileLockGuard::acquire(&state_path)?;
+    if let Ok(meta) = fs::symlink_metadata(&state_path)
+        && meta.file_type().is_symlink()
+    {
+        return Err(format!(
+            "SYMLINK_STATE_FORBIDDEN: review state '{}' cannot be a symlink",
+            state_path.display()
+        ));
+    }
+
+    let (mut last_round, mut min_next_attempt, mut finalized) = (0u8, 1u32, false);
+    if state_path.exists() {
+        let raw = fs::read_to_string(&state_path).map_err(|e| {
+            format!(
+                "failed reading review state '{}': {e}",
+                state_path.display()
+            )
+        })?;
+        let val = JsonValue::parse(&raw)
+            .map_err(|e| format!("CORRUPT_REVIEW_STATE: invalid JSON: {e}"))?;
+        let stored_plan = val
+            .get("plan_sha256")
+            .and_then(JsonValue::as_str)
+            .ok_or_else(|| "CORRUPT_REVIEW_STATE: missing plan_sha256".to_string())?;
+        let stored_task = val
+            .get("task_id")
+            .and_then(JsonValue::as_str)
+            .ok_or_else(|| "CORRUPT_REVIEW_STATE: missing task_id".to_string())?;
+        let stored_round = val
+            .get("last_round")
+            .and_then(JsonValue::as_u64)
+            .ok_or_else(|| "CORRUPT_REVIEW_STATE: missing last_round".to_string())?
+            as u8;
+        let stored_min_attempt = val
+            .get("min_next_attempt")
+            .and_then(JsonValue::as_u64)
+            .ok_or_else(|| "CORRUPT_REVIEW_STATE: missing min_next_attempt".to_string())?
+            as u32;
+        let stored_final = val
+            .get("finalized")
+            .and_then(JsonValue::as_bool)
+            .ok_or_else(|| "CORRUPT_REVIEW_STATE: missing finalized".to_string())?;
+        let stored_mac = val
+            .get("state_mac")
+            .and_then(JsonValue::as_str)
+            .ok_or_else(|| "CORRUPT_REVIEW_STATE: missing state_mac".to_string())?;
+        let expected_payload = encode_review_state_mac_payload(
+            stored_plan,
+            stored_task,
+            stored_round,
+            stored_min_attempt,
+            stored_final,
+        );
+        verify_arbitrary_hmac_hex(
+            repo_root,
+            REVIEW_STATE_HMAC_DOMAIN,
+            &expected_payload,
+            stored_mac,
+        )?;
+        if stored_task != task_id {
+            return Err("CORRUPT_REVIEW_STATE: task_id mismatch in review state".to_string());
+        }
+        if stored_plan == plan_sha_hex {
+            last_round = stored_round;
+            min_next_attempt = stored_min_attempt;
+            finalized = stored_final;
+        }
+    }
+
+    if finalized {
+        return Err(format!(
+            "REVIEW_VERDICT_FINALIZED: review for task '{task_id}' is already finalized at round {last_round}"
+        ));
+    }
+    let expected_round = last_round.saturating_add(1);
+    if round != expected_round {
+        return Err(format!(
+            "REVIEW_ROUND_REPLAY_OR_SKIP: task '{task_id}' is at review round {last_round}; expected --round {expected_round}, got --round {round}"
+        ));
+    }
+    if attempt < min_next_attempt {
+        return Err(format!(
+            "REVIEW_STALE_ATTEMPT: task '{task_id}' round {round} requires attempt >= {min_next_attempt}, got attempt {attempt}"
+        ));
+    }
+
+    let outcome = evaluate_reviewer_verdict(task_id, round, approved, attempt)?;
+    let (new_min_attempt, new_finalized) = match &outcome {
+        ReviewVerdictOutcome::Approved { .. } => (attempt, true),
+        ReviewVerdictOutcome::RetryCleanSlate { next_attempt, .. } => (*next_attempt, false),
+        ReviewVerdictOutcome::EscalateToMaster { .. } => (attempt, true),
+    };
+    let mac_payload = encode_review_state_mac_payload(
+        &plan_sha_hex,
+        task_id,
+        round,
+        new_min_attempt,
+        new_finalized,
+    );
+    let mac_hex = compute_arbitrary_hmac_hex(repo_root, REVIEW_STATE_HMAC_DOMAIN, &mac_payload)?;
+    let state_json = JsonValue::Object(vec![
+        ("plan_sha256".to_string(), JsonValue::Str(plan_sha_hex)),
+        ("task_id".to_string(), JsonValue::Str(task_id.to_string())),
+        (
+            "last_round".to_string(),
+            JsonValue::Number(f64::from(round)),
+        ),
+        (
+            "min_next_attempt".to_string(),
+            JsonValue::Number(f64::from(new_min_attempt)),
+        ),
+        ("finalized".to_string(), JsonValue::Bool(new_finalized)),
+        ("state_mac".to_string(), JsonValue::Str(mac_hex)),
+    ])
+    .to_json_string();
+    fs::write(&state_path, format!("{state_json}\n")).map_err(|e| {
+        format!(
+            "failed persisting review state '{}': {e}",
+            state_path.display()
+        )
+    })?;
+    Ok(outcome)
+}
+
 fn run_reviewer(repo_root: &Path, args: &[String]) -> Result<(), String> {
-    let _cap =
+    let cap =
         resolve_worker_capability(repo_root, args, SwarmRole::AdversarialReviewer, "reviewer")?;
     let sub = args.first().map(String::as_str).unwrap_or("--help");
     match sub {
@@ -988,9 +1450,11 @@ fn run_reviewer(repo_root: &Path, args: &[String]) -> Result<(), String> {
             };
             let attempt = flag_val(args, "--attempt")
                 .and_then(|s| s.parse::<u32>().ok())
-                .unwrap_or(1);
+                .unwrap_or(cap.attempt);
             let notes = flag_val(args, "--notes").unwrap_or_default();
-            let outcome = evaluate_reviewer_verdict(&task_id, round, approved, attempt)?;
+            let outcome = record_and_evaluate_reviewer_verdict(
+                repo_root, &cap, &task_id, round, approved, attempt,
+            )?;
             let out = match outcome {
                 ReviewVerdictOutcome::Approved { task_id, round } => JsonValue::Object(vec![
                     (

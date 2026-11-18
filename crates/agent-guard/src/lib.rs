@@ -830,7 +830,11 @@ fn evaluate_tool_invocation(
             cwd.join(raw_path)
         };
 
-        let role_max_depth = role_sandbox::max_walk_depth_for_role(role);
+        let role_max_depth = if cap.is_some() {
+            role_sandbox::max_walk_depth_for_role(role)
+        } else {
+            crate::path_policy::MAX_DIRECTORY_WALK_DEPTH
+        };
         if candidate.is_file() {
             let valid = match validate_path_with_max_depth(
                 repo_root,

@@ -21,8 +21,8 @@ use std::path::{Path, PathBuf};
 
 use crate::Decision;
 use crate::breadcrumbs::{
-    ExclusiveFileLockGuard, append_breadcrumb_for_path, compute_arbitrary_hmac_hex, sha256_digest,
-    swarm_state_dir, verify_arbitrary_hmac_hex,
+    ExclusiveFileLockGuard, append_breadcrumb_for_path, compute_arbitrary_hmac_hex,
+    constant_time_eq_bytes, sha256_digest, swarm_state_dir, verify_arbitrary_hmac_hex,
 };
 use crate::budget_guard::estimate_bpe_tokens;
 use crate::json::JsonValue;
@@ -577,7 +577,7 @@ pub fn load_session_capability(
             format!("FORGED_SESSION_CAPABILITY: missing record_mac on session '{session_id}'")
         })?;
     let expected_mac = compute_capability_mac_hex(repo_root, &cap)?;
-    if recorded_mac != expected_mac {
+    if !constant_time_eq_bytes(recorded_mac.as_bytes(), expected_mac.as_bytes()) {
         return Err(format!(
             "FORGED_SESSION_CAPABILITY: HMAC verification failed for session '{session_id}'"
         ));
@@ -606,12 +606,14 @@ pub fn list_session_capabilities(repo_root: &Path) -> Result<Vec<SessionCapabili
 /// Resolves active `SwarmRole` and optional minted `SessionCapability` for a hook turn:
 /// 1. Explicit Swarm `session_id` (`AGENT_GUARD_SESSION_ID` or `"swm_*"` hook ID) -> fail-closed HMAC check
 ///    (and binds non-default hook UUID `session_id` to that Swarm session).
-/// 2. Explicit hook-UUID binding in `active_sessions.json` (`lookup_bound_hook_capability`).
+/// 2. Explicit hook-UUID binding in `active_sessions.json` (`lookup_bound_hook_capability`) -- cannot be
+///    overridden by `AGENT_GUARD_ROLE=master`.
 /// 3. Active repo-scoped capability registry (`active_sessions.json`):
-///    - Supervising `AGENT_GUARD_ROLE=master` remains operational even when `>= 2` parallel-wave workers are open.
+///    - Unauthenticated `AGENT_GUARD_ROLE=master` is denied inside worker sandboxes or whenever any minted
+///      session capability is open; concurrent supervision requires presenting a signed `Master` capability.
 ///    - Exactly `1` open worker session -> enforces worker jail automatically with zero env friction.
 ///    - `>= 2` open worker sessions without explicit `session_id` -> fails closed (`AMBIGUOUS_CONCURRENT_SWARM_SESSIONS`).
-/// 4. Ambient `AGENT_GUARD_ROLE`, defaulting to `StandardCoding` when no Swarm session is active.
+/// 4. Ambient `AGENT_GUARD_ROLE` (only when zero conflicting capabilities are open), defaulting to `StandardCoding`.
 pub fn resolve_active_role(
     repo_root: &Path,
     session_id: &str,
@@ -626,6 +628,16 @@ pub fn resolve_active_role(
         }
         _ => None,
     };
+
+    if env_role == Some(SwarmRole::Master)
+        && (std::env::var("AGENT_GUARD_IN_SANDBOX").as_deref() == Ok("1")
+            || std::env::var("AGENT_GUARD_WORKER_LOCK").as_deref() == Ok("1"))
+    {
+        return Err(
+            "ROLE_CAPABILITY_MISMATCH: sandboxed worker subprocess cannot claim AGENT_GUARD_ROLE=master"
+                .to_string(),
+        );
+    }
 
     let explicit_sid = std::env::var("AGENT_GUARD_SESSION_ID")
         .ok()
@@ -660,7 +672,6 @@ pub fn resolve_active_role(
         match env_role {
             None => return Ok((bound_cap.role, Some(bound_cap))),
             Some(er) if er == bound_cap.role => return Ok((bound_cap.role, Some(bound_cap))),
-            Some(SwarmRole::Master) => return Ok((SwarmRole::Master, None)),
             Some(er) => {
                 return Err(format!(
                     "ROLE_CAPABILITY_MISMATCH: AGENT_GUARD_ROLE '{}' conflicts with bound session '{}' capability role '{}'",
@@ -672,8 +683,17 @@ pub fn resolve_active_role(
         }
     }
 
+    let open_caps = load_open_session_capabilities(repo_root)?;
     if env_role == Some(SwarmRole::Master) {
-        let _ = load_open_session_capabilities(repo_root)?;
+        let has_minted_master = list_session_capabilities(repo_root)
+            .map(|caps| caps.iter().any(|c| c.role == SwarmRole::Master))
+            .unwrap_or(false);
+        if !open_caps.is_empty() || has_minted_master {
+            return Err(
+                "ROLE_CAPABILITY_MISMATCH: unauthenticated AGENT_GUARD_ROLE=master is denied while minted session capabilities are active; present a signed Master capability via AGENT_GUARD_SESSION_ID"
+                    .to_string(),
+            );
+        }
         return Ok((SwarmRole::Master, None));
     }
 
@@ -681,7 +701,6 @@ pub fn resolve_active_role(
         match env_role {
             None => return Ok((slot_cap.role, Some(slot_cap))),
             Some(er) if er == slot_cap.role => return Ok((slot_cap.role, Some(slot_cap))),
-            Some(SwarmRole::Master) => return Ok((SwarmRole::Master, None)),
             Some(er) => {
                 return Err(format!(
                     "ROLE_CAPABILITY_MISMATCH: AGENT_GUARD_ROLE '{}' conflicts with active repo capability slot '{}' (role '{}')",
@@ -763,10 +782,42 @@ pub fn enforce_role_pre_tool(
     ) || (norm.is_empty()
         && (input.get("command").is_some() || input.get("CommandLine").is_some()));
 
+    if is_web_tool {
+        return Some(match role {
+            SwarmRole::AdversarialReviewer => Decision::deny(
+                "REVIEWER_EXFILTRATION_URL_BLOCKED",
+                "Adversarial Reviewer cannot fetch arbitrary URLs (`F08` exfiltration guard); use `swarm-tool reviewer lookup-doc`.",
+                true,
+            ),
+            SwarmRole::Investigator => Decision::deny(
+                "INVESTIGATOR_WEB_FORBIDDEN",
+                "Swarm Investigator operates strictly inside the local repository airlock.",
+                false,
+            ),
+            SwarmRole::ForensicCoroner => Decision::deny(
+                "CORONER_WEB_FORBIDDEN",
+                "Forensic Coroner operates strictly offline on local spools and breadcrumbs.",
+                false,
+            ),
+            SwarmRole::Master | SwarmRole::QaEngineer | SwarmRole::Grunt => Decision::deny(
+                "ROLE_NETWORK_EXFIL_BLOCKED",
+                format!(
+                    "Swarm role '{}' operates strictly offline; web/network fetch tools are forbidden.",
+                    role.as_str_id()
+                ),
+                true,
+            ),
+            SwarmRole::StandardCoding => unreachable!(),
+        });
+    }
+
     if is_shell_tool {
         if let Some(cmd) = extract_cmd_arg(input) {
             if let Some(ns_denial) = check_role_swarm_tool_namespace(role, cmd) {
                 return Some(ns_denial);
+            }
+            if let Some(net_denial) = check_role_shell_network_exfil(role, cmd) {
+                return Some(net_denial);
             }
         }
     }
@@ -827,12 +878,12 @@ pub fn enforce_role_pre_tool(
                     false,
                 ));
             }
-            if is_web_tool {
-                return Some(Decision::deny(
-                    "INVESTIGATOR_WEB_FORBIDDEN",
-                    "Swarm Investigator operates strictly inside the local repository airlock.",
-                    false,
-                ));
+            if is_shell_tool {
+                if let Some(cmd) = extract_cmd_arg(input) {
+                    if let Some(write_denial) = check_zero_write_role_shell(role, cmd) {
+                        return Some(write_denial);
+                    }
+                }
             }
             None
         }
@@ -861,6 +912,15 @@ pub fn enforce_role_pre_tool(
                                 false,
                             ));
                         }
+                    }
+                }
+            }
+            if is_shell_tool {
+                if let Some(cmd) = extract_cmd_arg(input) {
+                    if let Some(shell_denial) =
+                        check_scoped_worker_shell_mutation(role, cap, cmd, repo_root, cwd)
+                    {
+                        return Some(shell_denial);
                     }
                 }
             }
@@ -893,6 +953,15 @@ pub fn enforce_role_pre_tool(
                     true,
                 ));
             };
+            if is_shell_tool {
+                if let Some(cmd) = extract_cmd_arg(input) {
+                    if let Some(shell_denial) =
+                        check_scoped_worker_shell_mutation(role, Some(c), cmd, repo_root, cwd)
+                    {
+                        return Some(shell_denial);
+                    }
+                }
+            }
             if is_read_tool {
                 if let Some(raw_p) = extract_path_arg(input) {
                     if let Ok(valid) =
@@ -950,22 +1019,10 @@ pub fn enforce_role_pre_tool(
                     false,
                 ));
             }
-            if is_web_tool {
-                return Some(Decision::deny(
-                    "REVIEWER_EXFILTRATION_URL_BLOCKED",
-                    "Adversarial Reviewer cannot fetch arbitrary URLs (`F08` exfiltration guard); use `swarm-tool reviewer lookup-doc`.",
-                    true,
-                ));
-            }
             if is_shell_tool {
                 if let Some(cmd) = extract_cmd_arg(input) {
-                    let lower = cmd.to_ascii_lowercase();
-                    if lower.contains("http://") || lower.contains("https://") {
-                        return Some(Decision::deny(
-                            "REVIEWER_EXFILTRATION_URL_BLOCKED",
-                            "Adversarial Reviewer shell commands cannot contain raw URLs (`F08` exfiltration guard); use `swarm-tool reviewer lookup-doc`.",
-                            true,
-                        ));
+                    if let Some(write_denial) = check_zero_write_role_shell(role, cmd) {
+                        return Some(write_denial);
                     }
                 }
             }
@@ -980,12 +1037,12 @@ pub fn enforce_role_pre_tool(
                     false,
                 ));
             }
-            if is_web_tool {
-                return Some(Decision::deny(
-                    "CORONER_WEB_FORBIDDEN",
-                    "Forensic Coroner operates strictly offline on local spools and breadcrumbs.",
-                    false,
-                ));
+            if is_shell_tool {
+                if let Some(cmd) = extract_cmd_arg(input) {
+                    if let Some(write_denial) = check_zero_write_role_shell(role, cmd) {
+                        return Some(write_denial);
+                    }
+                }
             }
             None
         }
@@ -1603,15 +1660,34 @@ fn is_master_readable_doc_or_skill(repo_rel: &str) -> bool {
 }
 
 pub fn is_qa_writable_path(repo_rel: &str) -> bool {
-    let lower = repo_rel.to_ascii_lowercase();
-    let fname = lower.rsplit('/').next().unwrap_or(&lower);
-    lower == "test_attribution.toml"
-        || lower.ends_with("/test_attribution.toml")
-        || lower == "tests/swarm_v2_attribution.toml"
-        || lower.starts_with("tests/")
-        || lower.contains("/tests/")
-        || lower.starts_with("__tests__/")
-        || lower.contains("/__tests__/")
+    let clean = repo_rel
+        .trim()
+        .trim_start_matches("./")
+        .to_ascii_lowercase();
+    let segs: Vec<&str> = clean.split('/').filter(|s| !s.is_empty()).collect();
+    let Some(&fname) = segs.last() else {
+        return false;
+    };
+    let dir_segs = &segs[..segs.len() - 1];
+    if dir_segs.contains(&"src") {
+        return false;
+    }
+    if matches!(
+        fname,
+        "build.rs"
+            | "cargo.toml"
+            | "cargo.lock"
+            | "package.json"
+            | "pyproject.toml"
+            | "setup.py"
+            | "makefile"
+            | "justfile"
+    ) {
+        return false;
+    }
+    clean == "test_attribution.toml"
+        || clean.ends_with("/test_attribution.toml")
+        || dir_segs.iter().any(|&s| s == "tests" || s == "__tests__")
         || fname.ends_with("_test.rs")
         || fname.ends_with("_tests.rs")
         || fname.ends_with("_test.go")
@@ -1764,6 +1840,265 @@ fn is_allowed_master_shell(cmd: &str) -> bool {
     false
 }
 
+fn strip_shell_quotes_and_escapes(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    let mut in_single = false;
+    let mut in_double = false;
+    while let Some(ch) = chars.next() {
+        if in_single {
+            if ch == '\'' {
+                in_single = false;
+            } else {
+                out.push(ch);
+            }
+        } else if in_double {
+            if ch == '"' {
+                in_double = false;
+            } else if ch == '\\' {
+                if let Some(&next) = chars.peek() {
+                    if matches!(next, '"' | '\\' | '$' | '`') {
+                        out.push(chars.next().unwrap_or('\\'));
+                    } else {
+                        out.push(ch);
+                    }
+                } else {
+                    out.push(ch);
+                }
+            } else {
+                out.push(ch);
+            }
+        } else {
+            match ch {
+                '\'' => in_single = true,
+                '"' => in_double = true,
+                '\\' => {
+                    if let Some(next) = chars.next()
+                        && next != '\n'
+                    {
+                        out.push(next);
+                    }
+                }
+                other => out.push(other),
+            }
+        }
+    }
+    out
+}
+
+fn split_shell_segments_and_words(cmd: &str) -> Vec<Vec<String>> {
+    let mut segments: Vec<Vec<String>> = Vec::new();
+    let mut cur_seg: Vec<String> = Vec::new();
+    let mut cur_word = String::new();
+    let mut in_word = false;
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut chars = cmd.chars().peekable();
+
+    let flush_word = |seg: &mut Vec<String>, word: &mut String, active: &mut bool| {
+        if *active {
+            seg.push(std::mem::take(word));
+            *active = false;
+        }
+    };
+    let flush_seg = |segs: &mut Vec<Vec<String>>,
+                     seg: &mut Vec<String>,
+                     word: &mut String,
+                     active: &mut bool| {
+        flush_word(seg, word, active);
+        if !seg.is_empty() {
+            segs.push(std::mem::take(seg));
+        }
+    };
+
+    while let Some(ch) = chars.next() {
+        if in_single {
+            if ch == '\'' {
+                in_single = false;
+            } else {
+                cur_word.push(ch);
+            }
+            continue;
+        }
+        if in_double {
+            match ch {
+                '"' => in_double = false,
+                '`' => {
+                    in_double = false;
+                    flush_seg(&mut segments, &mut cur_seg, &mut cur_word, &mut in_word);
+                }
+                '$' if chars.peek() == Some(&'(') => {
+                    let _ = chars.next();
+                    in_double = false;
+                    flush_seg(&mut segments, &mut cur_seg, &mut cur_word, &mut in_word);
+                }
+                '\\' => {
+                    if let Some(&next) = chars.peek() {
+                        if matches!(next, '"' | '\\' | '$' | '`') {
+                            cur_word.push(chars.next().unwrap_or('\\'));
+                        } else if next == '\n' {
+                            let _ = chars.next();
+                        } else {
+                            cur_word.push(ch);
+                        }
+                    } else {
+                        cur_word.push(ch);
+                    }
+                }
+                other => cur_word.push(other),
+            }
+            continue;
+        }
+
+        match ch {
+            '\'' => {
+                in_single = true;
+                in_word = true;
+            }
+            '"' => {
+                in_double = true;
+                in_word = true;
+            }
+            '\\' => {
+                if let Some(next) = chars.next()
+                    && next != '\n'
+                {
+                    in_word = true;
+                    cur_word.push(next);
+                }
+            }
+            '$' if chars.peek() == Some(&'(') => {
+                let _ = chars.next();
+                flush_seg(&mut segments, &mut cur_seg, &mut cur_word, &mut in_word);
+            }
+            '|' | ';' | '&' | '\n' | '(' | ')' | '{' | '}' | '`' => {
+                flush_seg(&mut segments, &mut cur_seg, &mut cur_word, &mut in_word);
+            }
+            c if c.is_ascii_whitespace() => {
+                flush_word(&mut cur_seg, &mut cur_word, &mut in_word);
+            }
+            other => {
+                in_word = true;
+                cur_word.push(other);
+            }
+        }
+    }
+    flush_seg(&mut segments, &mut cur_seg, &mut cur_word, &mut in_word);
+    segments
+}
+
+fn has_unquoted_output_redirect(cmd: &str) -> bool {
+    let mut chars = cmd.chars().peekable();
+    let mut in_single = false;
+    let mut in_double = false;
+    while let Some(ch) = chars.next() {
+        if in_single {
+            if ch == '\'' {
+                in_single = false;
+            }
+        } else if in_double {
+            if ch == '"' {
+                in_double = false;
+            } else if ch == '\\' {
+                let _ = chars.next();
+            }
+        } else {
+            match ch {
+                '\'' => in_single = true,
+                '"' => in_double = true,
+                '\\' => {
+                    let _ = chars.next();
+                }
+                '>' => {
+                    if chars.peek() == Some(&'&') {
+                        let _ = chars.next();
+                        if let Some(&fd_ch) = chars.peek()
+                            && (fd_ch.is_ascii_digit() || fd_ch == '-')
+                        {
+                            continue;
+                        }
+                    }
+                    return true;
+                }
+                _ => {}
+            }
+        }
+    }
+    false
+}
+
+/// Peels leading `KEY=VAL` assignments and command wrappers (`env`, `command`, `exec`, `nohup`,
+/// `nice`, `time`, `timeout`, `stdbuf`, `xargs`), returning `(start_index_of_invoked_cmd, env_assignments)`.
+fn peel_shell_wrappers(words: &[String]) -> (usize, Vec<&str>) {
+    let mut idx = 0usize;
+    let mut env_assigns = Vec::new();
+    while idx < words.len() {
+        let w = words[idx].as_str();
+        if w.contains('=') && !w.starts_with('-') {
+            env_assigns.push(w);
+            idx += 1;
+            continue;
+        }
+        let base = w.rsplit('/').next().unwrap_or(w);
+        match base {
+            "env" => {
+                idx += 1;
+                while idx < words.len() {
+                    let ew = words[idx].as_str();
+                    if ew == "-u" || ew == "--unset" || ew == "-C" || ew == "--chdir" {
+                        idx = (idx + 2).min(words.len());
+                    } else if ew == "--" {
+                        idx += 1;
+                        break;
+                    } else if ew.starts_with('-') {
+                        idx += 1;
+                    } else if ew.contains('=') {
+                        env_assigns.push(ew);
+                        idx += 1;
+                    } else {
+                        break;
+                    }
+                }
+            }
+            "command" | "builtin" | "exec" | "nohup" | "time" => {
+                idx += 1;
+                while idx < words.len() && words[idx].starts_with('-') {
+                    if words[idx] == "--" {
+                        idx += 1;
+                        break;
+                    }
+                    idx += 1;
+                }
+            }
+            "nice" | "stdbuf" | "xargs" => {
+                idx += 1;
+                while idx < words.len() && words[idx].starts_with('-') {
+                    if matches!(words[idx].as_str(), "-n" | "-I" | "-L" | "-P") {
+                        idx = (idx + 2).min(words.len());
+                    } else {
+                        idx += 1;
+                    }
+                }
+            }
+            "timeout" => {
+                idx += 1;
+                while idx < words.len() && words[idx].starts_with('-') {
+                    if matches!(words[idx].as_str(), "-k" | "-s") {
+                        idx = (idx + 2).min(words.len());
+                    } else {
+                        idx += 1;
+                    }
+                }
+                if idx < words.len() {
+                    idx += 1; // skip duration operand
+                }
+            }
+            _ => break,
+        }
+    }
+    (idx, env_assigns)
+}
+
 fn check_role_swarm_tool_namespace(role: SwarmRole, cmd: &str) -> Option<Decision> {
     let expected_ns = match role {
         SwarmRole::Master => "master",
@@ -1775,67 +2110,489 @@ fn check_role_swarm_tool_namespace(role: SwarmRole, cmd: &str) -> Option<Decisio
         SwarmRole::StandardCoding => return None,
     };
 
-    for seg in cmd.split(['|', ';', '&', '\n', '(', '`']) {
-        let words: Vec<&str> = seg.split_whitespace().collect();
-        if words.is_empty() {
-            continue;
-        }
-        // Skip leading `env`, flags to `env`, or `KEY=VAL` assignments
-        let mut idx = 0usize;
-        while idx < words.len() {
-            let w = words[idx].trim_matches(['"', '\'']);
-            let base = w.rsplit('/').next().unwrap_or(w);
-            if base == "env" {
-                idx += 1;
-                while idx < words.len() {
-                    let ew = words[idx].trim_matches(['"', '\'']);
-                    if ew == "-u" || ew == "--unset" {
-                        idx += 2;
-                    } else if ew.starts_with('-') || ew.contains('=') {
-                        idx += 1;
-                    } else {
-                        break;
-                    }
-                }
-                continue;
-            }
-            if w.contains('=') && !w.starts_with('-') {
-                idx += 1;
-                continue;
-            }
-            break;
-        }
-        if idx >= words.len() {
-            continue;
-        }
-        let bin = words[idx].trim_matches(['"', '\'']);
-        let base = bin.rsplit('/').next().unwrap_or(bin);
-        let invoked_ns = if base == "swarm-tool" {
-            words.get(idx + 1).map(|s| s.trim_matches(['"', '\'']))
-        } else if base == "cargo"
-            && words.get(idx + 1).copied() == Some("run")
-            && seg.contains("swarm-tool")
-        {
-            words
-                .iter()
-                .skip(idx + 2)
-                .position(|&w| w == "--")
-                .and_then(|rel_sep| words.get(idx + 2 + rel_sep + 1))
-                .map(|s| s.trim_matches(['"', '\'']))
-        } else {
-            None
-        };
-
-        if let Some(ns) = invoked_ns {
-            if !matches!(ns, "--help" | "-h" | "help") && ns != expected_ns {
+    let dequoted_full = strip_shell_quotes_and_escapes(cmd);
+    for words in split_shell_segments_and_words(cmd) {
+        let (idx, env_assigns) = peel_shell_wrappers(&words);
+        for assign in env_assigns {
+            let key = assign.split('=').next().unwrap_or("");
+            if role != SwarmRole::Master
+                && matches!(
+                    key,
+                    "AGENT_GUARD_ROLE"
+                        | "AGENT_GUARD_SESSION_ID"
+                        | "AGENT_GUARD_STATE_DIR"
+                        | "AGENT_GUARD_IN_SANDBOX"
+                        | "AGENT_GUARD_WORKER_LOCK"
+                        | "AGENT_GUARD_ALLOW_SWARM"
+                )
+            {
                 return Some(Decision::deny(
                     "ROLE_NAMESPACE_ESCALATION_BLOCKED",
                     format!(
-                        "Role '{}' cannot invoke `swarm-tool {ns}` (permitted namespace: `swarm-tool {expected_ns}`).",
+                        "Worker role '{}' cannot override protected guard environment variable '{key}'.",
                         role.as_str_id()
                     ),
                     true,
                 ));
+            }
+        }
+        if idx >= words.len() {
+            continue;
+        }
+        let bin = words[idx].as_str();
+        let base = bin.rsplit('/').next().unwrap_or(bin);
+        if matches!(base, "sh" | "bash" | "dash" | "zsh" | "ksh" | "eval")
+            && dequoted_full.contains("swarm-tool")
+        {
+            return Some(Decision::deny(
+                "ROLE_NAMESPACE_ESCALATION_BLOCKED",
+                format!(
+                    "Role '{}' cannot wrap `swarm-tool` inside subshell/eval '{base}'.",
+                    role.as_str_id()
+                ),
+                true,
+            ));
+        }
+
+        let invoked_ns = if base == "swarm-tool" {
+            words.get(idx + 1).map(String::as_str)
+        } else if base == "cargo"
+            && words.get(idx + 1).map(String::as_str) == Some("run")
+            && words.iter().any(|w| w.contains("swarm-tool"))
+        {
+            words
+                .iter()
+                .skip(idx + 2)
+                .position(|w| w == "--")
+                .and_then(|rel_sep| words.get(idx + 2 + rel_sep + 1))
+                .map(String::as_str)
+        } else {
+            None
+        };
+
+        if let Some(ns) = invoked_ns
+            && !matches!(ns, "--help" | "-h" | "help")
+            && ns != expected_ns
+        {
+            return Some(Decision::deny(
+                "ROLE_NAMESPACE_ESCALATION_BLOCKED",
+                format!(
+                    "Role '{}' cannot invoke `swarm-tool {ns}` (permitted namespace: `swarm-tool {expected_ns}`).",
+                    role.as_str_id()
+                ),
+                true,
+            ));
+        }
+    }
+    None
+}
+
+fn check_role_shell_network_exfil(role: SwarmRole, cmd: &str) -> Option<Decision> {
+    let code = if role == SwarmRole::AdversarialReviewer {
+        "REVIEWER_EXFILTRATION_URL_BLOCKED"
+    } else {
+        "ROLE_NETWORK_EXFIL_BLOCKED"
+    };
+    let dequoted_lower = strip_shell_quotes_and_escapes(cmd).to_ascii_lowercase();
+    for scheme in [
+        "http://", "https://", "ftp://", "ws://", "wss://", "scp://", "sftp://",
+    ] {
+        if dequoted_lower.contains(scheme) {
+            return Some(Decision::deny(
+                code,
+                format!(
+                    "Swarm role '{}' shell command cannot contain network URL scheme '{scheme}'.",
+                    role.as_str_id()
+                ),
+                true,
+            ));
+        }
+    }
+    if dequoted_lower.contains("/dev/tcp/") || dequoted_lower.contains("/dev/udp/") {
+        return Some(Decision::deny(
+            code,
+            format!(
+                "Swarm role '{}' shell command cannot open /dev/tcp or /dev/udp sockets.",
+                role.as_str_id()
+            ),
+            true,
+        ));
+    }
+
+    for words in split_shell_segments_and_words(cmd) {
+        let (idx, _) = peel_shell_wrappers(&words);
+        if idx >= words.len() {
+            continue;
+        }
+        let base = words[idx]
+            .rsplit('/')
+            .next()
+            .unwrap_or(words[idx].as_str())
+            .to_ascii_lowercase();
+        if matches!(
+            base.as_str(),
+            "curl"
+                | "wget"
+                | "nc"
+                | "ncat"
+                | "netcat"
+                | "socat"
+                | "telnet"
+                | "ssh"
+                | "scp"
+                | "sftp"
+                | "rsync"
+                | "ftp"
+                | "tftp"
+                | "dig"
+                | "nslookup"
+                | "host"
+                | "whois"
+                | "ping"
+                | "gh"
+        ) {
+            return Some(Decision::deny(
+                code,
+                format!(
+                    "Swarm role '{}' operates strictly offline; network utility '{base}' is forbidden.",
+                    role.as_str_id()
+                ),
+                true,
+            ));
+        }
+    }
+    None
+}
+
+fn is_inline_interpreter_invocation(base: &str, args: &[String]) -> bool {
+    match base {
+        "sh" | "bash" | "dash" | "zsh" | "ksh" | "eval" => true,
+        "python" | "python3" | "pypy" | "pypy3" => args.iter().any(|a| a == "-c"),
+        "node" | "deno" | "bun" => args
+            .iter()
+            .any(|a| matches!(a.as_str(), "-e" | "--eval" | "-p" | "--print")),
+        "perl" | "ruby" | "php" | "lua" => args
+            .iter()
+            .any(|a| a == "-e" || a.starts_with("-i") || a.starts_with("-pi") || a == "-r"),
+        "awk" | "gawk" => args.iter().any(|a| a == "-i" || a == "inplace"),
+        _ => false,
+    }
+}
+
+fn check_zero_write_role_shell(role: SwarmRole, cmd: &str) -> Option<Decision> {
+    if has_unquoted_output_redirect(cmd) {
+        return Some(Decision::deny(
+            "ROLE_SHELL_WRITE_FORBIDDEN",
+            format!(
+                "Role '{}' is strictly read-only (`0` writes permitted); shell output redirection is forbidden.",
+                role.as_str_id()
+            ),
+            false,
+        ));
+    }
+    for words in split_shell_segments_and_words(cmd) {
+        let (idx, _) = peel_shell_wrappers(&words);
+        if idx >= words.len() {
+            continue;
+        }
+        let base = words[idx]
+            .rsplit('/')
+            .next()
+            .unwrap_or(words[idx].as_str())
+            .to_ascii_lowercase();
+        let args = &words[idx + 1..];
+        if is_inline_interpreter_invocation(&base, args) {
+            return Some(Decision::deny(
+                "ROLE_SHELL_WRITE_FORBIDDEN",
+                format!(
+                    "Role '{}' cannot invoke subshell or inline interpreter '{base}' that could mutate files.",
+                    role.as_str_id()
+                ),
+                false,
+            ));
+        }
+        if matches!(
+            base.as_str(),
+            "rm" | "unlink"
+                | "rmdir"
+                | "mv"
+                | "cp"
+                | "install"
+                | "dd"
+                | "tee"
+                | "touch"
+                | "mkdir"
+                | "ln"
+                | "chmod"
+                | "chown"
+                | "chgrp"
+                | "truncate"
+                | "shred"
+                | "patch"
+        ) {
+            return Some(Decision::deny(
+                "ROLE_SHELL_WRITE_FORBIDDEN",
+                format!(
+                    "Role '{}' has zero file-write privileges; mutating command '{base}' is forbidden.",
+                    role.as_str_id()
+                ),
+                false,
+            ));
+        }
+        if matches!(base.as_str(), "sed" | "gsed")
+            && args
+                .iter()
+                .any(|a| a.starts_with("-i") || a == "--in-place")
+        {
+            return Some(Decision::deny(
+                "ROLE_SHELL_WRITE_FORBIDDEN",
+                format!("Role '{}' cannot run in-place `sed -i`.", role.as_str_id()),
+                false,
+            ));
+        }
+        if base == "git"
+            && let Some(sub) = args.iter().find(|a| !a.starts_with('-'))
+            && matches!(
+                sub.as_str(),
+                "add"
+                    | "commit"
+                    | "checkout"
+                    | "switch"
+                    | "restore"
+                    | "reset"
+                    | "clean"
+                    | "rm"
+                    | "mv"
+                    | "stash"
+                    | "apply"
+                    | "am"
+                    | "cherry-pick"
+                    | "merge"
+                    | "rebase"
+                    | "revert"
+            )
+        {
+            return Some(Decision::deny(
+                "ROLE_SHELL_WRITE_FORBIDDEN",
+                format!(
+                    "Role '{}' cannot run mutating `git {sub}`.",
+                    role.as_str_id()
+                ),
+                false,
+            ));
+        }
+    }
+    None
+}
+
+fn check_scoped_worker_shell_mutation(
+    role: SwarmRole,
+    cap: Option<&SessionCapability>,
+    cmd: &str,
+    repo_root: &Path,
+    cwd: &Path,
+) -> Option<Decision> {
+    for words in split_shell_segments_and_words(cmd) {
+        let (idx, _) = peel_shell_wrappers(&words);
+        if idx >= words.len() {
+            continue;
+        }
+        let base = words[idx]
+            .rsplit('/')
+            .next()
+            .unwrap_or(words[idx].as_str())
+            .to_ascii_lowercase();
+        let args = &words[idx + 1..];
+
+        if is_inline_interpreter_invocation(&base, args) {
+            return Some(Decision::deny(
+                "ROLE_SHELL_WRITE_FORBIDDEN",
+                format!(
+                    "Worker role '{}' cannot invoke subshell or inline interpreter '{base}' that bypasses path-scoped write inspection.",
+                    role.as_str_id()
+                ),
+                false,
+            ));
+        }
+
+        if base == "git"
+            && let Some(sub) = args.iter().find(|a| !a.starts_with('-'))
+            && matches!(
+                sub.as_str(),
+                "commit"
+                    | "checkout"
+                    | "switch"
+                    | "restore"
+                    | "reset"
+                    | "clean"
+                    | "rm"
+                    | "mv"
+                    | "stash"
+                    | "apply"
+                    | "am"
+                    | "cherry-pick"
+                    | "merge"
+                    | "rebase"
+                    | "revert"
+            )
+        {
+            return Some(Decision::deny(
+                "ROLE_SHELL_WRITE_FORBIDDEN",
+                format!(
+                    "Worker role '{}' cannot run mutating `git {sub}` directly.",
+                    role.as_str_id()
+                ),
+                false,
+            ));
+        }
+
+        let mut candidate_targets: Vec<&str> = Vec::new();
+        let is_mutator = match base.as_str() {
+            "dd" | "patch" | "shred" => {
+                return Some(Decision::deny(
+                    "ROLE_SHELL_WRITE_FORBIDDEN",
+                    format!(
+                        "Worker role '{}' cannot invoke unstructured file mutator '{base}'; use structured Edit/Write tools.",
+                        role.as_str_id()
+                    ),
+                    false,
+                ));
+            }
+            "rm" | "unlink" | "rmdir" | "touch" | "mkdir" | "truncate" | "tee" => {
+                let mut after_ddash = false;
+                for a in args {
+                    if !after_ddash && a == "--" {
+                        after_ddash = true;
+                        continue;
+                    }
+                    if !after_ddash && a.starts_with('-') {
+                        continue;
+                    }
+                    candidate_targets.push(a.as_str());
+                }
+                true
+            }
+            "mv" | "cp" | "install" | "ln" => {
+                let mut non_flags: Vec<&str> = Vec::new();
+                let mut after_ddash = false;
+                for a in args {
+                    if !after_ddash && a == "--" {
+                        after_ddash = true;
+                        continue;
+                    }
+                    if !after_ddash && a.starts_with('-') {
+                        continue;
+                    }
+                    non_flags.push(a.as_str());
+                }
+                if base == "mv" {
+                    candidate_targets.extend(non_flags);
+                } else if let Some(&dest) = non_flags.last() {
+                    candidate_targets.push(dest);
+                }
+                true
+            }
+            "chmod" | "chown" | "chgrp" => {
+                let mut non_flags = args.iter().filter(|a| !a.starts_with('-'));
+                let _ = non_flags.next(); // mode or owner
+                for a in non_flags {
+                    candidate_targets.push(a.as_str());
+                }
+                true
+            }
+            "sed" | "gsed"
+                if args
+                    .iter()
+                    .any(|a| a.starts_with("-i") || a == "--in-place") =>
+            {
+                let mut skipped_script = false;
+                let has_explicit_expr = args.iter().any(|a| a == "-e" || a == "-f");
+                let mut skip_next = false;
+                for a in args {
+                    if skip_next {
+                        skip_next = false;
+                        continue;
+                    }
+                    if a == "-e" || a == "-f" {
+                        skip_next = true;
+                        continue;
+                    }
+                    if a == "-i" {
+                        continue;
+                    }
+                    if a.starts_with('-') {
+                        continue;
+                    }
+                    if !has_explicit_expr && !skipped_script {
+                        skipped_script = true;
+                        continue;
+                    }
+                    candidate_targets.push(a.as_str());
+                }
+                true
+            }
+            _ => false,
+        };
+
+        if !is_mutator {
+            continue;
+        }
+        if candidate_targets.is_empty() {
+            return Some(Decision::deny(
+                "MISSING_WRITE_TARGETS",
+                format!(
+                    "Worker role '{}' shell command '{base}' missing verifiable target path.",
+                    role.as_str_id()
+                ),
+                false,
+            ));
+        }
+
+        for raw_target in candidate_targets {
+            let valid = match validate_path_with_max_depth(
+                repo_root,
+                cwd,
+                raw_target,
+                PathAccess::Write,
+                2,
+            ) {
+                Ok(v) => v,
+                Err(pv) => return Some(Decision::deny(pv.code, pv.detail, pv.is_poisoned_zone)),
+            };
+            match role {
+                SwarmRole::QaEngineer => {
+                    if !is_qa_writable_path(&valid.repo_rel) {
+                        return Some(Decision::deny(
+                            "QA_PRODUCTION_WRITE_FORBIDDEN",
+                            format!(
+                                "QA Engineer shell command '{base}' attempted mutation of non-test path '{}'.",
+                                valid.repo_rel
+                            ),
+                            false,
+                        ));
+                    }
+                }
+                SwarmRole::Grunt => {
+                    let Some(c) = cap else {
+                        return Some(Decision::deny(
+                            "GRUNT_MISSING_CAPABILITY",
+                            "Swarm Grunt shell mutation requires a Master-minted SessionCapability.",
+                            true,
+                        ));
+                    };
+                    if !path_matches_any_scope(&valid.repo_rel, &c.allowed_write_paths) {
+                        bump_blocked_scope(repo_root, c);
+                        return Some(Decision::deny(
+                            "GRUNT_WRITE_OUT_OF_SCOPE",
+                            format!(
+                                "Grunt shell command '{base}' target '{}' is outside session '{}' allowed_write_paths.",
+                                valid.repo_rel, c.session_id
+                            ),
+                            false,
+                        ));
+                    }
+                }
+                _ => {}
             }
         }
     }
@@ -1867,17 +2624,34 @@ fn extract_all_write_targets(norm_tool: &str, v: &JsonValue) -> Vec<String> {
 }
 
 fn shell_contains_search_binary(cmd: &str) -> bool {
-    for seg in cmd.split(['|', ';', '&', '\n']) {
-        let first = seg
-            .split_whitespace()
-            .find(|tok| !tok.contains('='))
-            .unwrap_or("");
-        let base = first.rsplit('/').next().unwrap_or(first);
+    let dequoted_full = strip_shell_quotes_and_escapes(cmd);
+    for words in split_shell_segments_and_words(cmd) {
+        let (idx, _) = peel_shell_wrappers(&words);
+        if idx >= words.len() {
+            continue;
+        }
+        let base = words[idx]
+            .rsplit('/')
+            .next()
+            .unwrap_or(words[idx].as_str())
+            .to_ascii_lowercase();
         if matches!(
-            base,
+            base.as_str(),
             "rg" | "ripgrep" | "grep" | "egrep" | "fgrep" | "find" | "fd" | "fdfind"
         ) {
             return true;
+        }
+        if matches!(
+            base.as_str(),
+            "sh" | "bash" | "dash" | "zsh" | "ksh" | "eval"
+        ) {
+            for sb in [
+                "rg", "ripgrep", "grep", "egrep", "fgrep", "find", "fd", "fdfind",
+            ] {
+                if dequoted_full.contains(sb) {
+                    return true;
+                }
+            }
         }
     }
     false

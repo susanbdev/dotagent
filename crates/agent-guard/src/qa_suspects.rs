@@ -241,27 +241,96 @@ fn validate_dag_invariants(tasks: &[DagTaskSpec]) -> Result<(), String> {
         return Err("DAG contains a dependency cycle".to_string());
     }
 
-    // 2. Verify disjoint `allowed_write_paths` for concurrent tasks in the same wave
-    let mut wave_writes: BTreeMap<&str, BTreeMap<&str, &str>> = BTreeMap::new();
-    for t in tasks {
-        let map = wave_writes.entry(t.wave_id.as_str()).or_default();
-        for w in &t.allowed_write_paths {
-            if let Some(&prev_task) = map.get(w.as_str()) {
-                if prev_task != t.task_id
-                    && !t.depends_on.iter().any(|d| d == prev_task)
-                    && !by_id[prev_task].depends_on.iter().any(|d| d == &t.task_id)
-                {
-                    return Err(format!(
-                        "PARALLEL_WRITE_CONFLICT in wave '{}': tasks '{}' and '{}' both claim write access to '{}'",
-                        t.wave_id, prev_task, t.task_id, w
-                    ));
+    // 2. Verify disjoint `allowed_write_paths` (including prefix and glob overlaps)
+    //    for concurrent tasks in the same wave (`MEDIUM-DA-06`).
+    let is_dep_ordered = |a: &str, b: &str| -> bool {
+        let mut seen = BTreeSet::new();
+        let mut stack = vec![a];
+        while let Some(cur) = stack.pop() {
+            if cur == b {
+                return true;
+            }
+            if seen.insert(cur)
+                && let Some(t) = by_id.get(cur)
+            {
+                for dep in &t.depends_on {
+                    stack.push(dep.as_str());
                 }
             }
-            map.insert(w.as_str(), t.task_id.as_str());
+        }
+        false
+    };
+
+    for i in 0..tasks.len() {
+        for j in (i + 1)..tasks.len() {
+            let ta = &tasks[i];
+            let tb = &tasks[j];
+            if ta.wave_id != tb.wave_id
+                || ta.task_id == tb.task_id
+                || is_dep_ordered(&ta.task_id, &tb.task_id)
+                || is_dep_ordered(&tb.task_id, &ta.task_id)
+            {
+                continue;
+            }
+            for wa in &ta.allowed_write_paths {
+                for wb in &tb.allowed_write_paths {
+                    if write_scopes_overlap(wa, wb) {
+                        return Err(format!(
+                            "PARALLEL_WRITE_CONFLICT in wave '{}': tasks '{}' ('{}') and '{}' ('{}') have overlapping write scopes",
+                            ta.wave_id, ta.task_id, wa, tb.task_id, wb
+                        ));
+                    }
+                }
+            }
         }
     }
 
     Ok(())
+}
+
+fn normalize_scope_pattern(raw: &str) -> String {
+    let mut s = raw.trim().replace('\\', "/");
+    while let Some(stripped) = s.strip_prefix("./") {
+        s = stripped.to_string();
+    }
+    while s.len() > 1 && s.ends_with('/') {
+        s.pop();
+    }
+    s
+}
+
+fn static_dir_prefix_before_glob(pat: &str) -> &str {
+    match pat.find(['*', '?', '[']) {
+        Some(idx) => pat[..idx].trim_end_matches('/'),
+        None => pat,
+    }
+}
+
+fn write_scopes_overlap(raw_a: &str, raw_b: &str) -> bool {
+    let a = normalize_scope_pattern(raw_a);
+    let b = normalize_scope_pattern(raw_b);
+    if a.is_empty() || b.is_empty() {
+        return false;
+    }
+    if a == b || a == "*" || b == "*" {
+        return true;
+    }
+    if crate::role_sandbox::path_matches_any_scope(&a, std::slice::from_ref(&b))
+        || crate::role_sandbox::path_matches_any_scope(&b, std::slice::from_ref(&a))
+    {
+        return true;
+    }
+    let a_has_glob = a.contains(['*', '?', '[']);
+    let b_has_glob = b.contains(['*', '?', '[']);
+    if !a_has_glob && !b_has_glob {
+        return a.starts_with(&format!("{b}/")) || b.starts_with(&format!("{a}/"));
+    }
+    let pa = static_dir_prefix_before_glob(&a);
+    let pb = static_dir_prefix_before_glob(&b);
+    if pa.is_empty() || pb.is_empty() {
+        return true;
+    }
+    pa == pb || pa.starts_with(&format!("{pb}/")) || pb.starts_with(&format!("{pa}/"))
 }
 
 fn serialize_locked_tasks_canonical(plan_id: &str, tasks: &[DagTaskSpec]) -> String {
@@ -370,6 +439,12 @@ pub fn save_locked_plan(
         ),
         ("record_mac".to_string(), JsonValue::Str(record_mac)),
     ]);
+    if fs::symlink_metadata(&lock_path).is_ok_and(|m| m.file_type().is_symlink()) {
+        return Err(format!(
+            "SYMLINK_REJECTED: PLAN.lock.json path '{}' is a symlink",
+            lock_path.display()
+        ));
+    }
     fs::write(&lock_path, format!("{}\n", wrapper.to_json_string()))
         .map_err(|e| format!("failed writing PLAN.lock.json: {e}"))?;
     #[cfg(unix)]
@@ -387,6 +462,12 @@ pub fn load_locked_plan(repo_root: &Path) -> Result<LockedPlan, String> {
 }
 
 fn load_locked_plan_unlocked(repo_root: &Path, lock_path: &Path) -> Result<LockedPlan, String> {
+    if fs::symlink_metadata(lock_path).is_ok_and(|m| m.file_type().is_symlink()) {
+        return Err(format!(
+            "PLAN_LOCK_TAMPERED: PLAN.lock.json path '{}' is a symlink",
+            lock_path.display()
+        ));
+    }
     let raw = fs::read_to_string(lock_path)
         .map_err(|e| format!("no locked plan found at '{}': {e}", lock_path.display()))?;
     if raw.trim().is_empty() {
@@ -623,31 +704,40 @@ pub fn triangulate_faults(
         }
     }
 
-    // Case 1: Boundary test failed; check whether neighbor broke or seam conflicted
+    // Case 1: Boundary test failed; check whether any secondary neighbor broke or seam conflicted
     for r in &failing_rules {
-        if let Some(sec) = r.secondary_suspects.first() {
+        if !r.secondary_suspects.is_empty() {
             let primary_isolated_failed =
                 isolated_failures_by_task.contains_key(r.primary_suspect.as_str());
-            let sec_isolated_failed = isolated_failures_by_task.contains_key(sec.as_str());
+            let failing_secondaries: Vec<&String> = r
+                .secondary_suspects
+                .iter()
+                .filter(|sec| isolated_failures_by_task.contains_key(sec.as_str()))
+                .collect();
 
-            if !primary_isolated_failed && sec_isolated_failed {
+            if !primary_isolated_failed && let Some(sec) = failing_secondaries.first() {
                 return SuspectVerdict::BlockedByNeighbor {
                     victim: r.primary_suspect.clone(),
-                    neighbor_suspect: sec.clone(),
+                    neighbor_suspect: (*sec).clone(),
                     boundary_test: r.test_name.clone(),
                 };
             }
 
-            let both_isolated_green = !primary_isolated_failed
-                && !sec_isolated_failed
+            let all_isolated_green = !primary_isolated_failed
+                && failing_secondaries.is_empty()
                 && isolated_passes_by_task.contains(r.primary_suspect.as_str())
                 && r.secondary_suspects
                     .iter()
                     .all(|s| isolated_passes_by_task.contains(s.as_str()));
-            if both_isolated_green && !r.boundary_interfaces.is_empty() {
+            if all_isolated_green && !r.boundary_interfaces.is_empty() {
+                let task_b = if r.secondary_suspects.len() == 1 {
+                    r.secondary_suspects[0].clone()
+                } else {
+                    r.secondary_suspects.join("+")
+                };
                 return SuspectVerdict::SeamOrSpecConflict {
                     task_a: r.primary_suspect.clone(),
-                    task_b: sec.clone(),
+                    task_b,
                     boundary_test: r.test_name.clone(),
                 };
             }

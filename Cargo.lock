@@ -74,6 +74,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "dotagent-harness"
+version = "1.0.0"
+dependencies = [
+ "agent-guard",
+]
+
+[[package]]
 name = "enumflags2"
 version = "0.7.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"

@@ -1,0 +1,17 @@
+[package]
+name = "dotagent-harness"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Deterministic full-stack test harness for susanbdev/dotagent multi-harness hooks, compiler, and bootstrap"
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "dotagent-harness"
+path = "src/main.rs"
+
+[dependencies]
+agent-guard = { path = "../agent-guard" }

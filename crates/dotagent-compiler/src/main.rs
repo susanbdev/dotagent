@@ -150,58 +150,50 @@ fn verify_all(repo_root: &Path) -> Result<usize, String> {
         }
         let digest = sha256_hex(disk_content.as_bytes());
         expected_lines.push(format!("{digest}  dist/{rel_path}"));
-    }
-
-    if is_self_hosted_dotagent_repo(repo_root) {
-        for (root_rel, dist_rel) in ROOT_MIRROR_MAP {
-            let Some(expected_content) = artifacts.get(*dist_rel) else {
-                return Err(format!(
-                    "missing bundle artifact '{dist_rel}' for root mirror"
-                ));
-            };
-            let root_path = repo_root.join(root_rel);
-            let actual_root = read_contained_regular_file(repo_root, &root_path).map_err(|e| {
+        if let Some(live_copy) = repo_harness_copy_path(repo_root, rel_path) {
+            let actual_copy = read_contained_regular_file(repo_root, &live_copy).map_err(|e| {
                 format!(
-                    "missing or invalid root harness mirror '{}': {e}",
-                    root_path.display()
+                    "missing or invalid live harness copy '{}': {e}",
+                    live_copy.display()
                 )
             })?;
-            if &actual_root != expected_content {
+            if &actual_copy != expected_content {
+                let rel_disp = live_copy
+                    .strip_prefix(repo_root)
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|_| live_copy.display().to_string());
                 return Err(format!(
-                    "root harness file '{root_rel}' drifted from compiled 'dist/{dist_rel}' (run `dotagent-compiler build .`)"
+                    "live harness file '{rel_disp}' drifted from compiled 'dist/{rel_path}' (run `dotagent-compiler build .`)"
                 ));
             }
         }
-        for (rel_path, expected_content) in &artifacts {
-            let maybe_agent_mirror = rel_path
-                .strip_prefix("claude/agents/")
-                .map(|f| repo_root.join(".claude").join("agents").join(f))
-                .or_else(|| {
-                    rel_path
-                        .strip_prefix("cursor/agents/")
-                        .map(|f| repo_root.join(".cursor").join("agents").join(f))
-                })
-                .or_else(|| {
-                    rel_path
-                        .strip_prefix("codex/agents/")
-                        .map(|f| repo_root.join(".codex").join("agents").join(f))
-                });
-            if let Some(mirror_path) = maybe_agent_mirror {
-                let actual_mirror =
-                    read_contained_regular_file(repo_root, &mirror_path).map_err(|e| {
-                        format!(
-                            "missing or invalid root agent mirror '{}': {e}",
-                            mirror_path.display()
-                        )
-                    })?;
-                if &actual_mirror != expected_content {
-                    return Err(format!(
-                        "root agent mirror '{}' drifted from compiled 'dist/{rel_path}' (run `dotagent-compiler build .`)",
-                        mirror_path.display()
-                    ));
-                }
-            }
+    }
+
+    let root_agents_path = repo_root.join("AGENTS.md");
+    if is_self_hosted_dotagent_repo(repo_root) {
+        let Some(expected_agents) = artifacts.get("AGENTS.md") else {
+            return Err("missing bundle artifact 'AGENTS.md' for root mirror".to_string());
+        };
+        let actual_agents =
+            read_contained_regular_file(repo_root, &root_agents_path).map_err(|e| {
+                format!(
+                    "missing or invalid root harness mirror '{}': {e}",
+                    root_agents_path.display()
+                )
+            })?;
+        if &actual_agents != expected_agents {
+            return Err(
+                "root harness file 'AGENTS.md' drifted from compiled 'dist/AGENTS.md' (run `dotagent-compiler build .`)"
+                    .to_string(),
+            );
         }
+    } else if fs::symlink_metadata(&root_agents_path).is_ok() {
+        let _ = read_contained_regular_file(repo_root, &root_agents_path).map_err(|e| {
+            format!(
+                "invalid root AGENTS.md '{}': {e}",
+                root_agents_path.display()
+            )
+        })?;
     }
 
     let skills_digest = sha256_hex(actual_skills_lock.as_bytes());
@@ -518,8 +510,8 @@ fn write_file_contained(repo_root: &Path, path: &Path, content: &str) -> Result<
         .map_err(|e| format!("cannot write '{}': {e}", path.display()))
 }
 
-fn sync_repo_harness_copy(repo_root: &Path, rel_path: &str, content: &str) -> Result<(), String> {
-    let maybe_dest = match rel_path {
+fn repo_harness_copy_path(repo_root: &Path, rel_path: &str) -> Option<PathBuf> {
+    match rel_path {
         ".ignore" => Some(repo_root.join(".ignore")),
         "cursor/.cursorignore" => Some(repo_root.join(".cursorignore")),
         "claude/settings.json" => Some(repo_root.join(".claude").join("settings.json")),
@@ -538,8 +530,11 @@ fn sync_repo_harness_copy(repo_root: &Path, rel_path: &str, content: &str) -> Re
                     .strip_prefix("codex/agents/")
                     .map(|f| repo_root.join(".codex").join("agents").join(f))
             }),
-    };
-    if let Some(dest) = maybe_dest {
+    }
+}
+
+fn sync_repo_harness_copy(repo_root: &Path, rel_path: &str, content: &str) -> Result<(), String> {
+    if let Some(dest) = repo_harness_copy_path(repo_root, rel_path) {
         write_file_contained(repo_root, &dest, content)?;
     }
     Ok(())
@@ -1248,9 +1243,10 @@ exclude_tmpdir_env_var = true
 exclude_slash_tmp = true
 
 [shell_environment_policy]
-inherit = "core"
+inherit = "all"
 ignore_default_excludes = false
 exclude = ["AWS_*", "GITHUB_*", "GH_*", "ANTHROPIC_*", "OPENAI_*", "GEMINI_*", "*_TOKEN", "*_SECRET", "*_KEY"]
+include_only = ["PATH", "HOME", "USER", "LOGNAME", "SHELL", "LANG", "LC_*", "TERM", "GIT_CONFIG_GLOBAL", "GIT_CONFIG_NOSYSTEM", "AGENT_GUARD_*"]
 
 [mcp_servers.susanbdev]
 url = "https://mcp.zt.susanb.dev/mcp"
