@@ -131,8 +131,6 @@ fn enforce_ambient_role_namespace(
         }
     }
 
-    let open_sessions = load_open_session_capabilities(repo_root)?;
-
     if expected_role == SwarmRole::Master {
         if std::env::var("AGENT_GUARD_WORKER_LOCK").as_deref() == Ok("1") {
             return Err(
@@ -152,25 +150,28 @@ fn enforce_ambient_role_namespace(
                         .to_string(),
                 );
             }
-            if list_session_capabilities(repo_root)?
-                .iter()
-                .any(|c| c.role == SwarmRole::Master)
-            {
-                return Err(
-                    "ROLE_CAPABILITY_MISMATCH: a signed Master capability is active; 'swarm-tool master' requires --master-session or AGENT_GUARD_SESSION_ID"
-                        .to_string(),
-                );
-            }
             if explicit_env_role == Some(SwarmRole::Master) {
-                // Verify direct host vault possession so a Landlocked/Seatbelted worker that stripped
-                // `AGENT_GUARD_IN_SANDBOX` via `env -u` still fails closed (`EACCES` on `vault/hmac.key`).
+                // Verify direct host vault possession first so a Landlocked/Seatbelted worker that stripped
+                // `AGENT_GUARD_IN_SANDBOX` via `env -u` fails closed (`EACCES` on `vault/hmac.key`)
+                // before touching any session/lock state directory.
                 let _ = load_or_init_vault_hmac_key(repo_root).map_err(|_| {
                     "ROLE_CAPABILITY_MISMATCH: sandboxed process lacks vault authority and cannot invoke 'swarm-tool master' without a signed Master capability"
                         .to_string()
                 })?;
+                if list_session_capabilities(repo_root)?
+                    .iter()
+                    .any(|c| c.role == SwarmRole::Master)
+                {
+                    return Err(
+                        "ROLE_CAPABILITY_MISMATCH: a signed Master capability is active; 'swarm-tool master' requires --master-session or AGENT_GUARD_SESSION_ID"
+                            .to_string(),
+                    );
+                }
                 return Ok(());
             }
-            if let Some(worker_cap) = open_sessions.iter().find(|c| c.role != SwarmRole::Master) {
+            if let Ok(open_sessions) = load_open_session_capabilities(repo_root)
+                && let Some(worker_cap) = open_sessions.iter().find(|c| c.role != SwarmRole::Master)
+            {
                 return Err(format!(
                     "ROLE_CAPABILITY_MISMATCH: active '{}' session '{}' is open; cannot invoke 'swarm-tool master' before session closes",
                     worker_cap.role.as_str_id(),
