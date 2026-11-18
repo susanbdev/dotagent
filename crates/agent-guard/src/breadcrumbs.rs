@@ -405,17 +405,102 @@ pub fn compute_event_mac_for_repo(
     compute_event_mac(&key, event)
 }
 
+#[inline(never)]
+pub fn constant_time_eq_bytes(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (&x, &y) in a.iter().zip(b.iter()) {
+        diff |= std::hint::black_box(x ^ y);
+    }
+    std::hint::black_box(diff) == 0
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+const O_NOFOLLOW_BITS: i32 = 0o400_000;
+#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+const O_NOFOLLOW_BITS: i32 = 0o100_000;
+#[cfg(target_os = "macos")]
+const O_NOFOLLOW_BITS: i32 = 0x0100;
+
+/// Opens `path` for append without following symlinks (`O_NOFOLLOW` + `(dev, ino)` verification).
+pub fn open_append_nofollow(path: &Path) -> Result<File, String> {
+    if let Some(parent) = path.parent()
+        && let Ok(pmeta) = fs::symlink_metadata(parent)
+        && pmeta.file_type().is_symlink()
+    {
+        return Err(format!(
+            "SYMLINK_REJECTED: refusing symlink parent directory '{}'",
+            parent.display()
+        ));
+    }
+    if let Ok(meta) = fs::symlink_metadata(path)
+        && (meta.file_type().is_symlink() || !meta.file_type().is_file())
+    {
+        return Err(format!(
+            "SYMLINK_REJECTED: '{}' must be a regular non-symlink file",
+            path.display()
+        ));
+    }
+
+    let mut opts = OpenOptions::new();
+    opts.create(true).append(true);
+    #[cfg(any(
+        all(target_os = "linux", target_arch = "x86_64"),
+        all(target_os = "linux", target_arch = "aarch64"),
+        target_os = "macos"
+    ))]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.custom_flags(O_NOFOLLOW_BITS);
+    }
+    let file = opts
+        .open(path)
+        .map_err(|e| format!("failed opening '{}' (O_NOFOLLOW): {e}", path.display()))?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let fmeta = file
+            .metadata()
+            .map_err(|e| format!("failed stating open fd '{}': {e}", path.display()))?;
+        let lmeta = fs::symlink_metadata(path)
+            .map_err(|e| format!("failed lstating '{}': {e}", path.display()))?;
+        if lmeta.file_type().is_symlink()
+            || !fmeta.file_type().is_file()
+            || fmeta.dev() != lmeta.dev()
+            || fmeta.ino() != lmeta.ino()
+        {
+            return Err(format!(
+                "SYMLINK_REJECTED: TOCTOU or symlink mismatch detected on '{}'",
+                path.display()
+            ));
+        }
+    }
+
+    Ok(file)
+}
+
+pub fn ensure_regular_non_symlink_file(path: &Path) -> Result<(), String> {
+    let meta =
+        fs::symlink_metadata(path).map_err(|e| format!("cannot stat '{}': {e}", path.display()))?;
+    if meta.file_type().is_symlink() || !meta.file_type().is_file() {
+        return Err(format!(
+            "SYMLINK_REJECTED: '{}' must be a regular non-symlink file",
+            path.display()
+        ));
+    }
+    Ok(())
+}
+
 pub fn verify_event_mac_for_repo(
     repo_root: &Path,
     event: &AuthenticatedEvent,
     expected_mac: &[u8; 32],
 ) -> Result<(), String> {
     let actual = compute_event_mac_for_repo(repo_root, event)?;
-    let mut diff = 0u8;
-    for (a, b) in actual.iter().zip(expected_mac.iter()) {
-        diff |= a ^ b;
-    }
-    if diff == 0 {
+    if constant_time_eq_bytes(&actual, expected_mac) {
         Ok(())
     } else {
         Err("HMAC-SHA256 authentication tag mismatch (tampered field or path swap)".to_string())
@@ -455,16 +540,16 @@ pub fn verify_arbitrary_hmac_hex(
     expected_hex: &str,
 ) -> Result<(), String> {
     let actual = compute_arbitrary_hmac_hex(repo_root, domain, payload)?;
-    let a = actual.as_bytes();
-    let b = expected_hex.trim().as_bytes();
-    if a.len() != b.len() {
+    let norm_expected: Vec<u8> = expected_hex
+        .trim()
+        .bytes()
+        .map(|b| b.to_ascii_lowercase())
+        .collect();
+    let norm_actual: Vec<u8> = actual.bytes().map(|b| b.to_ascii_lowercase()).collect();
+    if norm_actual.len() != norm_expected.len() {
         return Err("HMAC authentication tag length mismatch".to_string());
     }
-    let mut diff = 0u8;
-    for (&x, &y) in a.iter().zip(b.iter()) {
-        diff |= x.to_ascii_lowercase() ^ y.to_ascii_lowercase();
-    }
-    if diff == 0 {
+    if constant_time_eq_bytes(&norm_actual, &norm_expected) {
         Ok(())
     } else {
         Err("HMAC authentication tag mismatch".to_string())
@@ -486,8 +571,17 @@ pub fn spool_file_path(repo_root: &Path, session_id: &str) -> Result<PathBuf, St
     Ok(dir.join(format!("{safe_sid}.spool")))
 }
 
-/// Appends a binary `[u32 be_len][u32 be_crc32][json_bytes]\n` frame to the session spool.
+/// Appends a binary `[u32 be_len][u32 be_crc32][json_bytes]\n` frame to the session spool
+/// under an exclusive advisory lock and `O_NOFOLLOW`.
 pub fn append_spool_frame(
+    spool_path: &Path,
+    record: &SignedBreadcrumbRecord,
+) -> Result<(), String> {
+    let _spool_lock = ExclusiveFileLockGuard::acquire(spool_path)?;
+    append_spool_frame_unlocked(spool_path, record)
+}
+
+fn append_spool_frame_unlocked(
     spool_path: &Path,
     record: &SignedBreadcrumbRecord,
 ) -> Result<(), String> {
@@ -502,11 +596,7 @@ pub fn append_spool_frame(
     frame.extend_from_slice(&json_bytes);
     frame.push(b'\n');
 
-    let mut file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(spool_path)
-        .map_err(|e| format!("failed opening spool '{}': {e}", spool_path.display()))?;
+    let mut file = open_append_nofollow(spool_path)?;
     file.write_all(&frame)
         .map_err(|e| format!("failed writing spool frame: {e}"))?;
     file.sync_data()
@@ -515,15 +605,19 @@ pub fn append_spool_frame(
     Ok(())
 }
 
-/// Reads `[u32 len][u32 crc32][json]\n` frames, cleanly quarantining any torn crash tail (`F14`).
+/// Reads `[u32 len][u32 crc32][json]\n` frames:
+/// - Quarantines ONLY genuinely incomplete/truncated crash tails at EOF (`frame_end > raw.len()`).
+/// - Fails closed (`Err`) on any complete frame with a bad delimiter, CRC32 mismatch, invalid UTF-8,
+///   or malformed record JSON (`HIGH-DA-05`), preventing silent history truncation.
 pub fn recover_spool_frames(spool_path: &Path) -> Result<SpoolRecoveryReport, String> {
-    if !spool_path.exists() {
+    if fs::symlink_metadata(spool_path).is_err() {
         return Ok(SpoolRecoveryReport {
             valid_records: Vec::new(),
             quarantined_tail_bytes: 0,
             quarantine_path: None,
         });
     }
+    ensure_regular_non_symlink_file(spool_path)?;
 
     let raw = fs::read(spool_path)
         .map_err(|e| format!("failed reading spool '{}': {e}", spool_path.display()))?;
@@ -550,20 +644,36 @@ pub fn recover_spool_frames(spool_path: &Path) -> Result<SpoolRecoveryReport, St
             .saturating_add(8)
             .saturating_add(len)
             .saturating_add(1);
-        if frame_end > raw.len() || raw[frame_end - 1] != b'\n' {
+        if frame_end > raw.len() {
+            // Genuinely truncated EOF write (e.g., SIGKILL mid-write): quarantine tail
             break;
+        }
+        if raw[frame_end - 1] != b'\n' {
+            return Err(format!(
+                "CORRUPT_SPOOL_FRAME: missing newline framing at byte offset {offset} in '{}'",
+                spool_path.display()
+            ));
         }
         let payload = &raw[offset + 8..offset + 8 + len];
         let actual_crc = crc32fast::hash(payload);
         if actual_crc != expected_crc {
-            break;
+            return Err(format!(
+                "CORRUPT_SPOOL_FRAME: CRC32 mismatch at byte offset {offset} in '{}' (expected {expected_crc:#010x}, got {actual_crc:#010x})",
+                spool_path.display()
+            ));
         }
-        let Ok(line_str) = std::str::from_utf8(payload) else {
-            break;
-        };
-        let Ok(rec) = SignedBreadcrumbRecord::from_json_line(line_str) else {
-            break;
-        };
+        let line_str = std::str::from_utf8(payload).map_err(|e| {
+            format!(
+                "CORRUPT_SPOOL_FRAME: non-UTF8 payload at byte offset {offset} in '{}': {e}",
+                spool_path.display()
+            )
+        })?;
+        let rec = SignedBreadcrumbRecord::from_json_line(line_str).map_err(|e| {
+            format!(
+                "CORRUPT_SPOOL_FRAME: malformed record at byte offset {offset} in '{}': {e}",
+                spool_path.display()
+            )
+        })?;
         valid_records.push(rec);
         offset = frame_end;
     }
@@ -571,6 +681,12 @@ pub fn recover_spool_frames(spool_path: &Path) -> Result<SpoolRecoveryReport, St
     if offset < raw.len() {
         let torn = &raw[offset..];
         let qpath = spool_path.with_extension("spool.quarantine");
+        if fs::symlink_metadata(&qpath).is_ok_and(|m| m.file_type().is_symlink()) {
+            return Err(format!(
+                "SYMLINK_REJECTED: quarantine path '{}' is a symlink",
+                qpath.display()
+            ));
+        }
         fs::write(&qpath, torn)
             .map_err(|e| format!("failed writing quarantine tail '{}': {e}", qpath.display()))?;
         set_file_0600(&qpath);
@@ -632,7 +748,7 @@ pub fn append_breadcrumb_for_path(
     let record_mac = compute_event_mac_for_repo(&canon_repo, &event)?;
     let signed = SignedBreadcrumbRecord { event, record_mac };
 
-    append_spool_frame(&spool_path, &signed)?;
+    append_spool_frame_unlocked(&spool_path, &signed)?;
     let _ = ensure_git_info_exclude(&canon_repo);
 
     let trail_path = trail_path_for_rel_path(&canon_repo, canonical_rel_path)?;
@@ -776,7 +892,8 @@ pub fn flush_records_idempotent(
     let _lock = ExclusiveFileLockGuard::acquire(trail_path)?;
 
     let mut existing_ids = BTreeSet::new();
-    if trail_path.exists() {
+    if fs::symlink_metadata(trail_path).is_ok() {
+        ensure_regular_non_symlink_file(trail_path)?;
         let content = fs::read_to_string(trail_path)
             .map_err(|e| format!("failed reading '{}': {e}", trail_path.display()))?;
         for line in content.lines() {
@@ -797,11 +914,7 @@ pub fn flush_records_idempotent(
         return Ok(0);
     }
 
-    let mut file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(trail_path)
-        .map_err(|e| format!("failed opening '{}': {e}", trail_path.display()))?;
+    let mut file = open_append_nofollow(trail_path)?;
     for line in &to_append {
         writeln!(file, "{line}").map_err(|e| format!("failed appending breadcrumb line: {e}"))?;
     }

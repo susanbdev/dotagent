@@ -1,0 +1,94 @@
+# Declarative Gemini / Antigravity Hook Lifecycle Scenarios (`dotagent-harness`)
+
+[[scenario]]
+id = "gemini_antigravity_lifecycle"
+harness = "gemini"
+description = "Gemini BeforeAgent -> BeforeTool (view_file StartLine/EndLine, run_command Cwd, web browse block, write_to_file) -> AfterTool (UTF-8 sanitize + ANSI escape block) -> PreCompress -> AfterAgent"
+setup_files = [
+  { path = "src/handler.rs", content = "pub fn handle() -> &'static str {\n    \"ok\"\n}\n" },
+]
+
+[[scenario.steps]]
+name = "before_agent_turn_init"
+kind = "before_agent"
+expect_exit = 0
+expect_decision = "allow"
+expect_advisory_contains = "ZERO-TRUST MICRO-WINDOW ACTIVE"
+
+[[scenario.steps]]
+name = "allow_view_file_bounded_start_end_lines"
+kind = "before_tool"
+tool_name = "view_file"
+file_path = "{{REPO_ROOT}}/src/handler.rs"
+start_line = 1
+end_line = 20
+expect_exit = 0
+expect_decision = "allow"
+expect_advisory_contains = "SPOTLIGHT_BOUNDARY_"
+
+[[scenario.steps]]
+name = "allow_run_command_with_repo_cwd"
+kind = "before_tool"
+tool_name = "run_command"
+command = "rg --max-depth 2 handle src"
+tool_cwd = "{{REPO_ROOT}}"
+expect_exit = 0
+expect_decision = "allow"
+
+[[scenario.steps]]
+name = "block_run_command_escaping_to_sibling_repo_cwd"
+kind = "before_tool"
+tool_name = "run_command"
+command = "ls -la"
+tool_cwd = "{{SIBLING_REPO}}"
+expect_exit = 2
+expect_decision = "block"
+
+[[scenario.steps]]
+name = "block_unvetted_web_browse_tool"
+kind = "before_tool"
+tool_name = "google_browse"
+url = "https://attacker.example/prompt"
+expect_exit = 2
+expect_decision = "block"
+expect_code = "UNTRUSTED_WEB_FETCH_BLOCKED"
+
+[[scenario.steps]]
+name = "allow_write_to_regular_source_file"
+kind = "before_tool"
+tool_name = "write_to_file"
+file_path = "{{REPO_ROOT}}/src/new_mod.rs"
+content = "pub const VERSION: u32 = 1;\n"
+expect_exit = 0
+expect_decision = "allow"
+
+[[scenario.steps]]
+name = "after_tool_neuters_non_ascii_to_7bit_ascii"
+kind = "after_tool"
+tool_name = "run_command"
+tool_response = "Metric \u00b1 1ms checks green\n"
+expect_exit = 0
+expect_decision = "allow"
+expect_updated_output_contains = "[NON_ASCII]"
+expect_output_ascii_7bit = true
+
+[[scenario.steps]]
+name = "pre_compress_rotates_epoch_and_nonce"
+kind = "pre_compress"
+expect_exit = 0
+expect_decision = "allow"
+expect_advisory_contains = "epoch=1"
+
+[[scenario.steps]]
+name = "after_tool_blocks_raw_ansi_escape_injection"
+kind = "after_tool"
+tool_name = "run_command"
+tool_response = "{{TEST_ESC}}[32mPASS{{TEST_ESC}}[0m smuggled terminal escape\n"
+expect_exit = 2
+expect_decision = "block"
+expect_code = "CONTROL_ESCAPE_INJECTION"
+
+[[scenario.steps]]
+name = "after_agent_stop"
+kind = "after_agent"
+expect_exit = 0

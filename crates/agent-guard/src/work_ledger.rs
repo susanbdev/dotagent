@@ -5,16 +5,16 @@
 //! engine, and fail-closed `Grunt` `on-stop` tree-OID verifier (`F18`, `F32`, `F33`).
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs::{self, OpenOptions};
+use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use crate::breadcrumbs::{
     ExclusiveFileLockGuard, append_breadcrumb_for_path, compute_arbitrary_hmac_hex,
-    flush_records_idempotent, recover_spool_frames, sha256_digest, spool_file_path,
-    swarm_state_dir, trail_path_for_rel_path, verify_arbitrary_hmac_hex, verify_breadcrumbs_file,
-    verify_event_mac_for_repo,
+    ensure_regular_non_symlink_file, flush_records_idempotent, open_append_nofollow,
+    recover_spool_frames, sha256_digest, spool_file_path, swarm_state_dir, trail_path_for_rel_path,
+    verify_arbitrary_hmac_hex, verify_breadcrumbs_file, verify_event_mac_for_repo,
 };
 use crate::json::JsonValue;
 use crate::path_policy::{PathAccess, validate_path_with_max_depth};
@@ -28,7 +28,52 @@ use crate::swarm_contracts::{
 };
 use crate::unicode_guard::{ScanMode, scan_unicode};
 
-const LEDGER_HMAC_DOMAIN: &[u8] = b"DOTAGENT_SWARM_V2_WORK_LEDGER_V1";
+const LEDGER_HMAC_DOMAIN: &[u8] = b"DOTAGENT_SWARM_V2_WORK_LEDGER_V2";
+const GENESIS_LEDGER_PREV_MAC: &str =
+    "0000000000000000000000000000000000000000000000000000000000000000";
+
+fn push_len_prefixed_bytes(buf: &mut Vec<u8>, slice: &[u8]) {
+    buf.extend_from_slice(&(slice.len() as u64).to_be_bytes());
+    buf.extend_from_slice(slice);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn encode_work_ledger_mac_payload(
+    prev_mac_hex: &str,
+    session_id: &str,
+    task_id: &str,
+    attempt: u32,
+    git_tree_oid: &str,
+    event_ids: &[String],
+    what_changed: &str,
+    why_changed: &str,
+    smell_badges: &[SmellBadge],
+) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(256);
+    push_len_prefixed_bytes(&mut buf, prev_mac_hex.as_bytes());
+    push_len_prefixed_bytes(&mut buf, session_id.as_bytes());
+    push_len_prefixed_bytes(&mut buf, task_id.as_bytes());
+    buf.extend_from_slice(&attempt.to_be_bytes());
+    push_len_prefixed_bytes(&mut buf, git_tree_oid.as_bytes());
+    buf.extend_from_slice(&(event_ids.len() as u64).to_be_bytes());
+    for eid in event_ids {
+        push_len_prefixed_bytes(&mut buf, eid.as_bytes());
+    }
+    push_len_prefixed_bytes(&mut buf, what_changed.as_bytes());
+    push_len_prefixed_bytes(&mut buf, why_changed.as_bytes());
+    buf.extend_from_slice(&(smell_badges.len() as u64).to_be_bytes());
+    for badge in smell_badges {
+        let bucket_str = match badge.bucket {
+            SmellBucket::Malicious => "MALICIOUS",
+            SmellBucket::OffTask => "OFF_TASK",
+            SmellBucket::Confused => "CONFUSED",
+            SmellBucket::Risky => "RISKY",
+        };
+        push_len_prefixed_bytes(&mut buf, bucket_str.as_bytes());
+        push_len_prefixed_bytes(&mut buf, badge.signal.as_bytes());
+    }
+    buf
+}
 
 pub fn work_ledger_state_path(repo_root: &Path) -> Result<PathBuf, String> {
     let dir = swarm_state_dir(repo_root)?.join("ledger");
@@ -487,45 +532,75 @@ pub fn submit_work_ledger_entry(
     }
 
     let smell_badges = classify_session_smells(repo_root, &cap)?;
-    let events_csv = verified.ids.join(",");
-    let mac_payload = format!(
-        "{}|{}|{}|{}|{}|{}|{}",
-        cap.session_id,
-        cap.task_id,
-        cap.attempt,
-        current_oid,
-        events_csv,
-        what_changed.trim(),
-        why_changed.trim()
-    );
-    let record_mac_hex =
-        compute_arbitrary_hmac_hex(repo_root, LEDGER_HMAC_DOMAIN, mac_payload.as_bytes())?;
-
-    let entry = WorkLedgerEntry {
-        session_id: cap.session_id.clone(),
-        task_id: cap.task_id.clone(),
-        attempt: cap.attempt,
-        git_tree_oid: current_oid.clone(),
-        event_ids: verified.ids,
-        what_changed: what_changed.trim().to_string(),
-        why_changed: why_changed.trim().to_string(),
-        smell_badges,
-        record_mac_hex,
-    };
+    let what_trimmed = what_changed.trim().to_string();
+    let why_trimmed = why_changed.trim().to_string();
+    let event_ids = verified.ids;
 
     let ledger_path = work_ledger_state_path(repo_root)?;
-    {
+    let entry = {
         let _ledger_lock = ExclusiveFileLockGuard::acquire(&ledger_path)?;
-        let mut file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&ledger_path)
-            .map_err(|e| format!("failed opening WORK_LEDGER.jsonl: {e}"))?;
-        writeln!(file, "{}", entry.to_json_value().to_json_string())
+        let prev_mac_hex = if fs::symlink_metadata(&ledger_path).is_ok() {
+            ensure_regular_non_symlink_file(&ledger_path)?;
+            let existing_raw = fs::read_to_string(&ledger_path)
+                .map_err(|e| format!("failed reading WORK_LEDGER.jsonl: {e}"))?;
+            match existing_raw.lines().map(str::trim).rfind(|l| !l.is_empty()) {
+                Some(last_line) => {
+                    let parsed = JsonValue::parse(last_line).map_err(|e| {
+                        format!("FORGED_WORK_LEDGER_ENTRY: corrupt tail in WORK_LEDGER.jsonl: {e}")
+                    })?;
+                    parsed
+                        .get("record_mac")
+                        .and_then(JsonValue::as_str)
+                        .filter(|s| !s.is_empty())
+                        .ok_or_else(|| {
+                            "FORGED_WORK_LEDGER_ENTRY: missing record_mac in tail entry".to_string()
+                        })?
+                        .to_string()
+                }
+                None => GENESIS_LEDGER_PREV_MAC.to_string(),
+            }
+        } else {
+            GENESIS_LEDGER_PREV_MAC.to_string()
+        };
+
+        let mac_payload = encode_work_ledger_mac_payload(
+            &prev_mac_hex,
+            &cap.session_id,
+            &cap.task_id,
+            cap.attempt,
+            &current_oid,
+            &event_ids,
+            &what_trimmed,
+            &why_trimmed,
+            &smell_badges,
+        );
+        let record_mac_hex =
+            compute_arbitrary_hmac_hex(repo_root, LEDGER_HMAC_DOMAIN, &mac_payload)?;
+
+        let built = WorkLedgerEntry {
+            session_id: cap.session_id.clone(),
+            task_id: cap.task_id.clone(),
+            attempt: cap.attempt,
+            git_tree_oid: current_oid.clone(),
+            event_ids,
+            what_changed: what_trimmed,
+            why_changed: why_trimmed,
+            smell_badges,
+            record_mac_hex,
+        };
+
+        let mut json_val = built.to_json_value();
+        if let JsonValue::Object(ref mut fields) = json_val {
+            fields.push(("prev_record_mac".to_string(), JsonValue::Str(prev_mac_hex)));
+        }
+
+        let mut file = open_append_nofollow(&ledger_path)?;
+        writeln!(file, "{}", json_val.to_json_string())
             .map_err(|e| format!("failed writing WORK_LEDGER.jsonl: {e}"))?;
         file.sync_data()
             .map_err(|e| format!("failed fsyncing WORK_LEDGER.jsonl: {e}"))?;
-    }
+        built
+    };
 
     let plan_bytes = hex_decode_32(&cap.plan_sha256).unwrap_or([0u8; 32]);
     let tree_bytes = hex_decode_32(&current_oid).unwrap_or([0u8; 32]);
@@ -544,14 +619,18 @@ pub fn submit_work_ledger_entry(
 }
 
 /// Loads and authenticates every entry in `WORK_LEDGER.jsonl` (`2+2` sentence schema,
-/// `LEDGER_HMAC_DOMAIN` signature, and pinned session `event_ids` provenance).
+/// length-prefixed `LEDGER_HMAC_DOMAIN` signature covering `smell_badges` + `prev_record_mac`
+/// hash chain, and pinned session `event_ids` provenance).
 pub fn load_work_ledger_entries(repo_root: &Path) -> Result<Vec<WorkLedgerEntry>, String> {
     let path = work_ledger_state_path(repo_root)?;
-    if !path.exists() {
+    if fs::symlink_metadata(&path).is_err() {
         return Ok(Vec::new());
     }
+    ensure_regular_non_symlink_file(&path)?;
     let raw = fs::read_to_string(&path).map_err(|e| e.to_string())?;
     let mut out = Vec::new();
+    let mut expected_prev_mac = GENESIS_LEDGER_PREV_MAC.to_string();
+
     for (line_idx, line) in raw.lines().enumerate() {
         let t = line.trim();
         if t.is_empty() {
@@ -563,29 +642,39 @@ pub fn load_work_ledger_entries(repo_root: &Path) -> Result<Vec<WorkLedgerEntry>
                 line_idx + 1
             )
         })?;
-        let badges = v
-            .get("smell_badges")
-            .and_then(JsonValue::as_array)
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(JsonValue::as_str)
-                    .filter_map(|s| {
-                        let (b, sig) = s.split_once(':')?;
-                        let bucket = match b {
-                            "MALICIOUS" => SmellBucket::Malicious,
-                            "OFF_TASK" => SmellBucket::OffTask,
-                            "CONFUSED" => SmellBucket::Confused,
-                            "RISKY" => SmellBucket::Risky,
-                            _ => return None,
-                        };
-                        Some(SmellBadge {
-                            bucket,
-                            signal: sig.to_string(),
-                        })
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
+        let mut badges = Vec::new();
+        if let Some(arr) = v.get("smell_badges").and_then(JsonValue::as_array) {
+            for item in arr {
+                let raw_badge = item.as_str().ok_or_else(|| {
+                    format!(
+                        "FORGED_WORK_LEDGER_ENTRY: non-string smell_badge at line {}",
+                        line_idx + 1
+                    )
+                })?;
+                let (b, sig) = raw_badge.split_once(':').ok_or_else(|| {
+                    format!(
+                        "FORGED_WORK_LEDGER_ENTRY: malformed smell_badge '{raw_badge}' at line {}",
+                        line_idx + 1
+                    )
+                })?;
+                let bucket = match b {
+                    "MALICIOUS" => SmellBucket::Malicious,
+                    "OFF_TASK" => SmellBucket::OffTask,
+                    "CONFUSED" => SmellBucket::Confused,
+                    "RISKY" => SmellBucket::Risky,
+                    _ => {
+                        return Err(format!(
+                            "FORGED_WORK_LEDGER_ENTRY: unknown smell bucket '{b}' at line {}",
+                            line_idx + 1
+                        ));
+                    }
+                };
+                badges.push(SmellBadge {
+                    bucket,
+                    signal: sig.to_string(),
+                });
+            }
+        }
         let event_ids: Vec<String> = v
             .get("event_ids")
             .and_then(JsonValue::as_array)
@@ -596,6 +685,16 @@ pub fn load_work_ledger_entries(repo_root: &Path) -> Result<Vec<WorkLedgerEntry>
                     .collect()
             })
             .unwrap_or_default();
+
+        if let Some(recorded_prev) = v.get("prev_record_mac").and_then(JsonValue::as_str)
+            && !recorded_prev.eq_ignore_ascii_case(&expected_prev_mac)
+        {
+            return Err(format!(
+                "FORGED_WORK_LEDGER_ENTRY: broken hash chain at line {} (expected prev_record_mac '{}', got '{recorded_prev}')",
+                line_idx + 1,
+                expected_prev_mac
+            ));
+        }
 
         let entry = WorkLedgerEntry {
             session_id: v
@@ -651,21 +750,21 @@ pub fn load_work_ledger_entries(repo_root: &Path) -> Result<Vec<WorkLedgerEntry>
             )
         })?;
 
-        let events_csv = entry.event_ids.join(",");
-        let expected_payload = format!(
-            "{}|{}|{}|{}|{}|{}|{}",
-            entry.session_id,
-            entry.task_id,
+        let expected_payload = encode_work_ledger_mac_payload(
+            &expected_prev_mac,
+            &entry.session_id,
+            &entry.task_id,
             entry.attempt,
-            entry.git_tree_oid,
-            events_csv,
-            entry.what_changed,
-            entry.why_changed
+            &entry.git_tree_oid,
+            &entry.event_ids,
+            &entry.what_changed,
+            &entry.why_changed,
+            &entry.smell_badges,
         );
         verify_arbitrary_hmac_hex(
             repo_root,
             LEDGER_HMAC_DOMAIN,
-            expected_payload.as_bytes(),
+            &expected_payload,
             &entry.record_mac_hex,
         )
         .map_err(|e| {
@@ -697,6 +796,7 @@ pub fn load_work_ledger_entries(repo_root: &Path) -> Result<Vec<WorkLedgerEntry>
             }
         }
 
+        expected_prev_mac = entry.record_mac_hex.clone();
         out.push(entry);
     }
     Ok(out)

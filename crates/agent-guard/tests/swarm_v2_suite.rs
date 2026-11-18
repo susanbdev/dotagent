@@ -542,12 +542,14 @@ fn all_six_role_skills_guides_and_compiled_agents_verified() {
 fn pr2_review_regressions_role_sandbox_spool_and_ledger_pins() {
     let (repo, _) = isolated_sandbox("pr2_review_regressions");
 
-    // 1. QA writable path policy blocks `src/test_*.rs` production writes while allowing pytest `test_*.py`
+    // 1. QA writable path policy blocks all `src/` writes (including `src/*_test.rs` & `src/tests/*`) while allowing `tests/` & `pkg/test_*.py`
     assert!(!is_qa_writable_path("src/test_backdoor.rs"));
     assert!(!is_qa_writable_path(
         "crates/agent-guard/src/test_helper.rs"
     ));
-    assert!(is_qa_writable_path("src/calc_test.rs"));
+    assert!(!is_qa_writable_path("src/calc_test.rs"));
+    assert!(!is_qa_writable_path("src/tests/evil.rs"));
+    assert!(is_qa_writable_path("crates/foo/tests/calc_test.rs"));
     assert!(is_qa_writable_path("tests/integration.rs"));
     assert!(is_qa_writable_path("pkg/test_auth.py"));
 
