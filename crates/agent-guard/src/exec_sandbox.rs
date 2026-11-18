@@ -295,13 +295,28 @@ pub fn run_exec_sandbox_cli(args: &[String], default_cwd: &Path) -> ExitCode {
     let writes_allowed = load_active_profile(&repo_root)
         .map(|p| p.enable_write_tools)
         .unwrap_or(true);
-    let invokes_git = leading_token_is_git(&shell_script);
+    let invokes_git = is_atomic_leading_command(&shell_script, "git");
+    let invokes_swarm_tool = is_atomic_leading_command(&shell_script, "swarm-tool");
+
+    // Pre-launch the out-of-sandbox Vault Coordinator daemon BEFORE `restrict_self()` so
+    // `swarm-tool` can sign/verify provenance via `ipc/coord.sock` while `vault/hmac.key`
+    // stays 100% kernel-inaccessible (`EACCES`) inside Landlock/Seatbelt!
+    if invokes_swarm_tool {
+        let _ = crate::coordinator::ensure_coordinator_daemon(&repo_root);
+        precreate_swarm_tool_sandbox_targets(&repo_root, &shell_script);
+    }
 
     let ephemeral_tmp = EphemeralTmpDir::create();
     let tmp_dir_path = ephemeral_tmp.as_ref().map(|t| t.path.as_path());
 
     // Apply OS kernel sandbox to THIS process prior to spawning `bash` on Linux (inherited across fork/exec!).
-    let mode = apply_current_process_sandbox(&repo_root, tmp_dir_path, writes_allowed, invokes_git);
+    let mode = apply_current_process_sandbox(
+        &repo_root,
+        tmp_dir_path,
+        writes_allowed,
+        invokes_git,
+        invokes_swarm_tool,
+    );
     if require_kernel && !mode.is_kernel_enforced() {
         eprintln!(
             "[AGENT-GUARD HARD DENY :: KERNEL_SANDBOX_UNAVAILABLE] Host kernel does not enforce Landlock/Seatbelt VFS containment (mode={}).",
@@ -310,7 +325,13 @@ pub fn run_exec_sandbox_cli(args: &[String], default_cwd: &Path) -> ExitCode {
         return ExitCode::from(2);
     }
 
-    let mut child_cmd = build_child_command(&shell_script, &repo_root, &cwd, tmp_dir_path);
+    let mut child_cmd = build_child_command(
+        &shell_script,
+        &repo_root,
+        &cwd,
+        tmp_dir_path,
+        invokes_swarm_tool,
+    );
 
     if sanitize_stream {
         let mut child = match child_cmd
@@ -387,9 +408,116 @@ pub fn run_exec_sandbox_cli(args: &[String], default_cwd: &Path) -> ExitCode {
     }
 }
 
-fn leading_token_is_git(script: &str) -> bool {
-    let first = script.split_whitespace().next().unwrap_or("");
-    first == "git" || first.ends_with("/git")
+/// Returns true ONLY if `script` is a single atomic command (zero unquoted compound operators,
+/// pipes, redirections, subshells, or command substitutions) whose leading executable basename
+/// equals `target_bin`.
+fn is_atomic_leading_command(script: &str, target_bin: &str) -> bool {
+    let trimmed = script.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    let bytes = trimmed.as_bytes();
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut escaped = false;
+    let mut first_token = String::new();
+    let mut first_done = false;
+
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if escaped {
+            if !first_done {
+                first_token.push(b as char);
+            }
+            escaped = false;
+            i += 1;
+            continue;
+        }
+        if in_single {
+            if b == b'\'' {
+                in_single = false;
+            } else if !first_done {
+                first_token.push(b as char);
+            }
+            i += 1;
+            continue;
+        }
+        if in_double {
+            match b {
+                b'\\' => {
+                    escaped = true;
+                }
+                b'"' => {
+                    in_double = false;
+                }
+                b'`' => return false,
+                b'$' if bytes.get(i + 1) == Some(&b'(') => return false,
+                _ => {
+                    if !first_done {
+                        first_token.push(b as char);
+                    }
+                }
+            }
+            i += 1;
+            continue;
+        }
+
+        match b {
+            b'\\' => {
+                escaped = true;
+            }
+            b'\'' => {
+                in_single = true;
+            }
+            b'"' => {
+                in_double = true;
+            }
+            b';' | b'|' | b'&' | b'\n' | b'\r' | b'`' | b'<' | b'>' | b'(' | b')' => {
+                return false;
+            }
+            b' ' | b'\t' => {
+                if !first_token.is_empty() {
+                    first_done = true;
+                }
+            }
+            _ => {
+                if !first_done {
+                    first_token.push(b as char);
+                }
+            }
+        }
+        i += 1;
+    }
+
+    if in_single || in_double || escaped || first_token.is_empty() {
+        return false;
+    }
+    first_token == target_bin || first_token.ends_with(&format!("/{target_bin}"))
+}
+
+fn precreate_swarm_tool_sandbox_targets(repo_root: &Path, _shell_script: &str) {
+    let canon_repo = fs::canonicalize(repo_root).unwrap_or_else(|_| repo_root.to_path_buf());
+    if let Ok(sdir) = crate::breadcrumbs::swarm_state_dir(&canon_repo) {
+        for sub in ["ipc", "sessions", "spools", "ledger"] {
+            let p = sdir.join(sub);
+            let _ = fs::create_dir_all(&p);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = fs::set_permissions(&p, fs::Permissions::from_mode(0o700));
+            }
+        }
+    }
+    let _ = crate::breadcrumbs::swarm_locks_dir();
+    let _ = crate::breadcrumbs::ensure_git_info_exclude(&canon_repo);
+
+    // Pre-open `.breadcrumbs.jsonl` before Landlock `restrict_self()` (which deliberately withholds
+    // `MakeReg` on `canon_repo` to keep `AGENTS.md` and `.env*` kernel-immutable).
+    let bc = canon_repo.join(".breadcrumbs.jsonl");
+    if !bc.exists() {
+        let _ = fs::OpenOptions::new().create(true).append(true).open(&bc);
+    }
 }
 
 fn build_child_command(
@@ -397,10 +525,11 @@ fn build_child_command(
     repo_root: &Path,
     cwd: &Path,
     ephemeral_tmp: Option<&Path>,
+    invokes_swarm_tool: bool,
 ) -> Command {
     #[cfg(target_os = "macos")]
     let mut cmd = if Path::new("/usr/bin/sandbox-exec").is_file() {
-        let profile = render_macos_seatbelt_profile(repo_root, ephemeral_tmp);
+        let profile = render_macos_seatbelt_profile(repo_root, ephemeral_tmp, invokes_swarm_tool);
         let mut c = Command::new("/usr/bin/sandbox-exec");
         c.arg("-p")
             .arg(profile)
@@ -418,7 +547,7 @@ fn build_child_command(
 
     #[cfg(not(target_os = "macos"))]
     let mut cmd = {
-        let _ = repo_root;
+        let _ = (repo_root, invokes_swarm_tool);
         let mut c = Command::new("bash");
         c.arg("-o").arg("pipefail").arg("-c").arg(shell_script);
         c
@@ -428,6 +557,7 @@ fn build_child_command(
     for var in SCRUBBED_ENV_VARS {
         cmd.env_remove(var);
     }
+    cmd.env("AGENT_GUARD_IN_SANDBOX", "1");
     cmd.env("PYTHONDONTWRITEBYTECODE", "1");
     cmd.env("PIP_NO_CACHE_DIR", "1");
     cmd.env("NPM_CONFIG_IGNORE_SCRIPTS", "true");
@@ -499,6 +629,14 @@ fn is_secret_or_forbidden_root_entry(name: &str) -> bool {
         )
 }
 
+fn is_swarm_mutable_root_artifact(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    matches!(
+        lower.as_str(),
+        "plan.lock.json" | "work_ledger.jsonl" | ".breadcrumbs.jsonl"
+    )
+}
+
 fn is_immutable_control_root_entry(name: &str) -> bool {
     let lower = name.to_ascii_lowercase();
     matches!(
@@ -526,14 +664,27 @@ fn apply_current_process_sandbox(
     ephemeral_tmp: Option<&Path>,
     writes_allowed: bool,
     invokes_git: bool,
+    invokes_swarm_tool: bool,
 ) -> KernelSandboxMode {
     #[cfg(target_os = "linux")]
     {
-        apply_linux_landlock(repo_root, ephemeral_tmp, writes_allowed, invokes_git)
+        apply_linux_landlock(
+            repo_root,
+            ephemeral_tmp,
+            writes_allowed,
+            invokes_git,
+            invokes_swarm_tool,
+        )
     }
     #[cfg(target_os = "macos")]
     {
-        let _ = (repo_root, ephemeral_tmp, writes_allowed, invokes_git);
+        let _ = (
+            repo_root,
+            ephemeral_tmp,
+            writes_allowed,
+            invokes_git,
+            invokes_swarm_tool,
+        );
         if Path::new("/usr/bin/sandbox-exec").is_file() {
             KernelSandboxMode::MacosSeatbeltEnforced
         } else {
@@ -542,7 +693,13 @@ fn apply_current_process_sandbox(
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
-        let _ = (repo_root, ephemeral_tmp, writes_allowed, invokes_git);
+        let _ = (
+            repo_root,
+            ephemeral_tmp,
+            writes_allowed,
+            invokes_git,
+            invokes_swarm_tool,
+        );
         KernelSandboxMode::FallbackEnvAndAstOnly
     }
 }
@@ -553,6 +710,7 @@ fn apply_linux_landlock(
     ephemeral_tmp: Option<&Path>,
     writes_allowed: bool,
     invokes_git: bool,
+    invokes_swarm_tool: bool,
 ) -> KernelSandboxMode {
     use landlock::{
         ABI, Access, AccessFs, BitFlags, CompatLevel, Compatible, Ruleset, RulesetAttr,
@@ -607,6 +765,16 @@ fn apply_linux_landlock(
         if p.exists() {
             add_path(p, ro_access);
         }
+    }
+
+    // Allow read+execute on the directory containing `agent-guard` itself so sibling `swarm-tool`
+    // binaries in non-installed build directories (e.g. `target/debug/swarm-tool`) can execute.
+    if let Ok(exe) = env::current_exe()
+        && let Some(exe_dir) = exe.parent()
+        && exe_dir != Path::new("/")
+        && exe_dir.is_dir()
+    {
+        add_path(exe_dir, ro_access);
     }
 
     // 2. Safe pseudo-devices & optional GIT_CONFIG_GLOBAL read access
@@ -674,10 +842,28 @@ fn apply_linux_landlock(
         add_path(tmp, rw_access);
     }
 
+    // 4b. Granular Swarm state access ONLY for atomic `swarm-tool` invocations:
+    //     `<swarm_state_dir>/vault` (`hmac.key`) is UNCONDITIONALLY OMITTED (`EACCES`)!
+    let canon_repo = fs::canonicalize(repo_root).unwrap_or_else(|_| repo_root.to_path_buf());
+    if invokes_swarm_tool {
+        if let Ok(sdir) = crate::breadcrumbs::swarm_state_dir(&canon_repo) {
+            for allowed_sub in ["ipc", "sessions", "spools", "ledger"] {
+                let sub_p = sdir.join(allowed_sub);
+                if sub_p.is_dir() {
+                    add_path(&sub_p, rw_access);
+                }
+            }
+        }
+        if let Ok(locks_dir) = crate::breadcrumbs::swarm_locks_dir()
+            && locks_dir.is_dir()
+        {
+            add_path(&locks_dir, rw_access);
+        }
+    }
+
     // 5. Granular `repo_root` rules:
     //    - `repo_root` itself gets `ReadDir` ONLY so unlisted/secret root files (`.env*`) cannot be read
     //      and immutable root control files (`AGENTS.md`) cannot be overwritten or unlinked!
-    let canon_repo = fs::canonicalize(repo_root).unwrap_or_else(|_| repo_root.to_path_buf());
     add_path(&canon_repo, dir_list_access);
 
     // Pre-create `target` if writes are allowed and `Cargo.toml` exists so `cargo` can build even
@@ -720,7 +906,9 @@ fn apply_linux_landlock(
                                 add_path(&gpath, file_ro_access); // Read-only .git/config
                                 continue;
                             }
-                            let g_access = if invokes_git && writes_allowed {
+                            let g_access = if (invokes_git && writes_allowed)
+                                || (invokes_swarm_tool && gname.eq_ignore_ascii_case("info"))
+                            {
                                 rw_access
                             } else if gpath.is_dir() {
                                 ro_access
@@ -730,6 +918,18 @@ fn apply_linux_landlock(
                             add_path(&gpath, g_access);
                         }
                     }
+                } else {
+                    add_path(&entry_path, file_ro_access);
+                }
+                continue;
+            }
+
+            if is_swarm_mutable_root_artifact(&name) {
+                if invokes_swarm_tool {
+                    add_path(
+                        &entry_path,
+                        AccessFs::ReadFile | AccessFs::WriteFile | AccessFs::Truncate,
+                    );
                 } else {
                     add_path(&entry_path, file_ro_access);
                 }
@@ -771,7 +971,11 @@ fn apply_linux_landlock(
 }
 
 #[cfg(target_os = "macos")]
-fn render_macos_seatbelt_profile(repo_root: &Path, ephemeral_tmp: Option<&Path>) -> String {
+fn render_macos_seatbelt_profile(
+    repo_root: &Path,
+    ephemeral_tmp: Option<&Path>,
+    invokes_swarm_tool: bool,
+) -> String {
     let canon_repo = fs::canonicalize(repo_root).unwrap_or_else(|_| repo_root.to_path_buf());
     let repo_s = canon_repo.to_string_lossy().replace('"', "\\\"");
     let home_s = env::var("HOME").unwrap_or_default().replace('"', "\\\"");
@@ -785,6 +989,30 @@ fn render_macos_seatbelt_profile(repo_root: &Path, ephemeral_tmp: Option<&Path>)
     if !home_s.is_empty() {
         p.push_str(&format!(
             "(deny file-read* file-write* (subpath \"{home_s}/.ssh\") (subpath \"{home_s}/.aws\") (subpath \"{home_s}/.gnupg\") (subpath \"{home_s}/.config/gh\") (subpath \"{home_s}/.local/state/agent-guard\"))\n"
+        ));
+    }
+    if invokes_swarm_tool {
+        if let Ok(sdir) = crate::breadcrumbs::swarm_state_dir(&canon_repo) {
+            for sub in ["ipc", "sessions", "spools", "ledger"] {
+                let sp = sdir.join(sub).to_string_lossy().replace('"', "\\\"");
+                p.push_str(&format!(
+                    "(allow file-read* file-write* (subpath \"{sp}\"))\n"
+                ));
+            }
+            let vp = sdir.join("vault").to_string_lossy().replace('"', "\\\"");
+            p.push_str(&format!(
+                "(deny file-read* file-write* (subpath \"{vp}\"))\n"
+            ));
+        }
+        if let Ok(locks_dir) = crate::breadcrumbs::swarm_locks_dir() {
+            let lp = locks_dir.to_string_lossy().replace('"', "\\\"");
+            p.push_str(&format!(
+                "(allow file-read* file-write* (subpath \"{lp}\"))\n"
+            ));
+        }
+    } else {
+        p.push_str(&format!(
+            "(deny file-write* (literal \"{repo_s}/PLAN.lock.json\") (literal \"{repo_s}/WORK_LEDGER.jsonl\") (literal \"{repo_s}/.breadcrumbs.jsonl\"))\n"
         ));
     }
     p.push_str(&format!(

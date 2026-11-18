@@ -14,16 +14,22 @@
 //! - Cache bleed & cross-repository context contamination (`SHA-256` repo-isolated ledger)
 //! - Confused deputy attacks (git hooks disabled, lifecycle scripts blocked, taint-gated CLIs, MCP lock)
 
+pub mod breadcrumbs;
 pub mod budget_guard;
 pub mod cmd_policy;
+pub mod coordinator;
 pub mod exec_sandbox;
 pub mod injection_scan;
 pub mod json;
 pub mod path_policy;
+pub mod qa_suspects;
+pub mod role_sandbox;
 pub mod sanitizer;
 pub mod sha256;
+pub mod swarm_contracts;
 pub mod traversal_ledger;
 pub mod unicode_guard;
+pub mod work_ledger;
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -41,7 +47,7 @@ use injection_scan::scan_untrusted_content;
 use json::JsonValue;
 use path_policy::{
     MAX_DIRECTORY_WALK_DEPTH, PathAccess, lexical_normalize, validate_path,
-    validate_workspace_glob_pattern,
+    validate_path_with_max_depth, validate_workspace_glob_pattern,
 };
 use sanitizer::{
     DEFAULT_COMPACT_STREAM_MAX_BYTES, DEFAULT_COMPACT_STREAM_MAX_LINES, neuter_to_clean_ascii,
@@ -258,14 +264,33 @@ pub fn handle_pre_tool_hook(raw_json: &str, fallback_cwd: &Path) -> Decision {
     let tool_name = extract_tool_name(&parsed);
     let tool_input = parsed.get("tool_input").unwrap_or(&parsed);
 
-    let decision = evaluate_tool_invocation(
+    let (role, cap_opt) = match role_sandbox::resolve_active_role(&repo_root, &session_id) {
+        Ok(rc) => rc,
+        Err(err) => {
+            return Decision::deny("INVALID_SWARM_ROLE", err, true);
+        }
+    };
+
+    let decision = if let Some(role_denial) = role_sandbox::enforce_role_pre_tool(
+        role,
+        cap_opt.as_ref(),
         &tool_name,
         tool_input,
         &repo_root,
         &cwd,
-        &profile,
-        &mut ledger,
-    );
+    ) {
+        role_denial
+    } else {
+        evaluate_tool_invocation(
+            &tool_name,
+            tool_input,
+            &repo_root,
+            &cwd,
+            &profile,
+            &mut ledger,
+            (role, cap_opt.as_ref()),
+        )
+    };
     if let Decision::Deny {
         code,
         ref reason,
@@ -274,6 +299,10 @@ pub fn handle_pre_tool_hook(raw_json: &str, fallback_cwd: &Path) -> Decision {
     {
         if halt_session {
             ledger.trip_circuit_breaker(format!("{code}: {reason}"));
+            if let Some(mut c) = cap_opt {
+                c.malicious_flags = c.malicious_flags.saturating_add(1);
+                let _ = role_sandbox::save_session_capability(&repo_root, &c);
+            }
         }
         append_audit_jsonl(
             &repo_root,
@@ -299,6 +328,10 @@ fn evaluate_tool_invocation(
     cwd: &Path,
     profile: &RuntimeProfile,
     ledger: &mut SessionLedger,
+    (role, cap): (
+        swarm_contracts::SwarmRole,
+        Option<&swarm_contracts::SessionCapability>,
+    ),
 ) -> Decision {
     let norm_tool = tool_name.to_ascii_lowercase();
     let writes_disabled = !profile.enable_write_tools || profile.write_scope_none;
@@ -393,6 +426,20 @@ fn evaluate_tool_invocation(
                 ),
                 false,
             );
+        }
+
+        let write_rels: Vec<String> = plan.write_files.iter().map(|(r, _)| r.clone()).collect();
+        if let Err(role_denial) =
+            role_sandbox::check_role_shell_write_scope(role, cap, &write_rels, repo_root)
+        {
+            return role_denial;
+        }
+
+        let read_rels: Vec<String> = plan.read_files.iter().map(|(r, _, _)| r.clone()).collect();
+        if let Err(role_denial) =
+            role_sandbox::check_role_shell_read_scope(role, cap, &read_rels, repo_root)
+        {
+            return role_denial;
         }
 
         // Pre-inspect every file read by the shell command (enforces A->B->C, Unicode, injection, & token budget!)
@@ -720,8 +767,9 @@ fn evaluate_tool_invocation(
             | "delegate"
             | "delegate_task"
     );
-    let swarm_allowed =
-        std::env::var("AGENT_GUARD_ALLOW_SWARM").ok().as_deref() == Some("1") && !ledger.tainted;
+    let swarm_allowed = (std::env::var("AGENT_GUARD_ALLOW_SWARM").ok().as_deref() == Some("1")
+        || role == swarm_contracts::SwarmRole::Master)
+        && !ledger.tainted;
     let is_research_airlock =
         is_research_airlock_delegation(norm_tool.as_str(), input, ledger.tainted);
     if is_subagent_tool && !swarm_allowed && !is_research_airlock {
@@ -782,8 +830,15 @@ fn evaluate_tool_invocation(
             cwd.join(raw_path)
         };
 
+        let role_max_depth = role_sandbox::max_walk_depth_for_role(role);
         if candidate.is_file() {
-            let valid = match validate_path(repo_root, cwd, raw_path, PathAccess::Read) {
+            let valid = match validate_path_with_max_depth(
+                repo_root,
+                cwd,
+                raw_path,
+                PathAccess::Read,
+                role_max_depth,
+            ) {
                 Ok(v) => v,
                 Err(pv) => return Decision::deny(pv.code, pv.detail, pv.is_poisoned_zone),
             };
@@ -791,20 +846,27 @@ fn evaluate_tool_invocation(
                 return Decision::deny(code, msg, false);
             }
         } else if is_glob_tool {
-            if let Err(pv) = validate_path(repo_root, cwd, raw_path, PathAccess::ReferencePointer) {
+            if let Err(pv) = validate_path_with_max_depth(
+                repo_root,
+                cwd,
+                raw_path,
+                PathAccess::ReferencePointer,
+                role_max_depth,
+            ) {
                 return Decision::deny(pv.code, pv.detail, pv.is_poisoned_zone);
             }
         } else {
             let req_depth = extract_first_u64(input, &["max_depth", "MaxDepth", "depth"])
                 .map(|d| d as usize)
-                .or(Some(MAX_DIRECTORY_WALK_DEPTH));
-            if let Err(pv) = validate_path(
+                .or(Some(role_max_depth));
+            if let Err(pv) = validate_path_with_max_depth(
                 repo_root,
                 cwd,
                 raw_path,
                 PathAccess::ListSearch {
                     requested_depth: req_depth,
                 },
+                role_max_depth,
             ) {
                 return Decision::deny(pv.code, pv.detail, pv.is_poisoned_zone);
             }
@@ -1444,6 +1506,21 @@ pub fn handle_post_edit(file_path: &str, cwd: &Path) -> Decision {
                 valid.repo_rel
             ),
             true,
+        );
+    }
+
+    if let Ok((_role, Some(cap))) = role_sandbox::resolve_active_role(&repo_root, "") {
+        let doc_digest = breadcrumbs::sha256_digest(content.as_bytes());
+        let plan_bytes = swarm_contracts::hex_decode_32(&cap.plan_sha256).unwrap_or([0u8; 32]);
+        let _ = breadcrumbs::append_breadcrumb_for_path(
+            &repo_root,
+            &cap.session_id,
+            &cap.task_id,
+            plan_bytes,
+            swarm_contracts::EventOp::FileEdit,
+            &valid.repo_rel,
+            None,
+            doc_digest,
         );
     }
 
@@ -2134,7 +2211,7 @@ fn format_json_multiline(v: &JsonValue, indent: usize, out: &mut String) {
     }
 }
 
-fn extract_patch_target_paths(patch: &str) -> Vec<String> {
+pub(crate) fn extract_patch_target_paths(patch: &str) -> Vec<String> {
     let mut out = Vec::new();
     let lines: Vec<&str> = patch.lines().collect();
     let mut push_unique = |raw: &str| {
@@ -2217,7 +2294,7 @@ fn extract_patch_target_paths(patch: &str) -> Vec<String> {
     out
 }
 
-fn collect_nested_path_fields(v: &JsonValue, out: &mut Vec<String>) {
+pub(crate) fn collect_nested_path_fields(v: &JsonValue, out: &mut Vec<String>) {
     match v {
         JsonValue::Object(entries) => {
             for (k, val) in entries {

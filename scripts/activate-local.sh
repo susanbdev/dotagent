@@ -72,7 +72,7 @@ done < <(compgen -e)
 # 1. Build static release binaries and install with read-execute-only VFS mode (0555)
 cargo build --release --manifest-path "${DOTAGENT_ROOT}/Cargo.toml" --offline 2>/dev/null \
     || cargo build --release --manifest-path "${DOTAGENT_ROOT}/Cargo.toml"
-for bin_name in agent-guard dotagent-compiler; do
+for bin_name in agent-guard dotagent-compiler swarm-tool; do
     if [[ -e "${BIN_DIR}/${bin_name}" ]]; then
         chmod u+w "${BIN_DIR}/${bin_name}" 2>/dev/null || true
     fi
@@ -124,27 +124,45 @@ for entry in "${REQUIRED_GIT_SETTINGS[@]}"; do
     fi
 done
 
-# 4. Install Gemini / Antigravity global constitution & hook wiring
+# 4. Install Gemini / Antigravity global constitution, hook wiring, & Swarm role subagents
 # Use `cp -f` so FUSE/virtiofs persistent ~/.gemini mounts that disallow chmod succeed cleanly.
-mkdir -p "${HOME}/.gemini"
+mkdir -p "${HOME}/.gemini/agents"
 cp -f "${DOTAGENT_ROOT}/dist/gemini/GEMINI.md" "${HOME}/.gemini/GEMINI.md"
 cp -f "${DOTAGENT_ROOT}/dist/gemini/settings.json" "${HOME}/.gemini/settings.json"
+for af in research-airlock.md swarm-master.md swarm-investigator.md swarm-qa-engineer.md swarm-grunt.md swarm-adversarial-reviewer.md swarm-forensic-coroner.md; do
+    cp -f "${DOTAGENT_ROOT}/dist/gemini/agents/${af}" "${HOME}/.gemini/agents/${af}"
+done
 
-# 5. Deploy root AGENTS.md + harness hooks + research-airlock subagent
+# 5. Deploy root AGENTS.md + harness hooks + research-airlock & 6 Swarm role subagents across Claude, Cursor, and Codex
 #    Source repo keeps 0644 for git workflows; deployed runtime workspace gets VFS read-only 0444!
 deploy_harness_bundle() {
     local root="$1"
     local mode="$2"
-    mkdir -p "${root}/.claude/agents" "${root}/.cursor" "${root}/.codex"
+    mkdir -p "${root}/.claude/agents" "${root}/.cursor/agents" "${root}/.codex/agents"
+    local agent_files=(
+        "research-airlock.md"
+        "swarm-master.md"
+        "swarm-investigator.md"
+        "swarm-qa-engineer.md"
+        "swarm-grunt.md"
+        "swarm-adversarial-reviewer.md"
+        "swarm-forensic-coroner.md"
+    )
     local targets=(
         "${root}/AGENTS.md"
         "${root}/.ignore"
         "${root}/.cursorignore"
         "${root}/.claude/settings.json"
-        "${root}/.claude/agents/research-airlock.md"
         "${root}/.cursor/hooks.json"
         "${root}/.codex/config.toml"
     )
+    for af in "${agent_files[@]}"; do
+        targets+=(
+            "${root}/.claude/agents/${af}"
+            "${root}/.cursor/agents/${af}"
+            "${root}/.codex/agents/${af}"
+        )
+    done
     for t in "${targets[@]}"; do
         if [[ -e "${t}" ]]; then
             chmod u+w "${t}" 2>/dev/null || true
@@ -154,7 +172,11 @@ deploy_harness_bundle() {
     install -m "${mode}" "${DOTAGENT_ROOT}/dist/.ignore" "${root}/.ignore"
     install -m "${mode}" "${DOTAGENT_ROOT}/dist/cursor/.cursorignore" "${root}/.cursorignore"
     install -m "${mode}" "${DOTAGENT_ROOT}/dist/claude/settings.json" "${root}/.claude/settings.json"
-    install -m "${mode}" "${DOTAGENT_ROOT}/dist/claude/agents/research-airlock.md" "${root}/.claude/agents/research-airlock.md"
+    for af in "${agent_files[@]}"; do
+        install -m "${mode}" "${DOTAGENT_ROOT}/dist/claude/agents/${af}" "${root}/.claude/agents/${af}"
+        install -m "${mode}" "${DOTAGENT_ROOT}/dist/cursor/agents/${af}" "${root}/.cursor/agents/${af}"
+        install -m "${mode}" "${DOTAGENT_ROOT}/dist/codex/agents/${af}" "${root}/.codex/agents/${af}"
+    done
     install -m "${mode}" "${DOTAGENT_ROOT}/dist/cursor/hooks.json" "${root}/.cursor/hooks.json"
     install -m "${mode}" "${DOTAGENT_ROOT}/dist/codex/config.toml" "${root}/.codex/config.toml"
 }

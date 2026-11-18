@@ -416,13 +416,25 @@ pub fn load_profile_by_id(
     profile_id: &str,
 ) -> Result<RuntimeProfile, BudgetViolation> {
     let mut profile = match profile_id {
-        "coding-agent" => RuntimeProfile::coding_agent_default(),
-        "research-readonly" => RuntimeProfile::research_readonly_default(),
+        "coding-agent" | "swarm-grunt" | "swarm-qa-engineer" => {
+            let mut p = RuntimeProfile::coding_agent_default();
+            p.profile_id = profile_id.to_string();
+            p
+        }
+        "research-readonly"
+        | "swarm-master"
+        | "swarm-investigator"
+        | "swarm-adversarial-reviewer"
+        | "swarm-forensic-coroner" => {
+            let mut p = RuntimeProfile::research_readonly_default();
+            p.profile_id = profile_id.to_string();
+            p
+        }
         other => {
             return Err(BudgetViolation {
                 code: "UNKNOWN_RUNTIME_PROFILE",
                 detail: format!(
-                    "Unrecognized AGENT_GUARD_PROFILE '{other}' (expected 'coding-agent' or 'research-readonly')."
+                    "Unrecognized AGENT_GUARD_PROFILE '{other}' (expected 'coding-agent', 'research-readonly', or 'swarm-*')."
                 ),
             });
         }

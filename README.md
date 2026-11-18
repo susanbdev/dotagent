@@ -4,10 +4,11 @@ Secure by design Agent and LLM skills, settings, configurations, and tools for v
 
 ## Components
 
-- **`crates/agent-guard`**: Zero-dependency, `#![forbid(unsafe_code)]` Rust 2024 deterministic security kernel intercepting `PreToolUse`, `PostToolUse`, `UserPromptSubmit`, `PreCompact`, `PostEdit`, and `Stop` lifecycle events across Antigravity / Gemini, Claude Code, and Cursor, plus sandbox/MCP lockdown and `notify = ["agent-guard", "on-stop"]` stop-gate verification on OpenAI Codex.
-- **`crates/dotagent-compiler`**: Reproducible bundle compiler and `SHA-256` / `policy-hub` / pure-7-bit-ASCII verifier emitting `dist/` harness configurations, `research-airlock` subagent manifest, `skills/manifest.lock.json`, and `dist-verify/manifest.sha256`.
-- **`profiles/` & `skills/`**: Token-minimal (`<= 3 KiB`), zero-network role manifests and domain skills.
-- **`tests/bypass_corpus.toml`**: `290` adversarial shell AST, symlink, Unicode smuggling, build-config trap, token-bomb, cache-bleed, and confused-deputy bypass vectors verified at `100%` block rate in zero-credential GitHub Actions CI (`.github/workflows/ci.yml`).
+- **`crates/agent-guard`**: `#![forbid(unsafe_code)]` Rust 2024 deterministic security kernel (`hmac`, `sha2`, `crc32fast`) intercepting `PreToolUse`, `PostToolUse`, `UserPromptSubmit`, `PreCompact`, `PostEdit`, and `Stop` lifecycle events across Antigravity / Gemini, Claude Code, and Cursor, plus sandbox/MCP lockdown and `notify = ["agent-guard", "on-stop"]` stop-gate verification on OpenAI Codex, Swarm v2 role sandboxes, full-record HMAC breadcrumbs, upfront QA fault triangulation, and fail-closed `2+2` Work Ledger gates.
+- **`crates/swarm-tools`**: Dedicated Rust role CLI binary (`swarm-tool`) equipping each of the 6 Swarm v2 roles (`master`, `investigator`, `qa`, `grunt`, `reviewer`, `coroner`) with deterministic local execution commands.
+- **`crates/dotagent-compiler`**: Reproducible bundle compiler and `SHA-256` / `policy-hub` / pure-7-bit-ASCII verifier emitting `dist/` harness configurations, `research-airlock` + 6 `swarm-*` subagent manifests across Claude Code, Cursor, OpenAI Codex, and Gemini, `skills/manifest.lock.json`, and `dist-verify/manifest.sha256`.
+- **`profiles/` & `skills/`**: Token-minimal (`<= 3 KiB`) pure-ASCII `SKILL.md` manifests plus explicit per-role `ROLE_GUIDE.md` manuals (`skills/swarm-{master,investigator,qa-engineer,grunt,adversarial-reviewer,forensic-coroner}/`) defining each role's job, hard rules, and Rust tooling.
+- **`tests/bypass_corpus.toml` & Swarm v2 Suites**: `290` adversarial bypass vectors (`100%` block rate) plus `swarm_v2_suite.rs` and `cli_delegation.rs` verifying full-record HMAC path binding, CRC32 crash spool recovery, linked `git worktree` excludes, depth-20 Investigator scoping, Reviewer URL-exfiltration blocking, `1 / 0..2 / 0..N` fault triangulation, and fail-closed `on-stop` gates.
 
 ## Enforced Security Guarantees
 

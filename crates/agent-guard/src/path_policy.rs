@@ -44,11 +44,42 @@ pub struct ValidatedPath {
     pub is_root_authority: bool,
 }
 
+pub fn effective_max_walk_depth_for_repo(repo_root: &Path) -> usize {
+    if let Ok((crate::swarm_contracts::SwarmRole::Investigator, Some(_))) =
+        crate::role_sandbox::resolve_active_role(repo_root, "")
+    {
+        return crate::swarm_contracts::INVESTIGATOR_MAX_WALK_DEPTH;
+    }
+    MAX_DIRECTORY_WALK_DEPTH
+}
+
+pub fn effective_max_walk_depth() -> usize {
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let repo_root = crate::resolve_repo_root(&cwd);
+    effective_max_walk_depth_for_repo(&repo_root)
+}
+
 pub fn validate_path(
     repo_root: &Path,
     cwd: &Path,
     raw_path: &str,
     access: PathAccess,
+) -> Result<ValidatedPath, PathViolation> {
+    validate_path_with_max_depth(
+        repo_root,
+        cwd,
+        raw_path,
+        access,
+        effective_max_walk_depth_for_repo(repo_root),
+    )
+}
+
+pub fn validate_path_with_max_depth(
+    repo_root: &Path,
+    cwd: &Path,
+    raw_path: &str,
+    access: PathAccess,
+    max_walk_depth: usize,
 ) -> Result<ValidatedPath, PathViolation> {
     let trimmed = raw_path.trim();
     if trimmed.is_empty() {
@@ -97,23 +128,23 @@ pub fn validate_path(
         });
     }
 
-    // Enforce directory search / walk depth ceiling (<= 2)
+    // Enforce directory search / walk depth ceiling (`<= 2` default, `<= 20` for Investigator)
     if let PathAccess::ListSearch { requested_depth } = access {
         match requested_depth {
             None => {
                 return Err(PathViolation {
                     code: "UNBOUNDED_TRAVERSAL_BLOCKED",
                     detail: format!(
-                        "Unbounded recursive traversal on '{trimmed}' is forbidden; restrict depth to <= {MAX_DIRECTORY_WALK_DEPTH} levels."
+                        "Unbounded recursive traversal on '{trimmed}' is forbidden; restrict depth to <= {max_walk_depth} levels."
                     ),
                     is_poisoned_zone: false,
                 });
             }
-            Some(d) if d > MAX_DIRECTORY_WALK_DEPTH => {
+            Some(d) if d > max_walk_depth => {
                 return Err(PathViolation {
                     code: "MAX_TRAVERSAL_DEPTH_EXCEEDED",
                     detail: format!(
-                        "Requested traversal depth {d} on '{trimmed}' exceeds max {MAX_DIRECTORY_WALK_DEPTH} levels."
+                        "Requested traversal depth {d} on '{trimmed}' exceeds max {max_walk_depth} levels."
                     ),
                     is_poisoned_zone: false,
                 });
@@ -974,11 +1005,14 @@ fn check_immutable_control_plane(repo_rel: &str) -> Result<(), PathViolation> {
             | "rust-toolchain.toml"
             | ".mise.toml"
             | ".tool-versions"
+            | ".breadcrumbs.jsonl"
+            | "plan.lock.json"
+            | "work_ledger.jsonl"
     ) {
         return Err(PathViolation {
             code: "IMMUTABLE_CONTROL_PLANE",
             detail: format!(
-                "Modifying protected execution/filter configuration '{repo_rel}' is hard-blocked."
+                "Modifying protected execution/filter or swarm provenance file '{repo_rel}' directly is hard-blocked; use `swarm-tool`."
             ),
             is_poisoned_zone: false,
         });

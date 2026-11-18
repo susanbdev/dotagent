@@ -1,0 +1,1088 @@
+#![forbid(unsafe_code)]
+
+//! Tamper-evident local flight recorder (`<dir>/.breadcrumbs.jsonl`) and
+//! crash-consistent CRC32 session spools (`[u32 len][u32 crc32][json]\n`).
+//!
+//! Addresses hostile audit findings:
+//! - `F02`: Full-record length-delimited `HMAC-SHA256` binds `repo_sha256`,
+//!   `plan_sha256`, `session_id`, `task_id`, `seq_no`, `prev_event_mac`, `op`,
+//!   `canonical_rel_path`, `line_range`, and `doc_sha256`.
+//! - `F14`: Binary `[u32 len][u32 crc32][json]\n` spool quarantines torn crash
+//!   tails without corrupting valid prefix events.
+//! - `F16`: Registers `.breadcrumbs.jsonl` via `git rev-parse --git-path info/exclude`
+//!   so linked `git worktree` checkouts stay clean.
+//! - `F17`: Idempotent `event_id` (`record_mac`) deduplication on flush.
+
+use std::collections::{BTreeMap, BTreeSet};
+use std::fs::{self, File, OpenOptions};
+use std::io::{ErrorKind, Read, Write};
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::thread;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use hmac::{Hmac, Mac};
+use sha2::{Digest, Sha256};
+
+use crate::json::JsonValue;
+use crate::swarm_contracts::{
+    AUTH_EVENT_SCHEMA_V1, AuthenticatedEvent, EventOp, hex_decode_32, hex_encode,
+};
+use crate::traversal_ledger::state_base_dir;
+
+type HmacSha256 = Hmac<Sha256>;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SignedBreadcrumbRecord {
+    pub event: AuthenticatedEvent,
+    pub record_mac: [u8; 32],
+}
+
+impl SignedBreadcrumbRecord {
+    pub fn event_id_hex(&self) -> String {
+        hex_encode(&self.record_mac)
+    }
+
+    pub fn to_json_line(&self) -> String {
+        let line_start = self
+            .event
+            .line_range
+            .map(|(s, _)| JsonValue::Number(s as f64))
+            .unwrap_or(JsonValue::Null);
+        let line_end = self
+            .event
+            .line_range
+            .map(|(_, e)| JsonValue::Number(e as f64))
+            .unwrap_or(JsonValue::Null);
+        let obj = JsonValue::Object(vec![
+            (
+                "schema_version".to_string(),
+                JsonValue::Number(f64::from(self.event.schema_version)),
+            ),
+            ("event_id".to_string(), JsonValue::Str(self.event_id_hex())),
+            (
+                "repo_sha256".to_string(),
+                JsonValue::Str(hex_encode(&self.event.repo_sha256)),
+            ),
+            (
+                "plan_sha256".to_string(),
+                JsonValue::Str(hex_encode(&self.event.plan_sha256)),
+            ),
+            (
+                "session_id".to_string(),
+                JsonValue::Str(self.event.session_id.clone()),
+            ),
+            (
+                "task_id".to_string(),
+                JsonValue::Str(self.event.task_id.clone()),
+            ),
+            (
+                "seq_no".to_string(),
+                JsonValue::Number(self.event.seq_no as f64),
+            ),
+            (
+                "prev_event_mac".to_string(),
+                JsonValue::Str(hex_encode(&self.event.prev_event_mac)),
+            ),
+            (
+                "op".to_string(),
+                JsonValue::Str(self.event.op.as_str().to_string()),
+            ),
+            (
+                "canonical_rel_path".to_string(),
+                JsonValue::Str(self.event.canonical_rel_path.clone()),
+            ),
+            ("line_start".to_string(), line_start),
+            ("line_end".to_string(), line_end),
+            (
+                "doc_sha256".to_string(),
+                JsonValue::Str(hex_encode(&self.event.doc_sha256)),
+            ),
+            (
+                "record_mac".to_string(),
+                JsonValue::Str(hex_encode(&self.record_mac)),
+            ),
+        ]);
+        obj.to_json_string()
+    }
+
+    pub fn from_json_line(line: &str) -> Result<Self, String> {
+        let v = JsonValue::parse(line).map_err(|e| format!("invalid breadcrumb JSON: {e}"))?;
+        let schema_version =
+            v.get("schema_version")
+                .and_then(JsonValue::as_u64)
+                .ok_or_else(|| "missing schema_version".to_string())? as u16;
+        if schema_version != AUTH_EVENT_SCHEMA_V1 {
+            return Err(format!("unsupported schema_version {schema_version}"));
+        }
+        let repo_sha256 = hex_decode_32(
+            v.get("repo_sha256")
+                .and_then(JsonValue::as_str)
+                .ok_or_else(|| "missing repo_sha256".to_string())?,
+        )?;
+        let plan_sha256 = hex_decode_32(
+            v.get("plan_sha256")
+                .and_then(JsonValue::as_str)
+                .ok_or_else(|| "missing plan_sha256".to_string())?,
+        )?;
+        let session_id = v
+            .get("session_id")
+            .and_then(JsonValue::as_str)
+            .ok_or_else(|| "missing session_id".to_string())?
+            .to_string();
+        let task_id = v
+            .get("task_id")
+            .and_then(JsonValue::as_str)
+            .ok_or_else(|| "missing task_id".to_string())?
+            .to_string();
+        let seq_no = v
+            .get("seq_no")
+            .and_then(JsonValue::as_u64)
+            .ok_or_else(|| "missing seq_no".to_string())?;
+        let prev_event_mac = hex_decode_32(
+            v.get("prev_event_mac")
+                .and_then(JsonValue::as_str)
+                .ok_or_else(|| "missing prev_event_mac".to_string())?,
+        )?;
+        let op_str = v
+            .get("op")
+            .and_then(JsonValue::as_str)
+            .ok_or_else(|| "missing op".to_string())?;
+        let op =
+            EventOp::from_str_id(op_str).ok_or_else(|| format!("unknown event op '{op_str}'"))?;
+        let canonical_rel_path = v
+            .get("canonical_rel_path")
+            .and_then(JsonValue::as_str)
+            .ok_or_else(|| "missing canonical_rel_path".to_string())?
+            .to_string();
+        let line_range = match (
+            v.get("line_start").and_then(JsonValue::as_u64),
+            v.get("line_end").and_then(JsonValue::as_u64),
+        ) {
+            (Some(s), Some(e)) => Some((s, e)),
+            (None, None) => None,
+            _ => return Err("partial line_start/line_end range".to_string()),
+        };
+        let doc_sha256 = hex_decode_32(
+            v.get("doc_sha256")
+                .and_then(JsonValue::as_str)
+                .ok_or_else(|| "missing doc_sha256".to_string())?,
+        )?;
+        let record_mac = hex_decode_32(
+            v.get("record_mac")
+                .and_then(JsonValue::as_str)
+                .ok_or_else(|| "missing record_mac".to_string())?,
+        )?;
+
+        Ok(Self {
+            event: AuthenticatedEvent {
+                schema_version,
+                repo_sha256,
+                plan_sha256,
+                session_id,
+                task_id,
+                seq_no,
+                prev_event_mac,
+                op,
+                canonical_rel_path,
+                line_range,
+                doc_sha256,
+            },
+            record_mac,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SpoolRecoveryReport {
+    pub valid_records: Vec<SignedBreadcrumbRecord>,
+    pub quarantined_tail_bytes: usize,
+    pub quarantine_path: Option<PathBuf>,
+}
+
+/// Computes SHA-256 bytes using audited `sha2` crate.
+pub fn sha256_digest(bytes: &[u8]) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    let result = hasher.finalize();
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&result);
+    out
+}
+
+/// Repo-isolated Swarm state directory inside `~/.local/state/agent-guard` (or `AGENT_GUARD_STATE_DIR`).
+pub fn swarm_state_dir(repo_root: &Path) -> Result<PathBuf, String> {
+    let base = state_base_dir();
+    let parent = if base.file_name().is_some_and(|n| n == "sessions") {
+        base.parent().unwrap_or(&base).to_path_buf()
+    } else {
+        base
+    };
+    let canon = fs::canonicalize(repo_root).unwrap_or_else(|_| repo_root.to_path_buf());
+    let repo_hash = hex_encode(&sha256_digest(canon.to_string_lossy().as_bytes()));
+    let dir = parent.join("swarm").join(&repo_hash[..24]);
+    if !dir.is_dir() {
+        fs::create_dir_all(&dir)
+            .map_err(|e| format!("failed creating swarm state dir '{}': {e}", dir.display()))?;
+        set_dir_0700(&dir);
+    }
+    Ok(dir)
+}
+
+/// Out-of-repo lock directory (`~/.local/state/agent-guard/locks`) so exclusive file locks
+/// never create or unlink transient `.lock` files inside Landlocked repository directories.
+pub fn swarm_locks_dir() -> Result<PathBuf, String> {
+    let base = state_base_dir();
+    let parent = if base.file_name().is_some_and(|n| n == "sessions") {
+        base.parent().unwrap_or(&base).to_path_buf()
+    } else {
+        base
+    };
+    let dir = parent.join("locks");
+    if !dir.is_dir() {
+        fs::create_dir_all(&dir)
+            .map_err(|e| format!("failed creating swarm locks dir '{}': {e}", dir.display()))?;
+        set_dir_0700(&dir);
+    }
+    Ok(dir)
+}
+
+pub fn hex_decode_bytes(hex: &str) -> Result<Vec<u8>, String> {
+    let trimmed = hex.trim();
+    if trimmed.len() % 2 != 0 {
+        return Err("odd-length hex string".to_string());
+    }
+    let mut out = Vec::with_capacity(trimmed.len() / 2);
+    let bytes = trimmed.as_bytes();
+    let val = |b: u8| -> Result<u8, String> {
+        match b {
+            b'0'..=b'9' => Ok(b - b'0'),
+            b'a'..=b'f' => Ok(b - b'a' + 10),
+            b'A'..=b'F' => Ok(b - b'A' + 10),
+            _ => Err(format!("invalid hex byte 0x{b:02x}")),
+        }
+    };
+    let mut i = 0usize;
+    while i < bytes.len() {
+        out.push((val(bytes[i])? << 4) | val(bytes[i + 1])?);
+        i += 2;
+    }
+    Ok(out)
+}
+
+pub fn vault_hmac_key_path(repo_root: &Path) -> Result<PathBuf, String> {
+    let base = swarm_state_dir(repo_root)?;
+    let vault_dir = base.join("vault");
+    fs::create_dir_all(&vault_dir).map_err(|e| {
+        format!(
+            "failed creating swarm vault dir '{}': {e}",
+            vault_dir.display()
+        )
+    })?;
+    set_dir_0700(&vault_dir);
+    Ok(vault_dir.join("hmac.key"))
+}
+
+/// Host-only vault HMAC key loader/initializer (`<swarm_state_dir>/vault/hmac.key`).
+/// Refuses direct filesystem access when `AGENT_GUARD_IN_SANDBOX=1` (additionally enforced
+/// by Linux Landlock / macOS Seatbelt omitting `vault/`).
+pub fn load_or_init_vault_hmac_key(repo_root: &Path) -> Result<[u8; 32], String> {
+    if std::env::var("AGENT_GUARD_IN_SANDBOX").ok().as_deref() == Some("1") {
+        return Err(
+            "VAULT_KEY_ISOLATED: direct vault/hmac.key access is forbidden inside exec-sandbox; use coordinator socket"
+                .to_string(),
+        );
+    }
+    let dir = swarm_state_dir(repo_root)?;
+    let legacy_path = dir.join("hmac.key");
+    let key_path = vault_hmac_key_path(repo_root)?;
+
+    if !key_path.exists() && legacy_path.exists() {
+        if let Ok(hex) = fs::read_to_string(&legacy_path) {
+            if let Ok(parsed) = hex_decode_32(&hex) {
+                let _ = fs::hard_link(&legacy_path, &key_path);
+                set_file_0600(&key_path);
+                let _ = fs::remove_file(&legacy_path);
+                return Ok(parsed);
+            }
+        }
+    }
+
+    if key_path.exists() {
+        let hex = fs::read_to_string(&key_path)
+            .map_err(|e| format!("failed reading vault/hmac.key: {e}"))?;
+        return hex_decode_32(&hex);
+    }
+
+    let mut key = [0u8; 32];
+    let mut rng = File::open("/dev/urandom")
+        .map_err(|e| format!("failed opening /dev/urandom for HMAC key generation: {e}"))?;
+    rng.read_exact(&mut key)
+        .map_err(|e| format!("failed reading 32 bytes from /dev/urandom: {e}"))?;
+    if key.iter().all(|&b| b == 0) {
+        return Err("CSPRNG returned all-zero key; failing closed".to_string());
+    }
+
+    let vault_dir = key_path.parent().unwrap_or(&dir);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let staging_path = vault_dir.join(format!(".hmac.key.init.{}_{}", std::process::id(), nanos));
+    let encoded = format!("{}\n", hex_encode(&key));
+    {
+        let mut stage_file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&staging_path)
+            .map_err(|e| format!("failed creating staging vault/hmac.key: {e}"))?;
+        stage_file
+            .write_all(encoded.as_bytes())
+            .map_err(|e| format!("failed writing staging vault/hmac.key: {e}"))?;
+        stage_file
+            .sync_all()
+            .map_err(|e| format!("failed fsyncing staging vault/hmac.key: {e}"))?;
+    }
+    set_file_0600(&staging_path);
+
+    let link_res = fs::hard_link(&staging_path, &key_path);
+    let _ = fs::remove_file(&staging_path);
+    match link_res {
+        Ok(()) => Ok(key),
+        Err(e) if e.kind() == ErrorKind::AlreadyExists => {
+            let hex = fs::read_to_string(&key_path)
+                .map_err(|re| format!("failed reading existing vault/hmac.key after race: {re}"))?;
+            hex_decode_32(&hex)
+        }
+        Err(e) => Err(format!("failed atomically publishing vault/hmac.key: {e}")),
+    }
+}
+
+pub fn load_or_init_hmac_key(repo_root: &Path) -> Result<[u8; 32], String> {
+    load_or_init_vault_hmac_key(repo_root)
+}
+
+pub fn compute_event_mac(key: &[u8; 32], event: &AuthenticatedEvent) -> Result<[u8; 32], String> {
+    let mut mac =
+        HmacSha256::new_from_slice(key).map_err(|e| format!("HMAC key init failure: {e}"))?;
+    mac.update(&event.encode_canonical());
+    let tag = mac.finalize().into_bytes();
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&tag);
+    Ok(out)
+}
+
+pub fn verify_event_mac(
+    key: &[u8; 32],
+    event: &AuthenticatedEvent,
+    expected_mac: &[u8; 32],
+) -> Result<(), String> {
+    let mut mac =
+        HmacSha256::new_from_slice(key).map_err(|e| format!("HMAC key init failure: {e}"))?;
+    mac.update(&event.encode_canonical());
+    mac.verify_slice(expected_mac).map_err(|_| {
+        "HMAC-SHA256 authentication tag mismatch (tampered field or path swap)".to_string()
+    })
+}
+
+pub fn compute_event_mac_for_repo(
+    repo_root: &Path,
+    event: &AuthenticatedEvent,
+) -> Result<[u8; 32], String> {
+    let canonical = event.encode_canonical();
+    if crate::coordinator::ping_coordinator(repo_root) {
+        return crate::coordinator::rpc_compute_raw_hmac_bytes(repo_root, &canonical);
+    }
+    if std::env::var("AGENT_GUARD_IN_SANDBOX").ok().as_deref() == Some("1") {
+        return crate::coordinator::rpc_compute_raw_hmac_bytes(repo_root, &canonical);
+    }
+    if crate::coordinator::ensure_coordinator_daemon(repo_root).is_ok() {
+        if let Ok(tag) = crate::coordinator::rpc_compute_raw_hmac_bytes(repo_root, &canonical) {
+            return Ok(tag);
+        }
+    }
+    let key = load_or_init_vault_hmac_key(repo_root)?;
+    compute_event_mac(&key, event)
+}
+
+pub fn verify_event_mac_for_repo(
+    repo_root: &Path,
+    event: &AuthenticatedEvent,
+    expected_mac: &[u8; 32],
+) -> Result<(), String> {
+    let actual = compute_event_mac_for_repo(repo_root, event)?;
+    let mut diff = 0u8;
+    for (a, b) in actual.iter().zip(expected_mac.iter()) {
+        diff |= a ^ b;
+    }
+    if diff == 0 {
+        Ok(())
+    } else {
+        Err("HMAC-SHA256 authentication tag mismatch (tampered field or path swap)".to_string())
+    }
+}
+
+pub fn compute_arbitrary_hmac_hex(
+    repo_root: &Path,
+    domain: &[u8],
+    payload: &[u8],
+) -> Result<String, String> {
+    if crate::coordinator::ping_coordinator(repo_root) {
+        return crate::coordinator::rpc_compute_domain_hmac_hex(repo_root, domain, payload);
+    }
+    if std::env::var("AGENT_GUARD_IN_SANDBOX").ok().as_deref() == Some("1") {
+        return crate::coordinator::rpc_compute_domain_hmac_hex(repo_root, domain, payload);
+    }
+    if crate::coordinator::ensure_coordinator_daemon(repo_root).is_ok() {
+        if let Ok(hex) = crate::coordinator::rpc_compute_domain_hmac_hex(repo_root, domain, payload)
+        {
+            return Ok(hex);
+        }
+    }
+    let key = load_or_init_vault_hmac_key(repo_root)?;
+    let mut mac =
+        HmacSha256::new_from_slice(&key).map_err(|e| format!("HMAC key init failure: {e}"))?;
+    mac.update(domain);
+    mac.update(&(payload.len() as u64).to_be_bytes());
+    mac.update(payload);
+    Ok(hex_encode(&mac.finalize().into_bytes()))
+}
+
+pub fn verify_arbitrary_hmac_hex(
+    repo_root: &Path,
+    domain: &[u8],
+    payload: &[u8],
+    expected_hex: &str,
+) -> Result<(), String> {
+    let actual = compute_arbitrary_hmac_hex(repo_root, domain, payload)?;
+    let a = actual.as_bytes();
+    let b = expected_hex.trim().as_bytes();
+    if a.len() != b.len() {
+        return Err("HMAC authentication tag length mismatch".to_string());
+    }
+    let mut diff = 0u8;
+    for (&x, &y) in a.iter().zip(b.iter()) {
+        diff |= x.to_ascii_lowercase() ^ y.to_ascii_lowercase();
+    }
+    if diff == 0 {
+        Ok(())
+    } else {
+        Err("HMAC authentication tag mismatch".to_string())
+    }
+}
+
+pub fn spool_file_path(repo_root: &Path, session_id: &str) -> Result<PathBuf, String> {
+    let dir = swarm_state_dir(repo_root)?.join("spools");
+    fs::create_dir_all(&dir).map_err(|e| format!("failed creating spools dir: {e}"))?;
+    set_dir_0700(&dir);
+    let safe_sid: String = session_id
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-'))
+        .take(80)
+        .collect();
+    if safe_sid.is_empty() {
+        return Err("empty session_id for spool".to_string());
+    }
+    Ok(dir.join(format!("{safe_sid}.spool")))
+}
+
+/// Appends a binary `[u32 be_len][u32 be_crc32][json_bytes]\n` frame to the session spool.
+pub fn append_spool_frame(
+    spool_path: &Path,
+    record: &SignedBreadcrumbRecord,
+) -> Result<(), String> {
+    let json_bytes = record.to_json_line().into_bytes();
+    let len = u32::try_from(json_bytes.len())
+        .map_err(|_| "breadcrumb record exceeds u32 frame limit".to_string())?;
+    let crc = crc32fast::hash(&json_bytes);
+
+    let mut frame = Vec::with_capacity(8 + json_bytes.len() + 1);
+    frame.extend_from_slice(&len.to_be_bytes());
+    frame.extend_from_slice(&crc.to_be_bytes());
+    frame.extend_from_slice(&json_bytes);
+    frame.push(b'\n');
+
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(spool_path)
+        .map_err(|e| format!("failed opening spool '{}': {e}", spool_path.display()))?;
+    file.write_all(&frame)
+        .map_err(|e| format!("failed writing spool frame: {e}"))?;
+    file.sync_data()
+        .map_err(|e| format!("failed fsyncing spool frame: {e}"))?;
+    set_file_0600(spool_path);
+    Ok(())
+}
+
+/// Reads `[u32 len][u32 crc32][json]\n` frames, cleanly quarantining any torn crash tail (`F14`).
+pub fn recover_spool_frames(spool_path: &Path) -> Result<SpoolRecoveryReport, String> {
+    if !spool_path.exists() {
+        return Ok(SpoolRecoveryReport {
+            valid_records: Vec::new(),
+            quarantined_tail_bytes: 0,
+            quarantine_path: None,
+        });
+    }
+
+    let raw = fs::read(spool_path)
+        .map_err(|e| format!("failed reading spool '{}': {e}", spool_path.display()))?;
+    let mut offset = 0usize;
+    let mut valid_records = Vec::new();
+
+    while offset < raw.len() {
+        if offset + 8 > raw.len() {
+            break;
+        }
+        let len = u32::from_be_bytes([
+            raw[offset],
+            raw[offset + 1],
+            raw[offset + 2],
+            raw[offset + 3],
+        ]) as usize;
+        let expected_crc = u32::from_be_bytes([
+            raw[offset + 4],
+            raw[offset + 5],
+            raw[offset + 6],
+            raw[offset + 7],
+        ]);
+        let frame_end = offset
+            .saturating_add(8)
+            .saturating_add(len)
+            .saturating_add(1);
+        if frame_end > raw.len() || raw[frame_end - 1] != b'\n' {
+            break;
+        }
+        let payload = &raw[offset + 8..offset + 8 + len];
+        let actual_crc = crc32fast::hash(payload);
+        if actual_crc != expected_crc {
+            break;
+        }
+        let Ok(line_str) = std::str::from_utf8(payload) else {
+            break;
+        };
+        let Ok(rec) = SignedBreadcrumbRecord::from_json_line(line_str) else {
+            break;
+        };
+        valid_records.push(rec);
+        offset = frame_end;
+    }
+
+    if offset < raw.len() {
+        let torn = &raw[offset..];
+        let qpath = spool_path.with_extension("spool.quarantine");
+        fs::write(&qpath, torn)
+            .map_err(|e| format!("failed writing quarantine tail '{}': {e}", qpath.display()))?;
+        set_file_0600(&qpath);
+        fs::write(spool_path, &raw[..offset])
+            .map_err(|e| format!("failed truncating recovered spool: {e}"))?;
+        return Ok(SpoolRecoveryReport {
+            valid_records,
+            quarantined_tail_bytes: torn.len(),
+            quarantine_path: Some(qpath),
+        });
+    }
+
+    Ok(SpoolRecoveryReport {
+        valid_records,
+        quarantined_tail_bytes: 0,
+        quarantine_path: None,
+    })
+}
+
+/// Appends a signed event to the session spool AND flushes idempotently (`event_id` dedup)
+/// into `<parent_dir>/.breadcrumbs.jsonl`, ensuring `.breadcrumbs.jsonl` is listed in
+/// `git rev-parse --git-path info/exclude` (`F16` worktree-safe).
+#[allow(clippy::too_many_arguments)]
+pub fn append_breadcrumb_for_path(
+    repo_root: &Path,
+    session_id: &str,
+    task_id: &str,
+    plan_sha256: [u8; 32],
+    op: EventOp,
+    canonical_rel_path: &str,
+    line_range: Option<(u64, u64)>,
+    doc_sha256: [u8; 32],
+) -> Result<SignedBreadcrumbRecord, String> {
+    let canon_repo = fs::canonicalize(repo_root).unwrap_or_else(|_| repo_root.to_path_buf());
+    let repo_sha256 = sha256_digest(canon_repo.to_string_lossy().as_bytes());
+
+    let spool_path = spool_file_path(&canon_repo, session_id)?;
+    let _spool_lock = ExclusiveFileLockGuard::acquire(&spool_path)?;
+
+    let recovery = recover_spool_frames(&spool_path)?;
+    let (seq_no, prev_event_mac) = match recovery.valid_records.last() {
+        Some(prev) => (prev.event.seq_no.saturating_add(1), prev.record_mac),
+        None => (1, [0u8; 32]),
+    };
+
+    let event = AuthenticatedEvent {
+        schema_version: AUTH_EVENT_SCHEMA_V1,
+        repo_sha256,
+        plan_sha256,
+        session_id: session_id.to_string(),
+        task_id: task_id.to_string(),
+        seq_no,
+        prev_event_mac,
+        op,
+        canonical_rel_path: canonical_rel_path.to_string(),
+        line_range,
+        doc_sha256,
+    };
+    let record_mac = compute_event_mac_for_repo(&canon_repo, &event)?;
+    let signed = SignedBreadcrumbRecord { event, record_mac };
+
+    append_spool_frame(&spool_path, &signed)?;
+    let _ = ensure_git_info_exclude(&canon_repo);
+
+    let trail_path = trail_path_for_rel_path(&canon_repo, canonical_rel_path)?;
+    if let Err(e) = flush_records_idempotent(&trail_path, std::slice::from_ref(&signed)) {
+        let root_trail = canon_repo.join(".breadcrumbs.jsonl");
+        if std::env::var("AGENT_GUARD_IN_SANDBOX").ok().as_deref() == Some("1")
+            && trail_path != root_trail
+        {
+            flush_records_idempotent(&root_trail, std::slice::from_ref(&signed))?;
+        } else {
+            return Err(e);
+        }
+    }
+
+    Ok(signed)
+}
+
+/// Resolves the validated `<parent_dir>/.breadcrumbs.jsonl` trail path for `canonical_rel_path`,
+/// refusing symlinks or path traversal outside `repo_root`.
+pub fn trail_path_for_rel_path(
+    repo_root: &Path,
+    canonical_rel_path: &str,
+) -> Result<PathBuf, String> {
+    let canon_repo = fs::canonicalize(repo_root).unwrap_or_else(|_| repo_root.to_path_buf());
+    let clean = canonical_rel_path.trim().trim_start_matches("./");
+    if clean.is_empty() || Path::new(clean).is_absolute() {
+        return Err(format!(
+            "invalid breadcrumb relative path '{canonical_rel_path}'"
+        ));
+    }
+    let mut acc = canon_repo.clone();
+    let rel_path = Path::new(clean);
+    if let Some(parent) = rel_path.parent() {
+        for comp in parent.components() {
+            match comp {
+                std::path::Component::Normal(seg) => {
+                    acc.push(seg);
+                    if let Ok(meta) = fs::symlink_metadata(&acc) {
+                        if meta.file_type().is_symlink() {
+                            return Err(format!(
+                                "refusing symlink directory '{}' in breadcrumb trail path",
+                                acc.display()
+                            ));
+                        }
+                    }
+                }
+                std::path::Component::CurDir => {}
+                _ => {
+                    return Err(format!(
+                        "disallowed traversal component in breadcrumb path '{canonical_rel_path}'"
+                    ));
+                }
+            }
+        }
+    }
+    let trail_dir = if acc.starts_with(&canon_repo) && acc.is_dir() {
+        acc
+    } else {
+        canon_repo
+    };
+    Ok(trail_dir.join(".breadcrumbs.jsonl"))
+}
+
+pub struct ExclusiveFileLockGuard {
+    lock_path: PathBuf,
+}
+
+impl ExclusiveFileLockGuard {
+    pub fn acquire(target_path: &Path) -> Result<Self, String> {
+        let locks_dir = swarm_locks_dir()?;
+        let norm = match target_path.parent().and_then(|p| fs::canonicalize(p).ok()) {
+            Some(canon_parent) => match target_path.file_name() {
+                Some(fname) => canon_parent.join(fname),
+                None => canon_parent,
+            },
+            None => target_path.to_path_buf(),
+        };
+        let digest_hex = hex_encode(&sha256_digest(norm.to_string_lossy().as_bytes()));
+        let lock_path = locks_dir.join(format!("{}.lock", &digest_hex[..32]));
+        for attempt in 0..300u32 {
+            match OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&lock_path)
+            {
+                Ok(mut f) => {
+                    let _ = writeln!(f, "pid={}", std::process::id());
+                    return Ok(Self { lock_path });
+                }
+                Err(e) if e.kind() == ErrorKind::AlreadyExists => {
+                    // Recover stale lock older than 30 seconds if a previous process crashed
+                    if let Ok(meta) = fs::metadata(&lock_path) {
+                        if let Ok(modified) = meta.modified() {
+                            if modified
+                                .elapsed()
+                                .is_ok_and(|age| age > Duration::from_secs(30))
+                            {
+                                let _ = fs::remove_file(&lock_path);
+                                continue;
+                            }
+                        }
+                    }
+                    if attempt == 299 {
+                        return Err(format!(
+                            "timed out acquiring exclusive lock '{}'",
+                            lock_path.display()
+                        ));
+                    }
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Err(e) => {
+                    return Err(format!(
+                        "failed creating exclusive lock '{}': {e}",
+                        lock_path.display()
+                    ));
+                }
+            }
+        }
+        Err(format!(
+            "failed acquiring exclusive lock '{}'",
+            lock_path.display()
+        ))
+    }
+}
+
+impl Drop for ExclusiveFileLockGuard {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.lock_path);
+    }
+}
+
+/// Idempotently flushes signed records into `<dir>/.breadcrumbs.jsonl` (`F17` dedup by `event_id`),
+/// serialized across concurrent processes via `<trail>.lock`.
+pub fn flush_records_idempotent(
+    trail_path: &Path,
+    records: &[SignedBreadcrumbRecord],
+) -> Result<usize, String> {
+    if records.is_empty() {
+        return Ok(0);
+    }
+    let _lock = ExclusiveFileLockGuard::acquire(trail_path)?;
+
+    let mut existing_ids = BTreeSet::new();
+    if trail_path.exists() {
+        let content = fs::read_to_string(trail_path)
+            .map_err(|e| format!("failed reading '{}': {e}", trail_path.display()))?;
+        for line in content.lines() {
+            if let Ok(rec) = SignedBreadcrumbRecord::from_json_line(line) {
+                existing_ids.insert(rec.event_id_hex());
+            }
+        }
+    }
+
+    let mut to_append = Vec::new();
+    for rec in records {
+        let id = rec.event_id_hex();
+        if existing_ids.insert(id) {
+            to_append.push(rec.to_json_line());
+        }
+    }
+    if to_append.is_empty() {
+        return Ok(0);
+    }
+
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(trail_path)
+        .map_err(|e| format!("failed opening '{}': {e}", trail_path.display()))?;
+    for line in &to_append {
+        writeln!(file, "{line}").map_err(|e| format!("failed appending breadcrumb line: {e}"))?;
+    }
+    file.sync_data()
+        .map_err(|e| format!("failed fsyncing '{}': {e}", trail_path.display()))?;
+    Ok(to_append.len())
+}
+
+fn load_verified_session_spool_chain(
+    repo_root: &Path,
+    session_id: &str,
+) -> Result<Option<BTreeMap<u64, SignedBreadcrumbRecord>>, String> {
+    let spool_path = spool_file_path(repo_root, session_id)?;
+    if !spool_path.exists() {
+        return Ok(None);
+    }
+    let report = recover_spool_frames(&spool_path)?;
+    let mut expected_seq = 1u64;
+    let mut expected_prev = [0u8; 32];
+    let mut map = BTreeMap::new();
+    for rec in report.valid_records {
+        if rec.event.session_id != session_id {
+            return Err(format!(
+                "spool '{}' contains foreign session '{}'",
+                spool_path.display(),
+                rec.event.session_id
+            ));
+        }
+        verify_event_mac_for_repo(repo_root, &rec.event, &rec.record_mac)?;
+        if rec.event.seq_no != expected_seq || rec.event.prev_event_mac != expected_prev {
+            return Err(format!(
+                "spool '{}' broken sequence/MAC continuity at seq_no={} (expected {})",
+                spool_path.display(),
+                rec.event.seq_no,
+                expected_seq
+            ));
+        }
+        expected_prev = rec.record_mac;
+        map.insert(expected_seq, rec);
+        expected_seq = expected_seq.saturating_add(1);
+    }
+    Ok(Some(map))
+}
+
+/// Verifies every record, monotonic sequence continuity, and `prev_event_mac` link in a
+/// `.breadcrumbs.jsonl` file (bridging legitimate cross-directory hops only via a verified
+/// contiguous session spool chain, and rejecting skipped, duplicate, or reordered records).
+pub fn verify_breadcrumbs_file(repo_root: &Path, trail_path: &Path) -> Result<usize, String> {
+    let canon_repo = fs::canonicalize(repo_root).unwrap_or_else(|_| repo_root.to_path_buf());
+    let canon_trail = fs::canonicalize(trail_path).unwrap_or_else(|_| trail_path.to_path_buf());
+    let trail_dir = canon_trail
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| canon_repo.clone());
+    let content = fs::read_to_string(trail_path)
+        .map_err(|e| format!("cannot read '{}': {e}", trail_path.display()))?;
+
+    let mut per_session_prev: BTreeMap<String, (u64, [u8; 32])> = BTreeMap::new();
+    let mut spool_cache: BTreeMap<String, Option<BTreeMap<u64, SignedBreadcrumbRecord>>> =
+        BTreeMap::new();
+    let mut count = 0usize;
+
+    for (idx, line) in content.lines().enumerate() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let rec = SignedBreadcrumbRecord::from_json_line(trimmed)
+            .map_err(|e| format!("line {}: {e}", idx + 1))?;
+        verify_event_mac_for_repo(&canon_repo, &rec.event, &rec.record_mac)
+            .map_err(|e| format!("line {} (session={}): {e}", idx + 1, rec.event.session_id))?;
+
+        let rec_expected_trail =
+            trail_path_for_rel_path(&canon_repo, &rec.event.canonical_rel_path)?;
+        let rec_expected_dir = fs::canonicalize(&rec_expected_trail)
+            .unwrap_or(rec_expected_trail)
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| canon_repo.clone());
+        if rec_expected_dir != trail_dir {
+            return Err(format!(
+                "line {}: foreign-directory breadcrumb '{}' placed inside '{}'",
+                idx + 1,
+                rec.event.canonical_rel_path,
+                trail_path.display()
+            ));
+        }
+
+        if rec.event.seq_no == 0 {
+            return Err(format!(
+                "line {}: invalid seq_no=0 for session '{}'",
+                idx + 1,
+                rec.event.session_id
+            ));
+        }
+        if rec.event.seq_no == 1 && rec.event.prev_event_mac != [0u8; 32] {
+            return Err(format!(
+                "line {}: seq_no=1 must have all-zero prev_event_mac for session '{}'",
+                idx + 1,
+                rec.event.session_id
+            ));
+        }
+        if rec.event.seq_no > 1 && rec.event.prev_event_mac == [0u8; 32] {
+            return Err(format!(
+                "line {}: seq_no={} cannot have all-zero prev_event_mac for session '{}'",
+                idx + 1,
+                rec.event.seq_no,
+                rec.event.session_id
+            ));
+        }
+
+        let (last_seq, last_mac) = per_session_prev
+            .get(&rec.event.session_id)
+            .copied()
+            .unwrap_or((0, [0u8; 32]));
+
+        if rec.event.seq_no <= last_seq {
+            return Err(format!(
+                "line {}: duplicate or out-of-order seq_no={} after seq_no={} for session '{}'",
+                idx + 1,
+                rec.event.seq_no,
+                last_seq,
+                rec.event.session_id
+            ));
+        }
+
+        if rec.event.seq_no == last_seq.saturating_add(1) {
+            if rec.event.prev_event_mac != last_mac {
+                return Err(format!(
+                    "line {}: broken prev_event_mac chain at seq_no={} for session '{}'",
+                    idx + 1,
+                    rec.event.seq_no,
+                    rec.event.session_id
+                ));
+            }
+        } else {
+            // Cross-directory gap: require an authenticated contiguous session spool chain
+            // proving that every omitted seq_no belonged to a DIFFERENT directory trail!
+            if !spool_cache.contains_key(&rec.event.session_id) {
+                let loaded = load_verified_session_spool_chain(&canon_repo, &rec.event.session_id)?;
+                spool_cache.insert(rec.event.session_id.clone(), loaded);
+            }
+            let Some(Some(spool_chain)) = spool_cache.get(&rec.event.session_id) else {
+                return Err(format!(
+                    "line {}: sequence gap ({} -> {}) without authenticated session spool for '{}'",
+                    idx + 1,
+                    last_seq,
+                    rec.event.seq_no,
+                    rec.event.session_id
+                ));
+            };
+            for missing_seq in (last_seq + 1)..rec.event.seq_no {
+                let Some(intervening) = spool_chain.get(&missing_seq) else {
+                    return Err(format!(
+                        "line {}: missing seq_no={} in session '{}' chain",
+                        idx + 1,
+                        missing_seq,
+                        rec.event.session_id
+                    ));
+                };
+                if let Ok(expected_trail) =
+                    trail_path_for_rel_path(&canon_repo, &intervening.event.canonical_rel_path)
+                {
+                    let canon_exp_dir = fs::canonicalize(&expected_trail)
+                        .unwrap_or(expected_trail)
+                        .parent()
+                        .map(Path::to_path_buf)
+                        .unwrap_or_else(|| canon_repo.clone());
+                    if canon_exp_dir == trail_dir {
+                        return Err(format!(
+                            "line {}: omitted in-directory event seq_no={} for '{}' in '{}'",
+                            idx + 1,
+                            missing_seq,
+                            rec.event.session_id,
+                            trail_path.display()
+                        ));
+                    }
+                }
+            }
+            let Some(prev_in_spool) = spool_chain.get(&(rec.event.seq_no - 1)) else {
+                return Err(format!(
+                    "line {}: missing predecessor seq_no={} in session '{}' spool",
+                    idx + 1,
+                    rec.event.seq_no - 1,
+                    rec.event.session_id
+                ));
+            };
+            if rec.event.prev_event_mac != prev_in_spool.record_mac {
+                return Err(format!(
+                    "line {}: broken cross-directory prev_event_mac at seq_no={} for session '{}'",
+                    idx + 1,
+                    rec.event.seq_no,
+                    rec.event.session_id
+                ));
+            }
+            if spool_chain
+                .get(&rec.event.seq_no)
+                .is_none_or(|s| s.record_mac != rec.record_mac)
+            {
+                return Err(format!(
+                    "line {}: record_mac at seq_no={} disagrees with authenticated session spool",
+                    idx + 1,
+                    rec.event.seq_no
+                ));
+            }
+        }
+
+        per_session_prev.insert(
+            rec.event.session_id.clone(),
+            (rec.event.seq_no, rec.record_mac),
+        );
+        count += 1;
+    }
+
+    Ok(count)
+}
+
+/// Uses `git rev-parse --git-path info/exclude` so linked `git worktree` repos
+/// resolve their shared gitdir exclude file properly (`F16`).
+pub fn ensure_git_info_exclude(repo_root: &Path) -> Result<Option<PathBuf>, String> {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(repo_root)
+        .args(["rev-parse", "--git-path", "info/exclude"])
+        .output();
+
+    let exclude_path = match out {
+        Ok(o) if o.status.success() => {
+            let raw = String::from_utf8_lossy(&o.stdout).trim().to_string();
+            if raw.is_empty() {
+                return Ok(None);
+            }
+            let p = PathBuf::from(&raw);
+            if p.is_absolute() {
+                p
+            } else {
+                repo_root.join(p)
+            }
+        }
+        _ => {
+            let dot_git = repo_root.join(".git");
+            if dot_git.is_dir() {
+                dot_git.join("info").join("exclude")
+            } else {
+                return Ok(None);
+            }
+        }
+    };
+
+    if let Some(parent) = exclude_path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|e| format!("failed creating git info dir '{}': {e}", parent.display()))?;
+    }
+    let existing = fs::read_to_string(&exclude_path).unwrap_or_default();
+    if !existing.lines().any(|l| l.trim() == ".breadcrumbs.jsonl") {
+        let mut f = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&exclude_path)
+            .map_err(|e| format!("failed updating '{}': {e}", exclude_path.display()))?;
+        if !existing.is_empty() && !existing.ends_with('\n') {
+            let _ = writeln!(f);
+        }
+        writeln!(f, ".breadcrumbs.jsonl")
+            .map_err(|e| format!("failed writing exclude rule: {e}"))?;
+    }
+    Ok(Some(exclude_path))
+}
+
+fn set_dir_0700(path: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o700));
+    }
+}
+
+fn set_file_0600(path: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o600));
+    }
+}

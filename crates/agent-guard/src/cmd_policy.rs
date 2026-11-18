@@ -744,12 +744,17 @@ fn check_single_command(
         if let Some(sub) = args.first().map(String::as_str) {
             if matches!(
                 sub,
-                "user-prompt" | "reset" | "reset-session" | "pre-compact" | "compact-reset"
+                "user-prompt"
+                    | "reset"
+                    | "reset-session"
+                    | "pre-compact"
+                    | "compact-reset"
+                    | "coordinator"
             ) {
                 return Err(CommandViolation {
                     code: "SELF_TAMPERING_BLOCKED",
                     detail:
-                        "Agents may not reset agent-guard session/compaction state or spoof lifecycle hooks."
+                        "Agents may not reset agent-guard session/compaction state, spoof lifecycle hooks, or directly invoke the vault coordinator."
                             .to_string(),
                     halt_session: true,
                 });
@@ -2193,6 +2198,78 @@ fn is_interpreter_binary(bin: &str) -> bool {
         || lower.starts_with("lua5")
 }
 
+fn check_unittest_command(
+    bin: &str,
+    args: &[String],
+    repo_root: &Path,
+    cwd: &Path,
+    plan: &mut CommandPlan,
+) -> Result<(), CommandViolation> {
+    let mut i = 0usize;
+    while i < args.len() {
+        let a = args[i].as_str();
+        check_embedded_path_literals(bin, a)?;
+        if a == "discover" {
+            i += 1;
+            continue;
+        }
+        if matches!(
+            a,
+            "-s" | "--start-directory" | "-t" | "--top-level-directory"
+        ) {
+            let Some(val) = args.get(i + 1) else {
+                return Err(CommandViolation {
+                    code: "MALFORMED_UNITTEST_COMMAND",
+                    detail: format!("`{bin} -m unittest {a}` missing directory argument."),
+                    halt_session: false,
+                });
+            };
+            check_embedded_path_literals(bin, val)?;
+            reject_shell_glob_in_operand(bin, val)?;
+            let valid = validate_path(repo_root, cwd, val, PathAccess::Read).map_err(|pv| {
+                CommandViolation {
+                    code: pv.code,
+                    detail: pv.detail,
+                    halt_session: pv.is_poisoned_zone,
+                }
+            })?;
+            plan.search_files
+                .push((valid.repo_rel, valid.canonical_or_norm));
+            i += 2;
+            continue;
+        }
+        if matches!(a, "-p" | "--pattern" | "-k") {
+            if let Some(val) = args.get(i + 1) {
+                check_embedded_path_literals(bin, val)?;
+            }
+            i += 2;
+            continue;
+        }
+        if a.starts_with('-') {
+            i += 1;
+            continue;
+        }
+        if a.contains('/')
+            || a.starts_with('.')
+            || a.starts_with('~')
+            || a.to_ascii_lowercase().ends_with(".py")
+        {
+            reject_shell_glob_in_operand(bin, a)?;
+            let valid = validate_path(repo_root, cwd, a, PathAccess::Read).map_err(|pv| {
+                CommandViolation {
+                    code: pv.code,
+                    detail: pv.detail,
+                    halt_session: pv.is_poisoned_zone,
+                }
+            })?;
+            plan.search_files
+                .push((valid.repo_rel, valid.canonical_or_norm));
+        }
+        i += 1;
+    }
+    Ok(())
+}
+
 fn check_interpreter_command(
     bin: &str,
     args: &[String],
@@ -2201,6 +2278,22 @@ fn check_interpreter_command(
     session_tainted: bool,
     plan: &mut CommandPlan,
 ) -> Result<(), CommandViolation> {
+    let lower_bin = bin.to_ascii_lowercase();
+    if !session_tainted
+        && matches!(lower_bin.as_str(), "python" | "python3")
+        && args.first().map(String::as_str) == Some("-m")
+    {
+        match args.get(1).map(String::as_str) {
+            Some("pytest") => {
+                return check_pytest_command(bin, &args[2..], repo_root, cwd, plan);
+            }
+            Some("unittest") => {
+                return check_unittest_command(bin, &args[2..], repo_root, cwd, plan);
+            }
+            _ => {}
+        }
+    }
+
     let allow_interpreter = std::env::var("AGENT_GUARD_ALLOW_INTERPRETER")
         .map(|v| v == "1")
         .unwrap_or(false);
@@ -2214,7 +2307,6 @@ fn check_interpreter_command(
         });
     }
 
-    let lower_bin = bin.to_ascii_lowercase();
     if matches!(lower_bin.as_str(), "uvx" | "pipx") {
         return Err(CommandViolation {
             code: "UNVETTED_URL_PACKAGE_BLOCKED",
@@ -3645,6 +3737,8 @@ fn check_embedded_path_literals(ctx: &str, text: &str) -> Result<(), CommandViol
         ".cursor/",
         ".agent-guard",
         "audit.jsonl",
+        "hmac.key",
+        "coord.sock",
         "/tmp",
         "/var/tmp",
         "/dev/shm",

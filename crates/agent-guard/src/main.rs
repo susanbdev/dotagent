@@ -167,6 +167,7 @@ fn main() -> ExitCode {
                 }
             }
         }
+        "coordinator" => agent_guard::coordinator::run_coordinator_cli(&args[1..], &cwd),
         "exec-sandbox" => agent_guard::exec_sandbox::run_exec_sandbox_cli(&args[1..], &cwd),
         "sandbox-status" => agent_guard::exec_sandbox::run_sandbox_status_cli(),
         "--probe-landlock-child" => agent_guard::exec_sandbox::run_probe_landlock_child(),
@@ -658,6 +659,13 @@ fn run_on_stop(cwd: &Path) -> ExitCode {
         for e in errs {
             eprintln!("[AGENT-GUARD ON-STOP FAIL] {e}");
         }
+        return ExitCode::from(2);
+    }
+
+    // 3. Enforce Swarm v2 fail-closed stop gates (reject staged `.breadcrumbs.jsonl`
+    //    and require verified green-tree `WORK_LEDGER.jsonl` receipt for active Grunt sessions)
+    if let Err(swarm_err) = agent_guard::work_ledger::verify_on_stop_swarm_gates(&repo_root) {
+        eprintln!("[AGENT-GUARD ON-STOP FAIL] {swarm_err}");
         return ExitCode::from(2);
     }
 

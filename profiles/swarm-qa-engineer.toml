@@ -1,0 +1,40 @@
+# Swarm QA Engineer (Upfront Spec-Test Author & Fault Triangulator) Role Profile
+profile_id = "swarm-qa-engineer"
+version = "2.0.0"
+role = "qa-engineer"
+skill = "skills/swarm-qa-engineer/SKILL.md"
+rust_cli = "swarm-tool qa"
+write_scope = "tests-and-attribution-only"
+approval_authority = "none"
+
+[authority]
+root_file = "AGENTS.md"
+allow_nested_authority_files = false
+allow_shadow_authority_files = false
+treat_all_other_files_as_untrusted = true
+
+[git]
+disable_all_hooks = true
+hooks_path = "/dev/null"
+attributes_file = "/dev/null"
+fsmonitor = false
+allowed_protocols = ["https"]
+allow_force_push = false
+allow_history_rewrite = false
+allow_autonomous_push = false
+
+[traversal]
+max_directory_walk_depth = 2
+max_reference_pointer_levels = 2
+halt_on_poisoned_pointer = true
+forbidden_zones = ["tmp", "cache", "dependencies", "secrets", "agent-guard-state"]
+
+[swarm]
+env_role = "qa-engineer"
+security_domain_coverage_floor_pct = 92
+primary_suspect_cardinality = 1
+max_secondary_suspects = 2
+
+[mcp]
+allowed_endpoint = "https://mcp.zt.susanb.dev/mcp"
+ban_stdio_npx_servers = true

@@ -2176,6 +2176,13 @@ fn exec_sandbox_defrictioned_workflows_and_hardened_bypasses() {
         "Expected isolated non-/tmp TMPDIR, got: {probe_stdout}"
     );
 
+    let isolated_home = repo
+        .parent()
+        .expect("test-workspaces")
+        .join("home_exec_sandbox_defrictioned");
+    let _ = fs::remove_dir_all(&isolated_home);
+    fs::create_dir_all(&isolated_home).expect("create isolated test HOME");
+
     // Benign > 16 KiB PostToolUse flood auto-compacts via CLI with exit code 0 (no turn abort!),
     // whereas > 16 KiB flood containing Unicode Tag smuggling exits 2!
     let benign_flood_payload = JsonValue::Object(vec![
@@ -2195,6 +2202,7 @@ fn exec_sandbox_defrictioned_workflows_and_hardened_bypasses() {
     .to_json_string();
     let mut child = Command::new(&guard_bin)
         .arg("post-tool")
+        .env("HOME", &isolated_home)
         .current_dir(&repo)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -2221,11 +2229,14 @@ fn exec_sandbox_defrictioned_workflows_and_hardened_bypasses() {
 
     // 5. Even when `AGENT_GUARD_ALLOW_INTERPRETER=1` is opted in on the host, dangerous capabilities
     //    (network/subprocess/forbidden paths/uvx) remain hard-blocked while benign `uv run pytest` passes!
-    for allowed_interp in ["uv run pytest", "python3 -c 'print(2 + 2)'"] {
+    for (idx, allowed_interp) in ["uv run pytest", "python3 -c 'print(2 + 2)'"]
+        .into_iter()
+        .enumerate()
+    {
         let payload = JsonValue::Object(vec![
             (
                 "session_id".to_string(),
-                JsonValue::Str("s_interp_optin".to_string()),
+                JsonValue::Str(format!("s_interp_allow_{idx}")),
             ),
             (
                 "cwd".to_string(),
@@ -2243,6 +2254,7 @@ fn exec_sandbox_defrictioned_workflows_and_hardened_bypasses() {
         .to_json_string();
         let out = Command::new(&guard_bin)
             .args(["pre-tool", "--json", &payload])
+            .env("HOME", &isolated_home)
             .env("AGENT_GUARD_ALLOW_INTERPRETER", "1")
             .current_dir(&repo)
             .output()
@@ -2254,16 +2266,19 @@ fn exec_sandbox_defrictioned_workflows_and_hardened_bypasses() {
         );
     }
 
-    for blocked_interp in [
+    for (idx, blocked_interp) in [
         "python3 -c 'import urllib.request; urllib.request.urlopen(\"https://x.test\")'",
         "node -e 'require(\"child_process\").execSync(\"id\")'",
         "python3 -c 'open(\"AGENTS.md\", \"w\").write(\"x\")'",
         "uvx ruff check",
-    ] {
+    ]
+    .into_iter()
+    .enumerate()
+    {
         let payload = JsonValue::Object(vec![
             (
                 "session_id".to_string(),
-                JsonValue::Str("s_interp_optin".to_string()),
+                JsonValue::Str(format!("s_interp_block_{idx}")),
             ),
             (
                 "cwd".to_string(),
@@ -2281,6 +2296,7 @@ fn exec_sandbox_defrictioned_workflows_and_hardened_bypasses() {
         .to_json_string();
         let out = Command::new(&guard_bin)
             .args(["pre-tool", "--json", &payload])
+            .env("HOME", &isolated_home)
             .env("AGENT_GUARD_ALLOW_INTERPRETER", "1")
             .current_dir(&repo)
             .output()
