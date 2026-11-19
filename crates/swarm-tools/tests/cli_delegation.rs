@@ -891,6 +891,54 @@ fn pr6_cli_capabilities_packet_provenance_and_landlock_vault_coordinator_e2e() {
         String::from_utf8_lossy(&direct_internal.stderr)
     );
 
+    // Worker-controlled `HOME` containing a 0755 fake `.local/bin/agent-guard` must NEVER be
+    // trusted when `swarm-tool` has no sibling `agent-guard` next to `current_exe()`.
+    let isolated_bin_dir = dir.join("isolated_bin");
+    let fake_home_dir = dir.join("fake_home").join(".local").join("bin");
+    fs::create_dir_all(&isolated_bin_dir).unwrap();
+    fs::create_dir_all(&fake_home_dir).unwrap();
+    let isolated_swarm_tool = isolated_bin_dir.join("swarm-tool");
+    fs::copy(swarm_tool_bin(), &isolated_swarm_tool).unwrap();
+    let fake_ag = fake_home_dir.join("agent-guard");
+    fs::write(
+        &fake_ag,
+        "#!/bin/sh\necho FAKE_HOME_AGENT_GUARD_HIJACK >&2\nexit 0\n",
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&isolated_swarm_tool, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::set_permissions(&fake_ag, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::set_permissions(&fake_home_dir, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let home_hijack = Command::new(&isolated_swarm_tool)
+        .args([
+            "grunt",
+            "checkpoint-green",
+            "--session",
+            &grunt_sid,
+            "--",
+            "python3",
+            "-m",
+            "unittest",
+            "discover",
+            "-s",
+            "tests",
+        ])
+        .current_dir(&repo)
+        .env("AGENT_GUARD_STATE_DIR", &state)
+        .env("HOME", dir.join("fake_home"))
+        .output()
+        .unwrap();
+    assert_eq!(home_hijack.status.code(), Some(2));
+    let hijack_stderr = String::from_utf8_lossy(&home_hijack.stderr);
+    assert!(
+        hijack_stderr.contains("SANDBOX_BINARY_UNAVAILABLE")
+            && !hijack_stderr.contains("FAKE_HOME_AGENT_GUARD_HIJACK"),
+        "HOME hijack attempt stderr: {hijack_stderr}"
+    );
+
     // `checkpoint-green` with `--skip` exclusion flag must be rejected
     let skip_cp = Command::new(swarm_tool_bin())
         .args([

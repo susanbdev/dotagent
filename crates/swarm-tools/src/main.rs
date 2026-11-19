@@ -1182,23 +1182,27 @@ fn format_role_denial(dec: Decision) -> String {
 }
 
 fn resolve_sibling_agent_guard_bin() -> Option<PathBuf> {
-    if let Ok(exe) = std::env::current_exe() {
-        let mut sib = exe;
-        sib.set_file_name("agent-guard");
-        if let Ok(meta) = fs::symlink_metadata(&sib)
-            && !meta.file_type().is_symlink()
-            && meta.file_type().is_file()
-        {
-            return Some(sib);
+    let exe_raw = std::env::current_exe().ok()?;
+    let exe = fs::canonicalize(&exe_raw).unwrap_or(exe_raw);
+    let exe_meta = fs::symlink_metadata(&exe).ok()?;
+    let mut sib = exe;
+    sib.set_file_name("agent-guard");
+    let meta = fs::symlink_metadata(&sib).ok()?;
+    if meta.file_type().is_symlink() || !meta.file_type().is_file() {
+        return None;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if meta.uid() != exe_meta.uid() {
+            return None;
         }
     }
-    if let Ok(home) = std::env::var("HOME") {
-        let pinned = PathBuf::from(home).join(".local/bin/agent-guard");
-        if agent_guard::coordinator::is_trusted_executable_file(&pinned) {
-            return Some(pinned);
-        }
+    #[cfg(not(unix))]
+    {
+        let _ = exe_meta;
     }
-    None
+    Some(sib)
 }
 
 fn run_grunt(repo_root: &Path, cwd: &Path, args: &[String]) -> Result<(), String> {
