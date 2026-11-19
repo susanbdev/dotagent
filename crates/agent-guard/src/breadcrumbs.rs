@@ -1222,9 +1222,22 @@ pub fn verify_breadcrumbs_file(repo_root: &Path, trail_path: &Path) -> Result<us
     Ok(count)
 }
 
-/// Uses `git rev-parse --git-path info/exclude` so linked `git worktree` repos
-/// resolve their shared gitdir exclude file properly (`F16`).
+/// Uses a zero-subprocess fast path when `.git` is a regular directory and `.git/info/exclude`
+/// already lists `.breadcrumbs.jsonl`, falling back to `git rev-parse --git-path info/exclude`
+/// so linked `git worktree` repos resolve their shared gitdir exclude file properly (`F16`).
 pub fn ensure_git_info_exclude(repo_root: &Path) -> Result<Option<PathBuf>, String> {
+    let dot_git = repo_root.join(".git");
+    if let Ok(meta) = fs::symlink_metadata(&dot_git)
+        && meta.file_type().is_dir()
+    {
+        let direct_exclude = dot_git.join("info").join("exclude");
+        if let Ok(existing) = fs::read_to_string(&direct_exclude)
+            && existing.lines().any(|l| l.trim() == ".breadcrumbs.jsonl")
+        {
+            return Ok(Some(direct_exclude));
+        }
+    }
+
     let out = Command::new("git")
         .arg("-C")
         .arg(repo_root)
@@ -1245,7 +1258,6 @@ pub fn ensure_git_info_exclude(repo_root: &Path) -> Result<Option<PathBuf>, Stri
             }
         }
         _ => {
-            let dot_git = repo_root.join(".git");
             if dot_git.is_dir() {
                 dot_git.join("info").join("exclude")
             } else {

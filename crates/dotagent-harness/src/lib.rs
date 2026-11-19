@@ -14,6 +14,7 @@
 //!    control plane, symlink target refusal, and pre-build RCE trap rejection).
 //! 5. `corpus`: Canonical 305-vector adversarial bypass corpus verification.
 
+pub mod bench_suite;
 pub mod bootstrap_suite;
 pub mod compiler_suite;
 pub mod corpus_suite;

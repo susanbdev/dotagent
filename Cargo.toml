@@ -18,6 +18,8 @@ unsafe_code = "forbid"
 
 [workspace.lints.clippy]
 all = { level = "deny", priority = -1 }
+dbg_macro = "deny"
+todo = "deny"
 
 [profile.release]
 opt-level = 3

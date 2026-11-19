@@ -720,9 +720,19 @@ fn pr2_deep_adversarial_capability_slot_hmac_shell_and_patch_regressions() {
     //    Even when a harness passes a random UUID `session_id` without env vars, `handle_pre_tool_hook`
     //    enforces Grunt's exact read/write/Bash/apply_patch jail!
     let cap = mint_session_capability(&repo, SwarmRole::Grunt, "TASK-DEEP", 1).unwrap();
+    let run_nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    let hook_sid = format!(
+        "d94e6f18-4b0c-4a12-9f88-{:012x}",
+        (run_nanos ^ u64::from(std::process::id())) & 0xffff_ffff_ffff
+    );
 
     let allowed_read = agent_guard::handle_pre_tool_hook(
-        r#"{"session_id":"d94e6f18-4b0c-4a12-9f88-112233445566","tool_name":"Read","tool_input":{"file_path":"src/allowed.rs"}}"#,
+        &format!(
+            r#"{{"session_id":"{hook_sid}","tool_name":"Read","tool_input":{{"file_path":"src/allowed.rs"}}}}"#
+        ),
         &repo,
     );
     assert!(
@@ -731,7 +741,9 @@ fn pr2_deep_adversarial_capability_slot_hmac_shell_and_patch_regressions() {
     );
 
     let out_of_scope_bash_read = agent_guard::handle_pre_tool_hook(
-        r#"{"session_id":"d94e6f18-4b0c-4a12-9f88-112233445566","tool_name":"Bash","tool_input":{"command":"cat src/forbidden.rs"}}"#,
+        &format!(
+            r#"{{"session_id":"{hook_sid}","tool_name":"Bash","tool_input":{{"command":"cat src/forbidden.rs"}}}}"#
+        ),
         &repo,
     );
     assert!(
@@ -740,7 +752,9 @@ fn pr2_deep_adversarial_capability_slot_hmac_shell_and_patch_regressions() {
     );
 
     let out_of_scope_patch = agent_guard::handle_pre_tool_hook(
-        r#"{"session_id":"d94e6f18-4b0c-4a12-9f88-112233445566","tool_name":"apply_patch","tool_input":{"patch":"*** Begin Patch\n*** Update File: src/forbidden.rs\n@@\n-pub fn nope() -> u8 { 2 }\n+pub fn nope() -> u8 { 9 }\n*** End Patch\n"}}"#,
+        &format!(
+            r#"{{"session_id":"{hook_sid}","tool_name":"apply_patch","tool_input":{{"patch":"*** Begin Patch\n*** Update File: src/forbidden.rs\n@@\n-pub fn nope() -> u8 {{ 2 }}\n+pub fn nope() -> u8 {{ 9 }}\n*** End Patch\n"}}}}"#
+        ),
         &repo,
     );
     assert!(

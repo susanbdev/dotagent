@@ -157,6 +157,9 @@ fn collect_scoped_blobs(
             .replace('\\', "/");
 
         if ft.is_dir() {
+            if !scope_patterns.is_empty() && !dir_can_match_any_scope(&rel, scope_patterns) {
+                continue;
+            }
             // Skip any forbidden cache, temp, dependency, secret, or guard-state directory before recursing!
             if validate_path_with_max_depth(
                 canon_repo,
@@ -192,6 +195,43 @@ fn collect_scoped_blobs(
             }
         }
     }
+}
+
+/// Returns `true` iff at least one descendant file inside `dir_rel` could possibly match `patterns`.
+fn dir_can_match_any_scope(dir_rel: &str, patterns: &[String]) -> bool {
+    let clean_dir = dir_rel.trim_start_matches("./").trim_end_matches('/');
+    for pat in patterns {
+        let p = pat.trim().trim_start_matches("./");
+        if matches!(p, "" | "." | "*" | "**") {
+            return true;
+        }
+        if let Some(prefix) = p.strip_suffix("/**") {
+            let base = prefix.trim_end_matches('/');
+            if base.is_empty()
+                || clean_dir == base
+                || clean_dir.starts_with(&format!("{base}/"))
+                || base.starts_with(&format!("{clean_dir}/"))
+            {
+                return true;
+            }
+        } else if let Some(prefix) = p.strip_suffix("/*") {
+            let base = prefix.trim_end_matches('/');
+            // `base/*` matches direct files inside `base`, so we must enter ancestors of `base` and `base` itself,
+            // but never need to recurse into subdirectories deeper than `base`!
+            if base.is_empty() || clean_dir == base || base.starts_with(&format!("{clean_dir}/")) {
+                return true;
+            }
+        } else {
+            let base = p.trim_end_matches('/');
+            if clean_dir == base
+                || clean_dir.starts_with(&format!("{base}/"))
+                || base.starts_with(&format!("{clean_dir}/"))
+            {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// Records the result of `swarm-tool grunt checkpoint-green` into the session capability
