@@ -395,7 +395,20 @@ fn evaluate_tool_invocation(
     ) || (norm_tool.is_empty()
         && extract_first_str(input, &["command", "CommandLine"]).is_some())
     {
-        let Some(cmd_str) = extract_first_str(input, &["command", "CommandLine", "cmd", "script"])
+        if let Err(dec) = ensure_single_alias_key(
+            input,
+            &["command", "CommandLine", "cmd", "script"],
+            tool_name,
+        ) {
+            return dec;
+        }
+        if let Err(dec) =
+            ensure_single_alias_key(input, &["cwd", "Cwd", "workdir", "directory"], tool_name)
+        {
+            return dec;
+        }
+        let Some((cmd_key, cmd_str)) =
+            extract_first_key_and_str(input, &["command", "CommandLine", "cmd", "script"])
         else {
             return Decision::deny(
                 "MISSING_COMMAND",
@@ -487,24 +500,21 @@ fn evaluate_tool_invocation(
         let wrap_ascii = std::env::var("AGENT_GUARD_WRAP_BASH_ASCII")
             .map(|v| v != "0")
             .unwrap_or(true);
-        if wrap_ascii
-            && !effective_cmd.contains("agent-guard exec-sandbox")
-            && !effective_cmd.contains("agent-guard sanitize-stream")
-        {
+        if wrap_ascii && !exec_sandbox::is_canonical_exec_sandbox_wrapper(effective_cmd) {
+            let wrapped = exec_sandbox::wrap_bash_with_exec_sandbox(effective_cmd, true);
+            let updated_json = build_updated_shell_input_json(input, cmd_key, &wrapped);
             return Decision::Allow {
                 advisory: None,
-                updated_bash_cmd: Some(exec_sandbox::wrap_bash_with_exec_sandbox(
-                    effective_cmd,
-                    true,
-                )),
-                updated_input_json: None,
+                updated_bash_cmd: Some(wrapped),
+                updated_input_json: updated_json,
             };
         }
         if let Some(rewritten) = plan.rewritten_command {
+            let updated_json = build_updated_shell_input_json(input, cmd_key, &rewritten);
             return Decision::Allow {
                 advisory: None,
                 updated_bash_cmd: Some(rewritten),
-                updated_input_json: None,
+                updated_input_json: updated_json,
             };
         }
 
@@ -516,6 +526,37 @@ fn evaluate_tool_invocation(
         norm_tool.as_str(),
         "read" | "view_file" | "read_file" | "notebookread" | "beforereadfile" | "open_file"
     ) {
+        if let Err(dec) = ensure_single_alias_key(
+            input,
+            &[
+                "file_path",
+                "AbsolutePath",
+                "path",
+                "target_file",
+                "notebook_path",
+            ],
+            tool_name,
+        ) {
+            return dec;
+        }
+        if let Err(dec) =
+            ensure_single_alias_key(input, &["offset", "StartLine", "start_line"], tool_name)
+        {
+            return dec;
+        }
+        if let Err(dec) = ensure_single_alias_key(
+            input,
+            &["limit", "max_lines", "EndLine", "end_line"],
+            tool_name,
+        ) {
+            return dec;
+        }
+        if let Err(dec) =
+            ensure_single_alias_key(input, &["ContentOffset", "content_offset"], tool_name)
+        {
+            return dec;
+        }
+
         let Some(raw_path) = extract_first_str(
             input,
             &[
@@ -536,20 +577,41 @@ fn evaluate_tool_invocation(
 
         let offset_line =
             extract_first_u64(input, &["offset", "StartLine", "start_line"]).map(|x| x as usize);
+        let raw_end_line = extract_first_u64(input, &["EndLine", "end_line"]);
+        if let Some(end) = raw_end_line {
+            let start = offset_line.map(|x| x as u64).unwrap_or(1).max(1);
+            if end < start {
+                return Decision::deny(
+                    "AMBIGUOUS_TOOL_PARAM_ALIAS",
+                    format!(
+                        "Tool '{tool_name}' specified invalid slice range EndLine ({end}) < StartLine ({start})."
+                    ),
+                    false,
+                );
+            }
+        }
         let limit_lines = extract_first_u64(input, &["limit", "max_lines"])
             .map(|x| x as usize)
             .or_else(|| {
-                let start = extract_first_u64(input, &["StartLine", "start_line"])?;
-                let end = extract_first_u64(input, &["EndLine", "end_line"])?;
-                if end >= start {
-                    Some((end - start + 1) as usize)
-                } else {
-                    None
-                }
+                let end = raw_end_line?;
+                let start = offset_line.map(|x| x as u64).unwrap_or(1).max(1);
+                Some((end - start + 1) as usize)
             });
+        let content_byte_offset =
+            extract_first_u64(input, &["ContentOffset", "content_offset"]).unwrap_or(0);
+        if content_byte_offset > 0 && (offset_line.is_some() || limit_lines.is_some()) {
+            return Decision::deny(
+                "AMBIGUOUS_TOOL_PARAM_ALIAS",
+                format!(
+                    "Tool '{tool_name}' cannot combine byte-level `ContentOffset` ({content_byte_offset}) with line-slice bounds; use explicit `StartLine`/`EndLine` (`<= 150` lines) only."
+                ),
+                true,
+            );
+        }
 
         let supports_input_rewrite =
-            !matches!(norm_tool.as_str(), "beforereadfile" | "notebookread");
+            !matches!(norm_tool.as_str(), "beforereadfile" | "notebookread")
+                && content_byte_offset == 0;
 
         match pre_inspect_file_for_ingestion_with_profile(
             &valid.canonical_or_norm,
@@ -647,7 +709,7 @@ fn evaluate_tool_invocation(
         }
     }
 
-    // 4b. Patch tools (`apply_patch`, `patch`) — extract and validate every modified/added/deleted path!
+    // 4b. Patch tools (`apply_patch`, `patch`) -- extract and validate every modified/added/deleted path!
     if matches!(norm_tool.as_str(), "apply_patch" | "patch") {
         if writes_disabled {
             return Decision::deny(
@@ -658,6 +720,20 @@ fn evaluate_tool_invocation(
                 ),
                 false,
             );
+        }
+        if let Err(dec) = ensure_single_alias_key(
+            input,
+            &[
+                "patch",
+                "input",
+                "diff",
+                "content",
+                "raw_patch",
+                "patchText",
+            ],
+            tool_name,
+        ) {
+            return dec;
         }
         let patch_body = extract_first_str(
             input,
@@ -719,6 +795,19 @@ fn evaluate_tool_invocation(
                 ),
                 false,
             );
+        }
+        if let Err(dec) = ensure_single_alias_key(
+            input,
+            &[
+                "file_path",
+                "TargetFile",
+                "path",
+                "target_file",
+                "notebook_path",
+            ],
+            tool_name,
+        ) {
+            return dec;
         }
         let mut target_paths = Vec::new();
         if let Some(raw_path) = extract_first_str(
@@ -801,6 +890,23 @@ fn evaluate_tool_invocation(
     ) {
         if let Some(reason) = detect_search_bypass_params(input, tool_name) {
             return Decision::deny("SEARCH_IGNORE_BYPASS_BLOCKED", reason, false);
+        }
+        if let Err(dec) = ensure_single_alias_key(
+            input,
+            &["path", "SearchPath", "DirectoryPath", "dir", "directory"],
+            tool_name,
+        ) {
+            return dec;
+        }
+        if let Err(dec) =
+            ensure_single_alias_key(input, &["pattern", "Pattern", "Query"], tool_name)
+        {
+            return dec;
+        }
+        if let Err(dec) =
+            ensure_single_alias_key(input, &["max_depth", "MaxDepth", "depth"], tool_name)
+        {
+            return dec;
         }
 
         let raw_path = extract_first_str(
@@ -921,6 +1027,16 @@ fn evaluate_tool_invocation(
                 true,
             );
         }
+        if writes_disabled && matches!(norm_tool.as_str(), "todowrite" | "todo_write") {
+            return Decision::deny(
+                "PROFILE_WRITE_TOOLS_DISABLED",
+                format!(
+                    "Active runtime profile '{}' forbids mutating tool '{tool_name}' (`enable_write_tools = false`).",
+                    profile.profile_id
+                ),
+                false,
+            );
+        }
         let mut nested_paths = Vec::new();
         collect_nested_path_fields(input, &mut nested_paths);
         for raw_p in &nested_paths {
@@ -946,21 +1062,28 @@ fn evaluate_tool_invocation(
                 "[AGENT-GUARD RESEARCH-AIRLOCK] Read-only `research-airlock` subagent authorized. Subagent return summary MUST stay <= 200 pure 7-bit ASCII tokens (file paths, line ranges, symbol signatures only).",
             );
         }
-        if is_approved_mcp && ledger.tainted {
+        if is_approved_mcp {
             let sub_action = &norm_tool[ALLOWED_MCP_SERVER_PREFIX.len()..];
-            if [
-                "write", "create", "update", "delete", "post", "send", "publish", "push", "merge",
-            ]
-            .iter()
-            .any(|verb| sub_action.contains(verb))
-            {
-                return Decision::deny(
-                    "TAINTED_EXTERNAL_MUTATION_BLOCKED",
-                    format!(
-                        "Tainted session cannot invoke mutating MCP tool '{tool_name}' (confused-deputy prevention)."
-                    ),
-                    true,
-                );
+            if is_mutating_mcp_sub_action(sub_action) {
+                if writes_disabled {
+                    return Decision::deny(
+                        "PROFILE_WRITE_TOOLS_DISABLED",
+                        format!(
+                            "Active runtime profile '{}' forbids mutating MCP tool '{tool_name}' (`enable_write_tools = false`).",
+                            profile.profile_id
+                        ),
+                        false,
+                    );
+                }
+                if ledger.tainted {
+                    return Decision::deny(
+                        "TAINTED_EXTERNAL_MUTATION_BLOCKED",
+                        format!(
+                            "Tainted session cannot invoke mutating MCP tool '{tool_name}' (confused-deputy prevention)."
+                        ),
+                        true,
+                    );
+                }
             }
         }
         return Decision::allow();
@@ -1066,6 +1189,8 @@ fn build_paginated_read_input_json(
                         | "EndLine"
                         | "start_line"
                         | "end_line"
+                        | "ContentOffset"
+                        | "content_offset"
                 )
             })
             .cloned()
@@ -1577,6 +1702,7 @@ fn scan_accidental_secret_literal(text: &str) -> Option<&'static str> {
 }
 
 fn resolve_validated_cwd(v: &JsonValue, fallback: &Path) -> Result<(PathBuf, PathBuf), Decision> {
+    ensure_single_alias_key(v, &["cwd", "working_directory"], "hook_envelope")?;
     let fallback_canon = fs::canonicalize(fallback).unwrap_or_else(|_| lexical_normalize(fallback));
     let trusted_repo = resolve_repo_root_from_canon(&fallback_canon);
 
@@ -1832,6 +1958,8 @@ pub(crate) fn collect_nested_path_fields(v: &JsonValue, out: &mut Vec<String>) {
                         | "target_file"
                         | "notebook_path"
                         | "cwd"
+                        | "Cwd"
+                        | "workdir"
                         | "directory"
                         | "dir"
                 ) {
@@ -1884,6 +2012,93 @@ fn find_first_unicode_violation_in_json(
         }
         _ => None,
     }
+}
+
+fn ensure_single_alias_key(v: &JsonValue, keys: &[&str], tool_name: &str) -> Result<(), Decision> {
+    let mut present: Vec<&str> = Vec::new();
+    for &k in keys {
+        if v.get(k).is_some() {
+            present.push(k);
+        }
+    }
+    if present.len() > 1 {
+        return Err(Decision::deny(
+            "AMBIGUOUS_TOOL_PARAM_ALIAS",
+            format!(
+                "Tool '{tool_name}' input supplied multiple conflicting alias keys ({}) simultaneously; cross-schema parameter smuggling is forbidden.",
+                present.join(", ")
+            ),
+            true,
+        ));
+    }
+    Ok(())
+}
+
+fn extract_first_key_and_str<'a>(
+    v: &'a JsonValue,
+    keys: &[&'static str],
+) -> Option<(&'static str, &'a str)> {
+    for &k in keys {
+        if let Some(s) = v.get(k).and_then(JsonValue::as_str) {
+            return Some((k, s));
+        }
+    }
+    None
+}
+
+fn build_updated_shell_input_json(
+    input: &JsonValue,
+    cmd_key: &str,
+    rewritten_cmd: &str,
+) -> Option<String> {
+    let JsonValue::Object(entries) = input else {
+        return None;
+    };
+    if cmd_key == "command" && entries.len() == 1 && entries[0].0 == "command" {
+        return None;
+    }
+    let mut updated = Vec::with_capacity(entries.len());
+    for (k, val) in entries {
+        if k == cmd_key {
+            updated.push((k.clone(), JsonValue::Str(rewritten_cmd.to_string())));
+        } else {
+            updated.push((k.clone(), val.clone()));
+        }
+    }
+    Some(JsonValue::Object(updated).to_json_string())
+}
+
+fn is_mutating_mcp_sub_action(sub_action: &str) -> bool {
+    let lower = sub_action.to_ascii_lowercase();
+    if [
+        "write", "create", "update", "delete", "remove", "publish", "modify", "trigger", "approve",
+        "comment", "upload", "deploy",
+    ]
+    .iter()
+    .any(|verb| lower.contains(verb))
+    {
+        return true;
+    }
+    lower
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|seg| !seg.is_empty())
+        .any(|seg| {
+            matches!(
+                seg,
+                "put"
+                    | "patch"
+                    | "post"
+                    | "send"
+                    | "push"
+                    | "merge"
+                    | "drop"
+                    | "set"
+                    | "edit"
+                    | "exec"
+                    | "run"
+                    | "close"
+            )
+        })
 }
 
 fn extract_first_str<'a>(v: &'a JsonValue, keys: &[&str]) -> Option<&'a str> {

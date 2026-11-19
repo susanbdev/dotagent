@@ -21,7 +21,6 @@ use std::process::Command;
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256};
 
 use crate::json::JsonValue;
@@ -29,8 +28,6 @@ use crate::swarm_contracts::{
     AUTH_EVENT_SCHEMA_V1, AuthenticatedEvent, EventOp, hex_decode_32, hex_encode,
 };
 use crate::traversal_ledger::state_base_dir;
-
-type HmacSha256 = Hmac<Sha256>;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SignedBreadcrumbRecord {
@@ -371,7 +368,12 @@ pub fn load_or_init_vault_hmac_key(repo_root: &Path) -> Result<[u8; 32], String>
     let link_res = fs::hard_link(&staging_path, &key_path);
     let _ = fs::remove_file(&staging_path);
     match link_res {
-        Ok(()) => Ok(key),
+        Ok(()) => {
+            let fmt_path = vault_dir.join("hmac.format");
+            let _ = fs::write(&fmt_path, b"bijective-v2\n");
+            set_file_0600(&fmt_path);
+            Ok(key)
+        }
         Err(e) if e.kind() == ErrorKind::AlreadyExists => {
             crate::crypto::zeroize_slice(&mut key);
             let hex = fs::read_to_string(&key_path)
@@ -404,15 +406,7 @@ pub fn load_or_init_hmac_key(repo_root: &Path) -> Result<[u8; 32], String> {
 
 pub fn compute_event_mac(key: &[u8; 32], event: &AuthenticatedEvent) -> Result<[u8; 32], String> {
     let canonical = event.encode_canonical();
-    let mut mac =
-        HmacSha256::new_from_slice(key).map_err(|e| format!("HMAC key init failure: {e}"))?;
-    mac.update(BREADCRUMB_EVENT_HMAC_DOMAIN);
-    mac.update(&(canonical.len() as u64).to_be_bytes());
-    mac.update(&canonical);
-    let tag = mac.finalize().into_bytes();
-    let mut out = [0u8; 32];
-    out.copy_from_slice(&tag);
-    Ok(out)
+    crate::coordinator::compute_domain_tag_raw(key, BREADCRUMB_EVENT_HMAC_DOMAIN, &canonical)
 }
 
 pub fn verify_event_mac(
@@ -421,14 +415,23 @@ pub fn verify_event_mac(
     expected_mac: &[u8; 32],
 ) -> Result<(), String> {
     let canonical = event.encode_canonical();
-    let mut mac =
-        HmacSha256::new_from_slice(key).map_err(|e| format!("HMAC key init failure: {e}"))?;
-    mac.update(BREADCRUMB_EVENT_HMAC_DOMAIN);
-    mac.update(&(canonical.len() as u64).to_be_bytes());
-    mac.update(&canonical);
-    mac.verify_slice(expected_mac).map_err(|_| {
-        "HMAC-SHA256 authentication tag mismatch (tampered field or path swap)".to_string()
-    })
+    let actual =
+        crate::coordinator::compute_domain_tag_raw(key, BREADCRUMB_EVENT_HMAC_DOMAIN, &canonical)?;
+    if constant_time_eq_bytes(&actual, expected_mac) {
+        Ok(())
+    } else if crate::coordinator::is_legacy_v1_unprefixed_domain_tag(
+        key,
+        BREADCRUMB_EVENT_HMAC_DOMAIN,
+        &canonical,
+        expected_mac,
+    ) {
+        Err(
+            "LEGACY_HMAC_V1_STATE_INVALIDATED: breadcrumb record uses pre-v2 unprefixed HMAC encoding; run `dotagent activate` or `dotagent session-reset --all` to reset pre-v2 swarm state"
+                .to_string(),
+        )
+    } else {
+        Err("HMAC-SHA256 authentication tag mismatch (tampered field or path swap)".to_string())
+    }
 }
 
 pub fn compute_event_mac_for_repo(
@@ -575,12 +578,8 @@ pub fn compute_arbitrary_hmac_hex(
     match load_or_init_vault_hmac_key(repo_root) {
         Ok(raw_key) => {
             let zkey = crate::crypto::ZeroizingKey::new(raw_key);
-            let mut mac = HmacSha256::new_from_slice(zkey.as_bytes())
-                .map_err(|e| format!("HMAC key init failure: {e}"))?;
-            mac.update(domain);
-            mac.update(&(payload.len() as u64).to_be_bytes());
-            mac.update(payload);
-            Ok(hex_encode(&mac.finalize().into_bytes()))
+            let tag = crate::coordinator::compute_domain_tag_raw(zkey.as_bytes(), domain, payload)?;
+            Ok(hex_encode(&tag))
         }
         Err(_) => crate::coordinator::rpc_compute_domain_hmac_hex(repo_root, domain, payload),
     }
@@ -608,16 +607,21 @@ pub fn verify_arbitrary_hmac_hex(
     match load_or_init_vault_hmac_key(repo_root) {
         Ok(raw_key) => {
             let zkey = crate::crypto::ZeroizingKey::new(raw_key);
-            let mut mac = HmacSha256::new_from_slice(zkey.as_bytes())
-                .map_err(|e| format!("HMAC key init failure: {e}"))?;
-            mac.update(domain);
-            mac.update(&(payload.len() as u64).to_be_bytes());
-            mac.update(payload);
-            let actual = hex_encode(&mac.finalize().into_bytes());
-            let norm_expected: Vec<u8> = trimmed.bytes().map(|b| b.to_ascii_lowercase()).collect();
-            let norm_actual: Vec<u8> = actual.bytes().map(|b| b.to_ascii_lowercase()).collect();
-            if constant_time_eq_bytes(&norm_actual, &norm_expected) {
+            let expected_bytes = hex_decode_bytes(trimmed)?;
+            let actual =
+                crate::coordinator::compute_domain_tag_raw(zkey.as_bytes(), domain, payload)?;
+            if constant_time_eq_bytes(&actual, &expected_bytes) {
                 Ok(())
+            } else if crate::coordinator::is_legacy_v1_unprefixed_domain_tag(
+                zkey.as_bytes(),
+                domain,
+                payload,
+                &expected_bytes,
+            ) {
+                Err(
+                    "LEGACY_HMAC_V1_STATE_INVALIDATED: persisted record uses pre-v2 unprefixed HMAC encoding; run `dotagent activate` or `dotagent session-reset --all` to reset pre-v2 swarm state"
+                        .to_string(),
+                )
             } else {
                 Err("HMAC authentication tag mismatch".to_string())
             }

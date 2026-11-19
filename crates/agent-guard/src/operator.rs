@@ -349,6 +349,11 @@ pub fn run_session_reset_cli(args: &[String], cwd: &Path) -> ExitCode {
                 }
             }
         }
+        let mut upgrade_notes = Vec::new();
+        let _ = invalidate_or_purge_swarm_state(&repo_root, true, false, &mut upgrade_notes);
+        for note in upgrade_notes {
+            println!("{note}");
+        }
         println!(
             "[AGENT-GUARD SESSION RESET] Cleared {removed} session ledger file(s) from interactive human TTY."
         );
@@ -1028,7 +1033,13 @@ fn execute_activate(
         )?;
     }
 
-    // 6. Live repository security audit on dotagent_root AND target_ws (if target_ws is a git repo)
+    // 6. Explicitly invalidate any pre-v2 unprefixed HMAC swarm state on upgrade
+    invalidate_or_purge_swarm_state(dotagent_root, false, dry_run, &mut log)?;
+    if canon_target != canon_dotagent {
+        invalidate_or_purge_swarm_state(target_ws, false, dry_run, &mut log)?;
+    }
+
+    // 7. Live repository security audit on dotagent_root AND target_ws (if target_ws is a git repo)
     if !dry_run {
         if let Err(errs) = audit_repository(dotagent_root) {
             return Err(format!(
@@ -1052,6 +1063,85 @@ fn execute_activate(
         target_ws.display()
     ));
     Ok(log)
+}
+
+fn invalidate_or_purge_swarm_state(
+    repo_root: &Path,
+    force_purge_sessions: bool,
+    dry_run: bool,
+    log: &mut Vec<String>,
+) -> Result<(), String> {
+    let Ok(sdir) = crate::breadcrumbs::swarm_state_dir(repo_root) else {
+        return Ok(());
+    };
+    let key_path = sdir.join("vault/hmac.key");
+    let fmt_path = sdir.join("vault/hmac.format");
+    let is_legacy_v1 = key_path.is_file()
+        && fs::read_to_string(&fmt_path)
+            .map(|s| !s.contains("bijective-v2"))
+            .unwrap_or(true);
+
+    if !is_legacy_v1 && !force_purge_sessions {
+        return Ok(());
+    }
+    if dry_run {
+        if is_legacy_v1 {
+            log.push(format!(
+                "[dry-run] would invalidate pre-v2 HMAC swarm state for '{}'",
+                repo_root.display()
+            ));
+        }
+        return Ok(());
+    }
+
+    let subdirs: &[&str] = if is_legacy_v1 {
+        &["sessions", "spools", "ledger"]
+    } else {
+        &["sessions"]
+    };
+    let mut cleared = 0usize;
+    for sub in subdirs {
+        let dir = sdir.join(sub);
+        if let Ok(entries) = fs::read_dir(&dir) {
+            for entry in entries.flatten() {
+                let p = entry.path();
+                if p.is_file() && fs::remove_file(&p).is_ok() {
+                    cleared += 1;
+                }
+            }
+        }
+    }
+
+    if is_legacy_v1 {
+        for repo_file in ["WORK_LEDGER.jsonl", ".breadcrumbs.jsonl"] {
+            let fp = repo_root.join(repo_file);
+            if let Ok(meta) = fs::symlink_metadata(&fp)
+                && meta.file_type().is_file()
+            {
+                let bak = repo_root.join(format!("{repo_file}.v1.bak"));
+                if !bak.exists() {
+                    let _ = fs::rename(&fp, &bak);
+                } else {
+                    let _ = fs::remove_file(&fp);
+                }
+                cleared += 1;
+            }
+        }
+        if let Some(vault_dir) = fmt_path.parent() {
+            let _ = fs::create_dir_all(vault_dir);
+        }
+        let _ = fs::write(&fmt_path, b"bijective-v2\n");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = fs::set_permissions(&fmt_path, fs::Permissions::from_mode(0o600));
+        }
+        log.push(format!(
+            "[upgrade] invalidated {cleared} pre-v2 HMAC swarm artifact(s) for '{}' and enabled bijective-v2 format",
+            repo_root.display()
+        ));
+    }
+    Ok(())
 }
 
 fn execute_deactivate(home: &Path, target_ws: &Path, dry_run: bool) -> Result<Vec<String>, String> {

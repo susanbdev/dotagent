@@ -462,7 +462,15 @@ fn emit_hook_decision(decision: Decision, phase: HookPhase) -> ExitCode {
                     "hookEventName".to_string(),
                     JsonValue::Str(phase.event_name().to_string()),
                 )];
-                if let Some(cmd) = updated_bash_cmd {
+                if let Some(raw_obj) = updated_input_json
+                    && let Ok(parsed_obj) = JsonValue::parse(&raw_obj)
+                {
+                    fields.push((
+                        "permissionDecision".to_string(),
+                        JsonValue::Str("allow".to_string()),
+                    ));
+                    fields.push(("updatedInput".to_string(), parsed_obj));
+                } else if let Some(cmd) = updated_bash_cmd {
                     fields.push((
                         "permissionDecision".to_string(),
                         JsonValue::Str("allow".to_string()),
@@ -471,14 +479,6 @@ fn emit_hook_decision(decision: Decision, phase: HookPhase) -> ExitCode {
                         "updatedInput".to_string(),
                         JsonValue::Object(vec![("command".to_string(), JsonValue::Str(cmd))]),
                     ));
-                } else if let Some(raw_obj) = updated_input_json
-                    && let Ok(parsed_obj) = JsonValue::parse(&raw_obj)
-                {
-                    fields.push((
-                        "permissionDecision".to_string(),
-                        JsonValue::Str("allow".to_string()),
-                    ));
-                    fields.push(("updatedInput".to_string(), parsed_obj));
                 }
                 if let Some(note) = advisory {
                     fields.push(("additionalContext".to_string(), JsonValue::Str(note)));

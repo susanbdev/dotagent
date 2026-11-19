@@ -247,8 +247,22 @@ fn command_invokes_bin(cmd: &ParsedCommand, target: &str) -> bool {
                 let is_timeout = tok == "timeout";
                 i += 1;
                 while i < cmd.argv.len() && cmd.argv[i].starts_with('-') {
-                    if matches!(cmd.argv[i].as_str(), "-k" | "-s" | "-n") {
+                    let opt = cmd.argv[i].as_str();
+                    if opt == "--" {
+                        i += 1;
+                        break;
+                    }
+                    if (is_timeout && matches!(opt, "-k" | "-s" | "--kill-after" | "--signal"))
+                        || (!is_timeout && matches!(opt, "-n" | "--adjustment"))
+                    {
                         i += 2;
+                    } else if opt.starts_with("--")
+                        && !matches!(opt, "--verbose" | "--foreground" | "--preserve-status")
+                        && !opt.starts_with("--kill-after=")
+                        && !opt.starts_with("--signal=")
+                        && !opt.starts_with("--adjustment=")
+                    {
+                        return false;
                     } else {
                         i += 1;
                     }
@@ -396,15 +410,34 @@ fn check_single_command(
         }
         "timeout" | "nice" => {
             // Skip flags and numeric duration/niceness, inspect wrapped command
+            let is_timeout = bin == "timeout";
             let mut idx = 0;
             while idx < args.len() && args[idx].starts_with('-') {
-                if matches!(args[idx].as_str(), "-k" | "-s" | "-n") {
+                let opt = args[idx].as_str();
+                if opt == "--" {
+                    idx += 1;
+                    break;
+                }
+                if (is_timeout && matches!(opt, "-k" | "-s" | "--kill-after" | "--signal"))
+                    || (!is_timeout && matches!(opt, "-n" | "--adjustment"))
+                {
                     idx += 2;
+                } else if opt.starts_with("--")
+                    && !matches!(opt, "--verbose" | "--foreground" | "--preserve-status")
+                    && !opt.starts_with("--kill-after=")
+                    && !opt.starts_with("--signal=")
+                    && !opt.starts_with("--adjustment=")
+                {
+                    return Err(CommandViolation {
+                        code: "MALFORMED_SUBSHELL",
+                        detail: format!("Unrecognized `{bin}` flag `{opt}`."),
+                        halt_session: false,
+                    });
                 } else {
                     idx += 1;
                 }
             }
-            if bin == "timeout" && idx < args.len() {
+            if is_timeout && idx < args.len() {
                 idx += 1; // duration argument
             }
             if idx < args.len() {
@@ -608,11 +641,30 @@ fn check_single_command(
         "xargs" => {
             let mut idx = 0;
             while idx < args.len() && args[idx].starts_with('-') {
+                let opt = args[idx].as_str();
+                if opt == "--" {
+                    idx += 1;
+                    break;
+                }
                 if matches!(
-                    args[idx].as_str(),
-                    "-I" | "-L" | "-n" | "-P" | "-s" | "-d" | "-E" | "-a"
+                    opt,
+                    "-I" | "-L"
+                        | "-n"
+                        | "-P"
+                        | "-s"
+                        | "-d"
+                        | "-E"
+                        | "-a"
+                        | "--replace"
+                        | "--max-lines"
+                        | "--max-args"
+                        | "--max-procs"
+                        | "--max-chars"
+                        | "--delimiter"
+                        | "--eof"
+                        | "--arg-file"
                 ) {
-                    if args[idx] == "-a" {
+                    if matches!(opt, "-a" | "--arg-file") {
                         if let Some(f) = args.get(idx + 1) {
                             reject_shell_glob_in_operand("xargs -a", f)?;
                             let valid = validate_path(repo_root, cwd, f, PathAccess::Read)
@@ -629,8 +681,58 @@ fn check_single_command(
                         }
                     }
                     idx += 2;
-                } else {
+                } else if let Some(f) = opt
+                    .strip_prefix("--arg-file=")
+                    .or_else(|| opt.strip_prefix("-a").filter(|rest| !rest.is_empty()))
+                {
+                    reject_shell_glob_in_operand("xargs --arg-file", f)?;
+                    let valid =
+                        validate_path(repo_root, cwd, f, PathAccess::Read).map_err(|pv| {
+                            CommandViolation {
+                                code: pv.code,
+                                detail: pv.detail,
+                                halt_session: pv.is_poisoned_zone,
+                            }
+                        })?;
+                    plan.read_files.push((
+                        valid.repo_rel,
+                        valid.canonical_or_norm,
+                        valid.is_root_authority,
+                    ));
                     idx += 1;
+                } else if matches!(
+                    opt,
+                    "-0" | "-r"
+                        | "-t"
+                        | "-x"
+                        | "--null"
+                        | "--no-run-if-empty"
+                        | "--verbose"
+                        | "--exit"
+                ) || opt.starts_with("--replace=")
+                    || opt.starts_with("--max-lines=")
+                    || opt.starts_with("--max-args=")
+                    || opt.starts_with("--max-procs=")
+                    || opt.starts_with("--max-chars=")
+                    || opt.starts_with("--delimiter=")
+                    || opt.starts_with("--eof=")
+                    || opt.starts_with("-I")
+                    || opt.starts_with("-L")
+                    || opt.starts_with("-n")
+                    || opt.starts_with("-P")
+                    || opt.starts_with("-s")
+                    || opt.starts_with("-d")
+                    || opt.starts_with("-E")
+                {
+                    idx += 1;
+                } else {
+                    return Err(CommandViolation {
+                        code: "XARGS_DYNAMIC_ARGS_BLOCKED",
+                        detail: format!(
+                            "Unrecognized or unsafe `xargs` option `{opt}` is forbidden."
+                        ),
+                        halt_session: false,
+                    });
                 }
             }
             if idx < args.len() {
@@ -739,28 +841,81 @@ fn check_single_command(
         return Ok(());
     }
 
-    // Prevent agent from invoking `agent-guard` state-reset, user-prompt, or pre-compact hooks directly
-    if bin == "agent-guard" {
-        if let Some(sub) = args.first().map(String::as_str) {
+    if bin == "swarm-tool"
+        && args.iter().any(|a| {
+            a == "--internal-exec-sandbox"
+                || a.starts_with("--internal-exec-sandbox=")
+                || a == "--probe-landlock-child"
+        })
+    {
+        return Err(CommandViolation {
+            code: "SELF_TAMPERING_BLOCKED",
+            detail: "Agents may not invoke internal sandbox flags on `swarm-tool` directly."
+                .to_string(),
+            halt_session: true,
+        });
+    }
+
+    // Prevent agent from invoking `agent-guard` / `dotagent` hooks, state resets, or unwrapped sandbox helpers
+    if matches!(bin, "agent-guard" | "dotagent") {
+        let sub_args: &[String] = if args.first().map(String::as_str) == Some("guard") {
+            &args[1..]
+        } else {
+            args
+        };
+        if sub_args.iter().any(|a| a == "--probe-landlock-child") {
+            return Err(CommandViolation {
+                code: "SELF_TAMPERING_BLOCKED",
+                detail: "Agents may not invoke internal Landlock probe flags directly.".to_string(),
+                halt_session: true,
+            });
+        }
+        if let Some(sub) = sub_args.first().map(String::as_str) {
             if matches!(
                 sub,
                 "user-prompt"
+                    | "pre-tool"
+                    | "post-tool"
+                    | "post-edit"
+                    | "on-stop"
                     | "reset"
                     | "reset-session"
+                    | "session-reset"
                     | "pre-compact"
                     | "compact-reset"
                     | "coordinator"
+                    | "activate"
+                    | "deactivate"
             ) {
                 return Err(CommandViolation {
                     code: "SELF_TAMPERING_BLOCKED",
                     detail:
-                        "Agents may not reset agent-guard session/compaction state, spoof lifecycle hooks, or directly invoke the vault coordinator."
+                        "Agents may not reset agent-guard session/compaction state, spoof lifecycle hooks, mutate activation, or directly invoke the vault coordinator."
                             .to_string(),
                     halt_session: true,
                 });
             }
+            if sub == "swarm" {
+                let mut forwarded = Vec::with_capacity(sub_args.len());
+                forwarded.push("swarm-tool".to_string());
+                forwarded.extend_from_slice(&sub_args[1..]);
+                let inner = ParsedCommand {
+                    env_vars: Vec::new(),
+                    argv: forwarded,
+                    redirs: cmd.redirs.clone(),
+                    piped_stdin: cmd.piped_stdin,
+                };
+                return check_single_command(
+                    &inner,
+                    repo_root,
+                    cwd,
+                    session_tainted,
+                    depth + 1,
+                    plan,
+                );
+            }
             if matches!(sub, "read-safe" | "scan-file") {
-                if let Some(target_file) = args.get(1) {
+                if let Some(target_file) = sub_args.get(1) {
                     validate_path(repo_root, cwd, target_file, PathAccess::Read).map_err(|pv| {
                         CommandViolation {
                             code: pv.code,
@@ -779,22 +934,22 @@ fn check_single_command(
                 let mut custom_cwd: Option<&str> = None;
                 let mut after_sep = false;
                 let mut inner_argv: Vec<String> = Vec::new();
-                while idx < args.len() {
+                while idx < sub_args.len() {
                     if after_sep {
-                        inner_argv.push(args[idx].clone());
+                        inner_argv.push(sub_args[idx].clone());
                         idx += 1;
                         continue;
                     }
-                    match args[idx].as_str() {
+                    match sub_args[idx].as_str() {
                         "--" => {
                             after_sep = true;
                             idx += 1;
                         }
-                        "--sanitize-stream" | "--require-kernel" => {
+                        "--sanitize-stream" | "--require-kernel" | "--deny-net" => {
                             idx += 1;
                         }
                         "--cwd" => {
-                            let Some(dir) = args.get(idx + 1) else {
+                            let Some(dir) = sub_args.get(idx + 1) else {
                                 return Err(CommandViolation {
                                     code: "MALFORMED_SUBSHELL",
                                     detail: "`agent-guard exec-sandbox --cwd` missing directory."
@@ -4307,7 +4462,7 @@ fn parse_shell_script(
     let mut cur_redirs = Vec::new();
     let mut cur_piped_stdin = false;
     let mut has_compound_list_op = false;
-    let mut pending_heredocs: Vec<(String, bool)> = Vec::new();
+    let mut pending_heredocs: Vec<(String, bool, bool)> = Vec::new();
 
     let flush = |env: &mut Vec<(String, String)>,
                  argv: &mut Vec<String>,
@@ -4364,7 +4519,9 @@ fn parse_shell_script(
                 i += 1;
             }
             if b == b'\n' && !pending_heredocs.is_empty() {
-                for (delim, strip_tabs) in pending_heredocs.drain(..) {
+                for (delim, strip_tabs, is_quoted_delim) in pending_heredocs.drain(..) {
+                    let body_start = i;
+                    let mut body_end = bytes.len();
                     while i < bytes.len() {
                         let line_start = i;
                         while i < bytes.len() && bytes[i] != b'\n' {
@@ -4381,8 +4538,15 @@ fn parse_shell_script(
                             i += 1;
                         }
                         if cmp_line == delim {
+                            body_end = line_start;
                             break;
                         }
+                    }
+                    if !is_quoted_delim && body_end > body_start {
+                        extract_unquoted_heredoc_expansions(
+                            &script[body_start..body_end],
+                            subscripts,
+                        )?;
                     }
                 }
             }
@@ -4468,6 +4632,7 @@ fn parse_shell_script(
             while i < bytes.len() && (bytes[i] == b' ' || bytes[i] == b'\t') {
                 i += 1;
             }
+            let raw_delim_start = i;
             let (target_word, next_i) = read_shell_word(script, i, subscripts)?;
             if next_i <= i {
                 return Err(CommandViolation {
@@ -4477,7 +4642,9 @@ fn parse_shell_script(
                 });
             }
             if is_multiline_heredoc && !target_word.is_empty() {
-                pending_heredocs.push((target_word.clone(), strip_heredoc_tabs));
+                let raw_delim = &script[raw_delim_start..next_i];
+                let is_quoted_delim = raw_delim.contains(['\'', '"', '\\']);
+                pending_heredocs.push((target_word.clone(), strip_heredoc_tabs, is_quoted_delim));
             }
             cur_redirs.push((kind, target_word));
             i = next_i;
@@ -4638,6 +4805,46 @@ fn read_shell_word(
     }
 
     Ok((out, i))
+}
+
+fn extract_unquoted_heredoc_expansions(
+    body: &str,
+    subscripts: &mut Vec<String>,
+) -> Result<(), CommandViolation> {
+    let bytes = body.as_bytes();
+    let mut j = 0usize;
+    while j < bytes.len() {
+        if bytes[j] == b'\\' {
+            if j + 1 < bytes.len() {
+                let ch_len = body[j + 1..].chars().next().map_or(1, char::len_utf8);
+                j += 1 + ch_len;
+            } else {
+                j += 1;
+            }
+            continue;
+        }
+        if bytes[j] == b'$' && bytes.get(j + 1) == Some(&b'(') {
+            if bytes.get(j + 2) == Some(&b'(') {
+                let (arith_inner, next_j) = extract_balanced_parens(body, j + 1)?;
+                extract_unquoted_heredoc_expansions(&arith_inner, subscripts)?;
+                j = next_j;
+                continue;
+            }
+            let (inner, next_j) = extract_balanced_parens(body, j + 1)?;
+            subscripts.push(inner);
+            j = next_j;
+            continue;
+        }
+        if bytes[j] == b'`' {
+            let (inner, next_j) = extract_backticks(body, j)?;
+            subscripts.push(inner);
+            j = next_j;
+            continue;
+        }
+        let ch_len = body[j..].chars().next().map_or(1, char::len_utf8);
+        j += ch_len;
+    }
+    Ok(())
 }
 
 fn extract_balanced_parens(

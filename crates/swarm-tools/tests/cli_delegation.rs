@@ -874,4 +874,176 @@ fn pr6_cli_capabilities_packet_provenance_and_landlock_vault_coordinator_e2e() {
         "sandboxed `swarm-tool grunt submit-ledger` failed: stderr={}",
         String::from_utf8_lossy(&sb_ledger.stderr)
     );
+
+    // Removed `--internal-exec-sandbox` CLI flag must fail closed (exit 2, UNKNOWN_SUBCOMMAND)
+    // even if a caller attempts to supply the former internal token env var.
+    let direct_internal = Command::new(swarm_tool_bin())
+        .args(["--internal-exec-sandbox", "--", "echo", "pwn"])
+        .current_dir(&repo)
+        .env("AGENT_GUARD_STATE_DIR", &state)
+        .env("AGENT_GUARD_INTERNAL_SBX_TOKEN", "1")
+        .output()
+        .unwrap();
+    assert_eq!(direct_internal.status.code(), Some(2));
+    assert!(
+        String::from_utf8_lossy(&direct_internal.stderr).contains("UNKNOWN_SUBCOMMAND"),
+        "direct --internal-exec-sandbox stderr: {}",
+        String::from_utf8_lossy(&direct_internal.stderr)
+    );
+
+    // Worker-controlled `HOME` containing a 0755 fake `.local/bin/agent-guard` must NEVER be
+    // trusted when `swarm-tool` has no sibling `agent-guard` next to `current_exe()`.
+    let isolated_bin_dir = dir.join("isolated_bin");
+    let fake_home_dir = dir.join("fake_home").join(".local").join("bin");
+    fs::create_dir_all(&isolated_bin_dir).unwrap();
+    fs::create_dir_all(&fake_home_dir).unwrap();
+    let isolated_swarm_tool = isolated_bin_dir.join("swarm-tool");
+    fs::copy(swarm_tool_bin(), &isolated_swarm_tool).unwrap();
+    let fake_ag = fake_home_dir.join("agent-guard");
+    fs::write(
+        &fake_ag,
+        "#!/bin/sh\necho FAKE_HOME_AGENT_GUARD_HIJACK >&2\nexit 0\n",
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&isolated_swarm_tool, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::set_permissions(&fake_ag, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::set_permissions(&fake_home_dir, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let home_hijack = Command::new(&isolated_swarm_tool)
+        .args([
+            "grunt",
+            "checkpoint-green",
+            "--session",
+            &grunt_sid,
+            "--",
+            "python3",
+            "-m",
+            "unittest",
+            "discover",
+            "-s",
+            "tests",
+        ])
+        .current_dir(&repo)
+        .env("AGENT_GUARD_STATE_DIR", &state)
+        .env("HOME", dir.join("fake_home"))
+        .output()
+        .unwrap();
+    assert_eq!(home_hijack.status.code(), Some(2));
+    let hijack_stderr = String::from_utf8_lossy(&home_hijack.stderr);
+    assert!(
+        hijack_stderr.contains("SANDBOX_BINARY_UNAVAILABLE")
+            && !hijack_stderr.contains("FAKE_HOME_AGENT_GUARD_HIJACK"),
+        "HOME hijack attempt stderr: {hijack_stderr}"
+    );
+
+    // `checkpoint-green` with `--skip` exclusion flag must be rejected
+    let skip_cp = Command::new(swarm_tool_bin())
+        .args([
+            "grunt",
+            "checkpoint-green",
+            "--session",
+            &grunt_sid,
+            "--",
+            "cargo",
+            "test",
+            "--",
+            "--skip",
+            "test_vault_isolated",
+        ])
+        .current_dir(&repo)
+        .env("AGENT_GUARD_STATE_DIR", &state)
+        .output()
+        .unwrap();
+    assert!(!skip_cp.status.success());
+    assert!(
+        String::from_utf8_lossy(&skip_cp.stderr).contains("INVALID_TEST_RUNNER_COMMAND"),
+        "skip checkpoint stderr: {}",
+        String::from_utf8_lossy(&skip_cp.stderr)
+    );
+
+    for bad_runner_args in [
+        &[
+            "grunt",
+            "checkpoint-green",
+            "--session",
+            &grunt_sid,
+            "--",
+            "pytest",
+            "--deselect=tests/test_vault_isolated.py::test_ok",
+        ][..],
+        &[
+            "grunt",
+            "checkpoint-green",
+            "--session",
+            &grunt_sid,
+            "--",
+            "go",
+            "test",
+            "-run",
+            "vault_isolation_test",
+            "-exec",
+            "sh",
+        ][..],
+    ] {
+        let bad_cp = Command::new(swarm_tool_bin())
+            .args(bad_runner_args)
+            .current_dir(&repo)
+            .env("AGENT_GUARD_STATE_DIR", &state)
+            .output()
+            .unwrap();
+        assert!(!bad_cp.status.success());
+        assert!(
+            String::from_utf8_lossy(&bad_cp.stderr).contains("INVALID_TEST_RUNNER_COMMAND"),
+            "bad runner args {bad_runner_args:?} stderr: {}",
+            String::from_utf8_lossy(&bad_cp.stderr)
+        );
+    }
+
+    // Once closed by Master, replaying `--session <grunt_sid>` must fail closed (`SESSION_CLOSED_OR_INACTIVE`)
+    assert!(
+        Command::new(swarm_tool_bin())
+            .args(["master", "close-session", "--session", &grunt_sid])
+            .current_dir(&repo)
+            .env("AGENT_GUARD_STATE_DIR", &state)
+            .env("AGENT_GUARD_ROLE", "master")
+            .status()
+            .unwrap()
+            .success()
+    );
+    let replay_closed = Command::new(swarm_tool_bin())
+        .args(["grunt", "context", "--session", &grunt_sid])
+        .current_dir(&repo)
+        .env("AGENT_GUARD_STATE_DIR", &state)
+        .output()
+        .unwrap();
+    assert!(!replay_closed.status.success());
+    assert!(
+        String::from_utf8_lossy(&replay_closed.stderr).contains("SESSION_CLOSED_OR_INACTIVE"),
+        "closed session replay stderr: {}",
+        String::from_utf8_lossy(&replay_closed.stderr)
+    );
+
+    // Non-TTY `lock-plan --amend --human-approved` must be rejected
+    let amend_non_tty = Command::new(swarm_tool_bin())
+        .args([
+            "master",
+            "lock-plan",
+            "plan.dag.json",
+            "--amend",
+            "--human-approved",
+        ])
+        .current_dir(&repo)
+        .env("AGENT_GUARD_STATE_DIR", &state)
+        .env("AGENT_GUARD_ROLE", "master")
+        .output()
+        .unwrap();
+    assert!(!amend_non_tty.status.success());
+    assert!(
+        String::from_utf8_lossy(&amend_non_tty.stderr).contains("PLAN_AMEND_REQUIRES_HUMAN_TTY"),
+        "non-tty amend stderr: {}",
+        String::from_utf8_lossy(&amend_non_tty.stderr)
+    );
 }

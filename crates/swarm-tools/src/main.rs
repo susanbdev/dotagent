@@ -54,9 +54,6 @@ fn main() -> ExitCode {
 
     match role_ns {
         "--probe-landlock-child" => return agent_guard::exec_sandbox::run_probe_landlock_child(),
-        "--internal-exec-sandbox" => {
-            return agent_guard::exec_sandbox::run_exec_sandbox_cli(rest, &cwd);
-        }
         "--version" | "-V" | "version" => {
             println!("swarm-tool {}", env!("CARGO_PKG_VERSION"));
             return ExitCode::SUCCESS;
@@ -227,6 +224,15 @@ fn load_capability_for_role(
             cap.role.as_str_id()
         ));
     }
+    if expected_role != SwarmRole::Master {
+        let open_caps = load_open_session_capabilities(repo_root)?;
+        if !open_caps.iter().any(|c| c.session_id == cap.session_id) {
+            return Err(format!(
+                "SESSION_CLOSED_OR_INACTIVE: session '{}' is closed or no longer registered in active_sessions.json",
+                cap.session_id
+            ));
+        }
+    }
     Ok(cap)
 }
 
@@ -341,6 +347,14 @@ fn run_master(repo_root: &Path, cwd: &Path, args: &[String]) -> Result<(), Strin
     let sub = args.first().map(String::as_str).unwrap_or("--help");
     match sub {
         "lock-plan" => {
+            if std::env::var("AGENT_GUARD_IN_SANDBOX").is_ok_and(|v| v == "1")
+                || std::env::var("AGENT_GUARD_WORKER_LOCK").is_ok_and(|v| v == "1")
+            {
+                return Err(
+                    "PLAN_LOCK_DENIED_IN_SANDBOX: `swarm-tool master lock-plan` must be executed on the host outside `exec-sandbox`."
+                        .to_string(),
+                );
+            }
             let dag_arg = args.get(1).ok_or_else(|| {
                 "usage: swarm-tool master lock-plan <dag.json> [--amend --human-approved]"
                     .to_string()
@@ -352,6 +366,15 @@ fn run_master(repo_root: &Path, cwd: &Path, args: &[String]) -> Result<(), Strin
             let plan = parse_and_validate_dag_json(&raw)?;
             let allow_amend =
                 args.iter().any(|a| a == "--amend") && args.iter().any(|a| a == "--human-approved");
+            if allow_amend
+                && (!std::io::IsTerminal::is_terminal(&std::io::stdin())
+                    || !std::io::IsTerminal::is_terminal(&std::io::stdout()))
+            {
+                return Err(
+                    "PLAN_AMEND_REQUIRES_HUMAN_TTY: `lock-plan --amend --human-approved` requires an interactive human terminal (stdin/stdout TTY) so AI agents cannot self-approve plan amendments."
+                        .to_string(),
+                );
+            }
             let saved_path = save_locked_plan(repo_root, &plan, allow_amend)?;
             let out = JsonValue::Object(vec![
                 (
@@ -782,6 +805,42 @@ fn validate_grunt_test_runner_command(
                 "INVALID_TEST_RUNNER_COMMAND: non-executing flag '{tok}' is forbidden in `checkpoint-green`"
             ));
         }
+        if matches!(
+            lower.as_str(),
+            "--skip"
+                | "-skip"
+                | "--exclude"
+                | "--exclude-regex"
+                | "--ignore"
+                | "--ignore-glob"
+                | "--deselect"
+                | "--testpathignorepatterns"
+        ) || lower.starts_with("--skip=")
+            || lower.starts_with("-skip=")
+            || lower.starts_with("--exclude=")
+            || lower.starts_with("--exclude-regex=")
+            || lower.starts_with("--ignore=")
+            || lower.starts_with("--ignore-glob=")
+            || lower.starts_with("--deselect=")
+            || lower.starts_with("--testpathignorepatterns=")
+            || (base == "ctest" && tok == "-E")
+        {
+            return Err(format!(
+                "INVALID_TEST_RUNNER_COMMAND: test-exclusion flag '{tok}' is forbidden in `checkpoint-green`"
+            ));
+        }
+        if matches!(lower.as_str(), "-exec" | "--exec")
+            || lower.starts_with("-exec=")
+            || lower.starts_with("--exec=")
+            || (base == "go"
+                && (matches!(lower.as_str(), "-c" | "--c" | "-o" | "--o")
+                    || lower.starts_with("-o=")
+                    || lower.starts_with("--o=")))
+        {
+            return Err(format!(
+                "INVALID_TEST_RUNNER_COMMAND: unsafe or non-executing runner flag '{tok}' is forbidden in `checkpoint-green`"
+            ));
+        }
     }
 
     let mut narrowed_filters: Vec<String> = Vec::new();
@@ -804,15 +863,18 @@ fn validate_grunt_test_runner_command(
             }
         }
         "pytest" | "py.test" => {
-            collect_pytest_filters(rest, &mut narrowed_filters);
+            collect_pytest_filters_checked(rest, &mut narrowed_filters)?;
             true
         }
-        "ctest" => true,
+        "ctest" => {
+            collect_ctest_filters(rest, &mut narrowed_filters);
+            true
+        }
         "python" | "python3" => {
             if rest.len() >= 2 && rest[0] == "-m" {
                 match rest[1].as_str() {
                     "pytest" => {
-                        collect_pytest_filters(&rest[2..], &mut narrowed_filters);
+                        collect_pytest_filters_checked(&rest[2..], &mut narrowed_filters)?;
                         true
                     }
                     "unittest" => {
@@ -827,20 +889,31 @@ fn validate_grunt_test_runner_command(
         }
         "uv" => {
             if rest.len() >= 2 && rest[0] == "run" && rest[1] == "pytest" {
-                collect_pytest_filters(&rest[2..], &mut narrowed_filters);
+                collect_pytest_filters_checked(&rest[2..], &mut narrowed_filters)?;
                 true
             } else {
                 false
             }
         }
         "npm" | "pnpm" | "yarn" | "bun" => match rest.first().map(String::as_str) {
-            Some("test" | "vitest" | "jest") => true,
-            Some("run") => rest
-                .get(1)
-                .is_some_and(|s| s == "test" || s.starts_with("test:")),
+            Some("test" | "vitest" | "jest") => {
+                collect_js_test_filters(&rest[1..], &mut narrowed_filters);
+                true
+            }
+            Some("run")
+                if rest
+                    .get(1)
+                    .is_some_and(|s| s == "test" || s.starts_with("test:")) =>
+            {
+                collect_js_test_filters(&rest[2..], &mut narrowed_filters);
+                true
+            }
             _ => false,
         },
-        "go" => rest.first().is_some_and(|s| s == "test"),
+        "go" if rest.first().is_some_and(|s| s == "test") => {
+            collect_go_test_filters(&rest[1..], &mut narrowed_filters);
+            true
+        }
         _ => false,
     };
 
@@ -919,10 +992,7 @@ fn collect_cargo_test_filters(args: &[String], out: &mut Vec<String>) {
                 i += 2;
                 continue;
             }
-        } else if matches!(tok, "--skip" | "--test-threads") {
-            if tok == "--skip" {
-                out.push("__HAS_SKIP_FILTER__".to_string());
-            }
+        } else if tok == "--test-threads" {
             i += 2;
             continue;
         }
@@ -933,6 +1003,105 @@ fn collect_cargo_test_filters(args: &[String], out: &mut Vec<String>) {
         out.push(tok.to_string());
         i += 1;
     }
+}
+
+fn collect_ctest_filters(args: &[String], out: &mut Vec<String>) {
+    let mut i = 0usize;
+    while i < args.len() {
+        let tok = args[i].as_str();
+        if matches!(tok, "-R" | "--tests-regex") {
+            if let Some(val) = args.get(i + 1) {
+                out.push(val.clone());
+            }
+            i += 2;
+            continue;
+        }
+        if let Some(val) = tok.strip_prefix("--tests-regex=") {
+            out.push(val.to_string());
+        }
+        i += 1;
+    }
+}
+
+fn collect_go_test_filters(args: &[String], out: &mut Vec<String>) {
+    let mut i = 0usize;
+    while i < args.len() {
+        let tok = args[i].as_str();
+        if matches!(tok, "-run" | "--run") {
+            if let Some(val) = args.get(i + 1) {
+                out.push(val.clone());
+            }
+            i += 2;
+            continue;
+        }
+        if let Some(val) = tok
+            .strip_prefix("-run=")
+            .or_else(|| tok.strip_prefix("--run="))
+        {
+            out.push(val.to_string());
+            i += 1;
+            continue;
+        }
+        if matches!(tok, "-count" | "-timeout" | "-parallel" | "-p" | "-tags") {
+            i += 2;
+            continue;
+        }
+        if !tok.starts_with('-') && !matches!(tok, "./..." | "." | "./") {
+            out.push(tok.to_string());
+        }
+        i += 1;
+    }
+}
+
+fn collect_js_test_filters(args: &[String], out: &mut Vec<String>) {
+    let mut i = 0usize;
+    while i < args.len() {
+        let tok = args[i].as_str();
+        if tok == "--" {
+            i += 1;
+            continue;
+        }
+        if matches!(tok, "-t" | "--testNamePattern" | "--testPathPattern") {
+            if let Some(val) = args.get(i + 1) {
+                out.push(val.clone());
+            }
+            i += 2;
+            continue;
+        }
+        if let Some(val) = tok
+            .strip_prefix("--testNamePattern=")
+            .or_else(|| tok.strip_prefix("--testPathPattern="))
+        {
+            out.push(val.to_string());
+            i += 1;
+            continue;
+        }
+        if !tok.starts_with('-') {
+            out.push(tok.to_string());
+        }
+        i += 1;
+    }
+}
+
+fn collect_pytest_filters_checked(args: &[String], out: &mut Vec<String>) -> Result<(), String> {
+    let mut i = 0usize;
+    while i < args.len() {
+        let tok = args[i].as_str();
+        if tok == "-k"
+            && let Some(expr) = args.get(i + 1)
+        {
+            let norm = format!(" {} ", expr.to_ascii_lowercase());
+            if norm.contains(" not ") || expr.trim_start().to_ascii_lowercase().starts_with("not(")
+            {
+                return Err(format!(
+                    "INVALID_TEST_RUNNER_COMMAND: negative pytest `-k '{expr}'` exclusion is forbidden in `checkpoint-green`"
+                ));
+            }
+        }
+        i += 1;
+    }
+    collect_pytest_filters(args, out);
+    Ok(())
 }
 
 fn collect_pytest_filters(args: &[String], out: &mut Vec<String>) {
@@ -1013,14 +1182,27 @@ fn format_role_denial(dec: Decision) -> String {
 }
 
 fn resolve_sibling_agent_guard_bin() -> Option<PathBuf> {
-    if let Ok(exe) = std::env::current_exe() {
-        let mut sib = exe;
-        sib.set_file_name("agent-guard");
-        if sib.is_file() {
-            return Some(sib);
+    let exe_raw = std::env::current_exe().ok()?;
+    let exe = fs::canonicalize(&exe_raw).unwrap_or(exe_raw);
+    let exe_meta = fs::symlink_metadata(&exe).ok()?;
+    let mut sib = exe;
+    sib.set_file_name("agent-guard");
+    let meta = fs::symlink_metadata(&sib).ok()?;
+    if meta.file_type().is_symlink() || !meta.file_type().is_file() {
+        return None;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if meta.uid() != exe_meta.uid() {
+            return None;
         }
     }
-    None
+    #[cfg(not(unix))]
+    {
+        let _ = exe_meta;
+    }
+    Some(sib)
 }
 
 fn run_grunt(repo_root: &Path, cwd: &Path, args: &[String]) -> Result<(), String> {
@@ -1122,23 +1304,18 @@ fn run_grunt(repo_root: &Path, cwd: &Path, args: &[String]) -> Result<(), String
             check_role_shell_read_scope(SwarmRole::Grunt, Some(&cap), &read_rels, repo_root)
                 .map_err(format_role_denial)?;
 
-            // Execute the untrusted test runner strictly inside `exec-sandbox --deny-net`
-            // (using sibling `agent-guard` or self `--internal-exec-sandbox` — NEVER unsandboxed!)
-            // so `cargo test`/`pytest`/`unittest` has zero kernel access to `vault/hmac.key`,
-            // `ipc/coord.sock`, `sessions/`, `spools/`, `ledger/`, or outbound TCP sockets.
-            let (sandbox_bin, sandbox_subcmd) = if let Some(ag_bin) = resolve_sibling_agent_guard_bin() {
-                (ag_bin, "exec-sandbox")
-            } else {
-                let self_exe = std::env::current_exe().map_err(|e| {
-                    format!(
-                        "SANDBOX_BINARY_UNAVAILABLE: refusing to execute untrusted test command outside OS sandbox ({e})"
-                    )
-                })?;
-                (self_exe, "--internal-exec-sandbox")
-            };
+            // Execute the untrusted test runner strictly inside `agent-guard exec-sandbox --deny-net`
+            // (never unsandboxed and without any self-CLI flag fallback) so `cargo test`/`pytest`/`unittest`
+            // has zero kernel access to `vault/hmac.key`, `ipc/coord.sock`, `sessions/`, `spools/`,
+            // `ledger/`, or outbound TCP sockets.
+            let sandbox_bin = resolve_sibling_agent_guard_bin().ok_or_else(|| {
+                "SANDBOX_BINARY_UNAVAILABLE: refusing to execute untrusted test command outside OS sandbox (`agent-guard` binary not found)"
+                    .to_string()
+            })?;
 
-            let status = Command::new(sandbox_bin)
-                .arg(sandbox_subcmd)
+            let mut sbx_cmd = Command::new(sandbox_bin);
+            sbx_cmd
+                .arg("exec-sandbox")
                 .arg("--deny-net")
                 .arg("--cwd")
                 .arg(repo_root)
@@ -1149,14 +1326,13 @@ fn run_grunt(repo_root: &Path, cwd: &Path, args: &[String]) -> Result<(), String
                 .env_remove("AGENT_GUARD_SESSION_ID")
                 .env_remove("AGENT_GUARD_COORDINATOR_SOCK")
                 .env("AGENT_GUARD_WORKER_LOCK", "1")
-                .env("PYTHONDONTWRITEBYTECODE", "1")
-                .status()
-                .map_err(|e| {
-                    format!(
-                        "SANDBOX_BINARY_UNAVAILABLE: failed spawning sandboxed test command '{}': {e}",
-                        cmd_tokens[0]
-                    )
-                })?;
+                .env("PYTHONDONTWRITEBYTECODE", "1");
+            let status = sbx_cmd.status().map_err(|e| {
+                format!(
+                    "SANDBOX_BINARY_UNAVAILABLE: failed spawning sandboxed test command '{}': {e}",
+                    cmd_tokens[0]
+                )
+            })?;
 
             let passed = status.success();
             let (_cap, tree_oid) = record_test_checkpoint(repo_root, &sid, passed)?;

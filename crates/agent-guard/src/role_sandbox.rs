@@ -40,12 +40,15 @@ const ACTIVE_SLOT_HMAC_DOMAIN: &[u8] = b"DOTAGENT_ACTIVE_SESSIONS_REGISTRY_V2";
 
 #[derive(Debug, Clone, Default)]
 struct ActiveSessionRegistry {
+    revision: u64,
     open_sessions: Vec<String>,
     hook_bindings: BTreeMap<String, String>,
 }
 
 fn encode_registry_mac_payload(reg: &ActiveSessionRegistry) -> Vec<u8> {
     let mut buf = Vec::new();
+    buf.extend_from_slice(b"REV2");
+    buf.extend_from_slice(&reg.revision.to_be_bytes());
     buf.extend_from_slice(&(reg.open_sessions.len() as u32).to_be_bytes());
     for sid in &reg.open_sessions {
         buf.extend_from_slice(&(sid.len() as u32).to_be_bytes());
@@ -131,6 +134,12 @@ fn load_registry_unlocked(repo_root: &Path, path: &Path) -> Result<ActiveSession
     }
     let v = JsonValue::parse(&raw)
         .map_err(|e| format!("FORGED_ACTIVE_SESSION_SLOT: corrupt active_sessions.json: {e}"))?;
+    let Some(revision) = v.get("revision").and_then(JsonValue::as_u64) else {
+        return Err(
+            "LEGACY_HMAC_V1_STATE_INVALIDATED: pre-v2 active_sessions.json missing revision field; run `dotagent activate` or `dotagent session-reset --all` to reset swarm state"
+                .to_string(),
+        );
+    };
     let open_arr = v
         .get("open_sessions")
         .and_then(JsonValue::as_array)
@@ -166,71 +175,115 @@ fn load_registry_unlocked(repo_root: &Path, path: &Path) -> Result<ActiveSession
             "FORGED_ACTIVE_SESSION_SLOT: missing record_mac in active_sessions.json".to_string()
         })?;
     let reg = ActiveSessionRegistry {
+        revision,
         open_sessions,
         hook_bindings,
     };
     let payload = encode_registry_mac_payload(&reg);
     verify_arbitrary_hmac_hex(repo_root, ACTIVE_SLOT_HMAC_DOMAIN, &payload, recorded_mac).map_err(
-        |_| {
-            "FORGED_ACTIVE_SESSION_SLOT: active_sessions.json HMAC authentication failed"
-                .to_string()
+        |e| {
+            if e.contains("LEGACY_HMAC_V1_STATE_INVALIDATED") {
+                e
+            } else {
+                "FORGED_ACTIVE_SESSION_SLOT: active_sessions.json HMAC authentication failed"
+                    .to_string()
+            }
         },
     )?;
     Ok(reg)
 }
 
-fn save_registry_unlocked(
-    repo_root: &Path,
-    path: &Path,
-    reg: &ActiveSessionRegistry,
-) -> Result<(), String> {
-    let payload = encode_registry_mac_payload(reg);
-    let mac = compute_arbitrary_hmac_hex(repo_root, ACTIVE_SLOT_HMAC_DOMAIN, &payload)?;
+pub(crate) fn serialize_active_sessions_json(
+    revision: u64,
+    open_sessions: &[String],
+    hook_bindings: &BTreeMap<String, String>,
+    mac_hex: &str,
+) -> String {
     let bindings_obj = JsonValue::Object(
-        reg.hook_bindings
+        hook_bindings
             .iter()
             .map(|(k, v)| (k.clone(), JsonValue::Str(v.clone())))
             .collect(),
     );
     let obj = JsonValue::Object(vec![
+        ("revision".to_string(), JsonValue::Uint(revision)),
         (
             "open_sessions".to_string(),
-            JsonValue::Array(
-                reg.open_sessions
-                    .iter()
-                    .cloned()
-                    .map(JsonValue::Str)
-                    .collect(),
-            ),
+            JsonValue::Array(open_sessions.iter().cloned().map(JsonValue::Str).collect()),
         ),
         ("hook_bindings".to_string(), bindings_obj),
-        ("record_mac".to_string(), JsonValue::Str(mac)),
+        (
+            "record_mac".to_string(),
+            JsonValue::Str(mac_hex.to_string()),
+        ),
     ]);
-    fs::write(path, format!("{}\n", obj.to_json_string()))
-        .map_err(|e| format!("failed writing active_sessions.json: {e}"))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o600));
+    format!("{}\n", obj.to_json_string())
+}
+
+fn commit_registry_with_lock(
+    repo_root: &Path,
+    path: &Path,
+    guard: ExclusiveFileLockGuard,
+    reg: &ActiveSessionRegistry,
+) -> Result<(), String> {
+    let payload = encode_registry_mac_payload(reg);
+    let in_sandbox = std::env::var("AGENT_GUARD_IN_SANDBOX").ok().as_deref() == Some("1");
+    if !in_sandbox && let Ok(raw_key) = crate::breadcrumbs::load_or_init_vault_hmac_key(repo_root) {
+        let zkey = crate::crypto::ZeroizingKey::new(raw_key);
+        let tag = crate::coordinator::compute_domain_tag_raw(
+            zkey.as_bytes(),
+            ACTIVE_SLOT_HMAC_DOMAIN,
+            &payload,
+        )?;
+        let mac_hex = crate::crypto::hex_encode(&tag);
+        let body = serialize_active_sessions_json(
+            reg.revision,
+            &reg.open_sessions,
+            &reg.hook_bindings,
+            &mac_hex,
+        );
+        fs::write(path, body).map_err(|e| format!("failed writing active_sessions.json: {e}"))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o600));
+        }
+        drop(guard);
+        return Ok(());
     }
+
+    // Worker IPC path: release local lock before RPC so the coordinator daemon can acquire
+    // the exact same `ExclusiveFileLockGuard(&slot_file)` without cross-process deadlock,
+    // verify `candidate_revision == existing_revision + 1` CAS + subset rules, and atomically
+    // persist `active_sessions.json` under the held registry lock.
+    drop(guard);
+    let _mac = crate::coordinator::rpc_compute_domain_hmac_hex(
+        repo_root,
+        ACTIVE_SLOT_HMAC_DOMAIN,
+        &payload,
+    )?;
     Ok(())
 }
 
 /// Registers an open non-Master session capability WITHOUT clobbering concurrent parallel-wave sessions.
 pub fn set_active_session_slot(repo_root: &Path, session_id: &str) -> Result<(), String> {
     let path = active_session_slot_path(repo_root)?;
-    let _guard = ExclusiveFileLockGuard::acquire(&path)?;
+    let guard = ExclusiveFileLockGuard::acquire(&path)?;
     let mut reg = load_registry_unlocked(repo_root, &path)?;
     if !reg.open_sessions.iter().any(|s| s == session_id) {
         reg.open_sessions.push(session_id.to_string());
     }
-    save_registry_unlocked(repo_root, &path, &reg)
+    reg.revision = reg
+        .revision
+        .checked_add(1)
+        .ok_or_else(|| "active_sessions revision overflow".to_string())?;
+    commit_registry_with_lock(repo_root, &path, guard, &reg)
 }
 
 /// Closes a single open session (`Some(sid)`) or all open sessions (`None`), preserving concurrent siblings.
 pub fn close_open_session(repo_root: &Path, session_id: Option<&str>) -> Result<(), String> {
     let path = active_session_slot_path(repo_root)?;
-    let _guard = ExclusiveFileLockGuard::acquire(&path)?;
+    let guard = ExclusiveFileLockGuard::acquire(&path)?;
     if !path.exists() {
         return Ok(());
     }
@@ -245,7 +298,11 @@ pub fn close_open_session(repo_root: &Path, session_id: Option<&str>) -> Result<
             reg.hook_bindings.clear();
         }
     }
-    save_registry_unlocked(repo_root, &path, &reg)
+    reg.revision = reg
+        .revision
+        .checked_add(1)
+        .ok_or_else(|| "active_sessions revision overflow".to_string())?;
+    commit_registry_with_lock(repo_root, &path, guard, &reg)
 }
 
 pub fn clear_active_session_slot(repo_root: &Path) -> Result<(), String> {
@@ -262,14 +319,18 @@ pub fn bind_hook_session_to_swarm_session(
         return Ok(());
     }
     let path = active_session_slot_path(repo_root)?;
-    let _guard = ExclusiveFileLockGuard::acquire(&path)?;
+    let guard = ExclusiveFileLockGuard::acquire(&path)?;
     let mut reg = load_registry_unlocked(repo_root, &path)?;
     if reg.open_sessions.iter().any(|s| s == swarm_session_id)
         && reg.hook_bindings.get(hs).map(String::as_str) != Some(swarm_session_id)
     {
         reg.hook_bindings
             .insert(hs.to_string(), swarm_session_id.to_string());
-        save_registry_unlocked(repo_root, &path, &reg)?;
+        reg.revision = reg
+            .revision
+            .checked_add(1)
+            .ok_or_else(|| "active_sessions revision overflow".to_string())?;
+        commit_registry_with_lock(repo_root, &path, guard, &reg)?;
     }
     Ok(())
 }
@@ -2161,7 +2222,9 @@ fn check_role_swarm_tool_namespace(role: SwarmRole, cmd: &str) -> Option<Decisio
         let bin = words[idx].as_str();
         let base = bin.rsplit('/').next().unwrap_or(bin);
         if matches!(base, "sh" | "bash" | "dash" | "zsh" | "ksh" | "eval")
-            && dequoted_full.contains("swarm-tool")
+            && (dequoted_full.contains("swarm-tool")
+                || dequoted_full.contains("dotagent swarm")
+                || dequoted_full.contains("agent-guard swarm"))
         {
             return Some(Decision::deny(
                 "ROLE_NAMESPACE_ESCALATION_BLOCKED",
@@ -2175,6 +2238,14 @@ fn check_role_swarm_tool_namespace(role: SwarmRole, cmd: &str) -> Option<Decisio
 
         let invoked_ns = if base == "swarm-tool" {
             words.get(idx + 1).map(String::as_str)
+        } else if matches!(base, "dotagent" | "agent-guard") {
+            match words.get(idx + 1).map(String::as_str) {
+                Some("swarm") => words.get(idx + 2).map(String::as_str),
+                Some("guard") if words.get(idx + 2).map(String::as_str) == Some("swarm") => {
+                    words.get(idx + 3).map(String::as_str)
+                }
+                _ => None,
+            }
         } else if base == "cargo"
             && words.get(idx + 1).map(String::as_str) == Some("run")
             && words.iter().any(|w| w.contains("swarm-tool"))

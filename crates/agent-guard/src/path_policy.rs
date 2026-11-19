@@ -45,8 +45,9 @@ pub struct ValidatedPath {
 }
 
 pub fn effective_max_walk_depth_for_repo(repo_root: &Path) -> usize {
+    let session_hint = std::env::var("AGENT_GUARD_SESSION_ID").unwrap_or_default();
     if let Ok((crate::swarm_contracts::SwarmRole::Investigator, Some(_))) =
-        crate::role_sandbox::resolve_active_role(repo_root, "")
+        crate::role_sandbox::resolve_active_role(repo_root, &session_hint)
     {
         return crate::swarm_contracts::INVESTIGATOR_MAX_WALK_DEPTH;
     }
@@ -383,6 +384,50 @@ pub fn validate_workspace_glob_pattern(
     Ok(())
 }
 
+fn expand_brace_candidates(
+    input: &str,
+    max_candidates: usize,
+) -> Result<Vec<String>, PathViolation> {
+    let mut queue: Vec<String> = vec![input.to_string()];
+    let mut out: Vec<String> = Vec::new();
+    while let Some(cur) = queue.pop() {
+        if let Some(close) = cur.find('}')
+            && let Some(inner_open) = cur[..close].rfind('{')
+        {
+            let prefix = &cur[..inner_open];
+            let suffix = &cur[close + 1..];
+            let alts: Vec<&str> = cur[inner_open + 1..close].split(',').collect();
+            if queue.len() + out.len() + alts.len() > max_candidates {
+                return Err(PathViolation {
+                    code: "SHADOW_AUTHORITY_FILE_BLOCKED",
+                    detail: format!(
+                        "Glob pattern '{input}' exceeds maximum brace-expansion bound ({max_candidates} alternatives); refusing potential shadow-authority smuggling."
+                    ),
+                    is_poisoned_zone: false,
+                });
+            }
+            for alt in alts {
+                queue.push(format!("{prefix}{}{suffix}", alt.trim()));
+            }
+        } else {
+            if out.len() >= max_candidates {
+                return Err(PathViolation {
+                    code: "SHADOW_AUTHORITY_FILE_BLOCKED",
+                    detail: format!(
+                        "Glob pattern '{input}' exceeds maximum brace-expansion bound ({max_candidates} alternatives); refusing potential shadow-authority smuggling."
+                    ),
+                    is_poisoned_zone: false,
+                });
+            }
+            out.push(cur);
+        }
+    }
+    if out.is_empty() {
+        out.push(input.to_string());
+    }
+    Ok(out)
+}
+
 fn check_glob_shadow_authority(
     pat_slashes: &str,
     has_subdir_or_slash: bool,
@@ -391,20 +436,9 @@ fn check_glob_shadow_authority(
     let debracketed = lower.replace(['[', ']'], "");
     let raw_tail = debracketed.rsplit('/').next().unwrap_or(&debracketed);
 
-    // Expand brace alternatives in tail (e.g. `claude.{md,txt}` -> `claude.md`, `claude.txt`)
-    let tail_candidates: Vec<String> = if let (Some(open), Some(close)) =
-        (raw_tail.find('{'), raw_tail.rfind('}'))
-        && open < close
-    {
-        let prefix = &raw_tail[..open];
-        let suffix = &raw_tail[close + 1..];
-        raw_tail[open + 1..close]
-            .split(',')
-            .map(|alt| format!("{prefix}{}{suffix}", alt.trim()))
-            .collect()
-    } else {
-        vec![raw_tail.to_string()]
-    };
+    // Iteratively expand brace alternatives in tail (e.g. `{c,x}laude.{md,txt}` -> `claude.md`, ...),
+    // failing closed if combinatorial brace expansion exceeds 128 candidates.
+    let tail_candidates = expand_brace_candidates(raw_tail, 128)?;
 
     let path_targets_rules_dir = debracketed.starts_with(".cursor/rules/")
         || debracketed.contains("/.cursor/rules/")
@@ -591,22 +625,37 @@ pub fn check_forbidden_zones_lexical(
                 is_poisoned_zone: true,
             });
         }
-        // Rust `target/{debug,release}/deps` or `target/{debug,release}/build`
+        // Rust `target/{debug,release}/{deps,build,.fingerprint}` and `target/<triple>/{debug,release}/{deps,build,.fingerprint}`
         if seg_lower == "target" {
-            if let (Some(profile), Some(sub)) = (segments.get(idx + 1), segments.get(idx + 2)) {
-                let pl = profile.to_ascii_lowercase();
-                let sl = sub.to_ascii_lowercase();
-                if matches!(pl.as_str(), "debug" | "release")
-                    && matches!(sl.as_str(), "deps" | "build" | ".fingerprint")
-                {
-                    return Err(PathViolation {
-                        code: "FORBIDDEN_DEPENDENCY_PATH",
-                        detail: format!(
-                            "Access to compiled dependency/cache artifact '{display_raw}' is forbidden."
-                        ),
-                        is_poisoned_zone: true,
-                    });
-                }
+            let direct_hit = segments
+                .get(idx + 1)
+                .zip(segments.get(idx + 2))
+                .is_some_and(|(profile, sub)| {
+                    matches!(profile.to_ascii_lowercase().as_str(), "debug" | "release")
+                        && matches!(
+                            sub.to_ascii_lowercase().as_str(),
+                            "deps" | "build" | ".fingerprint"
+                        )
+                });
+            let triple_hit = segments
+                .get(idx + 1)
+                .filter(|t| !t.is_empty())
+                .and_then(|_| segments.get(idx + 2).zip(segments.get(idx + 3)))
+                .is_some_and(|(profile, sub)| {
+                    matches!(profile.to_ascii_lowercase().as_str(), "debug" | "release")
+                        && matches!(
+                            sub.to_ascii_lowercase().as_str(),
+                            "deps" | "build" | ".fingerprint"
+                        )
+                });
+            if direct_hit || triple_hit {
+                return Err(PathViolation {
+                    code: "FORBIDDEN_DEPENDENCY_PATH",
+                    detail: format!(
+                        "Access to compiled dependency/cache artifact '{display_raw}' is forbidden."
+                    ),
+                    is_poisoned_zone: true,
+                });
             }
         }
         if !Path::new(&normalized_slashes).is_absolute()
