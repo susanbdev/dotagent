@@ -37,7 +37,10 @@ pub struct BenchReport {
 
 pub fn run_benchmarks(cfg: &HarnessConfig, quick: bool) -> Result<BenchReport, String> {
     let bins = resolve_workspace_binaries(cfg)?;
-    let sb = cfg.workspace_root.join("target").join("tbench");
+    let sb = cfg
+        .workspace_root
+        .join("target")
+        .join(format!("tbench-{}", std::process::id()));
     let _ = fs::remove_dir_all(&sb);
     let home = sb.join("h");
     let repo = sb.join("repo");

@@ -25,13 +25,16 @@ pub struct TestSandbox {
     pub gitconfig_path: PathBuf,
 }
 
+static SANDBOX_SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 impl TestSandbox {
     pub fn create(workspace_root: &Path, suite_slug: &str) -> Result<Self, String> {
         let sanitized_slug = sanitize_slug(suite_slug);
+        let seq = SANDBOX_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let root = workspace_root
             .join("target")
             .join("test-workspaces")
-            .join("dotagent-harness")
+            .join(format!("dh-{}-{seq}", std::process::id()))
             .join(sanitized_slug);
 
         reset_and_remove_dir(&root);
