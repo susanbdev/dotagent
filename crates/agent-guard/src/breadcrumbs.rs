@@ -210,6 +210,26 @@ pub fn sha256_digest(bytes: &[u8]) -> [u8; 32] {
     out
 }
 
+/// Fast read-only probe returning `Some(dir)` only when Swarm state has already been
+/// initialized for `repo_root` (avoiding `mkdir`, `chmod`, `canonicalize`, and `SHA-256`
+/// on every standard non-Swarm hook invocation).
+pub fn swarm_state_dir_if_exists(repo_root: &Path) -> Option<PathBuf> {
+    let base = state_base_dir();
+    let parent = if base.file_name().is_some_and(|n| n == "sessions") {
+        base.parent().unwrap_or(&base)
+    } else {
+        base.as_path()
+    };
+    let swarm_root = parent.join("swarm");
+    if !swarm_root.is_dir() {
+        return None;
+    }
+    let canon = fs::canonicalize(repo_root).unwrap_or_else(|_| repo_root.to_path_buf());
+    let repo_hash = hex_encode(&sha256_digest(canon.to_string_lossy().as_bytes()));
+    let dir = swarm_root.join(&repo_hash[..24]);
+    if dir.is_dir() { Some(dir) } else { None }
+}
+
 /// Repo-isolated Swarm state directory inside `~/.local/state/agent-guard` (or `AGENT_GUARD_STATE_DIR`).
 pub fn swarm_state_dir(repo_root: &Path) -> Result<PathBuf, String> {
     let base = state_base_dir();

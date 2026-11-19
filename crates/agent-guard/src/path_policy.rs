@@ -153,8 +153,15 @@ pub fn validate_path_with_max_depth(
         }
     }
 
-    let canon_repo = fs::canonicalize(repo_root).unwrap_or_else(|_| lexical_normalize(repo_root));
-    let lex_repo = lexical_normalize(repo_root);
+    let (canon_repo, repo_is_canon) = match fs::canonicalize(repo_root) {
+        Ok(c) => (c, true),
+        Err(_) => (lexical_normalize(repo_root), false),
+    };
+    let lex_repo = if repo_is_canon {
+        lexical_normalize(repo_root)
+    } else {
+        canon_repo.clone()
+    };
     let base_dir = if Path::new(&expanded).is_absolute() {
         PathBuf::from(&expanded)
     } else {
@@ -186,7 +193,7 @@ pub fn validate_path_with_max_depth(
     }
 
     // 2. Walk every existing component to detect symlinks pointing to forbidden zones or escaping repo_root
-    let resolved = resolve_checking_symlinks(&base_dir, &canon_repo)?;
+    let resolved = resolve_checking_symlinks(&base_dir, &canon_repo, repo_is_canon)?;
 
     // 3. Re-check forbidden zones on resolved canonical path
     check_forbidden_zones_lexical(&resolved.to_string_lossy(), trimmed)?;
@@ -838,13 +845,18 @@ fn is_secret_segment(seg_lower: &str) -> bool {
     false
 }
 
-fn resolve_checking_symlinks(abs_path: &Path, canon_repo: &Path) -> Result<PathBuf, PathViolation> {
-    resolve_checking_symlinks_depth(abs_path, canon_repo, 0)
+fn resolve_checking_symlinks(
+    abs_path: &Path,
+    canon_repo: &Path,
+    repo_is_canon: bool,
+) -> Result<PathBuf, PathViolation> {
+    resolve_checking_symlinks_depth(abs_path, canon_repo, repo_is_canon, 0)
 }
 
 fn resolve_checking_symlinks_depth(
     abs_path: &Path,
     canon_repo: &Path,
+    repo_is_canon: bool,
     symlink_depth: usize,
 ) -> Result<PathBuf, PathViolation> {
     if symlink_depth > 16 {
@@ -858,8 +870,13 @@ fn resolve_checking_symlinks_depth(
         });
     }
 
-    let mut acc = PathBuf::new();
-    for comp in abs_path.components() {
+    let (mut acc, iter_path) = if repo_is_canon && let Ok(rel) = abs_path.strip_prefix(canon_repo) {
+        (canon_repo.to_path_buf(), rel)
+    } else {
+        (PathBuf::new(), abs_path)
+    };
+
+    for comp in iter_path.components() {
         match comp {
             Component::RootDir => acc.push("/"),
             Component::Prefix(p) => acc.push(p.as_os_str()),
@@ -895,6 +912,7 @@ fn resolve_checking_symlinks_depth(
                         let canon_target = resolve_checking_symlinks_depth(
                             &resolved_target,
                             canon_repo,
+                            repo_is_canon,
                             symlink_depth + 1,
                         )?;
 

@@ -683,6 +683,10 @@ pub fn resolve_active_role(
         return Ok((cap.role, Some(cap)));
     }
 
+    if crate::breadcrumbs::swarm_state_dir_if_exists(repo_root).is_none() {
+        return Ok((env_role.unwrap_or(SwarmRole::StandardCoding), None));
+    }
+
     if let Some(bound_cap) = lookup_bound_hook_capability(repo_root, session_id)? {
         match env_role {
             None => return Ok((bound_cap.role, Some(bound_cap))),

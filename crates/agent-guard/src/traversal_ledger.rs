@@ -21,6 +21,10 @@ use std::collections::BTreeMap;
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::{
+    Mutex,
+    atomic::{AtomicU64, Ordering},
+};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::breadcrumbs::ExclusiveFileLockGuard;
@@ -147,7 +151,29 @@ impl SessionLedger {
             }
         }
         let serialized = merged.to_json();
-        atomic_write_nonsymlink_state_file(&path, serialized.as_bytes())
+        atomic_write_nonsymlink_state_file_opts(
+            &path,
+            serialized.as_bytes(),
+            merged.halted || merged.tainted,
+        )
+    }
+
+    /// Persists ledger while the caller already holds `SessionLedger::acquire_lock`,
+    /// avoiding a redundant disk re-read + JSON re-parse on the hook hot path while still
+    /// forcing durable storage sync whenever `halted` or `tainted` is set.
+    pub fn save_locked(&self, repo_root: &Path) -> Result<(), String> {
+        let key_hash = if self.session_key_hash.is_empty() {
+            compute_session_key_hash(repo_root, &self.session_id)
+        } else {
+            self.session_key_hash.clone()
+        };
+        let path = ledger_file_path_for_hash(&key_hash);
+        let serialized = self.to_json();
+        atomic_write_nonsymlink_state_file_opts(
+            &path,
+            serialized.as_bytes(),
+            self.halted || self.tainted,
+        )
     }
 
     pub fn reset_for_new_user_prompt(repo_root: &Path, session_id: &str) -> Result<Self, String> {
@@ -617,6 +643,7 @@ pub fn validate_state_dir_override(raw: &str) -> Option<PathBuf> {
         }
     }
 
+    let is_test_workspace = lower.contains("/target/test-workspaces/");
     let mut acc = PathBuf::new();
     let mut inside_git_repo = false;
     for comp in candidate.components() {
@@ -658,7 +685,7 @@ pub fn validate_state_dir_override(raw: &str) -> Option<PathBuf> {
                     if meta.file_type().is_symlink() {
                         return None;
                     }
-                    if acc.join(".git").exists() {
+                    if !is_test_workspace && !inside_git_repo && acc.join(".git").exists() {
                         inside_git_repo = true;
                     }
                 }
@@ -668,7 +695,6 @@ pub fn validate_state_dir_override(raw: &str) -> Option<PathBuf> {
 
     // Prevent redirecting guard state/audit logs into a repository working tree
     // (allowing only dedicated `target/test-workspaces/` sandboxes used by cargo tests).
-    let is_test_workspace = lower.contains("/target/test-workspaces/");
     if inside_git_repo && !is_test_workspace {
         return None;
     }
@@ -676,9 +702,22 @@ pub fn validate_state_dir_override(raw: &str) -> Option<PathBuf> {
     Some(acc)
 }
 
+static STATE_OVERRIDE_CACHE: Mutex<Option<(String, PathBuf)>> = Mutex::new(None);
+
 pub fn state_base_dir() -> PathBuf {
     if let Ok(override_dir) = std::env::var("AGENT_GUARD_STATE_DIR") {
+        if let Ok(guard) = STATE_OVERRIDE_CACHE.lock()
+            && let Some((ref cached_raw, ref cached_path)) = *guard
+            && *cached_raw == override_dir
+            && fs::symlink_metadata(cached_path)
+                .is_ok_and(|m| !m.file_type().is_symlink() && m.file_type().is_dir())
+        {
+            return cached_path.clone();
+        }
         if let Some(valid) = validate_state_dir_override(&override_dir) {
+            if let Ok(mut guard) = STATE_OVERRIDE_CACHE.lock() {
+                *guard = Some((override_dir, valid.clone()));
+            }
             return valid;
         }
     }
@@ -710,10 +749,24 @@ const O_NOFOLLOW_FLAG: i32 = 0o100000;
 const O_NOFOLLOW_FLAG: i32 = 0x0100;
 
 fn ensure_nonsymlink_state_dir(dir: &Path) -> Result<(), String> {
-    if let Ok(meta) = fs::symlink_metadata(dir)
-        && meta.file_type().is_symlink()
-    {
-        return Err(format!("state directory '{}' is a symlink", dir.display()));
+    if let Ok(meta) = fs::symlink_metadata(dir) {
+        if meta.file_type().is_symlink() {
+            return Err(format!("state directory '{}' is a symlink", dir.display()));
+        }
+        if !meta.file_type().is_dir() {
+            return Err(format!(
+                "state directory '{}' is not a regular directory",
+                dir.display()
+            ));
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if (meta.permissions().mode() & 0o777) != 0o700 {
+                let _ = fs::set_permissions(dir, fs::Permissions::from_mode(0o700));
+            }
+        }
+        return Ok(());
     }
     fs::create_dir_all(dir)
         .map_err(|e| format!("failed creating state dir '{}': {e}", dir.display()))?;
@@ -792,7 +845,17 @@ pub fn read_nonsymlink_state_file(path: &Path) -> Result<Option<String>, String>
         .map_err(|_| format!("non-UTF-8 bytes in state file '{}'", path.display()))
 }
 
+static STAGE_SEQ: AtomicU64 = AtomicU64::new(0);
+
 pub fn atomic_write_nonsymlink_state_file(path: &Path, data: &[u8]) -> Result<(), String> {
+    atomic_write_nonsymlink_state_file_opts(path, data, true)
+}
+
+pub fn atomic_write_nonsymlink_state_file_opts(
+    path: &Path,
+    data: &[u8],
+    durable_sync: bool,
+) -> Result<(), String> {
     let Some(parent) = path.parent() else {
         return Err("state file missing parent directory".to_string());
     };
@@ -810,11 +873,15 @@ pub fn atomic_write_nonsymlink_state_file(path: &Path, data: &[u8]) -> Result<()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
+    let seq = STAGE_SEQ.fetch_add(1, Ordering::Relaxed);
     let file_name = path
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("state.json");
-    let stage = parent.join(format!(".{file_name}.stage.{}.{nanos}", std::process::id()));
+    let stage = parent.join(format!(
+        ".{file_name}.stage.{}.{seq}.{nanos}",
+        std::process::id()
+    ));
     let _ = fs::remove_file(&stage);
 
     let mut opts = OpenOptions::new();
@@ -827,7 +894,12 @@ pub fn atomic_write_nonsymlink_state_file(path: &Path, data: &[u8]) -> Result<()
     let mut f = opts
         .open(&stage)
         .map_err(|e| format!("failed creating staging file '{}': {e}", stage.display()))?;
-    if let Err(e) = f.write_all(data).and_then(|()| f.sync_all()) {
+    let write_res = if durable_sync {
+        f.write_all(data).and_then(|()| f.sync_data())
+    } else {
+        f.write_all(data)
+    };
+    if let Err(e) = write_res {
         let _ = fs::remove_file(&stage);
         return Err(format!(
             "failed writing staging file '{}': {e}",

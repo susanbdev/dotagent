@@ -53,8 +53,7 @@ pub fn scan_untrusted_content(
     // Root `AGENTS.md` is the human's canonical security file; still scan it for
     // Markdown image exfiltration, but skip untrusted-override heuristics on it.
     if !is_root_authority {
-        scan_delimiter_breakouts(text, &mut report.findings);
-        scan_imperative_overrides(text, &mut report.findings);
+        scan_delimiters_and_imperatives(text, &mut report.findings);
     }
 
     scan_markdown_exfiltration(text, &mut report.findings);
@@ -66,7 +65,7 @@ pub fn scan_untrusted_content(
     report
 }
 
-fn scan_delimiter_breakouts(text: &str, findings: &mut Vec<InjectionFinding>) {
+fn scan_delimiters_and_imperatives(text: &str, findings: &mut Vec<InjectionFinding>) {
     const DELIMITER_MARKERS: &[(&str, &str)] = &[
         (
             concat!("<sys", "tem>"),
@@ -107,47 +106,56 @@ fn scan_delimiter_breakouts(text: &str, findings: &mut Vec<InjectionFinding>) {
         ),
     ];
 
-    for raw_line in text.lines() {
-        let lower = raw_line.to_ascii_lowercase();
-        for (needle, desc) in DELIMITER_MARKERS {
-            if lower.contains(needle) {
-                findings.push(InjectionFinding {
-                    code: "PROMPT_DELIMITER_INJECTION",
-                    severity: ScanSeverity::ImmediateHalt,
-                    detail: format!("{desc} detected in untrusted data"),
-                });
-            }
-        }
-    }
-}
+    const HARD_OVERRIDE_PHRASES: &[&str] = &[
+        concat!("ignore previous ", "instructions"),
+        concat!("ignore all previous ", "instructions"),
+        concat!("ignore prior ", "instructions"),
+        concat!("ignore all prior ", "instructions"),
+        concat!("ignore system ", "instructions"),
+        concat!("disregard previous ", "instructions"),
+        concat!("disregard all previous ", "instructions"),
+        concat!("disregard prior ", "rules"),
+        concat!("forget all previous ", "instructions"),
+        concat!("new system ", "instructions:"),
+        concat!("override security ", "instructions"),
+        concat!("bypass ", "agent-guard"),
+        concat!("disable ", "agent-guard"),
+        concat!("do not tell ", "the user"),
+        concat!("do not mention this ", "to the user"),
+        concat!("hide this from ", "the user"),
+        concat!("silently ", "execute"),
+        concat!("execute immediately ", "without asking"),
+        concat!("urgent security ", "override"),
+    ];
 
-fn scan_imperative_overrides(text: &str, findings: &mut Vec<InjectionFinding>) {
     for (line_idx, raw_line) in text.lines().enumerate() {
-        let norm = collapse_ascii_ws(&raw_line.to_ascii_lowercase());
+        let lower = raw_line.to_ascii_lowercase();
         let line_no = line_idx + 1;
 
-        const HARD_OVERRIDE_PHRASES: &[&str] = &[
-            concat!("ignore previous ", "instructions"),
-            concat!("ignore all previous ", "instructions"),
-            concat!("ignore prior ", "instructions"),
-            concat!("ignore all prior ", "instructions"),
-            concat!("ignore system ", "instructions"),
-            concat!("disregard previous ", "instructions"),
-            concat!("disregard all previous ", "instructions"),
-            concat!("disregard prior ", "rules"),
-            concat!("forget all previous ", "instructions"),
-            concat!("new system ", "instructions:"),
-            concat!("override security ", "instructions"),
-            concat!("bypass ", "agent-guard"),
-            concat!("disable ", "agent-guard"),
-            concat!("do not tell ", "the user"),
-            concat!("do not mention this ", "to the user"),
-            concat!("hide this from ", "the user"),
-            concat!("silently ", "execute"),
-            concat!("execute immediately ", "without asking"),
-            concat!("urgent security ", "override"),
-        ];
+        if lower.as_bytes().iter().any(|&b| b == b'<' || b == b'[') {
+            for (needle, desc) in DELIMITER_MARKERS {
+                if lower.contains(needle) {
+                    findings.push(InjectionFinding {
+                        code: "PROMPT_DELIMITER_INJECTION",
+                        severity: ScanSeverity::ImmediateHalt,
+                        detail: format!("{desc} detected in untrusted data"),
+                    });
+                }
+            }
+        }
 
+        let has_override_stem = lower.contains("instructions")
+            || lower.contains("rules")
+            || lower.contains("agent-guard")
+            || lower.contains("user")
+            || lower.contains("execute")
+            || lower.contains("override")
+            || lower.contains("<!--");
+        if !has_override_stem {
+            continue;
+        }
+
+        let norm = collapse_ascii_ws(&lower);
         for phrase in HARD_OVERRIDE_PHRASES {
             if norm.contains(phrase) {
                 findings.push(InjectionFinding {
