@@ -41,9 +41,6 @@ use agent_guard::work_ledger::{
     record_test_checkpoint, submit_work_ledger_entry,
 };
 
-const INTERNAL_SBX_TOKEN_ENV: &str = "AGENT_GUARD_INTERNAL_SBX_TOKEN";
-const INTERNAL_SBX_TOKEN_VAL: &str = "swarm-checkpoint-green-v1";
-
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
@@ -57,16 +54,6 @@ fn main() -> ExitCode {
 
     match role_ns {
         "--probe-landlock-child" => return agent_guard::exec_sandbox::run_probe_landlock_child(),
-        "--internal-exec-sandbox" => {
-            if std::env::var(INTERNAL_SBX_TOKEN_ENV).ok().as_deref() != Some(INTERNAL_SBX_TOKEN_VAL)
-            {
-                eprintln!(
-                    "[SWARM-TOOL HARD DENY :: SELF_TAMPERING_BLOCKED] `--internal-exec-sandbox` is reserved for `swarm-tool grunt checkpoint-green` and cannot be invoked directly."
-                );
-                return ExitCode::from(2);
-            }
-            return agent_guard::exec_sandbox::run_exec_sandbox_cli(rest, &cwd);
-        }
         "--version" | "-V" | "version" => {
             println!("swarm-tool {}", env!("CARGO_PKG_VERSION"));
             return ExitCode::SUCCESS;
@@ -1198,8 +1185,17 @@ fn resolve_sibling_agent_guard_bin() -> Option<PathBuf> {
     if let Ok(exe) = std::env::current_exe() {
         let mut sib = exe;
         sib.set_file_name("agent-guard");
-        if sib.is_file() {
+        if let Ok(meta) = fs::symlink_metadata(&sib)
+            && !meta.file_type().is_symlink()
+            && meta.file_type().is_file()
+        {
             return Some(sib);
+        }
+    }
+    if let Ok(home) = std::env::var("HOME") {
+        let pinned = PathBuf::from(home).join(".local/bin/agent-guard");
+        if agent_guard::coordinator::is_trusted_executable_file(&pinned) {
+            return Some(pinned);
         }
     }
     None
@@ -1304,24 +1300,18 @@ fn run_grunt(repo_root: &Path, cwd: &Path, args: &[String]) -> Result<(), String
             check_role_shell_read_scope(SwarmRole::Grunt, Some(&cap), &read_rels, repo_root)
                 .map_err(format_role_denial)?;
 
-            // Execute the untrusted test runner strictly inside `exec-sandbox --deny-net`
-            // (using sibling `agent-guard` or self `--internal-exec-sandbox` — NEVER unsandboxed!)
-            // so `cargo test`/`pytest`/`unittest` has zero kernel access to `vault/hmac.key`,
-            // `ipc/coord.sock`, `sessions/`, `spools/`, `ledger/`, or outbound TCP sockets.
-            let (sandbox_bin, sandbox_subcmd) = if let Some(ag_bin) = resolve_sibling_agent_guard_bin() {
-                (ag_bin, "exec-sandbox")
-            } else {
-                let self_exe = std::env::current_exe().map_err(|e| {
-                    format!(
-                        "SANDBOX_BINARY_UNAVAILABLE: refusing to execute untrusted test command outside OS sandbox ({e})"
-                    )
-                })?;
-                (self_exe, "--internal-exec-sandbox")
-            };
+            // Execute the untrusted test runner strictly inside `agent-guard exec-sandbox --deny-net`
+            // (never unsandboxed and without any self-CLI flag fallback) so `cargo test`/`pytest`/`unittest`
+            // has zero kernel access to `vault/hmac.key`, `ipc/coord.sock`, `sessions/`, `spools/`,
+            // `ledger/`, or outbound TCP sockets.
+            let sandbox_bin = resolve_sibling_agent_guard_bin().ok_or_else(|| {
+                "SANDBOX_BINARY_UNAVAILABLE: refusing to execute untrusted test command outside OS sandbox (`agent-guard` binary not found)"
+                    .to_string()
+            })?;
 
             let mut sbx_cmd = Command::new(sandbox_bin);
             sbx_cmd
-                .arg(sandbox_subcmd)
+                .arg("exec-sandbox")
                 .arg("--deny-net")
                 .arg("--cwd")
                 .arg(repo_root)
@@ -1333,9 +1323,6 @@ fn run_grunt(repo_root: &Path, cwd: &Path, args: &[String]) -> Result<(), String
                 .env_remove("AGENT_GUARD_COORDINATOR_SOCK")
                 .env("AGENT_GUARD_WORKER_LOCK", "1")
                 .env("PYTHONDONTWRITEBYTECODE", "1");
-            if sandbox_subcmd == "--internal-exec-sandbox" {
-                sbx_cmd.env(INTERNAL_SBX_TOKEN_ENV, INTERNAL_SBX_TOKEN_VAL);
-            }
             let status = sbx_cmd.status().map_err(|e| {
                 format!(
                     "SANDBOX_BINARY_UNAVAILABLE: failed spawning sandboxed test command '{}': {e}",

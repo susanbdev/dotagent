@@ -394,6 +394,72 @@ fn wave1_coordinator_blocks_plan_lock_master_mint_and_scope_escalation_over_ipc(
         "Stale active_sessions revision must be rejected by CAS check: {resp_stale}"
     );
 
+    // Worker IPC attempting to delete/deactivate open sessions or overwrite/remove existing hook
+    // bindings must fail closed with `ACTIVE_SESSION_DELETION_DENIED`!
+    let encode_rev2_with_bindings =
+        |rev: u64, open: &[&str], bindings: &[(&str, &str)]| -> String {
+            let mut buf = Vec::new();
+            buf.extend_from_slice(b"REV2");
+            buf.extend_from_slice(&rev.to_be_bytes());
+            buf.extend_from_slice(&(open.len() as u32).to_be_bytes());
+            for s in open {
+                buf.extend_from_slice(&(s.len() as u32).to_be_bytes());
+                buf.extend_from_slice(s.as_bytes());
+            }
+            buf.extend_from_slice(&(bindings.len() as u32).to_be_bytes());
+            for (k, v) in bindings {
+                buf.extend_from_slice(&(k.len() as u32).to_be_bytes());
+                buf.extend_from_slice(k.as_bytes());
+                buf.extend_from_slice(&(v.len() as u32).to_be_bytes());
+                buf.extend_from_slice(v.as_bytes());
+            }
+            hex_encode(&buf)
+        };
+    let rev5_two_open_hex = encode_rev2_with_bindings(
+        5,
+        &["swm_grunt_T1_a1_open01", "swm_qa_T1_a1_open02"],
+        &[("hook-uuid-1", "swm_grunt_T1_a1_open01")],
+    );
+    let rev5_two_open_bytes = decode_hex_for_test(&rev5_two_open_hex);
+    let rev5_two_open_mac = compute_host_domain_mac(
+        &[0x42u8; 32],
+        b"DOTAGENT_ACTIVE_SESSIONS_REGISTRY_V2",
+        &rev5_two_open_bytes,
+    );
+    fs::write(
+        swarm_dir.join("sessions").join("active_sessions.json"),
+        format!(
+            r#"{{"revision":5,"open_sessions":["swm_grunt_T1_a1_open01","swm_qa_T1_a1_open02"],"hook_bindings":{{"hook-uuid-1":"swm_grunt_T1_a1_open01"}},"record_mac":"{rev5_two_open_mac}"}}"#
+        ),
+    )
+    .expect("write rev5 active_sessions.json");
+
+    let deactivate_payload_hex = encode_rev2_with_bindings(
+        6,
+        &["swm_grunt_T1_a1_open01"],
+        &[("hook-uuid-1", "swm_grunt_T1_a1_open01")],
+    );
+    let resp_deactivate = send_rpc(&format!(
+        r#"{{"op":"domain_hmac","domain_hex":"{active_domain_hex}","payload_hex":"{deactivate_payload_hex}"}}"#
+    ));
+    assert!(
+        resp_deactivate.contains("ACTIVE_SESSION_DELETION_DENIED"),
+        "Worker IPC deactivating open session must be rejected: {resp_deactivate}"
+    );
+
+    let overwrite_binding_hex = encode_rev2_with_bindings(
+        6,
+        &["swm_grunt_T1_a1_open01", "swm_qa_T1_a1_open02"],
+        &[("hook-uuid-1", "swm_qa_T1_a1_open02")],
+    );
+    let resp_overwrite_bind = send_rpc(&format!(
+        r#"{{"op":"domain_hmac","domain_hex":"{active_domain_hex}","payload_hex":"{overwrite_binding_hex}"}}"#
+    ));
+    assert!(
+        resp_overwrite_bind.contains("ACTIVE_SESSION_DELETION_DENIED"),
+        "Worker IPC overwriting existing hook binding must be rejected: {resp_overwrite_bind}"
+    );
+
     // 8. Legacy pre-v2 unprefixed HMAC tag must fail closed with explicit LEGACY_HMAC_V1_STATE_INVALIDATED!
     let legacy_v1_mac = {
         use hmac::{Hmac, Mac};
@@ -614,6 +680,26 @@ fn wave2_audit_shell_heredoc_alias_smuggling_and_sandbox_unwrap_regressions() {
         (
             "s_al3",
             r#"{"session_id":"s_al3","tool_name":"view_file","tool_input":{"AbsolutePath":"src/clean.rs","StartLine":1,"EndLine":10,"ContentOffset":500}}"#,
+            "AMBIGUOUS_TOOL_PARAM_ALIAS",
+        ),
+        (
+            "s_al4",
+            r#"{"session_id":"s_al4","tool_name":"view_file","tool_input":{"AbsolutePath":"src/clean.rs","StartLine":1,"EndLine":50,"end_line":9999}}"#,
+            "AMBIGUOUS_TOOL_PARAM_ALIAS",
+        ),
+        (
+            "s_al5",
+            r#"{"session_id":"s_al5","tool_name":"Read","tool_input":{"file_path":"src/clean.rs","offset":1,"limit":50,"EndLine":9999}}"#,
+            "AMBIGUOUS_TOOL_PARAM_ALIAS",
+        ),
+        (
+            "s_al6",
+            r#"{"session_id":"s_al6","tool_name":"view_file","tool_input":{"AbsolutePath":"src/clean.rs","StartLine":20,"EndLine":10}}"#,
+            "AMBIGUOUS_TOOL_PARAM_ALIAS",
+        ),
+        (
+            "s_al7",
+            r#"{"session_id":"s_al7","cwd":".","working_directory":"/etc","tool_name":"Read","tool_input":{"file_path":"src/clean.rs"}}"#,
             "AMBIGUOUS_TOOL_PARAM_ALIAS",
         ),
     ] {

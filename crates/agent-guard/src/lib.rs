@@ -544,7 +544,11 @@ fn evaluate_tool_invocation(
         {
             return dec;
         }
-        if let Err(dec) = ensure_single_alias_key(input, &["limit", "max_lines"], tool_name) {
+        if let Err(dec) = ensure_single_alias_key(
+            input,
+            &["limit", "max_lines", "EndLine", "end_line"],
+            tool_name,
+        ) {
             return dec;
         }
         if let Err(dec) =
@@ -573,16 +577,25 @@ fn evaluate_tool_invocation(
 
         let offset_line =
             extract_first_u64(input, &["offset", "StartLine", "start_line"]).map(|x| x as usize);
+        let raw_end_line = extract_first_u64(input, &["EndLine", "end_line"]);
+        if let Some(end) = raw_end_line {
+            let start = offset_line.map(|x| x as u64).unwrap_or(1).max(1);
+            if end < start {
+                return Decision::deny(
+                    "AMBIGUOUS_TOOL_PARAM_ALIAS",
+                    format!(
+                        "Tool '{tool_name}' specified invalid slice range EndLine ({end}) < StartLine ({start})."
+                    ),
+                    false,
+                );
+            }
+        }
         let limit_lines = extract_first_u64(input, &["limit", "max_lines"])
             .map(|x| x as usize)
             .or_else(|| {
-                let start = extract_first_u64(input, &["StartLine", "start_line"])?;
-                let end = extract_first_u64(input, &["EndLine", "end_line"])?;
-                if end >= start {
-                    Some((end - start + 1) as usize)
-                } else {
-                    None
-                }
+                let end = raw_end_line?;
+                let start = offset_line.map(|x| x as u64).unwrap_or(1).max(1);
+                Some((end - start + 1) as usize)
             });
         let content_byte_offset =
             extract_first_u64(input, &["ContentOffset", "content_offset"]).unwrap_or(0);
@@ -1689,6 +1702,7 @@ fn scan_accidental_secret_literal(text: &str) -> Option<&'static str> {
 }
 
 fn resolve_validated_cwd(v: &JsonValue, fallback: &Path) -> Result<(PathBuf, PathBuf), Decision> {
+    ensure_single_alias_key(v, &["cwd", "working_directory"], "hook_envelope")?;
     let fallback_canon = fs::canonicalize(fallback).unwrap_or_else(|_| lexical_normalize(fallback));
     let trusted_repo = resolve_repo_root_from_canon(&fallback_canon);
 

@@ -8,7 +8,7 @@
 //!
 //! Security Invariants:
 //! 1. **Zero Signing Oracle on Verification**: `verify_event_mac` and `verify_domain_hmac`
-//!    perform constant-time MAC verification inside the coordinator and return `bool` only—never
+//!    perform constant-time MAC verification inside the coordinator and return `bool` only -- never
 //!    exposing raw tags to callers.
 //! 2. **Privilege-Separated Signing Policy**:
 //!    - `PLAN_LOCK_HMAC_DOMAIN` (`dotagent-plan-lock-v1`) signing is **hard-blocked** over IPC
@@ -1026,23 +1026,39 @@ fn commit_ipc_active_slot_update(
             ));
         }
     }
-    for (hook_sid, target_sid) in &candidate_bindings {
-        let unchanged = existing_bindings
-            .get(hook_sid)
-            .is_some_and(|ex_target| ex_target == target_sid);
-        if !unchanged && !existing_open.iter().any(|ex| ex == target_sid) {
+    if candidate_open != existing_open {
+        return Err(
+            "ACTIVE_SESSION_DELETION_DENIED: worker IPC cannot close or reorder open sessions; session lifecycle requires host authority"
+                .to_string(),
+        );
+    }
+
+    let mut candidate_bindings_map = std::collections::BTreeMap::new();
+    for (hook_sid, target_sid) in candidate_bindings {
+        if candidate_bindings_map
+            .insert(hook_sid.clone(), target_sid.clone())
+            .is_some()
+        {
+            return Err(format!(
+                "ACTIVE_SESSION_ESCALATION_DENIED: duplicate hook binding key '{hook_sid}'"
+            ));
+        }
+        if !existing_open.iter().any(|ex| ex == &target_sid) {
             return Err(format!(
                 "ACTIVE_SESSION_ESCALATION_DENIED: worker IPC cannot bind hook to closed/unminted session '{target_sid}'"
+            ));
+        }
+    }
+    for (ex_hook, ex_target) in &existing_bindings {
+        if candidate_bindings_map.get(ex_hook) != Some(ex_target) {
+            return Err(format!(
+                "ACTIVE_SESSION_DELETION_DENIED: worker IPC cannot delete or overwrite existing hook binding '{ex_hook}'"
             ));
         }
     }
 
     let new_tag = compute_domain_tag_raw(key, ACTIVE_SLOT_DOMAIN_BYTES, candidate_payload)?;
     let new_mac_hex = hex_encode(&new_tag);
-    let mut candidate_bindings_map = std::collections::BTreeMap::new();
-    for (k, t) in candidate_bindings {
-        candidate_bindings_map.insert(k, t);
-    }
     let body = crate::role_sandbox::serialize_active_sessions_json(
         candidate_rev,
         &candidate_open,

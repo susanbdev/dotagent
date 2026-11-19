@@ -875,16 +875,18 @@ fn pr6_cli_capabilities_packet_provenance_and_landlock_vault_coordinator_e2e() {
         String::from_utf8_lossy(&sb_ledger.stderr)
     );
 
-    // Direct `--internal-exec-sandbox` invocation without internal token must fail closed (exit 2)
+    // Removed `--internal-exec-sandbox` CLI flag must fail closed (exit 2, UNKNOWN_SUBCOMMAND)
+    // even if a caller attempts to supply the former internal token env var.
     let direct_internal = Command::new(swarm_tool_bin())
         .args(["--internal-exec-sandbox", "--", "echo", "pwn"])
         .current_dir(&repo)
         .env("AGENT_GUARD_STATE_DIR", &state)
+        .env("AGENT_GUARD_INTERNAL_SBX_TOKEN", "1")
         .output()
         .unwrap();
     assert_eq!(direct_internal.status.code(), Some(2));
     assert!(
-        String::from_utf8_lossy(&direct_internal.stderr).contains("SELF_TAMPERING_BLOCKED"),
+        String::from_utf8_lossy(&direct_internal.stderr).contains("UNKNOWN_SUBCOMMAND"),
         "direct --internal-exec-sandbox stderr: {}",
         String::from_utf8_lossy(&direct_internal.stderr)
     );
