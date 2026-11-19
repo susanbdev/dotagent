@@ -760,6 +760,7 @@ fn build_child_command(
     cmd
 }
 
+#[cfg(target_os = "linux")]
 fn is_secret_or_forbidden_root_entry(name: &str) -> bool {
     let lower = name.to_ascii_lowercase();
     lower == ".env"
@@ -806,6 +807,7 @@ fn is_secret_or_forbidden_root_entry(name: &str) -> bool {
         )
 }
 
+#[cfg(target_os = "linux")]
 fn is_swarm_mutable_root_artifact(name: &str) -> bool {
     let lower = name.to_ascii_lowercase();
     matches!(
@@ -814,6 +816,7 @@ fn is_swarm_mutable_root_artifact(name: &str) -> bool {
     )
 }
 
+#[cfg(target_os = "linux")]
 fn is_immutable_control_root_entry(name: &str) -> bool {
     let lower = name.to_ascii_lowercase();
     matches!(
@@ -1191,7 +1194,8 @@ fn render_macos_seatbelt_profile(
     }
 
     if let Some(tmp) = ephemeral_tmp {
-        let tmp_s = escape_sbpl_literal(&tmp.to_string_lossy());
+        let canon_tmp = fs::canonicalize(tmp).unwrap_or_else(|_| tmp.to_path_buf());
+        let tmp_s = escape_sbpl_literal(&canon_tmp.to_string_lossy());
         p.push_str(&format!(
             "(deny file-read* file-write* (subpath \"/tmp\") (subpath \"/private/tmp\") (subpath \"/var/tmp\") (subpath \"/private/var/tmp\"))\n(allow file-read* file-write* (subpath \"{tmp_s}\"))\n"
         ));
@@ -1202,19 +1206,30 @@ fn render_macos_seatbelt_profile(
         ));
     }
     if opts.invokes_swarm_tool {
-        if let Ok(sdir) = crate::breadcrumbs::swarm_state_dir(&canon_repo) {
+        if let Ok(raw_sdir) = crate::breadcrumbs::swarm_state_dir(&canon_repo) {
+            let sdir = fs::canonicalize(&raw_sdir).unwrap_or(raw_sdir);
             for sub in ["ipc", "sessions", "spools", "ledger"] {
-                let sp = escape_sbpl_literal(&sdir.join(sub).to_string_lossy());
+                let sub_path = sdir.join(sub);
+                let canon_sub = fs::canonicalize(&sub_path).unwrap_or(sub_path);
+                let sp = escape_sbpl_literal(&canon_sub.to_string_lossy());
                 p.push_str(&format!(
                     "(allow file-read* file-write* (subpath \"{sp}\"))\n"
                 ));
+                if sub == "ipc" && opts.deny_net {
+                    p.push_str(&format!(
+                        "(allow network-outbound (remote unix-socket (subpath \"{sp}\")))\n"
+                    ));
+                }
             }
-            let vp = escape_sbpl_literal(&sdir.join("vault").to_string_lossy());
+            let vault_dir = sdir.join("vault");
+            let canon_vault = fs::canonicalize(&vault_dir).unwrap_or(vault_dir);
+            let vp = escape_sbpl_literal(&canon_vault.to_string_lossy());
             p.push_str(&format!(
                 "(deny file-read* file-write* (subpath \"{vp}\"))\n"
             ));
         }
-        if let Ok(locks_dir) = crate::breadcrumbs::swarm_locks_dir() {
+        if let Ok(raw_locks) = crate::breadcrumbs::swarm_locks_dir() {
+            let locks_dir = fs::canonicalize(&raw_locks).unwrap_or(raw_locks);
             let lp = escape_sbpl_literal(&locks_dir.to_string_lossy());
             p.push_str(&format!(
                 "(allow file-read* file-write* (subpath \"{lp}\"))\n"

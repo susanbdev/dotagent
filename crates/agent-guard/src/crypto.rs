@@ -84,7 +84,7 @@ pub fn hex_encode(bytes: &[u8]) -> String {
 /// Decodes an even-length hexadecimal string into raw bytes.
 pub fn hex_decode_bytes(raw: &str) -> Result<Vec<u8>, String> {
     let trimmed = raw.trim();
-    if trimmed.len() % 2 != 0 {
+    if !trimmed.len().is_multiple_of(2) {
         return Err("hex string must have even byte length".to_string());
     }
     let mut out = Vec::with_capacity(trimmed.len() / 2);

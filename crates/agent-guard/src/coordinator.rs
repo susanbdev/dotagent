@@ -22,7 +22,9 @@
 //!    key bytes live in `ZeroizingKey`, and client streams run on bounded worker threads so
 //!    stalled connections cannot head-of-line block parallel Swarm waves.
 
-use std::fs::{self, File};
+use std::fs;
+#[cfg(target_os = "linux")]
+use std::fs::File;
 use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
 #[cfg(unix)]
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -79,6 +81,41 @@ pub fn coordinator_socket_path(repo_root: &Path) -> Result<PathBuf, String> {
     Ok(coordinator_ipc_dir(repo_root)?.join("coord.sock"))
 }
 
+#[cfg(all(unix, not(target_os = "linux")))]
+fn shorten_unix_socket_via_cwd(sock_path: &Path) -> PathBuf {
+    let Ok(cwd) = std::env::current_dir() else {
+        return sock_path.to_path_buf();
+    };
+    let canon_cwd = fs::canonicalize(&cwd).unwrap_or(cwd);
+    let canon_sock = sock_path
+        .parent()
+        .and_then(|p| fs::canonicalize(p).ok())
+        .and_then(|cp| sock_path.file_name().map(|f| cp.join(f)))
+        .unwrap_or_else(|| sock_path.to_path_buf());
+    let cwd_comps: Vec<_> = canon_cwd.components().collect();
+    let sock_comps: Vec<_> = canon_sock.components().collect();
+    let common = cwd_comps
+        .iter()
+        .zip(sock_comps.iter())
+        .take_while(|(a, b)| a == b)
+        .count();
+    if common == 0 {
+        return sock_path.to_path_buf();
+    }
+    let mut rel = PathBuf::new();
+    for _ in common..cwd_comps.len() {
+        rel.push("..");
+    }
+    for comp in &sock_comps[common..] {
+        rel.push(comp.as_os_str());
+    }
+    if rel.as_os_str().len() < sock_path.as_os_str().len() {
+        rel
+    } else {
+        sock_path.to_path_buf()
+    }
+}
+
 #[cfg(unix)]
 pub fn connect_unix_short_path(sock_path: &Path) -> std::io::Result<UnixStream> {
     if sock_path.as_os_str().len() <= 95 {
@@ -103,7 +140,7 @@ pub fn connect_unix_short_path(sock_path: &Path) -> std::io::Result<UnixStream> 
     }
     #[cfg(not(target_os = "linux"))]
     {
-        UnixStream::connect(sock_path)
+        UnixStream::connect(shorten_unix_socket_via_cwd(sock_path))
     }
 }
 
@@ -135,7 +172,7 @@ fn bind_unix_short_path(sock_path: &Path) -> std::io::Result<UnixListener> {
     }
     #[cfg(not(target_os = "linux"))]
     {
-        UnixListener::bind(sock_path)
+        UnixListener::bind(shorten_unix_socket_via_cwd(sock_path))
     }
 }
 

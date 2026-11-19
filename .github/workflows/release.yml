@@ -58,7 +58,7 @@ jobs:
           - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-musl
             use_musl_tools: "true"
-          - os: macos-13
+          - os: macos-latest
             target: x86_64-apple-darwin
             use_musl_tools: "false"
           - os: macos-latest

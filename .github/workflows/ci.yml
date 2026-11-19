@@ -59,8 +59,8 @@ jobs:
           cargo build --release --workspace
           ./target/release/dotagent-harness bench --quick
 
-  msrv-1-85:
-    name: MSRV 1.85.0 Compatibility Gate
+  msrv-1-88:
+    name: MSRV 1.88.0 Compatibility Gate
     runs-on: ubuntu-latest
     timeout-minutes: 10
     env:
@@ -73,8 +73,8 @@ jobs:
           persist-credentials: false
           submodules: false
 
-      - name: Install exact Rust 1.85.0 (Edition 2024 MSRV)
-        run: rustup toolchain install 1.85.0 --profile minimal
+      - name: Install exact Rust 1.88.0 (Edition 2024 + let_chains MSRV)
+        run: rustup toolchain install 1.88.0 --profile minimal
 
-      - name: Check entire workspace against Rust 1.85.0
-        run: cargo +1.85.0 check --workspace --all-targets
+      - name: Check entire workspace against Rust 1.88.0
+        run: cargo +1.88.0 check --workspace --all-targets

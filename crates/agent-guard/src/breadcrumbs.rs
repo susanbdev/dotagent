@@ -249,7 +249,7 @@ pub fn swarm_locks_dir() -> Result<PathBuf, String> {
 
 pub fn hex_decode_bytes(hex: &str) -> Result<Vec<u8>, String> {
     let trimmed = hex.trim();
-    if trimmed.len() % 2 != 0 {
+    if !trimmed.len().is_multiple_of(2) {
         return Err("odd-length hex string".to_string());
     }
     let mut out = Vec::with_capacity(trimmed.len() / 2);
