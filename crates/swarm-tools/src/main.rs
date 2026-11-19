@@ -52,6 +52,26 @@ fn main() -> ExitCode {
     };
     let rest = &args[1..];
 
+    match role_ns {
+        "--probe-landlock-child" => return agent_guard::exec_sandbox::run_probe_landlock_child(),
+        "--internal-exec-sandbox" => {
+            return agent_guard::exec_sandbox::run_exec_sandbox_cli(rest, &cwd);
+        }
+        "--version" | "-V" | "version" => {
+            println!("swarm-tool {}", env!("CARGO_PKG_VERSION"));
+            return ExitCode::SUCCESS;
+        }
+        "master" | "investigator" | "qa" | "grunt" | "reviewer" | "coroner"
+            if rest
+                .first()
+                .is_some_and(|s| matches!(s.as_str(), "--help" | "-h" | "help")) =>
+        {
+            print_role_usage(role_ns);
+            return ExitCode::SUCCESS;
+        }
+        _ => {}
+    }
+
     let result = match role_ns {
         "master" => enforce_ambient_role_namespace(&repo_root, SwarmRole::Master, role_ns, rest)
             .and_then(|()| run_master(&repo_root, &cwd, rest)),
@@ -79,7 +99,7 @@ fn main() -> ExitCode {
             Ok(())
         }
         other => Err(format!(
-            "unknown role namespace '{other}' (expected master, investigator, qa, grunt, reviewer, or coroner)"
+            "UNKNOWN_SUBCOMMAND: unknown role namespace '{other}' (expected master, investigator, qa, grunt, reviewer, or coroner)"
         )),
     };
 
@@ -1087,7 +1107,11 @@ fn run_grunt(repo_root: &Path, cwd: &Path, args: &[String]) -> Result<(), String
                 .ok_or_else(|| "usage: swarm-tool grunt checkpoint-green --session <sid> -- <test_cmd...>".to_string())?;
             let cmd_tokens = &args[sep_idx + 1..];
             validate_grunt_test_runner_command(cmd_tokens, &cap.assigned_tests)?;
-            let joined_cmd = cmd_tokens.join(" ");
+            let joined_cmd = cmd_tokens
+                .iter()
+                .map(|t| quote_token_for_shell_ast(t))
+                .collect::<Vec<_>>()
+                .join(" ");
             let plan = evaluate_shell_command(&joined_cmd, repo_root, cwd, false)
                 .map_err(|cv| format!("{}: {}", cv.code, cv.detail))?;
             let write_rels: Vec<String> = plan.write_files.iter().map(|(r, _)| r.clone()).collect();
@@ -1098,36 +1122,41 @@ fn run_grunt(repo_root: &Path, cwd: &Path, args: &[String]) -> Result<(), String
             check_role_shell_read_scope(SwarmRole::Grunt, Some(&cap), &read_rels, repo_root)
                 .map_err(format_role_denial)?;
 
-            // Execute the untrusted test runner inside `agent-guard exec-sandbox` (scrubbing Swarm
-            // session/coordinator env vars) so `cargo test`/`pytest`/`unittest` has zero kernel access
-            // to `vault/hmac.key`, `ipc/coord.sock`, `sessions/`, `spools/`, or `ledger/`!
-            let status = if let Some(ag_bin) = resolve_sibling_agent_guard_bin() {
-                let mut c = Command::new(ag_bin);
-                c.arg("exec-sandbox")
-                    .arg("--cwd")
-                    .arg(repo_root)
-                    .arg("--")
-                    .args(cmd_tokens)
-                    .current_dir(repo_root)
-                    .env_remove("AGENT_GUARD_ROLE")
-                    .env_remove("AGENT_GUARD_SESSION_ID")
-                    .env_remove("AGENT_GUARD_COORDINATOR_SOCK")
-                    .env("AGENT_GUARD_WORKER_LOCK", "1")
-                    .env("PYTHONDONTWRITEBYTECODE", "1");
-                c.status()
-                    .map_err(|e| format!("failed spawning sandboxed test command '{}': {e}", cmd_tokens[0]))?
+            // Execute the untrusted test runner strictly inside `exec-sandbox --deny-net`
+            // (using sibling `agent-guard` or self `--internal-exec-sandbox` — NEVER unsandboxed!)
+            // so `cargo test`/`pytest`/`unittest` has zero kernel access to `vault/hmac.key`,
+            // `ipc/coord.sock`, `sessions/`, `spools/`, `ledger/`, or outbound TCP sockets.
+            let (sandbox_bin, sandbox_subcmd) = if let Some(ag_bin) = resolve_sibling_agent_guard_bin() {
+                (ag_bin, "exec-sandbox")
             } else {
-                Command::new(&cmd_tokens[0])
-                    .args(&cmd_tokens[1..])
-                    .current_dir(repo_root)
-                    .env_remove("AGENT_GUARD_ROLE")
-                    .env_remove("AGENT_GUARD_SESSION_ID")
-                    .env_remove("AGENT_GUARD_COORDINATOR_SOCK")
-                    .env("AGENT_GUARD_WORKER_LOCK", "1")
-                    .env("PYTHONDONTWRITEBYTECODE", "1")
-                    .status()
-                    .map_err(|e| format!("failed spawning test command '{}': {e}", cmd_tokens[0]))?
+                let self_exe = std::env::current_exe().map_err(|e| {
+                    format!(
+                        "SANDBOX_BINARY_UNAVAILABLE: refusing to execute untrusted test command outside OS sandbox ({e})"
+                    )
+                })?;
+                (self_exe, "--internal-exec-sandbox")
             };
+
+            let status = Command::new(sandbox_bin)
+                .arg(sandbox_subcmd)
+                .arg("--deny-net")
+                .arg("--cwd")
+                .arg(repo_root)
+                .arg("--")
+                .args(cmd_tokens)
+                .current_dir(repo_root)
+                .env_remove("AGENT_GUARD_ROLE")
+                .env_remove("AGENT_GUARD_SESSION_ID")
+                .env_remove("AGENT_GUARD_COORDINATOR_SOCK")
+                .env("AGENT_GUARD_WORKER_LOCK", "1")
+                .env("PYTHONDONTWRITEBYTECODE", "1")
+                .status()
+                .map_err(|e| {
+                    format!(
+                        "SANDBOX_BINARY_UNAVAILABLE: failed spawning sandboxed test command '{}': {e}",
+                        cmd_tokens[0]
+                    )
+                })?;
 
             let passed = status.success();
             let (_cap, tree_oid) = record_test_checkpoint(repo_root, &sid, passed)?;
@@ -1638,16 +1667,52 @@ fn split_csv(raw: &str) -> Vec<String> {
         .collect()
 }
 
+fn quote_token_for_shell_ast(tok: &str) -> String {
+    if !tok.is_empty()
+        && tok.bytes().all(|b| {
+            b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.' | b'/' | b':' | b'=' | b'+')
+        })
+    {
+        tok.to_string()
+    } else {
+        format!("'{}'", tok.replace('\'', "'\\''"))
+    }
+}
+
+fn print_role_usage(role_ns: &str) {
+    match role_ns {
+        "master" => println!(
+            "swarm-tool master <lock-plan|mint-session|close-session|ingest-packet|status> [options]"
+        ),
+        "investigator" => {
+            println!("swarm-tool investigator <scout|emit-fact> [--session <sid>] [options]")
+        }
+        "qa" => println!(
+            "swarm-tool qa <coverage-targets|verify-attribution|triangulate> [--session <sid>] [options]"
+        ),
+        "grunt" => println!(
+            "swarm-tool grunt <context|record-edit|checkpoint-green|submit-ledger|report-blocker> [--session <sid>] [options]"
+        ),
+        "reviewer" => {
+            println!("swarm-tool reviewer <inspect|lookup-doc|verdict> [--session <sid>] [options]")
+        }
+        "coroner" => println!(
+            "swarm-tool coroner <verify-trail|recover-spool|triage> [--session <sid>] [options]"
+        ),
+        _ => print_usage(),
+    }
+}
+
 fn print_usage() {
     println!(
         "swarm-tool -- Role-specific deterministic Rust CLI tooling for dotagent Swarm v2\n\
          \n\
          Usage:\n\
-         \x20 swarm-tool master <lock-plan|mint-session|ingest-packet|status>\n\
+         \x20 swarm-tool master <lock-plan|mint-session|close-session|ingest-packet|status>\n\
          \x20 swarm-tool investigator <scout|emit-fact>\n\
          \x20 swarm-tool qa <coverage-targets|verify-attribution|triangulate>\n\
          \x20 swarm-tool grunt <context|record-edit|checkpoint-green|submit-ledger|report-blocker>\n\
-         \x20 swarm-tool reviewer <inspect|lookup-doc|verdict>\n\
-         \x20 swarm-tool coroner <verify-trail|recover-spool|triage>"
+         \x20 swarm-tool coroner <verify-trail|recover-spool|triage>\n\
+         \x20 swarm-tool reviewer <inspect|lookup-doc|verdict>"
     );
 }

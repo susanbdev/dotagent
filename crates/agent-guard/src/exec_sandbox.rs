@@ -3,35 +3,45 @@
 //! OS-level execution sandbox (`agent-guard exec-sandbox`) wrapping child shell commands.
 //!
 //! Enforces defense-in-depth containment beneath `PreToolUse` AST validation:
-//! 1. Scrubs dangerous dynamic-linker, compiler-wrapper, and interpreter hijack env vars
-//!    (`LD_PRELOAD`, `RUSTC_WRAPPER`, `NODE_OPTIONS`, `PYTHONPATH`, `BASH_ENV`, `GIT_SSH_COMMAND`, ...).
+//! 1. Scrubs dangerous dynamic-linker, OpenSSL engine, compiler-wrapper, Git override, and
+//!    interpreter hijack env vars (`LD_PRELOAD`, `OPENSSL_CONF`, `RUSTC_WRAPPER`, `CARGO_TARGET_*`,
+//!    `GIT_CONFIG_PARAMETERS`, `GIT_CONFIG_COUNT`, `NODE_OPTIONS`, `PYTHONPATH`, `BASH_ENV`, ...).
 //! 2. Locks down inherited Git configuration (`core.hooksPath=/dev/null`, `core.attributesFile=/dev/null`,
 //!    `core.fsmonitor=false`, `protocol.allow=never`, `protocol.https.allow=always`, `submodule.recurse=false`)
 //!    via `GIT_CONFIG_COUNT` when `GIT_CONFIG_GLOBAL` is not already pinned.
 //! 3. Allocates a private, per-invocation ephemeral `TMPDIR` outside `/tmp`, `/var/tmp`, and `/dev/shm`,
 //!    removing it automatically on process exit so compilers/test runners work seamlessly with zero
 //!    shared-`/tmp` snooping.
-//! 4. Applies OS kernel VFS sandboxing:
-//!    - **Linux**: Landlock LSM (`ABI::V5` best-effort down to `V1`) granting `ReadDir`-only on `repo_root`,
-//!      omitting `.env*`, `*.pem`, `*.key`, `.git/hooks`, `audit.jsonl`, `~/.ssh`, `~/.aws`,
-//!      `~/.local/state/agent-guard`, and `/tmp`, locking `AGENTS.md`, `.claude/`, `.codex/`, `.cursor/`,
-//!      `.github/`, `.cargo/`, and `.git/config` to read-only (`EACCES` on write), and honoring read-only
-//!      runtime profiles (`enable_write_tools = false`) across the entire workspace.
-//!    - **macOS**: Darwin Seatbelt (`/usr/bin/sandbox-exec`) profile denying secret/tmp/guard-state reads
-//!      and control-file writes.
+//! 4. Drains child `stdout`/`stderr` completely to EOF into bounded head+tail buffers so chatty builds
+//!    (`> 24 KiB`) never die from premature `SIGPIPE` while memory remains strictly bounded, running
+//!    children in an isolated process group (`process_group(0)`).
+//! 5. Applies OS kernel VFS + TCP sandboxing:
+//!    - **Linux**: Landlock LSM (`ABI::V5` best-effort down to `V1`, plus `AccessNet` TCP port blocking
+//!      when `network_access = "none"` or `--deny-net` is active) granting `ReadDir`-only on `repo_root`,
+//!      omitting `.env*`, `*.pem`, `*.key`, `node_modules`, `.venv`, `vendor`, `.git/hooks`, `audit.jsonl`,
+//!      `~/.ssh`, `~/.aws`, `~/.local/state/agent-guard`, and `/tmp`, locking control-plane files read-only,
+//!      and honoring read-only runtime profiles (`enable_write_tools = false`).
+//!    - **macOS**: Darwin Seatbelt (`/usr/bin/sandbox-exec`) profile with backslash-safe SBPL escaping,
+//!      `writes_allowed` and `deny_net` parity, Keychain/secret/tmp/guard-state blocks, and control-file locks.
 
 use std::env;
 use std::fs;
 use std::io::Read;
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::budget_guard::{MAX_SLICED_FILE_BYTES, load_active_profile};
+use crate::budget_guard::load_active_profile;
+use crate::crypto::sha256_bytes;
 use crate::resolve_repo_root;
 use crate::sanitizer::{
     DEFAULT_COMPACT_STREAM_MAX_BYTES, DEFAULT_COMPACT_STREAM_MAX_LINES, sanitize_and_compact_bytes,
 };
+
+const STREAM_HEAD_CAP_BYTES: usize = 16_384;
+const STREAM_TAIL_CAP_BYTES: usize = 16_384;
 
 const SCRUBBED_ENV_VARS: &[&str] = &[
     "LD_PRELOAD",
@@ -39,13 +49,27 @@ const SCRUBBED_ENV_VARS: &[&str] = &[
     "LD_AUDIT",
     "DYLD_INSERT_LIBRARIES",
     "DYLD_LIBRARY_PATH",
+    "DYLD_FRAMEWORK_PATH",
+    "OPENSSL_CONF",
+    "OPENSSL_ENGINES",
+    "OPENSSL_MODULES",
+    "RUSTC",
+    "RUSTDOC",
+    "RUSTFLAGS",
+    "RUSTDOCFLAGS",
+    "CARGO_ENCODED_RUSTFLAGS",
     "RUSTC_WRAPPER",
     "RUSTC_WORKSPACE_WRAPPER",
     "CARGO_BUILD_RUSTC_WRAPPER",
     "CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER",
     "NODE_OPTIONS",
+    "NODE_PATH",
     "PYTHONSTARTUP",
     "PYTHONPATH",
+    "PIP_INDEX_URL",
+    "PIP_EXTRA_INDEX_URL",
+    "UV_INDEX_URL",
+    "UV_EXTRA_INDEX_URL",
     "PERL5OPT",
     "PERL5LIB",
     "RUBYOPT",
@@ -53,10 +77,18 @@ const SCRUBBED_ENV_VARS: &[&str] = &[
     "BASH_ENV",
     "ENV",
     "PROMPT_COMMAND",
+    "SHELLOPTS",
+    "BASHOPTS",
+    "CDPATH",
+    "IFS",
     "GIT_SSH_COMMAND",
     "GIT_SSH",
     "GIT_EXTERNAL_DIFF",
     "GIT_ASKPASS",
+    "GIT_EXEC_PATH",
+    "GIT_TEMPLATE_DIR",
+    "GIT_CONFIG_PARAMETERS",
+    "GIT_CONFIG_COUNT",
     "SSH_ASKPASS",
     "AGENT_GUARD_ALLOW_SWARM",
     "AGENT_GUARD_ALLOW_INTERPRETER",
@@ -86,6 +118,14 @@ impl KernelSandboxMode {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+struct SandboxPolicyOpts {
+    writes_allowed: bool,
+    deny_net: bool,
+    invokes_git: bool,
+    invokes_swarm_tool: bool,
+}
+
 /// Formats a shell command to execute through `agent-guard exec-sandbox` with optional
 /// in-process pre-buffer 7-bit ASCII stream sanitization and line compaction.
 pub fn wrap_bash_with_exec_sandbox(cmd_str: &str, sanitize_stream: bool) -> String {
@@ -97,7 +137,7 @@ pub fn wrap_bash_with_exec_sandbox(cmd_str: &str, sanitize_stream: bool) -> Stri
     }
 }
 
-fn shell_quote_single(s: &str) -> String {
+pub fn shell_quote_single(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 
@@ -138,96 +178,169 @@ impl Drop for EphemeralTmpDir {
     }
 }
 
-/// Probes whether OS-level kernel filesystem sandboxing is supported on the current host.
-/// Note: on Linux, `restrict_self` mutates the calling process permanently, so `probe_kernel_sandbox_support`
-/// checks `/proc/sys` / kernel ABI via a short-lived self subprocess (`--probe-landlock-child`) when needed.
-pub fn run_sandbox_status_cli() -> ExitCode {
+/// Probes host OS kernel sandbox enforcement without mutating the current process.
+pub fn probe_host_sandbox_mode() -> KernelSandboxMode {
     #[cfg(target_os = "linux")]
     {
-        if let Ok(exe) = env::current_exe()
-            && let Ok(out) = Command::new(exe).arg("--probe-landlock-child").output()
-        {
-            let text = String::from_utf8_lossy(&out.stdout);
-            println!("{}", text.trim());
-            return if out.status.success() {
-                ExitCode::SUCCESS
-            } else {
-                ExitCode::from(1)
-            };
+        if let Ok(exe) = env::current_exe() {
+            let mut candidates = vec![exe.clone()];
+            if let Some(dir) = exe.parent() {
+                let sib = dir.join("agent-guard");
+                if sib != exe && sib.is_file() {
+                    candidates.insert(0, sib);
+                }
+            }
+            for bin in candidates {
+                if let Ok(out) = Command::new(bin).arg("--probe-landlock-child").output()
+                    && out.status.success()
+                {
+                    let text = String::from_utf8_lossy(&out.stdout);
+                    if text.contains("linux-landlock-enforced") {
+                        return KernelSandboxMode::LinuxLandlockEnforced;
+                    }
+                    if text.contains("linux-landlock-partial") {
+                        return KernelSandboxMode::LinuxLandlockPartiallyEnforced;
+                    }
+                    if text.contains("fallback-env-and-ast-only") {
+                        return KernelSandboxMode::FallbackEnvAndAstOnly;
+                    }
+                }
+            }
         }
-        println!("mode=fallback-env-and-ast-only");
-        ExitCode::SUCCESS
+        KernelSandboxMode::FallbackEnvAndAstOnly
     }
     #[cfg(target_os = "macos")]
     {
         if Path::new("/usr/bin/sandbox-exec").is_file() {
-            println!("mode=macos-seatbelt-enforced");
+            KernelSandboxMode::MacosSeatbeltEnforced
         } else {
-            println!("mode=fallback-env-and-ast-only");
+            KernelSandboxMode::FallbackEnvAndAstOnly
         }
-        ExitCode::SUCCESS
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
-        println!("mode=fallback-env-and-ast-only");
-        ExitCode::SUCCESS
+        KernelSandboxMode::FallbackEnvAndAstOnly
     }
 }
 
+/// Probes whether OS-level kernel filesystem sandboxing is supported on the current host.
+pub fn run_sandbox_status_cli() -> ExitCode {
+    let mode = probe_host_sandbox_mode();
+    println!(
+        "[AGENT-GUARD SANDBOX STATUS] mode={} kernel_enforced={}",
+        mode.as_str(),
+        mode.is_kernel_enforced()
+    );
+    ExitCode::SUCCESS
+}
+
+/// Internal subprocess probe (`agent-guard --probe-landlock-child`) safely testing Landlock ABI.
 pub fn run_probe_landlock_child() -> ExitCode {
     #[cfg(target_os = "linux")]
     {
         use landlock::{
-            ABI, Access, AccessFs, CompatLevel, Compatible, Ruleset, RulesetAttr,
+            ABI, Access, AccessFs, AccessNet, CompatLevel, Compatible, Ruleset, RulesetAttr,
             RulesetCreatedAttr, RulesetStatus,
         };
         let abi = ABI::V5;
-        let status = Ruleset::default()
+        let res = Ruleset::default()
             .set_compatibility(CompatLevel::BestEffort)
             .handle_access(AccessFs::from_all(abi))
+            .and_then(|r| r.handle_access(AccessNet::from_all(abi)))
             .and_then(|r| r.create())
-            .and_then(|r| {
-                r.add_rules(landlock::path_beneath_rules(
-                    ["/usr"],
+            .and_then(|c| {
+                c.add_rules(landlock::path_beneath_rules(
+                    ["/usr", "/bin", "/lib"],
                     AccessFs::from_read(abi),
                 ))
             })
-            .and_then(|r| r.restrict_self());
-        match status {
-            Ok(s) => {
-                match s.ruleset {
-                    RulesetStatus::FullyEnforced => {
-                        println!("mode={}", KernelSandboxMode::LinuxLandlockEnforced.as_str());
-                    }
+            .and_then(|c| c.restrict_self());
+        match res {
+            Ok(st) => {
+                let m = match st.ruleset {
+                    RulesetStatus::FullyEnforced => KernelSandboxMode::LinuxLandlockEnforced,
                     RulesetStatus::PartiallyEnforced => {
-                        println!(
-                            "mode={}",
-                            KernelSandboxMode::LinuxLandlockPartiallyEnforced.as_str()
-                        );
+                        KernelSandboxMode::LinuxLandlockPartiallyEnforced
                     }
-                    RulesetStatus::NotEnforced => {
-                        println!("mode={}", KernelSandboxMode::FallbackEnvAndAstOnly.as_str());
-                    }
-                }
+                    RulesetStatus::NotEnforced => KernelSandboxMode::FallbackEnvAndAstOnly,
+                };
+                println!("{}", m.as_str());
                 ExitCode::SUCCESS
             }
             Err(_) => {
-                println!("mode={}", KernelSandboxMode::FallbackEnvAndAstOnly.as_str());
+                println!("{}", KernelSandboxMode::FallbackEnvAndAstOnly.as_str());
                 ExitCode::SUCCESS
             }
         }
     }
     #[cfg(not(target_os = "linux"))]
     {
-        println!("mode={}", KernelSandboxMode::FallbackEnvAndAstOnly.as_str());
+        println!("{}", KernelSandboxMode::FallbackEnvAndAstOnly.as_str());
         ExitCode::SUCCESS
     }
 }
 
-/// CLI entrypoint for `agent-guard exec-sandbox [--sanitize-stream] [--require-kernel] [--cwd <dir>] -- <cmd>`
+/// Drains `reader` completely to EOF so the child process never receives a premature `SIGPIPE`
+/// on `> 24 KiB` output, retaining at most `STREAM_HEAD_CAP_BYTES + STREAM_TAIL_CAP_BYTES` in RAM.
+fn drain_stream_bounded<R: Read>(mut reader: R) -> Vec<u8> {
+    let mut head = Vec::with_capacity(STREAM_HEAD_CAP_BYTES);
+    let mut tail_ring = Vec::with_capacity(STREAM_TAIL_CAP_BYTES * 2);
+    let mut omitted_bytes: usize = 0;
+    let mut chunk = [0u8; 8192];
+
+    loop {
+        match reader.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) => {
+                let mut slice = &chunk[..n];
+                if head.len() < STREAM_HEAD_CAP_BYTES {
+                    let take_head = (STREAM_HEAD_CAP_BYTES - head.len()).min(slice.len());
+                    head.extend_from_slice(&slice[..take_head]);
+                    slice = &slice[take_head..];
+                }
+                if !slice.is_empty() {
+                    if slice.len() >= STREAM_TAIL_CAP_BYTES {
+                        omitted_bytes = omitted_bytes.saturating_add(
+                            tail_ring.len() + (slice.len() - STREAM_TAIL_CAP_BYTES),
+                        );
+                        tail_ring.clear();
+                        tail_ring.extend_from_slice(&slice[slice.len() - STREAM_TAIL_CAP_BYTES..]);
+                    } else {
+                        tail_ring.extend_from_slice(slice);
+                        if tail_ring.len() > STREAM_TAIL_CAP_BYTES {
+                            let drop_n = tail_ring.len() - STREAM_TAIL_CAP_BYTES;
+                            omitted_bytes = omitted_bytes.saturating_add(drop_n);
+                            tail_ring.drain(..drop_n);
+                        }
+                    }
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => break,
+        }
+    }
+
+    if tail_ring.is_empty() {
+        return head;
+    }
+    if omitted_bytes > 0 {
+        if !head.ends_with(b"\n") {
+            head.push(b'\n');
+        }
+        head.extend_from_slice(
+            format!("[... exec-sandbox drained {omitted_bytes} middle stream bytes ...]\n")
+                .as_bytes(),
+        );
+    }
+    head.extend_from_slice(&tail_ring);
+    head
+}
+
+/// CLI entrypoint for `agent-guard exec-sandbox [--sanitize-stream] [--require-kernel] [--deny-net] [--cwd <dir>] -- <cmd>`
 pub fn run_exec_sandbox_cli(args: &[String], default_cwd: &Path) -> ExitCode {
     let mut sanitize_stream = false;
     let mut require_kernel = false;
+    let mut explicit_deny_net = false;
     let mut custom_cwd: Option<PathBuf> = None;
     let mut cmd_parts: Vec<String> = Vec::new();
     let mut after_sep = false;
@@ -250,6 +363,10 @@ pub fn run_exec_sandbox_cli(args: &[String], default_cwd: &Path) -> ExitCode {
             }
             "--require-kernel" => {
                 require_kernel = true;
+                i += 1;
+            }
+            "--deny-net" => {
+                explicit_deny_net = true;
                 i += 1;
             }
             "--cwd" => {
@@ -275,7 +392,7 @@ pub fn run_exec_sandbox_cli(args: &[String], default_cwd: &Path) -> ExitCode {
 
     if cmd_parts.is_empty() {
         eprintln!(
-            "[AGENT-GUARD] usage: agent-guard exec-sandbox [--sanitize-stream] [--require-kernel] [--cwd <dir>] -- \"<command>\""
+            "[AGENT-GUARD] usage: agent-guard exec-sandbox [--sanitize-stream] [--require-kernel] [--deny-net] [--cwd <dir>] -- \"<command>\""
         );
         return ExitCode::from(2);
     }
@@ -292,16 +409,37 @@ pub fn run_exec_sandbox_cli(args: &[String], default_cwd: &Path) -> ExitCode {
 
     let cwd = custom_cwd.unwrap_or_else(|| default_cwd.to_path_buf());
     let repo_root = resolve_repo_root(&cwd);
-    let writes_allowed = load_active_profile(&repo_root)
+    let active_prof = load_active_profile(&repo_root).ok();
+    let writes_allowed = active_prof
+        .as_ref()
         .map(|p| p.enable_write_tools)
         .unwrap_or(true);
+    let profile_denies_net = active_prof
+        .as_ref()
+        .map(|p| p.network_access_none)
+        .unwrap_or(false);
     let invokes_git = is_atomic_leading_command(&shell_script, "git");
     let invokes_swarm_tool = is_atomic_leading_command(&shell_script, "swarm-tool");
+    let opts = SandboxPolicyOpts {
+        writes_allowed,
+        deny_net: explicit_deny_net || profile_denies_net,
+        invokes_git,
+        invokes_swarm_tool,
+    };
+
+    // Snapshot `.git/config` digest prior to vetted `git` writes so any `.git` lockfile access
+    // granted for `git add` / `git commit` can never tamper with `.git/config` unnoticed.
+    let git_cfg_path = repo_root.join(".git/config");
+    let pre_git_cfg_digest = if opts.invokes_git && opts.writes_allowed {
+        fs::read(&git_cfg_path).ok().map(|b| sha256_bytes(&b))
+    } else {
+        None
+    };
 
     // Pre-launch the out-of-sandbox Vault Coordinator daemon BEFORE `restrict_self()` so
     // `swarm-tool` can sign/verify provenance via `ipc/coord.sock` while `vault/hmac.key`
     // stays 100% kernel-inaccessible (`EACCES`) inside Landlock/Seatbelt!
-    if invokes_swarm_tool {
+    if opts.invokes_swarm_tool {
         let _ = crate::coordinator::ensure_coordinator_daemon(&repo_root);
         precreate_swarm_tool_sandbox_targets(&repo_root, &shell_script);
     }
@@ -310,13 +448,7 @@ pub fn run_exec_sandbox_cli(args: &[String], default_cwd: &Path) -> ExitCode {
     let tmp_dir_path = ephemeral_tmp.as_ref().map(|t| t.path.as_path());
 
     // Apply OS kernel sandbox to THIS process prior to spawning `bash` on Linux (inherited across fork/exec!).
-    let mode = apply_current_process_sandbox(
-        &repo_root,
-        tmp_dir_path,
-        writes_allowed,
-        invokes_git,
-        invokes_swarm_tool,
-    );
+    let mode = apply_current_process_sandbox(&repo_root, tmp_dir_path, opts);
     if require_kernel && !mode.is_kernel_enforced() {
         eprintln!(
             "[AGENT-GUARD HARD DENY :: KERNEL_SANDBOX_UNAVAILABLE] Host kernel does not enforce Landlock/Seatbelt VFS containment (mode={}).",
@@ -325,15 +457,9 @@ pub fn run_exec_sandbox_cli(args: &[String], default_cwd: &Path) -> ExitCode {
         return ExitCode::from(2);
     }
 
-    let mut child_cmd = build_child_command(
-        &shell_script,
-        &repo_root,
-        &cwd,
-        tmp_dir_path,
-        invokes_swarm_tool,
-    );
+    let mut child_cmd = build_child_command(&shell_script, &repo_root, &cwd, tmp_dir_path, opts);
 
-    if sanitize_stream {
+    let exit_code = if sanitize_stream {
         let mut child = match child_cmd
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -347,20 +473,14 @@ pub fn run_exec_sandbox_cli(args: &[String], default_cwd: &Path) -> ExitCode {
             }
         };
 
-        let stdout_handle = child.stdout.take().map(|out| {
-            std::thread::spawn(move || {
-                let mut buf = Vec::new();
-                let _ = out.take(MAX_SLICED_FILE_BYTES).read_to_end(&mut buf);
-                buf
-            })
-        });
-        let stderr_handle = child.stderr.take().map(|err| {
-            std::thread::spawn(move || {
-                let mut buf = Vec::new();
-                let _ = err.take(MAX_SLICED_FILE_BYTES).read_to_end(&mut buf);
-                buf
-            })
-        });
+        let stdout_handle = child
+            .stdout
+            .take()
+            .map(|out| std::thread::spawn(move || drain_stream_bounded(out)));
+        let stderr_handle = child
+            .stderr
+            .take()
+            .map(|err| std::thread::spawn(move || drain_stream_bounded(err)));
 
         let status = match child.wait() {
             Ok(s) => s,
@@ -402,10 +522,22 @@ pub fn run_exec_sandbox_cli(args: &[String], default_cwd: &Path) -> ExitCode {
             Ok(s) => ExitCode::from(s.code().unwrap_or(1) as u8),
             Err(e) => {
                 eprintln!("[AGENT-GUARD EXEC ERROR] failed executing sandboxed bash: {e}");
-                ExitCode::from(126)
+                return ExitCode::from(126);
             }
         }
+    };
+
+    if let Some(expected_digest) = pre_git_cfg_digest {
+        let post_digest = fs::read(&git_cfg_path).ok().map(|b| sha256_bytes(&b));
+        if post_digest != Some(expected_digest) {
+            eprintln!(
+                "[AGENT-GUARD HARD DENY :: GIT_CONFIG_TAMPERED] .git/config changed during git execution!"
+            );
+            return ExitCode::from(2);
+        }
     }
+
+    exit_code
 }
 
 /// Returns true ONLY if `script` is a single atomic command (zero unquoted compound operators,
@@ -525,15 +657,17 @@ fn build_child_command(
     repo_root: &Path,
     cwd: &Path,
     ephemeral_tmp: Option<&Path>,
-    invokes_swarm_tool: bool,
+    opts: SandboxPolicyOpts,
 ) -> Command {
     #[cfg(target_os = "macos")]
     let mut cmd = if Path::new("/usr/bin/sandbox-exec").is_file() {
-        let profile = render_macos_seatbelt_profile(repo_root, ephemeral_tmp, invokes_swarm_tool);
+        let profile = render_macos_seatbelt_profile(repo_root, ephemeral_tmp, opts);
         let mut c = Command::new("/usr/bin/sandbox-exec");
         c.arg("-p")
             .arg(profile)
             .arg("/bin/bash")
+            .arg("--norc")
+            .arg("--noprofile")
             .arg("-o")
             .arg("pipefail")
             .arg("-c")
@@ -541,22 +675,51 @@ fn build_child_command(
         c
     } else {
         let mut c = Command::new("bash");
-        c.arg("-o").arg("pipefail").arg("-c").arg(shell_script);
+        c.arg("--norc")
+            .arg("--noprofile")
+            .arg("-o")
+            .arg("pipefail")
+            .arg("-c")
+            .arg(shell_script);
         c
     };
 
     #[cfg(not(target_os = "macos"))]
     let mut cmd = {
-        let _ = (repo_root, invokes_swarm_tool);
+        let _ = (repo_root, opts);
         let mut c = Command::new("bash");
-        c.arg("-o").arg("pipefail").arg("-c").arg(shell_script);
+        c.arg("--norc")
+            .arg("--noprofile")
+            .arg("-o")
+            .arg("pipefail")
+            .arg("-c")
+            .arg(shell_script);
         c
     };
+
+    #[cfg(unix)]
+    cmd.process_group(0);
 
     cmd.current_dir(cwd);
     for var in SCRUBBED_ENV_VARS {
         cmd.env_remove(var);
     }
+    // Scrub dynamic Cargo runner/linker/alias/source overrides (`CARGO_TARGET_*`, `CARGO_ALIAS_*`, ...)
+    for (env_k, _) in env::vars_os() {
+        if let Some(ks) = env_k.to_str() {
+            let up = ks.to_ascii_uppercase();
+            if up.starts_with("CARGO_TARGET_")
+                || up.starts_with("CARGO_ALIAS_")
+                || up.starts_with("CARGO_REGISTRIES_")
+                || up.starts_with("CARGO_SOURCE_")
+                || up.starts_with("GIT_CONFIG_KEY_")
+                || up.starts_with("GIT_CONFIG_VALUE_")
+            {
+                cmd.env_remove(&env_k);
+            }
+        }
+    }
+
     cmd.env("AGENT_GUARD_IN_SANDBOX", "1");
     cmd.env("PYTHONDONTWRITEBYTECODE", "1");
     cmd.env("PIP_NO_CACHE_DIR", "1");
@@ -571,8 +734,8 @@ fn build_child_command(
         cmd.env("TMP", tmp);
     }
 
-    // Inject hermetic Git lockdown via GIT_CONFIG_COUNT when GIT_CONFIG_GLOBAL is not already pinned
-    if env::var_os("GIT_CONFIG_GLOBAL").is_none() && env::var_os("GIT_CONFIG_COUNT").is_none() {
+    // Always inject hermetic Git lockdown via GIT_CONFIG_COUNT unless GIT_CONFIG_GLOBAL is already pinned
+    if env::var_os("GIT_CONFIG_GLOBAL").is_none() {
         let pairs: &[(&str, &str)] = &[
             ("core.hooksPath", "/dev/null"),
             ("core.attributesFile", "/dev/null"),
@@ -618,6 +781,20 @@ fn is_secret_or_forbidden_root_entry(name: &str) -> bool {
                 | "temp"
                 | ".temp"
                 | ".cache"
+                | "__pycache__"
+                | ".pytest_cache"
+                | ".mypy_cache"
+                | ".ruff_cache"
+                | ".next"
+                | ".nuxt"
+                | ".turbo"
+                | ".parcel-cache"
+                | ".vite"
+                | "node_modules"
+                | "vendor"
+                | ".venv"
+                | "venv"
+                | "site-packages"
                 | "claude.md"
                 | "claude.local.md"
                 | "agents.override.md"
@@ -662,29 +839,15 @@ fn is_immutable_control_root_entry(name: &str) -> bool {
 fn apply_current_process_sandbox(
     repo_root: &Path,
     ephemeral_tmp: Option<&Path>,
-    writes_allowed: bool,
-    invokes_git: bool,
-    invokes_swarm_tool: bool,
+    opts: SandboxPolicyOpts,
 ) -> KernelSandboxMode {
     #[cfg(target_os = "linux")]
     {
-        apply_linux_landlock(
-            repo_root,
-            ephemeral_tmp,
-            writes_allowed,
-            invokes_git,
-            invokes_swarm_tool,
-        )
+        apply_linux_landlock(repo_root, ephemeral_tmp, opts)
     }
     #[cfg(target_os = "macos")]
     {
-        let _ = (
-            repo_root,
-            ephemeral_tmp,
-            writes_allowed,
-            invokes_git,
-            invokes_swarm_tool,
-        );
+        let _ = (repo_root, ephemeral_tmp, opts);
         if Path::new("/usr/bin/sandbox-exec").is_file() {
             KernelSandboxMode::MacosSeatbeltEnforced
         } else {
@@ -693,13 +856,7 @@ fn apply_current_process_sandbox(
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
-        let _ = (
-            repo_root,
-            ephemeral_tmp,
-            writes_allowed,
-            invokes_git,
-            invokes_swarm_tool,
-        );
+        let _ = (repo_root, ephemeral_tmp, opts);
         KernelSandboxMode::FallbackEnvAndAstOnly
     }
 }
@@ -708,12 +865,10 @@ fn apply_current_process_sandbox(
 fn apply_linux_landlock(
     repo_root: &Path,
     ephemeral_tmp: Option<&Path>,
-    writes_allowed: bool,
-    invokes_git: bool,
-    invokes_swarm_tool: bool,
+    opts: SandboxPolicyOpts,
 ) -> KernelSandboxMode {
     use landlock::{
-        ABI, Access, AccessFs, BitFlags, CompatLevel, Compatible, Ruleset, RulesetAttr,
+        ABI, Access, AccessFs, AccessNet, BitFlags, CompatLevel, Compatible, Ruleset, RulesetAttr,
         RulesetCreatedAttr, RulesetStatus,
     };
 
@@ -723,11 +878,17 @@ fn apply_linux_landlock(
     let file_ro_access = BitFlags::from(AccessFs::ReadFile);
     let dir_list_access = BitFlags::from(AccessFs::ReadDir);
 
-    let Ok(created) = Ruleset::default()
+    let base_ruleset = Ruleset::default()
         .set_compatibility(CompatLevel::BestEffort)
-        .handle_access(rw_access)
-        .and_then(|r| r.create())
-    else {
+        .handle_access(rw_access);
+    let with_net = if opts.deny_net {
+        // Landlock ABI V4+ (`Linux 6.7+`): handling `AccessNet::from_all` with zero `NetPort`
+        // rules blocks all outbound `ConnectTcp` and listening `BindTcp` sockets at the LSM layer!
+        base_ruleset.and_then(|r| r.handle_access(AccessNet::from_all(abi)))
+    } else {
+        base_ruleset
+    };
+    let Ok(created) = with_net.and_then(|r| r.create()) else {
         return KernelSandboxMode::FallbackEnvAndAstOnly;
     };
 
@@ -767,11 +928,14 @@ fn apply_linux_landlock(
         }
     }
 
-    // Allow read+execute on the directory containing `agent-guard` itself so sibling `swarm-tool`
-    // binaries in non-installed build directories (e.g. `target/debug/swarm-tool`) can execute.
+    let home_opt = env::var_os("HOME").map(PathBuf::from);
+
+    // Allow read+execute on the directory containing `agent-guard` itself (e.g. `target/debug`),
+    // guarding strictly against `/` and `$HOME` so placing the binary in `$HOME` never exposes `~/.ssh`!
     if let Ok(exe) = env::current_exe()
         && let Some(exe_dir) = exe.parent()
         && exe_dir != Path::new("/")
+        && home_opt.as_deref() != Some(exe_dir)
         && exe_dir.is_dir()
     {
         add_path(exe_dir, ro_access);
@@ -798,8 +962,7 @@ fn apply_linux_landlock(
     }
 
     // 3. User-space toolchain directories (Rustup, Cargo, NVM/Volta/fnm) WITHOUT exposing ~/.ssh, ~/.aws, ~/.local/state/agent-guard
-    if let Some(home_os) = env::var_os("HOME") {
-        let home = PathBuf::from(home_os);
+    if let Some(ref home) = home_opt {
         let rustup = env::var_os("RUSTUP_HOME")
             .map(PathBuf::from)
             .unwrap_or_else(|| home.join(".rustup"));
@@ -817,7 +980,14 @@ fn apply_linux_landlock(
             for sub in ["registry", "git", ".package-cache", ".package-cache-mutate"] {
                 let sp = cargo_home.join(sub);
                 if sp.exists() {
-                    add_path(&sp, if writes_allowed { rw_access } else { ro_access });
+                    add_path(
+                        &sp,
+                        if opts.writes_allowed {
+                            rw_access
+                        } else {
+                            ro_access
+                        },
+                    );
                 }
             }
         }
@@ -845,7 +1015,7 @@ fn apply_linux_landlock(
     // 4b. Granular Swarm state access ONLY for atomic `swarm-tool` invocations:
     //     `<swarm_state_dir>/vault` (`hmac.key`) is UNCONDITIONALLY OMITTED (`EACCES`)!
     let canon_repo = fs::canonicalize(repo_root).unwrap_or_else(|_| repo_root.to_path_buf());
-    if invokes_swarm_tool {
+    if opts.invokes_swarm_tool {
         if let Ok(sdir) = crate::breadcrumbs::swarm_state_dir(&canon_repo) {
             for allowed_sub in ["ipc", "sessions", "spools", "ledger"] {
                 let sub_p = sdir.join(allowed_sub);
@@ -868,7 +1038,7 @@ fn apply_linux_landlock(
 
     // Pre-create `target` if writes are allowed and `Cargo.toml` exists so `cargo` can build even
     // on a fresh clean checkout where `target/` did not yet exist prior to `restrict_self()`.
-    if writes_allowed && canon_repo.join("Cargo.toml").is_file() {
+    if opts.writes_allowed && canon_repo.join("Cargo.toml").is_file() {
         let target_dir = canon_repo.join("target");
         if !target_dir.exists() {
             let _ = fs::create_dir(&target_dir);
@@ -894,7 +1064,21 @@ fn apply_linux_landlock(
 
             if name == ".git" {
                 if meta.file_type().is_dir() {
-                    add_path(&entry_path, dir_list_access);
+                    if opts.invokes_git && opts.writes_allowed {
+                        // Vetted atomic `git` commands (`git add`, `git commit`, `git checkout -b`)
+                        // require `.git/index.lock` and `.git/HEAD.lock` creation/rename inside `.git/`;
+                        // `cmd_policy` blocks `git config`/`remote`/`hook`/`-c`, `GIT_CONFIG_COUNT`
+                        // overrides `.git/config`, and `run_exec_sandbox_cli` verifies `.git/config` SHA-256!
+                        add_path(
+                            &entry_path,
+                            AccessFs::ReadDir
+                                | AccessFs::MakeReg
+                                | AccessFs::RemoveFile
+                                | AccessFs::Refer,
+                        );
+                    } else {
+                        add_path(&entry_path, dir_list_access);
+                    }
                     if let Ok(git_entries) = fs::read_dir(&entry_path) {
                         for ge in git_entries.flatten() {
                             let gname = ge.file_name().to_string_lossy().into_owned();
@@ -906,8 +1090,8 @@ fn apply_linux_landlock(
                                 add_path(&gpath, file_ro_access); // Read-only .git/config
                                 continue;
                             }
-                            let g_access = if (invokes_git && writes_allowed)
-                                || (invokes_swarm_tool && gname.eq_ignore_ascii_case("info"))
+                            let g_access = if (opts.invokes_git && opts.writes_allowed)
+                                || (opts.invokes_swarm_tool && gname.eq_ignore_ascii_case("info"))
                             {
                                 rw_access
                             } else if gpath.is_dir() {
@@ -925,7 +1109,7 @@ fn apply_linux_landlock(
             }
 
             if is_swarm_mutable_root_artifact(&name) {
-                if invokes_swarm_tool {
+                if opts.invokes_swarm_tool {
                     add_path(
                         &entry_path,
                         AccessFs::ReadFile | AccessFs::WriteFile | AccessFs::Truncate,
@@ -945,7 +1129,7 @@ fn apply_linux_landlock(
                 continue;
             }
 
-            let normal_access = if writes_allowed {
+            let normal_access = if opts.writes_allowed {
                 if meta.file_type().is_dir() {
                     rw_access
                 } else {
@@ -971,41 +1155,67 @@ fn apply_linux_landlock(
 }
 
 #[cfg(target_os = "macos")]
+fn escape_sbpl_literal(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len() + 8);
+    for ch in raw.chars() {
+        match ch {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' | '\r' | '\0' => {}
+            other => out.push(other),
+        }
+    }
+    out
+}
+
+#[cfg(target_os = "macos")]
 fn render_macos_seatbelt_profile(
     repo_root: &Path,
     ephemeral_tmp: Option<&Path>,
-    invokes_swarm_tool: bool,
+    opts: SandboxPolicyOpts,
 ) -> String {
     let canon_repo = fs::canonicalize(repo_root).unwrap_or_else(|_| repo_root.to_path_buf());
-    let repo_s = canon_repo.to_string_lossy().replace('"', "\\\"");
-    let home_s = env::var("HOME").unwrap_or_default().replace('"', "\\\"");
+    let repo_s = escape_sbpl_literal(&canon_repo.to_string_lossy());
+    let home_s = escape_sbpl_literal(&env::var("HOME").unwrap_or_default());
     let mut p = String::from("(version 1)\n(allow default)\n");
+
+    if opts.deny_net {
+        p.push_str("(deny network*)\n");
+    }
+
+    // Default-deny arbitrary filesystem writes outside `repo_root` and `ephemeral_tmp`
+    p.push_str("(deny file-write*)\n");
+    p.push_str("(allow file-write* (literal \"/dev/null\") (literal \"/dev/zero\") (literal \"/dev/urandom\") (literal \"/dev/random\"))\n");
+    if opts.writes_allowed {
+        p.push_str(&format!("(allow file-write* (subpath \"{repo_s}\"))\n"));
+    }
+
     if let Some(tmp) = ephemeral_tmp {
-        let tmp_s = tmp.to_string_lossy().replace('"', "\\\"");
+        let tmp_s = escape_sbpl_literal(&tmp.to_string_lossy());
         p.push_str(&format!(
             "(deny file-read* file-write* (subpath \"/tmp\") (subpath \"/private/tmp\") (subpath \"/var/tmp\") (subpath \"/private/var/tmp\"))\n(allow file-read* file-write* (subpath \"{tmp_s}\"))\n"
         ));
     }
     if !home_s.is_empty() {
         p.push_str(&format!(
-            "(deny file-read* file-write* (subpath \"{home_s}/.ssh\") (subpath \"{home_s}/.aws\") (subpath \"{home_s}/.gnupg\") (subpath \"{home_s}/.config/gh\") (subpath \"{home_s}/.local/state/agent-guard\"))\n"
+            "(deny file-read* file-write* (subpath \"{home_s}/.ssh\") (subpath \"{home_s}/.aws\") (subpath \"{home_s}/.gnupg\") (subpath \"{home_s}/.config/gh\") (subpath \"{home_s}/Library/Keychains\") (subpath \"{home_s}/.local/state/agent-guard\"))\n"
         ));
     }
-    if invokes_swarm_tool {
+    if opts.invokes_swarm_tool {
         if let Ok(sdir) = crate::breadcrumbs::swarm_state_dir(&canon_repo) {
             for sub in ["ipc", "sessions", "spools", "ledger"] {
-                let sp = sdir.join(sub).to_string_lossy().replace('"', "\\\"");
+                let sp = escape_sbpl_literal(&sdir.join(sub).to_string_lossy());
                 p.push_str(&format!(
                     "(allow file-read* file-write* (subpath \"{sp}\"))\n"
                 ));
             }
-            let vp = sdir.join("vault").to_string_lossy().replace('"', "\\\"");
+            let vp = escape_sbpl_literal(&sdir.join("vault").to_string_lossy());
             p.push_str(&format!(
                 "(deny file-read* file-write* (subpath \"{vp}\"))\n"
             ));
         }
         if let Ok(locks_dir) = crate::breadcrumbs::swarm_locks_dir() {
-            let lp = locks_dir.to_string_lossy().replace('"', "\\\"");
+            let lp = escape_sbpl_literal(&locks_dir.to_string_lossy());
             p.push_str(&format!(
                 "(allow file-read* file-write* (subpath \"{lp}\"))\n"
             ));
@@ -1016,10 +1226,30 @@ fn render_macos_seatbelt_profile(
         ));
     }
     p.push_str(&format!(
-        "(deny file-read* file-write* (regex #\"/\\.env($|\\.)\") (regex #\"\\.(pem|key|p12|pfx)$\") (regex #\"/audit\\.jsonl$\") (subpath \"{repo_s}/.git/hooks\"))\n"
+        "(deny file-read* file-write* (regex #\"/\\.env($|\\.)\") (regex #\"\\.(pem|key|p12|pfx)$\") (regex #\"/audit\\.jsonl$\") (subpath \"{repo_s}/.git/hooks\") (subpath \"{repo_s}/node_modules\") (subpath \"{repo_s}/.venv\") (subpath \"{repo_s}/vendor\"))\n"
     ));
     p.push_str(&format!(
         "(deny file-write* (literal \"{repo_s}/AGENTS.md\") (literal \"{repo_s}/.git/config\") (subpath \"{repo_s}/.claude\") (subpath \"{repo_s}/.codex\") (subpath \"{repo_s}/.cursor\") (subpath \"{repo_s}/.github\") (subpath \"{repo_s}/.cargo\") (literal \"{repo_s}/.gitattributes\") (literal \"{repo_s}/.npmrc\"))\n"
     ));
     p
+}
+
+#[cfg(test)]
+mod tests {
+    use super::drain_stream_bounded;
+    use std::io::Cursor;
+
+    #[test]
+    fn drain_stream_bounded_reads_full_eof_without_truncating_pipe() {
+        let mut big = Vec::new();
+        big.extend_from_slice(b"HEAD_MARKER\n");
+        big.extend(std::iter::repeat_n(b'x', 80_000));
+        big.extend_from_slice(b"\nTAIL_MARKER\n");
+        let drained = drain_stream_bounded(Cursor::new(big));
+        let text = String::from_utf8_lossy(&drained);
+        assert!(text.starts_with("HEAD_MARKER\n"));
+        assert!(text.ends_with("TAIL_MARKER\n"));
+        assert!(text.contains("exec-sandbox drained"));
+        assert!(drained.len() < 36_000);
+    }
 }

@@ -18,6 +18,7 @@ pub mod breadcrumbs;
 pub mod budget_guard;
 pub mod cmd_policy;
 pub mod coordinator;
+pub mod crypto;
 pub mod exec_sandbox;
 pub mod injection_scan;
 pub mod json;
@@ -25,7 +26,6 @@ pub mod path_policy;
 pub mod qa_suspects;
 pub mod role_sandbox;
 pub mod sanitizer;
-pub mod sha256;
 pub mod swarm_contracts;
 pub mod traversal_ledger;
 pub mod unicode_guard;
@@ -202,6 +202,7 @@ pub fn handle_pre_compact_hook(raw_json: &str, fallback_cwd: &Path) -> Decision 
         Err(dec) => return dec,
     };
     let session_id = extract_session_id(&parsed);
+    let _session_lock = SessionLedger::acquire_lock(&repo_root, &session_id);
     let mut ledger = SessionLedger::load_or_create(&repo_root, &session_id);
     ledger.compact_step(&repo_root);
     if let Err(e) = ledger.save(&repo_root) {
@@ -246,6 +247,7 @@ pub fn handle_pre_tool_hook(raw_json: &str, fallback_cwd: &Path) -> Decision {
         Err(bv) => return Decision::deny(bv.code, bv.detail, false),
     };
     let session_id = extract_session_id(&parsed);
+    let _session_lock = SessionLedger::acquire_lock(&repo_root, &session_id);
     let mut ledger = SessionLedger::load_or_create(&repo_root, &session_id);
 
     if let Err(msg) = ledger.record_tool_call_with_limit(profile.max_turn_tool_calls) {
@@ -1249,6 +1251,7 @@ pub fn handle_post_tool_hook(raw_json: &str, fallback_cwd: &Path) -> Decision {
         Err(bv) => return Decision::deny(bv.code, bv.detail, false),
     };
     let session_id = extract_session_id(&parsed);
+    let _session_lock = SessionLedger::acquire_lock(&repo_root, &session_id);
     let mut ledger = SessionLedger::load_or_create(&repo_root, &session_id);
 
     let output_text = extract_tool_response_text(&parsed);
@@ -1663,7 +1666,7 @@ pub fn audit_repository(repo_root: &Path) -> Result<Vec<String>, Vec<String>> {
                         body.len()
                     ));
                 } else {
-                    root_agents_sha256 = Some(sha256::sha256_hex(body.as_bytes()));
+                    root_agents_sha256 = Some(crypto::sha256_hex(body.as_bytes()));
                     checks_ok.push("Verified root AGENTS.md integrity & clean Unicode".to_string());
                 }
             }
@@ -1914,7 +1917,7 @@ fn is_canonical_dist_authority_artifact(
     let Ok(bytes) = fs::read(full_path) else {
         return false;
     };
-    let actual_hash = sha256::sha256_hex(&bytes);
+    let actual_hash = crypto::sha256_hex(&bytes);
     if actual_hash != *manifest_hash {
         return false;
     }
@@ -2159,6 +2162,8 @@ fn format_json_multiline(v: &JsonValue, indent: usize, out: &mut String) {
     match v {
         JsonValue::Null => out.push_str("null"),
         JsonValue::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
+        JsonValue::Int(i) => out.push_str(&i.to_string()),
+        JsonValue::Uint(u) => out.push_str(&u.to_string()),
         JsonValue::Number(n) => out.push_str(&n.to_string()),
         JsonValue::Str(s) => {
             if s.contains('\n') {
@@ -2408,6 +2413,8 @@ fn detect_search_bypass_params(input: &JsonValue, tool_name: &str) -> Option<Str
         if let Some(val) = input.get(key) {
             let is_truthy = match val {
                 JsonValue::Bool(b) => *b,
+                JsonValue::Int(i) => *i != 0,
+                JsonValue::Uint(u) => *u != 0,
                 JsonValue::Number(n) => *n != 0.0,
                 JsonValue::Str(s) => matches!(
                     s.trim().to_ascii_lowercase().as_str(),

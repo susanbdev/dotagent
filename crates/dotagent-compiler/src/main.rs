@@ -8,8 +8,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
+use agent_guard::crypto::sha256_hex;
 use agent_guard::json::JsonValue;
-use agent_guard::sha256::sha256_hex;
 use agent_guard::unicode_guard::{ScanMode, scan_unicode};
 
 const MAX_SKILL_BYTES: usize = 3_072; // <= 3 KiB per spec Law 4
@@ -49,9 +49,19 @@ fn main() -> ExitCode {
                 ExitCode::from(2)
             }
         },
-        _ => {
+        "--help" | "-h" | "help" => {
             println!("Usage: dotagent-compiler <build|verify> [dotagent_repo_root]");
             ExitCode::SUCCESS
+        }
+        "--version" | "-V" | "version" => {
+            println!("dotagent-compiler {}", env!("CARGO_PKG_VERSION"));
+            ExitCode::SUCCESS
+        }
+        other => {
+            eprintln!(
+                "[dotagent-compiler HARD DENY :: UNKNOWN_SUBCOMMAND] unrecognized subcommand '{other}' (expected build|verify|--help)"
+            );
+            ExitCode::from(2)
         }
     }
 }
@@ -1216,6 +1226,11 @@ fn render_cursor_hooks() -> String {
         "command": "agent-guard pre-tool"
       }
     ],
+    "afterFileEdit": [
+      {
+        "command": "agent-guard post-edit"
+      }
+    ],
     "stop": [
       {
         "command": "agent-guard on-stop"
@@ -1245,8 +1260,8 @@ exclude_slash_tmp = true
 [shell_environment_policy]
 inherit = "all"
 ignore_default_excludes = false
-exclude = ["AWS_*", "GITHUB_*", "GH_*", "ANTHROPIC_*", "OPENAI_*", "GEMINI_*", "*_TOKEN", "*_SECRET", "*_KEY"]
-include_only = ["PATH", "HOME", "USER", "LOGNAME", "SHELL", "LANG", "LC_*", "TERM", "GIT_CONFIG_GLOBAL", "GIT_CONFIG_NOSYSTEM", "AGENT_GUARD_*"]
+exclude = ["AWS_*", "GITHUB_*", "GH_*", "ANTHROPIC_*", "OPENAI_*", "GEMINI_*", "*_TOKEN", "*_SECRET", "*_KEY", "AGENT_GUARD_ALLOW_*"]
+include_only = ["PATH", "HOME", "USER", "LOGNAME", "SHELL", "LANG", "LC_*", "TERM", "CARGO_HOME", "RUSTUP_HOME", "XDG_RUNTIME_DIR", "GIT_CONFIG_GLOBAL", "GIT_CONFIG_NOSYSTEM", "AGENT_GUARD_PROFILE", "AGENT_GUARD_ROLE", "AGENT_GUARD_SESSION_ID", "AGENT_GUARD_STATE_DIR", "AGENT_GUARD_COORDINATOR_SOCK"]
 
 [mcp_servers.susanbdev]
 url = "https://mcp.zt.susanb.dev/mcp"

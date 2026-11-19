@@ -300,9 +300,10 @@ pub fn load_or_init_vault_hmac_key(repo_root: &Path) -> Result<[u8; 32], String>
     if !key_path.exists() && legacy_path.exists() {
         if let Ok(hex) = fs::read_to_string(&legacy_path) {
             if let Ok(parsed) = hex_decode_32(&hex) {
-                let _ = fs::hard_link(&legacy_path, &key_path);
-                set_file_0600(&key_path);
-                let _ = fs::remove_file(&legacy_path);
+                if fs::hard_link(&legacy_path, &key_path).is_ok() || key_path.exists() {
+                    set_file_0600(&key_path);
+                    let _ = fs::remove_file(&legacy_path);
+                }
                 return Ok(parsed);
             }
         }
@@ -329,7 +330,7 @@ pub fn load_or_init_vault_hmac_key(repo_root: &Path) -> Result<[u8; 32], String>
         .map(|d| d.as_nanos())
         .unwrap_or(0);
     let staging_path = vault_dir.join(format!(".hmac.key.init.{}_{}", std::process::id(), nanos));
-    let encoded = format!("{}\n", hex_encode(&key));
+    let mut encoded = format!("{}\n", hex_encode(&key));
     {
         let mut stage_file = OpenOptions::new()
             .write(true)
@@ -343,6 +344,8 @@ pub fn load_or_init_vault_hmac_key(repo_root: &Path) -> Result<[u8; 32], String>
             .sync_all()
             .map_err(|e| format!("failed fsyncing staging vault/hmac.key: {e}"))?;
     }
+    // Overwrite and clear the hex-encoded staging buffer immediately after writing
+    clear_secret_string(&mut encoded);
     set_file_0600(&staging_path);
 
     let link_res = fs::hard_link(&staging_path, &key_path);
@@ -350,22 +353,42 @@ pub fn load_or_init_vault_hmac_key(repo_root: &Path) -> Result<[u8; 32], String>
     match link_res {
         Ok(()) => Ok(key),
         Err(e) if e.kind() == ErrorKind::AlreadyExists => {
+            crate::crypto::zeroize_slice(&mut key);
             let hex = fs::read_to_string(&key_path)
                 .map_err(|re| format!("failed reading existing vault/hmac.key after race: {re}"))?;
             hex_decode_32(&hex)
         }
-        Err(e) => Err(format!("failed atomically publishing vault/hmac.key: {e}")),
+        Err(e) => {
+            crate::crypto::zeroize_slice(&mut key);
+            Err(format!("failed atomically publishing vault/hmac.key: {e}"))
+        }
     }
 }
+
+fn clear_secret_string(s: &mut String) {
+    let cap = s.capacity();
+    s.clear();
+    for _ in 0..cap {
+        s.push('\0');
+    }
+    std::hint::black_box(s.as_str());
+    std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
+    s.clear();
+}
+
+pub const BREADCRUMB_EVENT_HMAC_DOMAIN: &[u8] = b"DOTAGENT_SWARM_V2_BREADCRUMB_EVENT_V2";
 
 pub fn load_or_init_hmac_key(repo_root: &Path) -> Result<[u8; 32], String> {
     load_or_init_vault_hmac_key(repo_root)
 }
 
 pub fn compute_event_mac(key: &[u8; 32], event: &AuthenticatedEvent) -> Result<[u8; 32], String> {
+    let canonical = event.encode_canonical();
     let mut mac =
         HmacSha256::new_from_slice(key).map_err(|e| format!("HMAC key init failure: {e}"))?;
-    mac.update(&event.encode_canonical());
+    mac.update(BREADCRUMB_EVENT_HMAC_DOMAIN);
+    mac.update(&(canonical.len() as u64).to_be_bytes());
+    mac.update(&canonical);
     let tag = mac.finalize().into_bytes();
     let mut out = [0u8; 32];
     out.copy_from_slice(&tag);
@@ -377,9 +400,12 @@ pub fn verify_event_mac(
     event: &AuthenticatedEvent,
     expected_mac: &[u8; 32],
 ) -> Result<(), String> {
+    let canonical = event.encode_canonical();
     let mut mac =
         HmacSha256::new_from_slice(key).map_err(|e| format!("HMAC key init failure: {e}"))?;
-    mac.update(&event.encode_canonical());
+    mac.update(BREADCRUMB_EVENT_HMAC_DOMAIN);
+    mac.update(&(canonical.len() as u64).to_be_bytes());
+    mac.update(&canonical);
     mac.verify_slice(expected_mac).map_err(|_| {
         "HMAC-SHA256 authentication tag mismatch (tampered field or path swap)".to_string()
     })
@@ -390,31 +416,20 @@ pub fn compute_event_mac_for_repo(
     event: &AuthenticatedEvent,
 ) -> Result<[u8; 32], String> {
     let canonical = event.encode_canonical();
-    if crate::coordinator::ping_coordinator(repo_root) {
-        return crate::coordinator::rpc_compute_raw_hmac_bytes(repo_root, &canonical);
-    }
     if std::env::var("AGENT_GUARD_IN_SANDBOX").ok().as_deref() == Some("1") {
         return crate::coordinator::rpc_compute_raw_hmac_bytes(repo_root, &canonical);
     }
-    if crate::coordinator::ensure_coordinator_daemon(repo_root).is_ok() {
-        if let Ok(tag) = crate::coordinator::rpc_compute_raw_hmac_bytes(repo_root, &canonical) {
-            return Ok(tag);
+    match load_or_init_vault_hmac_key(repo_root) {
+        Ok(raw_key) => {
+            let zkey = crate::crypto::ZeroizingKey::new(raw_key);
+            compute_event_mac(&zkey, event)
         }
+        Err(_) => crate::coordinator::rpc_compute_raw_hmac_bytes(repo_root, &canonical),
     }
-    let key = load_or_init_vault_hmac_key(repo_root)?;
-    compute_event_mac(&key, event)
 }
 
-#[inline(never)]
 pub fn constant_time_eq_bytes(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    let mut diff = 0u8;
-    for (&x, &y) in a.iter().zip(b.iter()) {
-        diff |= std::hint::black_box(x ^ y);
-    }
-    std::hint::black_box(diff) == 0
+    crate::crypto::constant_time_eq_bytes(a, b)
 }
 
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
@@ -499,11 +514,33 @@ pub fn verify_event_mac_for_repo(
     event: &AuthenticatedEvent,
     expected_mac: &[u8; 32],
 ) -> Result<(), String> {
-    let actual = compute_event_mac_for_repo(repo_root, event)?;
-    if constant_time_eq_bytes(&actual, expected_mac) {
-        Ok(())
-    } else {
-        Err("HMAC-SHA256 authentication tag mismatch (tampered field or path swap)".to_string())
+    if std::env::var("AGENT_GUARD_IN_SANDBOX").ok().as_deref() == Some("1") {
+        let canonical = event.encode_canonical();
+        let valid = crate::coordinator::rpc_verify_event_mac(repo_root, &canonical, expected_mac)?;
+        return if valid {
+            Ok(())
+        } else {
+            Err("HMAC-SHA256 authentication tag mismatch (tampered field or path swap)".to_string())
+        };
+    }
+    match load_or_init_vault_hmac_key(repo_root) {
+        Ok(raw_key) => {
+            let zkey = crate::crypto::ZeroizingKey::new(raw_key);
+            verify_event_mac(&zkey, event, expected_mac)
+        }
+        Err(_) => {
+            let canonical = event.encode_canonical();
+            let valid =
+                crate::coordinator::rpc_verify_event_mac(repo_root, &canonical, expected_mac)?;
+            if valid {
+                Ok(())
+            } else {
+                Err(
+                    "HMAC-SHA256 authentication tag mismatch (tampered field or path swap)"
+                        .to_string(),
+                )
+            }
+        }
     }
 }
 
@@ -512,25 +549,21 @@ pub fn compute_arbitrary_hmac_hex(
     domain: &[u8],
     payload: &[u8],
 ) -> Result<String, String> {
-    if crate::coordinator::ping_coordinator(repo_root) {
-        return crate::coordinator::rpc_compute_domain_hmac_hex(repo_root, domain, payload);
-    }
     if std::env::var("AGENT_GUARD_IN_SANDBOX").ok().as_deref() == Some("1") {
         return crate::coordinator::rpc_compute_domain_hmac_hex(repo_root, domain, payload);
     }
-    if crate::coordinator::ensure_coordinator_daemon(repo_root).is_ok() {
-        if let Ok(hex) = crate::coordinator::rpc_compute_domain_hmac_hex(repo_root, domain, payload)
-        {
-            return Ok(hex);
+    match load_or_init_vault_hmac_key(repo_root) {
+        Ok(raw_key) => {
+            let zkey = crate::crypto::ZeroizingKey::new(raw_key);
+            let mut mac = HmacSha256::new_from_slice(zkey.as_bytes())
+                .map_err(|e| format!("HMAC key init failure: {e}"))?;
+            mac.update(domain);
+            mac.update(&(payload.len() as u64).to_be_bytes());
+            mac.update(payload);
+            Ok(hex_encode(&mac.finalize().into_bytes()))
         }
+        Err(_) => crate::coordinator::rpc_compute_domain_hmac_hex(repo_root, domain, payload),
     }
-    let key = load_or_init_vault_hmac_key(repo_root)?;
-    let mut mac =
-        HmacSha256::new_from_slice(&key).map_err(|e| format!("HMAC key init failure: {e}"))?;
-    mac.update(domain);
-    mac.update(&(payload.len() as u64).to_be_bytes());
-    mac.update(payload);
-    Ok(hex_encode(&mac.finalize().into_bytes()))
 }
 
 pub fn verify_arbitrary_hmac_hex(
@@ -539,20 +572,45 @@ pub fn verify_arbitrary_hmac_hex(
     payload: &[u8],
     expected_hex: &str,
 ) -> Result<(), String> {
-    let actual = compute_arbitrary_hmac_hex(repo_root, domain, payload)?;
-    let norm_expected: Vec<u8> = expected_hex
-        .trim()
-        .bytes()
-        .map(|b| b.to_ascii_lowercase())
-        .collect();
-    let norm_actual: Vec<u8> = actual.bytes().map(|b| b.to_ascii_lowercase()).collect();
-    if norm_actual.len() != norm_expected.len() {
+    let trimmed = expected_hex.trim();
+    if trimmed.len() != 64 {
         return Err("HMAC authentication tag length mismatch".to_string());
     }
-    if constant_time_eq_bytes(&norm_actual, &norm_expected) {
-        Ok(())
-    } else {
-        Err("HMAC authentication tag mismatch".to_string())
+    if std::env::var("AGENT_GUARD_IN_SANDBOX").ok().as_deref() == Some("1") {
+        let valid =
+            crate::coordinator::rpc_verify_domain_hmac(repo_root, domain, payload, trimmed)?;
+        return if valid {
+            Ok(())
+        } else {
+            Err("HMAC authentication tag mismatch".to_string())
+        };
+    }
+    match load_or_init_vault_hmac_key(repo_root) {
+        Ok(raw_key) => {
+            let zkey = crate::crypto::ZeroizingKey::new(raw_key);
+            let mut mac = HmacSha256::new_from_slice(zkey.as_bytes())
+                .map_err(|e| format!("HMAC key init failure: {e}"))?;
+            mac.update(domain);
+            mac.update(&(payload.len() as u64).to_be_bytes());
+            mac.update(payload);
+            let actual = hex_encode(&mac.finalize().into_bytes());
+            let norm_expected: Vec<u8> = trimmed.bytes().map(|b| b.to_ascii_lowercase()).collect();
+            let norm_actual: Vec<u8> = actual.bytes().map(|b| b.to_ascii_lowercase()).collect();
+            if constant_time_eq_bytes(&norm_actual, &norm_expected) {
+                Ok(())
+            } else {
+                Err("HMAC authentication tag mismatch".to_string())
+            }
+        }
+        Err(_) => {
+            let valid =
+                crate::coordinator::rpc_verify_domain_hmac(repo_root, domain, payload, trimmed)?;
+            if valid {
+                Ok(())
+            } else {
+                Err("HMAC authentication tag mismatch".to_string())
+            }
+        }
     }
 }
 
@@ -839,16 +897,24 @@ impl ExclusiveFileLockGuard {
                     return Ok(Self { lock_path });
                 }
                 Err(e) if e.kind() == ErrorKind::AlreadyExists => {
-                    // Recover stale lock older than 30 seconds if a previous process crashed
-                    if let Ok(meta) = fs::metadata(&lock_path) {
-                        if let Ok(modified) = meta.modified() {
-                            if modified
-                                .elapsed()
-                                .is_ok_and(|age| age > Duration::from_secs(30))
-                            {
-                                let _ = fs::remove_file(&lock_path);
-                                continue;
-                            }
+                    // Recover stale lock older than 30 seconds ONLY when the recorded holder PID
+                    // is no longer alive (preventing split-brain lock stealing under slow runs),
+                    // using atomic rename so concurrent waiters never delete a newly acquired lock.
+                    if let Ok(meta) = fs::metadata(&lock_path)
+                        && let Ok(modified) = meta.modified()
+                        && modified
+                            .elapsed()
+                            .is_ok_and(|age| age > Duration::from_secs(30))
+                        && is_lock_holder_dead(&lock_path)
+                    {
+                        let reclaim_tmp = locks_dir.join(format!(
+                            ".reclaim.{}.{}",
+                            &digest_hex[..16],
+                            std::process::id()
+                        ));
+                        if fs::rename(&lock_path, &reclaim_tmp).is_ok() {
+                            let _ = fs::remove_file(&reclaim_tmp);
+                            continue;
                         }
                     }
                     if attempt == 299 {
@@ -877,6 +943,30 @@ impl ExclusiveFileLockGuard {
 impl Drop for ExclusiveFileLockGuard {
     fn drop(&mut self) {
         let _ = fs::remove_file(&self.lock_path);
+    }
+}
+
+fn is_lock_holder_dead(lock_path: &Path) -> bool {
+    let Ok(raw) = fs::read_to_string(lock_path) else {
+        return true;
+    };
+    let Some(pid_str) = raw.trim().strip_prefix("pid=") else {
+        return true;
+    };
+    let Ok(pid) = pid_str.trim().parse::<u32>() else {
+        return true;
+    };
+    if pid == 0 {
+        return true;
+    }
+    #[cfg(target_os = "linux")]
+    {
+        !Path::new(&format!("/proc/{pid}")).exists()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = pid;
+        true
     }
 }
 

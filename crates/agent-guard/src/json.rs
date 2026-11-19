@@ -1,17 +1,28 @@
 #![forbid(unsafe_code)]
 
-//! Minimal, zero-dependency RFC 8259 JSON parser and serializer with strict
-//! recursion-depth cap and full UTF-16 surrogate-pair decoding so JSON-escaped
-//! Unicode Tag surrogate pairs (DB40..DC41) or Bidi (U+202E) payloads cannot evade inspection.
+//! Strict RFC 8259 + RFC 7493 (I-JSON) parser and serializer with:
+//! - Recursion-depth cap (`MAX_JSON_DEPTH = 32`)
+//! - Duplicate object-key rejection (closing first-wins vs last-wins parser differentials)
+//! - Exact 64-bit signed/unsigned integer preservation (`Int(i64)` / `Uint(u64)`) so integers
+//!   above `2^53` never round silently through `f64`
+//! - Strict RFC 8259 number grammar (rejecting leading zeros `01`, trailing dots `1.`, and `NaN`/`Inf`)
+//! - Full UTF-16 surrogate-pair decoding so JSON-escaped Unicode Tag surrogate pairs
+//!   (`DB40..DC41`) or Bidi (`U+202E`) payloads cannot evade inspection.
 
 use std::fmt::Write as _;
 
 const MAX_JSON_DEPTH: usize = 32;
+/// Exact `2^64` in `f64` (`18446744073709551616.0`); values must be strictly `<` this bound
+/// when converting `f64` to `u64` to avoid `u64::MAX` saturation rounding.
+const TWO_POW_64_F64: f64 = 18_446_744_073_709_551_616.0;
+const TWO_POW_63_F64: f64 = 9_223_372_036_854_775_808.0;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum JsonValue {
     Null,
     Bool(bool),
+    Int(i64),
+    Uint(u64),
     Number(f64),
     Str(String),
     Array(Vec<JsonValue>),
@@ -57,9 +68,38 @@ impl JsonValue {
 
     pub fn as_u64(&self) -> Option<u64> {
         match self {
-            JsonValue::Number(n) if *n >= 0.0 && n.fract() == 0.0 && *n <= (u64::MAX as f64) => {
+            JsonValue::Uint(u) => Some(*u),
+            JsonValue::Int(i) if *i >= 0 => Some(*i as u64),
+            JsonValue::Number(n)
+                if n.is_finite() && *n >= 0.0 && n.fract() == 0.0 && *n < TWO_POW_64_F64 =>
+            {
                 Some(*n as u64)
             }
+            _ => None,
+        }
+    }
+
+    pub fn as_i64(&self) -> Option<i64> {
+        match self {
+            JsonValue::Int(i) => Some(*i),
+            JsonValue::Uint(u) => i64::try_from(*u).ok(),
+            JsonValue::Number(n)
+                if n.is_finite()
+                    && n.fract() == 0.0
+                    && *n >= (i64::MIN as f64)
+                    && *n < TWO_POW_63_F64 =>
+            {
+                Some(*n as i64)
+            }
+            _ => None,
+        }
+    }
+
+    pub fn as_f64(&self) -> Option<f64> {
+        match self {
+            JsonValue::Number(n) if n.is_finite() => Some(*n),
+            JsonValue::Int(i) => Some(*i as f64),
+            JsonValue::Uint(u) => Some(*u as f64),
             _ => None,
         }
     }
@@ -89,9 +129,15 @@ impl JsonValue {
             JsonValue::Null => out.push_str("null"),
             JsonValue::Bool(true) => out.push_str("true"),
             JsonValue::Bool(false) => out.push_str("false"),
+            JsonValue::Int(i) => {
+                let _ = write!(out, "{i}");
+            }
+            JsonValue::Uint(u) => {
+                let _ = write!(out, "{u}");
+            }
             JsonValue::Number(n) => {
                 if n.is_finite() {
-                    if n.fract() == 0.0 && *n >= (i64::MIN as f64) && *n <= (i64::MAX as f64) {
+                    if n.fract() == 0.0 && *n >= (i64::MIN as f64) && *n < TWO_POW_63_F64 {
                         let _ = write!(out, "{}", *n as i64);
                     } else {
                         let _ = write!(out, "{n}");
@@ -197,32 +243,86 @@ impl<'a> Parser<'a> {
 
     fn parse_number(&mut self) -> Result<JsonValue, String> {
         let start = self.pos;
-        if self.peek() == Some(b'-') {
+        let negative = if self.peek() == Some(b'-') {
             self.pos += 1;
-        }
-        while let Some(b'0'..=b'9') = self.peek() {
-            self.pos += 1;
-        }
-        if self.peek() == Some(b'.') {
-            self.pos += 1;
-            while let Some(b'0'..=b'9') = self.peek() {
+            true
+        } else {
+            false
+        };
+
+        // RFC 8259 Section 6: integer part must be either a single '0' or '1'..'9' followed by digits.
+        match self.peek() {
+            Some(b'0') => {
                 self.pos += 1;
+                if matches!(self.peek(), Some(b'0'..=b'9')) {
+                    return Err(format!(
+                        "leading zero in JSON number forbidden (RFC 8259) at offset {start}"
+                    ));
+                }
+            }
+            Some(b'1'..=b'9') => {
+                self.pos += 1;
+                while matches!(self.peek(), Some(b'0'..=b'9')) {
+                    self.pos += 1;
+                }
+            }
+            _ => {
+                return Err(format!(
+                    "expected digit in JSON number at offset {}",
+                    self.pos
+                ));
             }
         }
+
+        let mut is_float = false;
+        if self.peek() == Some(b'.') {
+            is_float = true;
+            self.pos += 1;
+            let frac_start = self.pos;
+            while matches!(self.peek(), Some(b'0'..=b'9')) {
+                self.pos += 1;
+            }
+            if self.pos == frac_start {
+                return Err(format!(
+                    "expected digit after decimal point in JSON number at offset {start}"
+                ));
+            }
+        }
+
         if matches!(self.peek(), Some(b'e' | b'E')) {
+            is_float = true;
             self.pos += 1;
             if matches!(self.peek(), Some(b'+' | b'-')) {
                 self.pos += 1;
             }
-            while let Some(b'0'..=b'9') = self.peek() {
+            let exp_start = self.pos;
+            while matches!(self.peek(), Some(b'0'..=b'9')) {
                 self.pos += 1;
             }
+            if self.pos == exp_start {
+                return Err(format!("expected digit in JSON exponent at offset {start}"));
+            }
         }
+
         let slice = std::str::from_utf8(&self.bytes[start..self.pos])
             .map_err(|_| "invalid UTF-8 in number".to_string())?;
+
+        if !is_float && slice != "-0" {
+            if negative {
+                if let Ok(i) = slice.parse::<i64>() {
+                    return Ok(JsonValue::Int(i));
+                }
+            } else if let Ok(u) = slice.parse::<u64>() {
+                return Ok(JsonValue::Uint(u));
+            }
+        }
+
         let num: f64 = slice
             .parse()
             .map_err(|_| format!("invalid JSON number '{slice}'"))?;
+        if !num.is_finite() {
+            return Err(format!("non-finite JSON number '{slice}' rejected"));
+        }
         Ok(JsonValue::Number(num))
     }
 
@@ -335,7 +435,7 @@ impl<'a> Parser<'a> {
     fn parse_object(&mut self, depth: usize) -> Result<JsonValue, String> {
         self.pos += 1; // '{'
         self.skip_ws();
-        let mut entries = Vec::new();
+        let mut entries: Vec<(String, JsonValue)> = Vec::new();
         if self.peek() == Some(b'}') {
             self.pos += 1;
             return Ok(JsonValue::Object(entries));
@@ -343,6 +443,11 @@ impl<'a> Parser<'a> {
         loop {
             self.skip_ws();
             let key = self.parse_string()?;
+            if entries.iter().any(|(existing, _)| existing == &key) {
+                return Err(format!(
+                    "duplicate JSON object key '{key}' rejected (RFC 7493 I-JSON anti-differential)"
+                ));
+            }
             self.skip_ws();
             if self.peek() != Some(b':') {
                 return Err(format!("expected ':' after key at offset {}", self.pos));
@@ -371,10 +476,48 @@ mod tests {
 
     #[test]
     fn decodes_surrogate_pair_unicode_tag() {
-        // High surrogate DB40 + low surrogate DC41 -> U+E0041 (Unicode Tag Latin Capital Letter A)
         let raw = concat!("{\"payload\":\"\\", "udb40\\", "udc41\"}");
         let v = JsonValue::parse(raw).expect("valid JSON");
         let s = v.get("payload").and_then(JsonValue::as_str).expect("str");
         assert_eq!(s.chars().next(), char::from_u32(0xE0041));
+    }
+
+    #[test]
+    fn rejects_duplicate_object_keys_and_malformed_numbers() {
+        let dup = r#"{"tool_input":{"command":"rm -rf /"},"tool_input":{"command":"echo ok"}}"#;
+        let err = JsonValue::parse(dup).expect_err("duplicate keys must be rejected");
+        assert!(err.contains("duplicate JSON object key"));
+
+        for bad_num in ["01", "-01", "1.", "1.e2", "1e", "1e+", "-"] {
+            assert!(
+                JsonValue::parse(bad_num).is_err(),
+                "must reject non-RFC8259 number '{bad_num}'"
+            );
+        }
+    }
+
+    #[test]
+    fn preserves_exact_64_bit_integers_beyond_f64_mantissa() {
+        let raw = format!(
+            r#"{{"u_max":{},"i_min":{},"above_53":{}}}"#,
+            u64::MAX,
+            i64::MIN,
+            9_007_199_254_740_993u64
+        );
+        let parsed = JsonValue::parse(&raw).expect("parse exact 64-bit ints");
+        assert_eq!(
+            parsed.get("u_max").and_then(JsonValue::as_u64),
+            Some(u64::MAX)
+        );
+        assert_eq!(
+            parsed.get("i_min").and_then(JsonValue::as_i64),
+            Some(i64::MIN)
+        );
+        assert_eq!(
+            parsed.get("above_53").and_then(JsonValue::as_u64),
+            Some(9_007_199_254_740_993u64)
+        );
+        let roundtrip = JsonValue::parse(&parsed.to_json_string()).expect("roundtrip");
+        assert_eq!(roundtrip, parsed);
     }
 }

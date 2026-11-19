@@ -93,11 +93,51 @@ fn main() -> ExitCode {
             run_read_safe(p, &args[2..], &cwd)
         }
         "post-edit" => {
-            let Some(file) = args.get(1) else {
+            if let Some(file) = args.get(1).filter(|a| a.as_str() != "--json") {
+                emit_cli_decision(handle_post_edit(file, &cwd))
+            } else if args.get(1).map(String::as_str) == Some("--json")
+                || !std::io::IsTerminal::is_terminal(&io::stdin())
+            {
+                let payload = match read_bounded_stdin_or_arg(&args[1..]) {
+                    Ok(s) => s,
+                    Err(msg) => return emit_hook_denial("HOOK_INPUT_OVERFLOW", &msg, false),
+                };
+                if payload.trim().is_empty() {
+                    eprintln!("[AGENT-GUARD] usage: agent-guard post-edit <file>");
+                    return ExitCode::from(2);
+                }
+                let parsed = match JsonValue::parse(&payload) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        return emit_hook_denial(
+                            "MALFORMED_HOOK_JSON",
+                            &format!("Invalid JSON in post-edit hook stdin: {e}"),
+                            false,
+                        );
+                    }
+                };
+                let target_file = parsed
+                    .get("file_path")
+                    .and_then(JsonValue::as_str)
+                    .or_else(|| parsed.get("path").and_then(JsonValue::as_str))
+                    .or_else(|| {
+                        parsed
+                            .get("tool_input")
+                            .and_then(|ti| ti.get("file_path").or_else(|| ti.get("path")))
+                            .and_then(JsonValue::as_str)
+                    });
+                let Some(file) = target_file.filter(|s| !s.trim().is_empty()) else {
+                    return emit_hook_denial(
+                        "MISSING_POST_EDIT_PATH",
+                        "post-edit hook payload missing non-empty 'file_path' or 'path'.",
+                        false,
+                    );
+                };
+                emit_cli_decision(handle_post_edit(file, &cwd))
+            } else {
                 eprintln!("[AGENT-GUARD] usage: agent-guard post-edit <file>");
-                return ExitCode::from(2);
-            };
-            emit_cli_decision(handle_post_edit(file, &cwd))
+                ExitCode::from(2)
+            }
         }
         "on-stop" => run_on_stop(&cwd),
         "check-cmd" => {
@@ -175,9 +215,9 @@ fn main() -> ExitCode {
             println!("agent-guard {}", env!("CARGO_PKG_VERSION"));
             ExitCode::SUCCESS
         }
-        _ => {
+        "--help" | "-h" | "help" => {
             println!(
-                "agent-guard {} — Zero-Trust AI Agent Security Kernel\n\
+                "agent-guard {} - Zero-Trust AI Agent Security Kernel\n\
                  Commands:\n\
                  \x20 pre-tool              PreToolUse / BeforeTool JSON hook gate (stdin)\n\
                  \x20 post-tool             PostToolUse / AfterTool JSON output scanner (stdin)\n\
@@ -187,7 +227,7 @@ fn main() -> ExitCode {
                  \x20 sandbox-status        Report active host kernel VFS sandbox enforcement mode\n\
                  \x20 sanitize-stream       Pre-buffer 7-bit ASCII sanitizer & 120-line stream compactor\n\
                  \x20 read-safe <path>      Read & neuter file into 128-bit spotlighted 7-bit ASCII\n\
-                 \x20 post-edit <file>      Incremental post-edit Unicode/secret/immutability check\n\
+                 \x20 post-edit [file]      Incremental post-edit Unicode/secret/immutability check\n\
                  \x20 on-stop               Verification & git-hook lockdown gate before completion\n\
                  \x20 check-cmd \"<cmd>\"     Validate a shell command against the AST policy\n\
                  \x20 check-path <path>     Validate a path (--write for write check)\n\
@@ -197,6 +237,13 @@ fn main() -> ExitCode {
             );
             ExitCode::SUCCESS
         }
+        other => emit_hook_denial(
+            "UNKNOWN_SUBCOMMAND",
+            &format!(
+                "Unrecognized agent-guard subcommand '{other}' (run 'agent-guard --help' for usage)."
+            ),
+            false,
+        ),
     }
 }
 
@@ -249,6 +296,7 @@ fn run_read_safe(raw_path: &str, extra: &[String], cwd: &Path) -> ExitCode {
     };
 
     let sid = std::env::var("AGENT_GUARD_SESSION_ID").unwrap_or_else(|_| "default".to_string());
+    let _session_lock = SessionLedger::acquire_lock(&repo_root, &sid);
     let mut ledger = SessionLedger::load_or_create(&repo_root, &sid);
     match pre_inspect_file_for_ingestion(
         &valid.canonical_or_norm,
@@ -539,7 +587,7 @@ fn resolve_nonsymlink_dist_bundle_artifact(
     }
 
     let bytes = std::fs::read(&cur).ok()?;
-    let actual_hex = agent_guard::sha256::sha256_hex(&bytes);
+    let actual_hex = agent_guard::crypto::sha256_hex(&bytes);
 
     // ONLY `dist/AGENTS.md` (matching non-symlink root `AGENTS.md`) and `dist/gemini/GEMINI.md`
     // (matching the compiled-in `CANONICAL_DIST_GEMINI_SHA256` constant) may receive
@@ -551,7 +599,7 @@ fn resolve_nonsymlink_dist_bundle_artifact(
             return None;
         }
         let root_bytes = std::fs::read(&root_agents).ok()?;
-        if agent_guard::sha256::sha256_hex(&root_bytes) == actual_hex {
+        if agent_guard::crypto::sha256_hex(&root_bytes) == actual_hex {
             return Some((cur, rel, true));
         }
         return None;

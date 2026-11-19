@@ -72,6 +72,19 @@ pub fn inspect_file_on_disk_hygiene(path: &Path) -> Result<String, BudgetViolati
         code: "FILE_OPEN_ERROR",
         detail: format!("Cannot open '{}': {e}", path.display()),
     })?;
+    let fd_meta = file.metadata().map_err(|e| BudgetViolation {
+        code: "FILE_STAT_ERROR",
+        detail: format!("Cannot fstat '{}': {e}", path.display()),
+    })?;
+    if !fd_meta.file_type().is_file() || fd_meta.len() > MAX_SLICED_FILE_BYTES {
+        return Err(BudgetViolation {
+            code: "FILE_TOCTOU_REJECTED",
+            detail: format!(
+                "Opened descriptor for '{}' failed regular-file or size check (TOCTOU swap blocked).",
+                path.display()
+            ),
+        });
+    }
 
     let mut raw = Vec::new();
     file.take(cap as u64)
@@ -356,6 +369,7 @@ pub struct RuntimeProfile {
     pub profile_id: String,
     pub enable_write_tools: bool,
     pub write_scope_none: bool,
+    pub network_access_none: bool,
     pub max_raw_file_bytes: u64,
     pub max_slice_lines: usize,
     pub max_single_line_bytes: usize,
@@ -371,6 +385,7 @@ impl RuntimeProfile {
             profile_id: "coding-agent".to_string(),
             enable_write_tools: true,
             write_scope_none: false,
+            network_access_none: false,
             max_raw_file_bytes: MAX_RAW_FILE_BYTES,
             max_slice_lines: MAX_SLICE_LINES,
             max_single_line_bytes: MAX_SINGLE_LINE_BYTES,
@@ -386,6 +401,7 @@ impl RuntimeProfile {
             profile_id: "research-readonly".to_string(),
             enable_write_tools: false,
             write_scope_none: true,
+            network_access_none: true,
             max_raw_file_bytes: MAX_RAW_FILE_BYTES,
             max_slice_lines: MAX_SLICE_LINES,
             max_single_line_bytes: MAX_SINGLE_LINE_BYTES,
@@ -422,19 +438,23 @@ pub fn load_profile_by_id(
             p
         }
         "research-readonly"
+        | "adversarial-reviewer"
         | "swarm-master"
         | "swarm-investigator"
         | "swarm-adversarial-reviewer"
         | "swarm-forensic-coroner" => {
             let mut p = RuntimeProfile::research_readonly_default();
             p.profile_id = profile_id.to_string();
+            if profile_id == "adversarial-reviewer" {
+                p.max_turn_tokens = MAX_TURN_TOKENS;
+            }
             p
         }
         other => {
             return Err(BudgetViolation {
                 code: "UNKNOWN_RUNTIME_PROFILE",
                 detail: format!(
-                    "Unrecognized AGENT_GUARD_PROFILE '{other}' (expected 'coding-agent', 'research-readonly', or 'swarm-*')."
+                    "Unrecognized AGENT_GUARD_PROFILE '{other}' (expected 'coding-agent', 'research-readonly', 'adversarial-reviewer', or 'swarm-*')."
                 ),
             });
         }
@@ -465,80 +485,411 @@ pub fn load_profile_by_id(
                     detail: format!("Profile '{}' exceeds 16 KiB ceiling.", toml_path.display()),
                 });
             }
-            if let Ok(file) = File::open(&toml_path) {
-                let mut buf = Vec::new();
-                if file.take(16_384).read_to_end(&mut buf).is_ok()
-                    && let Ok(text) = String::from_utf8(buf)
-                {
-                    apply_profile_toml_tightening(&mut profile, &text);
-                }
+            let file = File::open(&toml_path).map_err(|e| BudgetViolation {
+                code: "UNREADABLE_PROFILE_BLOCKED",
+                detail: format!("Failed opening profile '{}': {e}", toml_path.display()),
+            })?;
+            let fmeta = file.metadata().map_err(|e| BudgetViolation {
+                code: "UNREADABLE_PROFILE_BLOCKED",
+                detail: format!("Failed fstat on profile '{}': {e}", toml_path.display()),
+            })?;
+            if !fmeta.is_file() || fmeta.len() > 16_384 {
+                return Err(BudgetViolation {
+                    code: "OVERSIZED_PROFILE_BLOCKED",
+                    detail: format!(
+                        "Profile '{}' failed open descriptor validation.",
+                        toml_path.display()
+                    ),
+                });
             }
+            let mut buf = Vec::new();
+            file.take(16_385)
+                .read_to_end(&mut buf)
+                .map_err(|e| BudgetViolation {
+                    code: "UNREADABLE_PROFILE_BLOCKED",
+                    detail: format!("Failed reading profile '{}': {e}", toml_path.display()),
+                })?;
+            let text = String::from_utf8(buf).map_err(|_| BudgetViolation {
+                code: "MALFORMED_PROFILE_TOML",
+                detail: format!("Profile '{}' is not valid UTF-8.", toml_path.display()),
+            })?;
+            apply_profile_toml_tightening(&mut profile, &text)?;
         }
     }
 
     Ok(profile)
 }
 
-fn apply_profile_toml_tightening(profile: &mut RuntimeProfile, toml_text: &str) {
-    for raw_line in toml_text.lines() {
-        let line = raw_line.split('#').next().unwrap_or("").trim();
-        let Some((k, v)) = line.split_once('=') else {
+fn strip_toml_comment(line: &str) -> &str {
+    let mut in_quotes = false;
+    let mut escape = false;
+    for (idx, ch) in line.char_indices() {
+        if escape {
+            escape = false;
             continue;
-        };
-        let key = k.trim();
-        let val = v.trim().trim_matches('"');
-        match key {
-            "enable_write_tools" if val == "false" => {
-                profile.enable_write_tools = false;
-            }
-            "write_scope" if val == "none" => {
-                profile.write_scope_none = true;
-                profile.enable_write_tools = false;
-            }
-            "max_raw_file_bytes" => {
-                if let Ok(n) = val.parse::<u64>() {
-                    profile.max_raw_file_bytes = profile.max_raw_file_bytes.min(n.max(1024));
-                }
-            }
-            "max_slice_lines" => {
-                if let Ok(n) = val.parse::<usize>() {
-                    profile.max_slice_lines = profile.max_slice_lines.min(n.max(10));
-                }
-            }
-            "max_single_line_bytes" => {
-                if let Ok(n) = val.parse::<usize>() {
-                    profile.max_single_line_bytes = profile.max_single_line_bytes.min(n.max(128));
-                }
-            }
-            "max_turn_tokens" => {
-                if let Ok(n) = val.parse::<usize>() {
-                    profile.max_turn_tokens = profile.max_turn_tokens.min(n.max(512));
-                }
-            }
-            "max_turn_file_reads" => {
-                if let Ok(n) = val.parse::<usize>() {
-                    profile.max_turn_file_reads = profile.max_turn_file_reads.min(n.max(1));
-                }
-            }
-            "max_turn_tool_calls" => {
-                if let Ok(n) = val.parse::<usize>() {
-                    profile.max_turn_tool_calls = profile.max_turn_tool_calls.min(n.max(1));
-                }
-            }
-            "max_return_summary_ascii_tokens" | "subagent_airlock_max_tokens" => {
-                if let Ok(n) = val.parse::<usize>() {
-                    let cur = profile.max_return_summary_ascii_tokens.unwrap_or(200);
-                    profile.max_return_summary_ascii_tokens = Some(cur.min(n.max(16)));
-                }
-            }
-            _ => {}
+        }
+        if ch == '\\' && in_quotes {
+            escape = true;
+            continue;
+        }
+        if ch == '"' {
+            in_quotes = !in_quotes;
+            continue;
+        }
+        if ch == '#' && !in_quotes {
+            return &line[..idx];
         }
     }
+    line
+}
+
+fn require_invariant(cond: bool, key: &str, detail: &str) -> Result<(), BudgetViolation> {
+    if cond {
+        Ok(())
+    } else {
+        Err(BudgetViolation {
+            code: "PROFILE_INVARIANT_LOOSENED",
+            detail: format!("Profile key '{key}' violates kernel security invariant: {detail}"),
+        })
+    }
+}
+
+fn parse_positive_usize(val: &str, key: &str) -> Result<usize, BudgetViolation> {
+    val.parse::<usize>().map_err(|_| BudgetViolation {
+        code: "MALFORMED_PROFILE_TOML",
+        detail: format!("Profile key '{key}' expected non-negative integer, got '{val}'."),
+    })
+}
+
+fn apply_profile_toml_tightening(
+    profile: &mut RuntimeProfile,
+    toml_text: &str,
+) -> Result<(), BudgetViolation> {
+    let mut section = String::new();
+    let baseline_ro = !profile.enable_write_tools || profile.write_scope_none;
+    let baseline_net_none = profile.network_access_none;
+
+    for raw_line in toml_text.lines() {
+        let line = strip_toml_comment(raw_line).trim();
+        if line.is_empty() {
+            continue;
+        }
+        if line.starts_with('[') && line.ends_with(']') {
+            let sec = line[1..line.len() - 1].trim();
+            match sec {
+                "authority" | "git" | "traversal" | "sanitization" | "budgets" | "isolation"
+                | "swarm" | "mcp" => {
+                    section = sec.to_string();
+                    continue;
+                }
+                other => {
+                    return Err(BudgetViolation {
+                        code: "UNKNOWN_PROFILE_KEY",
+                        detail: format!(
+                            "Unrecognized TOML section '[{other}]' in profile '{}' .",
+                            profile.profile_id
+                        ),
+                    });
+                }
+            }
+        }
+        let Some((k, v)) = line.split_once('=') else {
+            return Err(BudgetViolation {
+                code: "MALFORMED_PROFILE_TOML",
+                detail: format!(
+                    "Malformed line '{line}' in profile '{}'.",
+                    profile.profile_id
+                ),
+            });
+        };
+        let key = k.trim();
+        let raw_val = v.trim();
+        let val = raw_val.trim_matches('"');
+
+        match (section.as_str(), key) {
+            ("", "profile_id") => {
+                require_invariant(
+                    val == profile.profile_id,
+                    "profile_id",
+                    "must match requested profile identifier",
+                )?;
+            }
+            ("", "version") | ("", "role") | ("", "skill") | ("", "rust_cli") => {
+                require_invariant(!val.is_empty(), key, "metadata field must not be empty")?;
+            }
+            ("", "privilege_tier") => {
+                require_invariant(val == "ring-1", key, "must remain 'ring-1'")?;
+            }
+            ("", "source_read_scope") => {
+                require_invariant(val == "none", key, "only 'none' is valid when set")?;
+            }
+            ("", "approval_authority") => {
+                require_invariant(
+                    !matches!(val, "autonomous" | "unrestricted" | "all" | "*"),
+                    key,
+                    "cannot grant autonomous approval authority",
+                )?;
+            }
+            ("", "enable_write_tools") => match val {
+                "false" => profile.enable_write_tools = false,
+                "true" => require_invariant(
+                    !baseline_ro,
+                    key,
+                    "cannot enable write tools on a read-only profile",
+                )?,
+                _ => {
+                    return Err(BudgetViolation {
+                        code: "MALFORMED_PROFILE_TOML",
+                        detail: format!("Invalid boolean '{val}' for enable_write_tools."),
+                    });
+                }
+            },
+            ("", "write_scope") => match val {
+                "none" => {
+                    profile.write_scope_none = true;
+                    profile.enable_write_tools = false;
+                }
+                "repo-bounded-non-control-plane"
+                | "session-allowed-write-paths-only"
+                | "tests-and-attribution-only" => {
+                    require_invariant(
+                        !baseline_ro,
+                        key,
+                        "cannot widen write_scope on a read-only profile",
+                    )?;
+                }
+                _ => {
+                    return Err(BudgetViolation {
+                        code: "PROFILE_INVARIANT_LOOSENED",
+                        detail: format!("Unsupported or overly broad write_scope '{val}'."),
+                    });
+                }
+            },
+            ("", "network_access") | ("swarm", "network_access") => match val {
+                "none" | "false" => profile.network_access_none = true,
+                "allowlisted" | "proxy-only" | "true" => require_invariant(
+                    !baseline_net_none,
+                    key,
+                    "cannot re-enable network access on an offline profile",
+                )?,
+                _ => {
+                    return Err(BudgetViolation {
+                        code: "PROFILE_INVARIANT_LOOSENED",
+                        detail: format!("Unsupported network_access '{val}'."),
+                    });
+                }
+            },
+            ("authority", "root_file") => {
+                require_invariant(val == "AGENTS.md", key, "must equal 'AGENTS.md'")?;
+            }
+            ("authority", "allow_nested_authority_files")
+            | ("authority", "allow_shadow_authority_files") => {
+                require_invariant(val == "false", key, "must equal false")?;
+            }
+            ("authority", "treat_all_other_files_as_untrusted") => {
+                require_invariant(val == "true", key, "must equal true")?;
+            }
+            ("git", "disable_all_hooks") | ("git", "protect_hfs") | ("git", "protect_ntfs") => {
+                require_invariant(val == "true", key, "must equal true")?;
+            }
+            ("git", "hooks_path") | ("git", "attributes_file") => {
+                require_invariant(val == "/dev/null", key, "must equal '/dev/null'")?;
+            }
+            ("git", "fsmonitor")
+            | ("git", "submodule_recurse")
+            | ("git", "allow_force_push")
+            | ("git", "allow_history_rewrite")
+            | ("git", "allow_autonomous_push") => {
+                require_invariant(val == "false", key, "must equal false")?;
+            }
+            ("git", "gc_auto") => {
+                require_invariant(val == "0", key, "must equal 0")?;
+            }
+            ("git", "allowed_protocols") => {
+                let compact: String = raw_val.chars().filter(|c| !c.is_whitespace()).collect();
+                require_invariant(
+                    compact == "[\"https\"]",
+                    key,
+                    "must restrict git protocols strictly to [\"https\"]",
+                )?;
+            }
+            ("traversal", "max_directory_walk_depth") => {
+                let depth = parse_positive_usize(val, key)?;
+                let max_allowed = if profile.profile_id == "swarm-investigator" {
+                    20
+                } else {
+                    2
+                };
+                require_invariant(
+                    depth <= max_allowed,
+                    key,
+                    "exceeds profile traversal depth ceiling",
+                )?;
+            }
+            ("traversal", "allow_repo_search") => {
+                require_invariant(matches!(val, "true" | "false"), key, "must be boolean")?;
+            }
+            ("traversal", "max_reference_pointer_levels") => {
+                let levels = parse_positive_usize(val, key)?;
+                require_invariant(levels <= 2, key, "cannot exceed 2-hop A->B ceiling")?;
+            }
+            ("traversal", "halt_on_poisoned_pointer") => {
+                require_invariant(val == "true", key, "must equal true")?;
+            }
+            ("traversal", "forbidden_zones") => {
+                for mandatory in ["\"tmp\"", "\"cache\"", "\"dependencies\"", "\"secrets\""] {
+                    require_invariant(
+                        raw_val.contains(mandatory),
+                        key,
+                        "must retain mandatory forbidden zones (tmp, cache, dependencies, secrets)",
+                    )?;
+                }
+            }
+            ("sanitization", "pre_buffer_ascii_only")
+            | ("sanitization", "defang_escape_sequences")
+            | ("sanitization", "strip_ansi_and_cr") => {
+                require_invariant(val == "true", key, "must equal true")?;
+            }
+            ("sanitization", "per_step_spotlight_nonce_bits") => {
+                let bits = parse_positive_usize(val, key)?;
+                require_invariant(bits >= 128, key, "nonce entropy must be >= 128 bits")?;
+            }
+            ("budgets", "max_raw_file_bytes") | ("", "max_raw_file_bytes") => {
+                let n = val.parse::<u64>().map_err(|_| BudgetViolation {
+                    code: "MALFORMED_PROFILE_TOML",
+                    detail: format!("Invalid u64 '{val}' for max_raw_file_bytes."),
+                })?;
+                profile.max_raw_file_bytes = profile.max_raw_file_bytes.min(n.max(1024));
+            }
+            ("budgets", "max_slice_lines") | ("", "max_slice_lines") => {
+                let n = parse_positive_usize(val, key)?;
+                profile.max_slice_lines = profile.max_slice_lines.min(n.max(10));
+            }
+            ("budgets", "max_unsliced_lines") => {
+                let n = parse_positive_usize(val, key)?;
+                require_invariant(n <= 300, key, "cannot exceed 300 unsliced lines")?;
+            }
+            ("budgets", "max_single_line_bytes") | ("", "max_single_line_bytes") => {
+                let n = parse_positive_usize(val, key)?;
+                profile.max_single_line_bytes = profile.max_single_line_bytes.min(n.max(128));
+            }
+            ("budgets", "step_soft_compact_tokens") => {
+                let n = parse_positive_usize(val, key)?;
+                require_invariant(
+                    n <= MAX_TURN_TOKENS,
+                    key,
+                    "cannot exceed turn token ceiling",
+                )?;
+            }
+            ("budgets", "max_turn_tokens") | ("", "max_turn_tokens") => {
+                let n = parse_positive_usize(val, key)?;
+                profile.max_turn_tokens = profile.max_turn_tokens.min(n.max(512));
+            }
+            ("budgets", "max_turn_file_reads") | ("", "max_turn_file_reads") => {
+                let n = parse_positive_usize(val, key)?;
+                profile.max_turn_file_reads = profile.max_turn_file_reads.min(n.max(1));
+            }
+            ("budgets", "max_turn_tool_calls") | ("", "max_turn_tool_calls") => {
+                let n = parse_positive_usize(val, key)?;
+                profile.max_turn_tool_calls = profile.max_turn_tool_calls.min(n.max(1));
+            }
+            ("budgets", "auto_compact_pct_override") => {
+                let n = parse_positive_usize(val, key)?;
+                require_invariant((1..=100).contains(&n), key, "must be percentage 1..=100")?;
+            }
+            ("budgets", "compact_after_every_step") => {
+                require_invariant(val == "true", key, "must equal true")?;
+            }
+            ("budgets", "max_return_summary_ascii_tokens")
+            | ("isolation", "subagent_airlock_max_tokens")
+            | ("swarm", "max_packet_ascii_tokens")
+            | ("", "max_return_summary_ascii_tokens")
+            | ("", "subagent_airlock_max_tokens") => {
+                let n = parse_positive_usize(val, key)?;
+                let cur = profile.max_return_summary_ascii_tokens.unwrap_or(200);
+                profile.max_return_summary_ascii_tokens = Some(cur.min(n.max(16)));
+            }
+            ("isolation", "disable_auto_memory")
+            | ("isolation", "per_repo_state_namespace")
+            | ("isolation", "block_cross_repo_reads")
+            | ("isolation", "taint_gates_privileged_clis") => {
+                require_invariant(val == "true", key, "must equal true")?;
+            }
+            ("swarm", "env_role") | ("swarm", "escalation_triggers") => {
+                require_invariant(!val.is_empty(), key, "swarm config must not be empty")?;
+            }
+            ("swarm", "max_adversarial_rounds") => {
+                let n = parse_positive_usize(val, key)?;
+                require_invariant((1..=2).contains(&n), key, "must be 1..=2")?;
+            }
+            ("swarm", "arbitrary_url_fetch") => {
+                require_invariant(val == "false", key, "must equal false")?;
+            }
+            ("swarm", "doc_broker") => {
+                require_invariant(
+                    val == "lockfile-pinned-offline",
+                    key,
+                    "must be offline lockfile-pinned",
+                )?;
+            }
+            ("swarm", "lazy_spawn_on_smell_only")
+            | ("swarm", "require_green_tree_oid_checkpoint")
+            | ("swarm", "require_two_plus_two_work_ledger")
+            | ("swarm", "fail_closed_on_stop")
+            | ("swarm", "typed_worker_packets_only")
+            | ("swarm", "clean_slate_retry") => {
+                require_invariant(val == "true", key, "must equal true")?;
+            }
+            ("swarm", "security_domain_coverage_floor_pct") => {
+                let n = parse_positive_usize(val, key)?;
+                require_invariant(
+                    (90..=100).contains(&n),
+                    key,
+                    "coverage floor must be 90..=100",
+                )?;
+            }
+            ("swarm", "primary_suspect_cardinality") => {
+                let n = parse_positive_usize(val, key)?;
+                require_invariant(n == 1, key, "primary_suspect_cardinality must equal 1")?;
+            }
+            ("swarm", "max_secondary_suspects") => {
+                let n = parse_positive_usize(val, key)?;
+                require_invariant(n <= 2, key, "max_secondary_suspects must be <= 2")?;
+            }
+            ("mcp", "allowed_endpoint") => {
+                require_invariant(
+                    val.starts_with("https://"),
+                    key,
+                    "MCP endpoint must use https://",
+                )?;
+            }
+            ("mcp", "ban_stdio_npx_servers") => {
+                require_invariant(val == "true", key, "must equal true")?;
+            }
+            (sec, other) => {
+                return Err(BudgetViolation {
+                    code: "UNKNOWN_PROFILE_KEY",
+                    detail: format!(
+                        "Unrecognized profile key '{}{other}' in profile '{}'.",
+                        if sec.is_empty() {
+                            String::new()
+                        } else {
+                            format!("{sec}.")
+                        },
+                        profile.profile_id
+                    ),
+                });
+            }
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{analyze_text_budget, load_profile_by_id};
+    use super::{
+        RuntimeProfile, analyze_text_budget, apply_profile_toml_tightening, load_profile_by_id,
+    };
     use std::path::Path;
 
     #[test]
@@ -558,8 +909,39 @@ mod tests {
         let err = analyze_text_budget(&splitter, true).expect_err("must block splitter bomb");
         assert_eq!(err.code, "TOKENIZER_SPLITTER_BOMB");
 
-        let ro = load_profile_by_id(Path::new("."), "research-readonly").expect("ro profile");
-        assert!(!ro.enable_write_tools);
-        assert_eq!(ro.max_turn_tokens, 12_000);
+        let repo_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        for id in [
+            "coding-agent",
+            "research-readonly",
+            "adversarial-reviewer",
+            "swarm-master",
+            "swarm-investigator",
+            "swarm-qa-engineer",
+            "swarm-grunt",
+            "swarm-adversarial-reviewer",
+            "swarm-forensic-coroner",
+        ] {
+            let p = load_profile_by_id(&repo_root, id)
+                .unwrap_or_else(|e| panic!("profile {id} must validate cleanly: {}", e.detail));
+            assert_eq!(p.profile_id, id);
+        }
+    }
+
+    #[test]
+    fn rejects_unknown_keys_and_invariant_loosening_in_profile_toml() {
+        let mut p = RuntimeProfile::coding_agent_default();
+        let err = apply_profile_toml_tightening(&mut p, "potemkin_magic_knob = true\n")
+            .expect_err("must reject unknown profile keys");
+        assert_eq!(err.code, "UNKNOWN_PROFILE_KEY");
+
+        let mut p2 = RuntimeProfile::coding_agent_default();
+        let err2 = apply_profile_toml_tightening(&mut p2, "[git]\ndisable_all_hooks = false\n")
+            .expect_err("must reject invariant loosening");
+        assert_eq!(err2.code, "PROFILE_INVARIANT_LOOSENED");
+
+        let mut p3 = RuntimeProfile::coding_agent_default();
+        apply_profile_toml_tightening(&mut p3, "network_access = \"none\"\n")
+            .expect("tightening network_access to none must succeed");
+        assert!(p3.network_access_none);
     }
 }

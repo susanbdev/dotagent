@@ -21,6 +21,11 @@
         "command": "agent-guard pre-tool"
       }
     ],
+    "afterFileEdit": [
+      {
+        "command": "agent-guard post-edit"
+      }
+    ],
     "stop": [
       {
         "command": "agent-guard on-stop"

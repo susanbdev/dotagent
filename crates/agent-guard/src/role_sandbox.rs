@@ -61,7 +61,7 @@ fn encode_registry_mac_payload(reg: &ActiveSessionRegistry) -> Vec<u8> {
     buf
 }
 
-fn compute_capability_mac_hex(repo_root: &Path, cap: &SessionCapability) -> Result<String, String> {
+pub(crate) fn encode_capability_mac_payload(cap: &SessionCapability) -> Vec<u8> {
     let mut payload = Vec::with_capacity(256);
     let push_str = |buf: &mut Vec<u8>, s: &str| {
         buf.extend_from_slice(&(s.len() as u32).to_be_bytes());
@@ -94,7 +94,11 @@ fn compute_capability_mac_hex(repo_root: &Path, cap: &SessionCapability) -> Resu
     payload.extend_from_slice(&cap.consecutive_test_failures.to_be_bytes());
     payload.extend_from_slice(&cap.blocked_scope_attempts.to_be_bytes());
     payload.extend_from_slice(&cap.malicious_flags.to_be_bytes());
+    payload
+}
 
+fn compute_capability_mac_hex(repo_root: &Path, cap: &SessionCapability) -> Result<String, String> {
+    let payload = encode_capability_mac_payload(cap);
     compute_arbitrary_hmac_hex(repo_root, CAPABILITY_HMAC_DOMAIN, &payload)
 }
 
@@ -493,14 +497,11 @@ pub fn save_session_capability(repo_root: &Path, cap: &SessionCapability) -> Res
     Ok(())
 }
 
-pub fn load_session_capability(
-    repo_root: &Path,
-    session_id: &str,
-) -> Result<SessionCapability, String> {
-    let path = session_capability_path(repo_root, session_id)?;
-    let raw = fs::read_to_string(&path)
-        .map_err(|e| format!("session capability '{}' not found: {e}", session_id))?;
-    let v = JsonValue::parse(&raw).map_err(|e| format!("corrupt session JSON: {e}"))?;
+pub(crate) fn parse_session_capability_record_json(
+    raw: &str,
+    expected_session_id: &str,
+) -> Result<(SessionCapability, String), String> {
+    let v = JsonValue::parse(raw).map_err(|e| format!("corrupt session JSON: {e}"))?;
     let role_str = v
         .get("role")
         .and_then(JsonValue::as_str)
@@ -564,9 +565,9 @@ pub fn load_session_capability(
             .unwrap_or(0) as u32,
     };
 
-    if cap.session_id != session_id {
+    if cap.session_id != expected_session_id {
         return Err(format!(
-            "FORGED_SESSION_CAPABILITY: session_id mismatch (expected '{session_id}', found '{}')",
+            "FORGED_SESSION_CAPABILITY: session_id mismatch (expected '{expected_session_id}', found '{}')",
             cap.session_id
         ));
     }
@@ -574,8 +575,22 @@ pub fn load_session_capability(
         .get("record_mac")
         .and_then(JsonValue::as_str)
         .ok_or_else(|| {
-            format!("FORGED_SESSION_CAPABILITY: missing record_mac on session '{session_id}'")
-        })?;
+            format!(
+                "FORGED_SESSION_CAPABILITY: missing record_mac on session '{expected_session_id}'"
+            )
+        })?
+        .to_string();
+    Ok((cap, recorded_mac))
+}
+
+pub fn load_session_capability(
+    repo_root: &Path,
+    session_id: &str,
+) -> Result<SessionCapability, String> {
+    let path = session_capability_path(repo_root, session_id)?;
+    let raw = fs::read_to_string(&path)
+        .map_err(|e| format!("session capability '{}' not found: {e}", session_id))?;
+    let (cap, recorded_mac) = parse_session_capability_record_json(&raw, session_id)?;
     let expected_mac = compute_capability_mac_hex(repo_root, &cap)?;
     if !constant_time_eq_bytes(recorded_mac.as_bytes(), expected_mac.as_bytes()) {
         return Err(format!(

@@ -15,8 +15,8 @@ exclude_slash_tmp = true
 [shell_environment_policy]
 inherit = "all"
 ignore_default_excludes = false
-exclude = ["AWS_*", "GITHUB_*", "GH_*", "ANTHROPIC_*", "OPENAI_*", "GEMINI_*", "*_TOKEN", "*_SECRET", "*_KEY"]
-include_only = ["PATH", "HOME", "USER", "LOGNAME", "SHELL", "LANG", "LC_*", "TERM", "GIT_CONFIG_GLOBAL", "GIT_CONFIG_NOSYSTEM", "AGENT_GUARD_*"]
+exclude = ["AWS_*", "GITHUB_*", "GH_*", "ANTHROPIC_*", "OPENAI_*", "GEMINI_*", "*_TOKEN", "*_SECRET", "*_KEY", "AGENT_GUARD_ALLOW_*"]
+include_only = ["PATH", "HOME", "USER", "LOGNAME", "SHELL", "LANG", "LC_*", "TERM", "CARGO_HOME", "RUSTUP_HOME", "XDG_RUNTIME_DIR", "GIT_CONFIG_GLOBAL", "GIT_CONFIG_NOSYSTEM", "AGENT_GUARD_PROFILE", "AGENT_GUARD_ROLE", "AGENT_GUARD_SESSION_ID", "AGENT_GUARD_STATE_DIR", "AGENT_GUARD_COORDINATOR_SOCK"]
 
 [mcp_servers.susanbdev]
 url = "https://mcp.zt.susanb.dev/mcp"
