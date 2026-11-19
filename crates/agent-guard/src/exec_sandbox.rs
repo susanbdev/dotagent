@@ -87,12 +87,20 @@ const SCRUBBED_ENV_VARS: &[&str] = &[
     "GIT_ASKPASS",
     "GIT_EXEC_PATH",
     "GIT_TEMPLATE_DIR",
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_INDEX_FILE",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_COMMON_DIR",
+    "GIT_CEILING_DIRECTORIES",
     "GIT_CONFIG_PARAMETERS",
     "GIT_CONFIG_COUNT",
     "SSH_ASKPASS",
     "AGENT_GUARD_ALLOW_SWARM",
     "AGENT_GUARD_ALLOW_INTERPRETER",
     "AGENT_GUARD_ALLOW_DEPUTY",
+    "AGENT_GUARD_INTERNAL_SBX_TOKEN",
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -135,6 +143,36 @@ pub fn wrap_bash_with_exec_sandbox(cmd_str: &str, sanitize_stream: bool) -> Stri
     } else {
         format!("agent-guard exec-sandbox -- {quoted}")
     }
+}
+
+/// Returns `true` ONLY when `cmd_str` is already an exact, single-command
+/// `agent-guard exec-sandbox --sanitize-stream -- '<single-quoted-payload>'` wrapper
+/// with zero trailing comments, pipelines, redirections, or chained commands.
+pub fn is_canonical_exec_sandbox_wrapper(cmd_str: &str) -> bool {
+    let trimmed = cmd_str.trim();
+    let Some(rest) = trimmed.strip_prefix("agent-guard exec-sandbox --sanitize-stream -- ") else {
+        return false;
+    };
+    is_exact_single_quoted_literal(rest)
+}
+
+fn is_exact_single_quoted_literal(s: &str) -> bool {
+    let bytes = s.as_bytes();
+    if bytes.len() < 2 || bytes[0] != b'\'' {
+        return false;
+    }
+    let mut i = 1usize;
+    while i < bytes.len() {
+        if bytes[i] == b'\'' {
+            if bytes.get(i + 1..i + 4) == Some(b"\\''") {
+                i += 4;
+                continue;
+            }
+            return i + 1 == bytes.len();
+        }
+        i += 1;
+    }
+    false
 }
 
 pub fn shell_quote_single(s: &str) -> String {
@@ -409,15 +447,15 @@ pub fn run_exec_sandbox_cli(args: &[String], default_cwd: &Path) -> ExitCode {
 
     let cwd = custom_cwd.unwrap_or_else(|| default_cwd.to_path_buf());
     let repo_root = resolve_repo_root(&cwd);
-    let active_prof = load_active_profile(&repo_root).ok();
-    let writes_allowed = active_prof
-        .as_ref()
-        .map(|p| p.enable_write_tools)
-        .unwrap_or(true);
-    let profile_denies_net = active_prof
-        .as_ref()
-        .map(|p| p.network_access_none)
-        .unwrap_or(false);
+    let active_prof = match load_active_profile(&repo_root) {
+        Ok(p) => p,
+        Err(bv) => {
+            eprintln!("[AGENT-GUARD HARD DENY :: {}] {}", bv.code, bv.detail);
+            return ExitCode::from(2);
+        }
+    };
+    let writes_allowed = active_prof.enable_write_tools;
+    let profile_denies_net = active_prof.network_access_none;
     let invokes_git = is_atomic_leading_command(&shell_script, "git");
     let invokes_swarm_tool = is_atomic_leading_command(&shell_script, "swarm-tool");
     let opts = SandboxPolicyOpts {
@@ -686,7 +724,7 @@ fn build_child_command(
 
     #[cfg(not(target_os = "macos"))]
     let mut cmd = {
-        let _ = (repo_root, opts);
+        let _ = repo_root;
         let mut c = Command::new("bash");
         c.arg("--norc")
             .arg("--noprofile")
@@ -703,6 +741,9 @@ fn build_child_command(
     cmd.current_dir(cwd);
     for var in SCRUBBED_ENV_VARS {
         cmd.env_remove(var);
+    }
+    if !opts.invokes_swarm_tool {
+        cmd.env_remove("AGENT_GUARD_COORDINATOR_SOCK");
     }
     // Scrub dynamic Cargo runner/linker/alias/source overrides (`CARGO_TARGET_*`, `CARGO_ALIAS_*`, ...)
     for (env_k, _) in env::vars_os() {
@@ -734,27 +775,26 @@ fn build_child_command(
         cmd.env("TMP", tmp);
     }
 
-    // Always inject hermetic Git lockdown via GIT_CONFIG_COUNT unless GIT_CONFIG_GLOBAL is already pinned
-    if env::var_os("GIT_CONFIG_GLOBAL").is_none() {
-        let pairs: &[(&str, &str)] = &[
-            ("core.hooksPath", "/dev/null"),
-            ("core.attributesFile", "/dev/null"),
-            ("core.fsmonitor", "false"),
-            ("core.protectHFS", "true"),
-            ("core.protectNTFS", "true"),
-            ("gc.auto", "0"),
-            ("protocol.allow", "never"),
-            ("protocol.https.allow", "always"),
-            ("protocol.file.allow", "never"),
-            ("protocol.ext.allow", "never"),
-            ("protocol.git.allow", "never"),
-            ("submodule.recurse", "false"),
-        ];
-        cmd.env("GIT_CONFIG_COUNT", pairs.len().to_string());
-        for (idx, (k, v)) in pairs.iter().enumerate() {
-            cmd.env(format!("GIT_CONFIG_KEY_{idx}"), k);
-            cmd.env(format!("GIT_CONFIG_VALUE_{idx}"), v);
-        }
+    // Unconditionally inject hermetic Git lockdown at CONFIG_SCOPE_COMMAND so even a custom
+    // GIT_CONFIG_GLOBAL can never re-enable hooks, fsmonitor, attributes, or file/ext protocols.
+    let pairs: &[(&str, &str)] = &[
+        ("core.hooksPath", "/dev/null"),
+        ("core.attributesFile", "/dev/null"),
+        ("core.fsmonitor", "false"),
+        ("core.protectHFS", "true"),
+        ("core.protectNTFS", "true"),
+        ("gc.auto", "0"),
+        ("protocol.allow", "never"),
+        ("protocol.https.allow", "always"),
+        ("protocol.file.allow", "never"),
+        ("protocol.ext.allow", "never"),
+        ("protocol.git.allow", "never"),
+        ("submodule.recurse", "false"),
+    ];
+    cmd.env("GIT_CONFIG_COUNT", pairs.len().to_string());
+    for (idx, (k, v)) in pairs.iter().enumerate() {
+        cmd.env(format!("GIT_CONFIG_KEY_{idx}"), k);
+        cmd.env(format!("GIT_CONFIG_VALUE_{idx}"), v);
     }
 
     cmd
@@ -922,7 +962,14 @@ fn apply_linux_landlock(
         "/etc/passwd",
         "/etc/group",
         "/etc/localtime",
-        "/proc/self",
+        "/proc/self/fd",
+        "/proc/self/stat",
+        "/proc/self/maps",
+        "/proc/cpuinfo",
+        "/proc/meminfo",
+        "/proc/stat",
+        "/proc/version",
+        "/proc/filesystems",
         "/sys/devices/system/cpu",
     ] {
         let p = Path::new(sys_ro);
@@ -944,7 +991,7 @@ fn apply_linux_landlock(
         add_path(exe_dir, ro_access);
     }
 
-    // 2. Safe pseudo-devices & optional GIT_CONFIG_GLOBAL read access
+    // 2. Safe pseudo-devices & validated non-symlink GIT_CONFIG_GLOBAL read access
     for dev_rw in ["/dev/null", "/dev/zero", "/dev/urandom", "/dev/random"] {
         let p = Path::new(dev_rw);
         if p.exists() {
@@ -954,12 +1001,15 @@ fn apply_linux_landlock(
             );
         }
     }
-    if Path::new("/dev/fd").exists() {
-        add_path(Path::new("/dev/fd"), ro_access);
-    }
     if let Some(git_cfg) = env::var_os("GIT_CONFIG_GLOBAL") {
         let p = PathBuf::from(git_cfg);
-        if p.is_file() {
+        let is_safe_gitconfig_name = p
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| matches!(n, ".gitconfig" | "gitconfig" | "gitconfig.hardened"));
+        let is_non_symlink_file = fs::symlink_metadata(&p)
+            .is_ok_and(|m| m.file_type().is_file() && !m.file_type().is_symlink());
+        if is_safe_gitconfig_name && is_non_symlink_file {
             add_path(&p, file_ro_access);
         }
     }

@@ -874,4 +874,88 @@ fn pr6_cli_capabilities_packet_provenance_and_landlock_vault_coordinator_e2e() {
         "sandboxed `swarm-tool grunt submit-ledger` failed: stderr={}",
         String::from_utf8_lossy(&sb_ledger.stderr)
     );
+
+    // Direct `--internal-exec-sandbox` invocation without internal token must fail closed (exit 2)
+    let direct_internal = Command::new(swarm_tool_bin())
+        .args(["--internal-exec-sandbox", "--", "echo", "pwn"])
+        .current_dir(&repo)
+        .env("AGENT_GUARD_STATE_DIR", &state)
+        .output()
+        .unwrap();
+    assert_eq!(direct_internal.status.code(), Some(2));
+    assert!(
+        String::from_utf8_lossy(&direct_internal.stderr).contains("SELF_TAMPERING_BLOCKED"),
+        "direct --internal-exec-sandbox stderr: {}",
+        String::from_utf8_lossy(&direct_internal.stderr)
+    );
+
+    // `checkpoint-green` with `--skip` exclusion flag must be rejected
+    let skip_cp = Command::new(swarm_tool_bin())
+        .args([
+            "grunt",
+            "checkpoint-green",
+            "--session",
+            &grunt_sid,
+            "--",
+            "cargo",
+            "test",
+            "--",
+            "--skip",
+            "test_vault_isolated",
+        ])
+        .current_dir(&repo)
+        .env("AGENT_GUARD_STATE_DIR", &state)
+        .output()
+        .unwrap();
+    assert!(!skip_cp.status.success());
+    assert!(
+        String::from_utf8_lossy(&skip_cp.stderr).contains("INVALID_TEST_RUNNER_COMMAND"),
+        "skip checkpoint stderr: {}",
+        String::from_utf8_lossy(&skip_cp.stderr)
+    );
+
+    // Once closed by Master, replaying `--session <grunt_sid>` must fail closed (`SESSION_CLOSED_OR_INACTIVE`)
+    assert!(
+        Command::new(swarm_tool_bin())
+            .args(["master", "close-session", "--session", &grunt_sid])
+            .current_dir(&repo)
+            .env("AGENT_GUARD_STATE_DIR", &state)
+            .env("AGENT_GUARD_ROLE", "master")
+            .status()
+            .unwrap()
+            .success()
+    );
+    let replay_closed = Command::new(swarm_tool_bin())
+        .args(["grunt", "context", "--session", &grunt_sid])
+        .current_dir(&repo)
+        .env("AGENT_GUARD_STATE_DIR", &state)
+        .output()
+        .unwrap();
+    assert!(!replay_closed.status.success());
+    assert!(
+        String::from_utf8_lossy(&replay_closed.stderr).contains("SESSION_CLOSED_OR_INACTIVE"),
+        "closed session replay stderr: {}",
+        String::from_utf8_lossy(&replay_closed.stderr)
+    );
+
+    // Non-TTY `lock-plan --amend --human-approved` must be rejected
+    let amend_non_tty = Command::new(swarm_tool_bin())
+        .args([
+            "master",
+            "lock-plan",
+            "plan.dag.json",
+            "--amend",
+            "--human-approved",
+        ])
+        .current_dir(&repo)
+        .env("AGENT_GUARD_STATE_DIR", &state)
+        .env("AGENT_GUARD_ROLE", "master")
+        .output()
+        .unwrap();
+    assert!(!amend_non_tty.status.success());
+    assert!(
+        String::from_utf8_lossy(&amend_non_tty.stderr).contains("PLAN_AMEND_REQUIRES_HUMAN_TTY"),
+        "non-tty amend stderr: {}",
+        String::from_utf8_lossy(&amend_non_tty.stderr)
+    );
 }

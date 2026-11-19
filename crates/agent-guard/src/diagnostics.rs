@@ -53,6 +53,8 @@ pub enum GuardCode {
     SandboxBinaryUnavailable,
     SessionResetRequiresHumanTty,
     SessionResetDeniedInSandbox,
+    AmbiguousToolParamAlias,
+    UnrecognizedHmacDomainDenied,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -444,6 +446,24 @@ const CATALOG: &[CodeExplanation] = &[
         summary: "`session-reset` was invoked inside `exec-sandbox` or a locked Swarm worker.",
         rationale: "Sandboxed agent subprocesses are strictly prohibited from resetting guard state.",
         remediation: "Run `dotagent session-reset` from an unsandboxed human shell.",
+    },
+    CodeExplanation {
+        variant: GuardCode::AmbiguousToolParamAlias,
+        code: "AMBIGUOUS_TOOL_PARAM_ALIAS",
+        severity: "CIRCUIT_BREAKER",
+        category: "json",
+        summary: "Tool input supplied multiple cross-harness synonym keys simultaneously.",
+        rationale: "Supplying both `file_path` and `AbsolutePath` (or `command` and `CommandLine`) enables cross-schema parameter smuggling where one key passes validation while the harness executes the other.",
+        remediation: "Pass only the single canonical parameter name expected by the active tool schema.",
+    },
+    CodeExplanation {
+        variant: GuardCode::UnrecognizedHmacDomainDenied,
+        code: "UNRECOGNIZED_HMAC_DOMAIN_DENIED",
+        severity: "HARD_DENY",
+        category: "swarm",
+        summary: "`coord.sock` rejected an unknown or unpermitted HMAC domain over IPC.",
+        rationale: "Restricts vault HMAC signing and verification strictly to length-prefixed, explicitly allowlisted Swarm v2 record domains.",
+        remediation: "Use the official `swarm-tool` role subcommands rather than raw `coord.sock` RPC frames.",
     },
 ];
 

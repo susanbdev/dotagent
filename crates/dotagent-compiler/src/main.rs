@@ -85,7 +85,7 @@ fn is_self_hosted_dotagent_repo(repo_root: &Path) -> bool {
 
 fn build_all(repo_root: &Path) -> Result<usize, String> {
     let skills_lock_json = validate_and_lock_skills(repo_root)?;
-    validate_profiles(repo_root)?;
+    let profile_hashes = validate_profiles(repo_root)?;
     validate_workflows(repo_root)?;
 
     let skills_lock_path = repo_root.join("skills").join("manifest.lock.json");
@@ -116,6 +116,10 @@ fn build_all(repo_root: &Path) -> Result<usize, String> {
         }
     }
 
+    for (prof_rel, digest) in &profile_hashes {
+        manifest_lines.push(format!("{digest}  {prof_rel}"));
+    }
+
     let skills_digest = sha256_hex(skills_lock_json.as_bytes());
     manifest_lines.push(format!("{skills_digest}  skills/manifest.lock.json"));
     manifest_lines.sort();
@@ -125,12 +129,12 @@ fn build_all(repo_root: &Path) -> Result<usize, String> {
     manifest_body.push('\n');
     write_file_contained(repo_root, &verify_path, &manifest_body)?;
 
-    Ok(artifacts.len() + 1)
+    Ok(artifacts.len() + 1 + profile_hashes.len())
 }
 
 fn verify_all(repo_root: &Path) -> Result<usize, String> {
     let expected_skills_lock = validate_and_lock_skills(repo_root)?;
-    validate_profiles(repo_root)?;
+    let profile_hashes = validate_profiles(repo_root)?;
     validate_workflows(repo_root)?;
 
     let actual_skills_lock = read_contained_regular_file(
@@ -179,6 +183,8 @@ fn verify_all(repo_root: &Path) -> Result<usize, String> {
         }
     }
 
+    verify_no_untracked_bundle_files(repo_root, &artifacts)?;
+
     let root_agents_path = repo_root.join("AGENTS.md");
     if is_self_hosted_dotagent_repo(repo_root) {
         let Some(expected_agents) = artifacts.get("AGENTS.md") else {
@@ -206,6 +212,10 @@ fn verify_all(repo_root: &Path) -> Result<usize, String> {
         })?;
     }
 
+    for (prof_rel, digest) in &profile_hashes {
+        expected_lines.push(format!("{digest}  {prof_rel}"));
+    }
+
     let skills_digest = sha256_hex(actual_skills_lock.as_bytes());
     expected_lines.push(format!("{skills_digest}  skills/manifest.lock.json"));
     expected_lines.sort();
@@ -221,7 +231,7 @@ fn verify_all(repo_root: &Path) -> Result<usize, String> {
         return Err("dist-verify/manifest.sha256 hash mismatch".to_string());
     }
 
-    Ok(artifacts.len() + 1)
+    Ok(artifacts.len() + 1 + profile_hashes.len())
 }
 
 const MAX_ROLE_README_BYTES: usize = 4_096;
@@ -311,9 +321,40 @@ fn validate_and_lock_skills(repo_root: &Path) -> Result<String, String> {
             ));
         }
         if !ft.is_dir() {
+            let fname = entry.file_name().to_string_lossy().into_owned();
+            if fname != "manifest.lock.json" {
+                return Err(format!(
+                    "unexpected top-level file 'skills/{fname}' (only skill directories and manifest.lock.json permitted)"
+                ));
+            }
             continue;
         }
         let skill_name = entry.file_name().to_string_lossy().into_owned();
+        if let Ok(sub_entries) = fs::read_dir(&p) {
+            for sub_entry in sub_entries.flatten() {
+                let sub_p = sub_entry.path();
+                let sub_ft = sub_entry
+                    .file_type()
+                    .map_err(|e| format!("cannot inspect '{}': {e}", sub_p.display()))?;
+                if sub_ft.is_symlink() {
+                    return Err(format!(
+                        "symlinked file '{}' inside skill directory is forbidden",
+                        sub_p.display()
+                    ));
+                }
+                let sub_name = sub_entry.file_name().to_string_lossy().into_owned();
+                if sub_name == "README.md" {
+                    return Err(format!(
+                        "Nested 'skills/{skill_name}/README.md' is forbidden by Rule 2 hygiene; rename to 'ROLE_GUIDE.md'"
+                    ));
+                }
+                if !sub_ft.is_file() || !matches!(sub_name.as_str(), "SKILL.md" | "ROLE_GUIDE.md") {
+                    return Err(format!(
+                        "unexpected untracked entry 'skills/{skill_name}/{sub_name}' inside skill directory"
+                    ));
+                }
+            }
+        }
         let md_path = p.join("SKILL.md");
         let body = read_contained_regular_file(&skills_dir, &md_path)
             .map_err(|e| format!("invalid SKILL.md in '{}': {e}", p.display()))?;
@@ -332,11 +373,6 @@ fn validate_and_lock_skills(repo_root: &Path) -> Result<String, String> {
             sha256_hex(body.as_bytes()),
         );
 
-        if p.join("README.md").exists() {
-            return Err(format!(
-                "Nested 'skills/{skill_name}/README.md' is forbidden by Rule 2 hygiene; rename to 'ROLE_GUIDE.md'"
-            ));
-        }
         let guide_path = p.join("ROLE_GUIDE.md");
         if strict_ascii && !guide_path.exists() {
             return Err(format!(
@@ -404,20 +440,70 @@ fn validate_skill_doc_hygiene(label: &str, body: &str, strict_ascii: bool) -> Re
     Ok(())
 }
 
-fn validate_profiles(repo_root: &Path) -> Result<(), String> {
+const REQUIRED_PROFILES: &[&str] = &[
+    "coding-agent.toml",
+    "adversarial-reviewer.toml",
+    "research-readonly.toml",
+    "swarm-master.toml",
+    "swarm-investigator.toml",
+    "swarm-qa-engineer.toml",
+    "swarm-grunt.toml",
+    "swarm-adversarial-reviewer.toml",
+    "swarm-forensic-coroner.toml",
+];
+
+fn strip_toml_line_comment(line: &str) -> &str {
+    let mut in_quotes = false;
+    let mut escaped = false;
+    for (idx, b) in line.bytes().enumerate() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if b == b'\\' && in_quotes {
+            escaped = true;
+            continue;
+        }
+        if b == b'"' {
+            in_quotes = !in_quotes;
+        } else if b == b'#' && !in_quotes {
+            return line[..idx].trim();
+        }
+    }
+    line.trim()
+}
+
+fn validate_profiles(repo_root: &Path) -> Result<BTreeMap<String, String>, String> {
     let profiles_dir = repo_root.join("profiles");
     let _ = ensure_no_symlink_components_under(repo_root, &profiles_dir)?;
-    for required in [
-        "coding-agent.toml",
-        "adversarial-reviewer.toml",
-        "research-readonly.toml",
-        "swarm-master.toml",
-        "swarm-investigator.toml",
-        "swarm-qa-engineer.toml",
-        "swarm-grunt.toml",
-        "swarm-adversarial-reviewer.toml",
-        "swarm-forensic-coroner.toml",
-    ] {
+    let dir_meta = fs::symlink_metadata(&profiles_dir)
+        .map_err(|e| format!("cannot stat profiles dir '{}': {e}", profiles_dir.display()))?;
+    if dir_meta.file_type().is_symlink() || !dir_meta.file_type().is_dir() {
+        return Err("profiles/ must be a regular non-symlink directory".to_string());
+    }
+    if let Ok(entries) = fs::read_dir(&profiles_dir) {
+        for entry in entries.flatten() {
+            let p = entry.path();
+            let ft = entry
+                .file_type()
+                .map_err(|e| format!("cannot inspect '{}': {e}", p.display()))?;
+            if ft.is_symlink() || !ft.is_file() {
+                return Err(format!(
+                    "non-regular or symlinked entry '{}' inside profiles/ is forbidden",
+                    p.display()
+                ));
+            }
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if !REQUIRED_PROFILES.contains(&name.as_str()) {
+                return Err(format!(
+                    "unexpected untracked profile 'profiles/{name}' (must be declared in REQUIRED_PROFILES)"
+                ));
+            }
+        }
+    }
+
+    let mut hashes = BTreeMap::new();
+    for required in REQUIRED_PROFILES {
         let p = profiles_dir.join(required);
         let text = read_contained_regular_file(&profiles_dir, &p)
             .map_err(|e| format!("missing or invalid profile '{}': {e}", p.display()))?;
@@ -428,12 +514,127 @@ fn validate_profiles(repo_root: &Path) -> Result<(), String> {
                 first.detail
             ));
         }
-        if !text.contains("hooks_path = \"/dev/null\"")
-            || !text.contains("root_file = \"AGENTS.md\"")
-        {
+        let mut saw_hooks_null = false;
+        let mut saw_root_agents = false;
+        for raw_line in text.lines() {
+            let clean = strip_toml_line_comment(raw_line);
+            if clean.is_empty() || clean.starts_with('[') {
+                continue;
+            }
+            if let Some((k, v)) = clean.split_once('=') {
+                let key = k.trim();
+                let val = v.trim();
+                if key == "hooks_path" {
+                    if val == "\"/dev/null\"" {
+                        saw_hooks_null = true;
+                    } else {
+                        return Err(format!(
+                            "profile '{required}' sets disallowed hooks_path={val} (expected hooks_path=/dev/null)"
+                        ));
+                    }
+                } else if key == "root_file" {
+                    if val == "\"AGENTS.md\"" {
+                        saw_root_agents = true;
+                    } else {
+                        return Err(format!(
+                            "profile '{required}' sets disallowed root_file={val} (expected root_file=AGENTS.md)"
+                        ));
+                    }
+                }
+            }
+        }
+        if !saw_hooks_null || !saw_root_agents {
             return Err(format!(
                 "profile '{required}' missing mandatory hooks_path=/dev/null or root_file=AGENTS.md"
             ));
+        }
+        hashes.insert(format!("profiles/{required}"), sha256_hex(text.as_bytes()));
+    }
+    Ok(hashes)
+}
+
+fn verify_no_untracked_bundle_files(
+    repo_root: &Path,
+    artifacts: &BTreeMap<String, String>,
+) -> Result<(), String> {
+    fn scan_dist_dir(
+        dist_root: &Path,
+        cur: &Path,
+        depth: usize,
+        artifacts: &BTreeMap<String, String>,
+    ) -> Result<(), String> {
+        if depth > 4 {
+            return Err(format!("unexpected deep nesting under '{}'", cur.display()));
+        }
+        let entries =
+            fs::read_dir(cur).map_err(|e| format!("cannot read '{}': {e}", cur.display()))?;
+        for entry in entries.flatten() {
+            let p = entry.path();
+            let ft = entry
+                .file_type()
+                .map_err(|e| format!("cannot inspect '{}': {e}", p.display()))?;
+            if ft.is_symlink() {
+                return Err(format!(
+                    "symlinked artifact '{}' inside dist/ is forbidden",
+                    p.display()
+                ));
+            }
+            if ft.is_dir() {
+                scan_dist_dir(dist_root, &p, depth + 1, artifacts)?;
+            } else if ft.is_file() {
+                let rel = p
+                    .strip_prefix(dist_root)
+                    .map_err(|e| e.to_string())?
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                if !artifacts.contains_key(&rel) {
+                    return Err(format!(
+                        "untracked file 'dist/{rel}' detected outside canonical compiler bundle"
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    let dist_root = repo_root.join("dist");
+    scan_dist_dir(&dist_root, &dist_root, 0, artifacts)?;
+
+    for (live_dir_rel, bundle_prefix) in [
+        (".claude/agents", "claude/agents/"),
+        (".cursor/agents", "cursor/agents/"),
+        (".codex/agents", "codex/agents/"),
+    ] {
+        let live_dir = repo_root.join(live_dir_rel);
+        let Ok(meta) = fs::symlink_metadata(&live_dir) else {
+            continue;
+        };
+        if meta.file_type().is_symlink() || !meta.file_type().is_dir() {
+            return Err(format!(
+                "'{}' must be a regular non-symlink directory",
+                live_dir.display()
+            ));
+        }
+        let entries = fs::read_dir(&live_dir)
+            .map_err(|e| format!("cannot read '{}': {e}", live_dir.display()))?;
+        for entry in entries.flatten() {
+            let p = entry.path();
+            let ft = entry
+                .file_type()
+                .map_err(|e| format!("cannot inspect '{}': {e}", p.display()))?;
+            if ft.is_symlink() || !ft.is_file() {
+                return Err(format!(
+                    "unexpected non-regular or symlinked entry '{}' inside '{live_dir_rel}'",
+                    p.display()
+                ));
+            }
+            let fname = entry.file_name().to_string_lossy().into_owned();
+            let bundle_key = format!("{bundle_prefix}{fname}");
+            if !artifacts.contains_key(&bundle_key) {
+                return Err(format!(
+                    "untracked agent file '{live_dir_rel}/{fname}' detected outside canonical compiler bundle"
+                ));
+            }
         }
     }
     Ok(())

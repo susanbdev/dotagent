@@ -110,8 +110,8 @@ fn blocks_entire_250_plus_bypass_corpus_at_100_percent() {
     let vectors = load_bypass_corpus();
     assert_eq!(
         vectors.len(),
-        305,
-        "Expected exact 305 adversarial bypass vectors, got {}",
+        315,
+        "Expected exact 315 adversarial bypass vectors, got {}",
         vectors.len()
     );
 

