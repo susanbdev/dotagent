@@ -1,29 +1,116 @@
 # dotagent
 
-Secure by design Agent and LLM skills, settings, configurations, and tools for various environments.
+Deterministic zero-trust security kernel, privilege-separated multi-agent swarm runtime, and reproducible harness compiler for Claude Code, Gemini / Antigravity, Cursor, and OpenAI Codex.
 
-## Components
+`dotagent` enforces repository containment, pre-buffer 7-bit ASCII sanitization, transitive reference hop limits (`A -> B`), Git/build-tool RCE lockdown, and OS-kernel sandboxing (`#![forbid(unsafe_code)]`, zero production `unwrap`/`expect`/`panic`) with sub-`5 ms` hook latency and zero workflow friction.
 
-- **`crates/agent-guard`**: `#![forbid(unsafe_code)]` Rust 2024 deterministic security kernel (`hmac`, `sha2`, `crc32fast`) intercepting `PreToolUse`, `PostToolUse`, `UserPromptSubmit`, `PreCompact`, `PostEdit`, and `Stop` lifecycle events across Antigravity / Gemini, Claude Code, and Cursor, plus sandbox/MCP lockdown and `notify = ["agent-guard", "on-stop"]` stop-gate verification on OpenAI Codex, Swarm v2 role sandboxes, full-record HMAC breadcrumbs, upfront QA fault triangulation, and fail-closed `2+2` Work Ledger gates.
-- **`crates/swarm-tools`**: Dedicated Rust role CLI binary (`swarm-tool`) equipping each of the 6 Swarm v2 roles (`master`, `investigator`, `qa`, `grunt`, `reviewer`, `coroner`) with deterministic local execution commands.
-- **`crates/dotagent-compiler`**: Reproducible bundle compiler and `SHA-256` / `policy-hub` / pure-7-bit-ASCII verifier emitting `dist/` harness configurations, `research-airlock` + 6 `swarm-*` subagent manifests across Claude Code, Cursor, OpenAI Codex, and Gemini, `skills/manifest.lock.json`, and `dist-verify/manifest.sha256`.
-- **`profiles/` & `skills/`**: Token-minimal (`<= 3 KiB`) pure-ASCII `SKILL.md` manifests plus explicit per-role `ROLE_GUIDE.md` manuals (`skills/swarm-{master,investigator,qa-engineer,grunt,adversarial-reviewer,forensic-coroner}/`) defining each role's job, hard rules, and Rust tooling.
-- **`tests/bypass_corpus.toml` & Swarm v2 Suites**: `290` adversarial bypass vectors (`100%` block rate) plus `swarm_v2_suite.rs` and `cli_delegation.rs` verifying full-record HMAC path binding, CRC32 crash spool recovery, linked `git worktree` excludes, depth-20 Investigator scoping, Reviewer URL-exfiltration blocking, `1 / 0..2 / 0..N` fault triangulation, and fail-closed `on-stop` gates.
+## Architecture & Trust Rings
+
+```mermaid
+flowchart TB
+    subgraph Ring2["Ring-2: Untrusted Data & Agent Harnesses"]
+        Repo["Untrusted Workspace Files, Logs, Compiler Output, & PR Text"]
+        Harness["Claude Code | Gemini / Antigravity | Cursor | OpenAI Codex"]
+    end
+
+    subgraph Ring1["Ring-1: Deterministic Rust Security Kernel (agent-guard)"]
+        Hooks["Lifecycle Gates: PreToolUse | PostToolUse | UserPrompt | PreCompact | Stop"]
+        Sanitizer["Pre-Buffer 7-Bit ASCII Stream Sanitizer & 128-Bit Nonce Spotlighting"]
+        Ledger["flock SessionLedger (A -> B Hop Cap, 16k Step Budget, Sticky Taint)"]
+        Coord["Privilege-Separated Coordinator (coord.sock) & 0600 Vault Key"]
+    end
+
+    subgraph Ring0["Ring-0: OS Kernel Sandbox"]
+        Landlock["Linux Landlock ABI V1..V5 VFS + V4 AccessNet TCP Deny"]
+        Seatbelt["macOS sandbox-exec SBPL File-Write & Network Deny"]
+    end
+
+    Harness -->|"JSON Hook / Wrapped Exec"| Hooks
+    Repo -->|"Raw Bytes"| Sanitizer
+    Sanitizer -->|"Clean 7-Bit ASCII"| Harness
+    Hooks --> Ledger
+    Hooks -->|"Domain-Separated HMAC RPC"| Coord
+    Hooks --> Landlock
+    Hooks --> Seatbelt
+```
 
 ## Enforced Security Guarantees
 
-1. **Untrusted Data Quarantine, 128-Bit Spotlighting, & Single Root Authority (`<repo_root>/AGENTS.md` ONLY)**: All repository files, docs, comments, logs, and tool outputs are untrusted passive data spotlighted inside per-step randomized 128-bit nonces (`<<<UNTRUSTED_ASCII_DATA_<nonce>>>>`). Nested/shadow instruction files are hard-blocked, and deployed control-plane files are VFS read-only (`0444` configs, `0555` binaries).
-2. **Pre-Buffer 7-Bit ASCII Sanitization & Escape Neutering**: Prior to reaching the agent's context buffer, all untrusted reads and wrapped `Bash` streams (`agent-guard sanitize-stream`) strip CR/ANSI/control bytes, neuter every non-ASCII character (`>= 0x80`), and defang literal `\uXXXX`, `\UXXXXXXXX`, `\xXX`, `\033`, `&#...;`, and `%XX` escape triggers, while Trojan Source Bidi, Unicode Tags (`U+E0000..U+E007F`), Variation Selectors, and homoglyphs trip an immediate session halt.
-3. **Zero Cache, Temp, Dependency, Secret, or Guard-State Snooping**: Lexical + component-by-component symlink checks block `/tmp`, `/var/tmp`, `/dev/shm`, `tmp/`, `.cache/`, `__pycache__/`, `.next/`, `.turbo/`, `node_modules/`, `vendor/`, `.venv/`, `site-packages/`, `.env*`, credential stores, and `~/.local/state/agent-guard` (`audit.jsonl` self-blindness).
-4. **Max 2-Level Traversal & `A -> B` Reference Hop Ledger**: Directory walks require depth `<= 2`, and stateful provenance tracking permits `File A -> File B` while hard-stopping `File B -> File C` (preserved across step compactions) and immediately tripping a session circuit breaker on any `cache`/`tmp`/`dependency` pointer.
-5. **Tiny Step Context Micro-Windows & Immediate Compaction**: Enforces `24 KiB` raw file cap (`<= 150`-line slices), `120`-line stream head/tail compaction, `8k` soft-compaction advisory (`COMPACT_STEP_NOW`), `16k` hard per-step token ceiling, harness auto-compaction (`15%` / `20k` tokens + `PreCompact` step reset), and a `<= 200`-token read-only `research-airlock` subagent so sessions never drag multi-feature history to 200k windows.
-6. **Git, Build-Tool, & Confused-Deputy Lockdown**: Globally disables Git hooks and attribute drivers (`core.hooksPath = /dev/null`, `core.attributesFile = /dev/null`, `core.fsmonitor = false`, `core.protectHFS = true`, `core.protectNTFS = true`, `gc.auto = 0`, `protocol.allow = never` + `https` only), blocks `.cargo/config*` (`rustc-wrapper`/`linker`/`runner`) and `.yarnrc*` (`yarnPath`) traps, and taint-gates ambient-authority CLIs.
+1. **Single Root Authority & 128-Bit Spotlighting**: Only `<repo_root>/AGENTS.md` (depth `0`) holds instruction authority. Nested or shadow instruction files (`CLAUDE.md`, `.cursorrules`, `.windsurfrules`, `.github/copilot-instructions.md`) are blocked at runtime and in static repository audits. Untrusted inputs are quarantined inside per-step 128-bit nonces (`<<<UNTRUSTED_ASCII_DATA_<nonce>>>>`).
+2. **Pre-Buffer 7-Bit ASCII Sanitization & RFC 7493 Strict JSON**: Prior to context ingestion, `agent-guard sanitize-stream` strips CR/ANSI/control bytes, neuters non-ASCII (`>= 0x80`), and defangs `\uXXXX`, `\UXXXXXXXX`, `\xXX`, `\033`, `&#...;`, and `%XX` escapes. Trojan Source Bidi controls, Unicode Tags (`U+E0000..U+E007F`), Variation Selectors, homoglyphs, and duplicate JSON object keys (`RFC 7493` I-JSON smuggling) fail closed immediately.
+3. **Zero Cache, Temp, Dependency, Secret, or Guard-State Snooping**: Component-by-component `lstat` resolution blocks access and symlinks into `/tmp`, `/var/tmp`, `/dev/shm`, `tmp/`, `.cache/`, `__pycache__/`, `.next/`, `.turbo/`, `node_modules/`, `vendor/`, `.venv/`, `.env*`, `~/.ssh`, `~/.aws`, and `~/.local/state/agent-guard` (`audit.jsonl` self-blindness).
+4. **Max Depth-2 Walks & `A -> B` Transitive Reference Ceiling**: Directory walks require explicit depth `<= 2`. Lock-serialized `SessionLedger` provenance permits `File A -> File B` and hard-stops `File B -> File C` across step compactions while tripping a session halt on any cache/temp/dependency pointer.
+5. **Git, Build-Tool, & Shell AST Lockdown**: Enforces 19 hardened global Git keys (`core.hooksPath=/dev/null`, `core.attributesFile=/dev/null`, `core.fsmonitor=false`, `protocol.allow=never` + `https` only, `transfer.fsckObjects=true`), audits `.cargo/config*` (`rustc-wrapper`/`linker`/`runner`), `.yarnrc*` (`yarnPath`), and `.github/workflows/*.yml` (zero chained triggers), and validates shell ASTs before execution.
+6. **Privilege-Separated Swarm v2 & Kernel Sandboxing**: Six least-privilege Swarm roles (`master`, `investigator`, `qa-engineer`, `grunt`, `adversarial-reviewer`, `forensic-coroner`) operate under scoped capabilities, domain-separated HMAC-SHA256 breadcrumbs (`coord.sock` holds the `0600` vault key outside worker Landlock rulesets), upfront `1 / 0..2 / 0..N` fault triangulation, and fail-closed `2+2` Work Ledger stop gates.
 
-## Quick Verification & Local Activation
+## Measured Release Performance
+
+Reproducible measurements via `./target/release/dotagent-harness bench` (`rustc` release profile, `x86_64-unknown-linux-gnu`):
+
+| Benchmark | Iters | `p50` (`us`) | `p95` (`us`) | `p99` (`us`) | Throughput |
+| :--- | ---: | ---: | ---: | ---: | ---: |
+| `pre_tool_read_hook_inproc` | 400 | 3,435 | 4,161 | 4,780 | - |
+| `pre_tool_bash_ast_inproc` | 400 | 3,340 | 3,995 | 5,387 | - |
+| `post_tool_scan_inproc` | 400 | 2,789 | 3,571 | 4,570 | - |
+| `sanitize_stream_64k` | 400 | 286 | 341 | 861 | `218.5 MiB/s` |
+| `cli_pre_tool_cold_start` (spawn + `flock` + JSON) | 50 | 4,154 | 4,892 | 5,658 | - |
+
+## 60-Second Zero-Friction Onboarding
+
+Build and install the read-only (`0555`) binaries into `~/.local/bin` and activate `dotagent` globally:
+
+```bash
+./scripts/activate-local.sh
+dotagent doctor
+```
+
+Activate deterministic hooks on any external repository without clobbering existing IDE preferences:
+
+```bash
+dotagent activate /path/to/your/repo
+```
+
+What `dotagent activate` guarantees:
+- **Non-Destructive Backups & JSON Preference Merging**: Snapshots existing `.claude/settings.json`, `.cursor/hooks.json`, `~/.gemini/settings.json`, and `~/.gitconfig` to `.dotagent.bak` before enforcing security keys, preserving unrelated user settings (`theme`, `model`, editor UI flags) and cleanly restoring originals on `dotagent deactivate /path/to/your/repo`.
+- **GUI IDE Hook Pinning**: Rewrites hook commands to absolute `~/.local/bin/agent-guard` paths on external workspaces and `~/.gemini/settings.json` so GUI apps (Cursor, Claude Desktop, VS Code) never fail when launched outside an interactive shell `PATH`, while configuring `~/.bashrc` and `~/.zshenv`.
+- **Instant Self-Remediation**: Every `[agent-guard HARD DENY :: <CODE>]` diagnostic includes an actionable `Remediation:` line and maps to `dotagent explain <CODE>`.
+
+## Unified `dotagent` Operator CLI
+
+`dotagent` is a single multicall binary providing operator workflows alongside low-level lifecycle hooks:
+
+```bash
+dotagent doctor [--json] [repo_root]          # 7-point binary, gitconfig, bundle, kernel, & session check
+dotagent explain <CODE | --list> [--json]     # Remediation guide for all 33 typed GuardCode diagnostics
+dotagent session-reset <session_id|--all>     # Interactive human-TTY circuit-breaker & taint reset
+dotagent activate [target_repo_root]          # Non-destructive workspace & global harness activation
+dotagent deactivate [target_repo_root]        # Restore .dotagent.bak configs cleanly
+dotagent audit-repo [repo_root]               # Static Git/hook/build-trap/shadow-authority/CI audit
+dotagent swarm <role> <subcommand> [...]      # Delegate to swarm-tool (master|investigator|qa|grunt|...)
+dotagent compile <build|verify> [repo_root]   # Delegate to dotagent-compiler deterministic bundle engine
+dotagent harness <run|list|bench> [...]       # Delegate to dotagent-harness corpus & benchmark runner
+```
+
+## Workspace Crates
+
+| Crate | Binary | Purpose |
+| :--- | :--- | :--- |
+| [`crates/agent-guard`](crates/agent-guard) | `agent-guard`, `dotagent` | Core zero-trust lifecycle kernel, shell/path/Unicode/JSON validators, Landlock/Seatbelt sandbox, privilege-separated HMAC coordinator, and operator CLI |
+| [`crates/swarm-tools`](crates/swarm-tools) | `swarm-tool` | Role-scoped deterministic CLI for the 6 Swarm v2 agents (`master`, `investigator`, `qa`, `grunt`, `reviewer`, `coroner`) |
+| [`crates/dotagent-compiler`](crates/dotagent-compiler) | `dotagent-compiler` | Reproducible multi-harness bundle compiler, pure-7-bit-ASCII gate, `policy-hub` validator, and `dist-verify/manifest.sha256` verifier |
+| [`crates/dotagent-harness`](crates/dotagent-harness) | `dotagent-harness` | Multi-harness replay engine, `305+` adversarial bypass corpus runner, and `p50`/`p95`/`p99` microbenchmark suite |
+
+## Verification & Security Documentation
 
 ```bash
 cargo fmt --all -- --check
-cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace
-./scripts/activate-local.sh
+cargo clippy --workspace --all-targets --offline -- -D warnings
+cargo test --workspace --offline
+./target/release/dotagent-compiler verify .
+./target/release/dotagent audit-repo .
+./target/release/dotagent-harness bench --quick
 ```
+
+- Formal architecture, trust rings, key hierarchy, and kernel matrix: [THREAT_MODEL.md](THREAT_MODEL.md)
+- Vulnerability reporting and supported versions: [SECURITY.md](SECURITY.md)
+- Release history: [CHANGELOG.md](CHANGELOG.md)
