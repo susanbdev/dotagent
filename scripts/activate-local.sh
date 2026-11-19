@@ -79,145 +79,30 @@ for bin_name in agent-guard dotagent-compiler swarm-tool; do
     install -m 0555 "${DOTAGENT_ROOT}/target/release/${bin_name}" "${BIN_DIR}/${bin_name}"
 done
 
-# Ensure ~/.local/bin is on PATH for non-login shells if not already configured
-if [[ -f "${HOME}/.bashrc" ]] && ! grep -q '\.local/bin' "${HOME}/.bashrc"; then
-    printf '\nexport PATH="$HOME/.local/bin:$PATH"\n' >> "${HOME}/.bashrc"
+# Install unified `dotagent` CLI (falling back to `agent-guard` multicall binary under minimal test shims)
+if [[ -e "${BIN_DIR}/dotagent" ]]; then
+    chmod u+w "${BIN_DIR}/dotagent" 2>/dev/null || true
+fi
+if [[ -f "${DOTAGENT_ROOT}/target/release/dotagent" ]]; then
+    install -m 0555 "${DOTAGENT_ROOT}/target/release/dotagent" "${BIN_DIR}/dotagent"
+else
+    install -m 0555 "${DOTAGENT_ROOT}/target/release/agent-guard" "${BIN_DIR}/dotagent"
+fi
+
+if [[ -f "${DOTAGENT_ROOT}/target/release/dotagent-harness" ]]; then
+    if [[ -e "${BIN_DIR}/dotagent-harness" ]]; then
+        chmod u+w "${BIN_DIR}/dotagent-harness" 2>/dev/null || true
+    fi
+    install -m 0555 "${DOTAGENT_ROOT}/target/release/dotagent-harness" "${BIN_DIR}/dotagent-harness"
 fi
 
 # 2. Verify compiled bundles match golden SHA-256 manifest
 "${BIN_DIR}/dotagent-compiler" verify "${DOTAGENT_ROOT}"
 
-# 3. Apply and verify ALL 19 global Git hardening keys (preserving user.name / user.email and credential helpers)
-REQUIRED_GIT_SETTINGS=(
-    "core.hooksPath:/dev/null"
-    "core.attributesFile:/dev/null"
-    "core.fsmonitor:false"
-    "core.pager:cat"
-    "core.symlinks:false"
-    "core.autocrlf:input"
-    "core.protectHFS:true"
-    "core.protectNTFS:true"
-    "gc.auto:0"
-    "protocol.allow:never"
-    "protocol.https.allow:always"
-    "protocol.file.allow:never"
-    "protocol.ext.allow:never"
-    "protocol.git.allow:never"
-    "submodule.recurse:false"
-    "submodule.fetchJobs:0"
-    "transfer.fsckObjects:true"
-    "fetch.fsckObjects:true"
-    "receive.fsckObjects:true"
-)
+# 3. Delegate non-destructive deployment (.dotagent.bak backups, JSON preference merging,
+#    zsh/bash PATH setup, 19-key Git lockdown, pinned GUI hooks, 0444 plane, & live audit-repo)
+"${BIN_DIR}/agent-guard" activate \
+    --dotagent-root "${DOTAGENT_ROOT}" \
+    --workspace "${TARGET_WORKSPACE}" \
+    --bin-dir "${BIN_DIR}"
 
-for entry in "${REQUIRED_GIT_SETTINGS[@]}"; do
-    key="${entry%%:*}"
-    expected="${entry#*:}"
-    current="$(git config --global --get "${key}" 2>/dev/null || true)"
-    if [[ "${current}" != "${expected}" ]]; then
-        git config --global "${key}" "${expected}"
-    fi
-    verified="$(git config --global --get "${key}" 2>/dev/null || true)"
-    if [[ "${verified}" != "${expected}" ]]; then
-        echo "[activate-local] HARD DENY: failed to enforce git config --global ${key}=${expected} (got '${verified}')" >&2
-        exit 2
-    fi
-done
-
-# 4. Install Gemini / Antigravity global constitution, hook wiring, & Swarm role subagents
-# Use `cp -f` so FUSE/virtiofs persistent ~/.gemini mounts that disallow chmod succeed cleanly.
-for gpath in "${HOME}/.gemini" "${HOME}/.gemini/agents" "${HOME}/.gemini/GEMINI.md" "${HOME}/.gemini/settings.json"; do
-    if [[ -L "${gpath}" ]]; then
-        echo "[activate-local] HARD DENY: refusing symlinked Gemini path '${gpath}'" >&2
-        exit 2
-    fi
-done
-mkdir -p "${HOME}/.gemini/agents"
-for af in research-airlock.md swarm-master.md swarm-investigator.md swarm-qa-engineer.md swarm-grunt.md swarm-adversarial-reviewer.md swarm-forensic-coroner.md; do
-    if [[ -L "${HOME}/.gemini/agents/${af}" ]]; then
-        echo "[activate-local] HARD DENY: refusing symlinked Gemini agent '${HOME}/.gemini/agents/${af}'" >&2
-        exit 2
-    fi
-    cp -f "${DOTAGENT_ROOT}/dist/gemini/agents/${af}" "${HOME}/.gemini/agents/${af}"
-done
-cp -f "${DOTAGENT_ROOT}/dist/gemini/GEMINI.md" "${HOME}/.gemini/GEMINI.md"
-cp -f "${DOTAGENT_ROOT}/dist/gemini/settings.json" "${HOME}/.gemini/settings.json"
-
-# 5. Deploy root AGENTS.md + harness hooks + research-airlock & 6 Swarm role subagents across Claude, Cursor, and Codex
-#    Source repo keeps 0644 for git workflows; deployed runtime workspace gets VFS read-only 0444!
-deploy_harness_bundle() {
-    local root="$1"
-    local mode="$2"
-    local dirs=(
-        "${root}"
-        "${root}/.claude"
-        "${root}/.claude/agents"
-        "${root}/.cursor"
-        "${root}/.cursor/agents"
-        "${root}/.codex"
-        "${root}/.codex/agents"
-    )
-    for d in "${dirs[@]}"; do
-        if [[ -L "${d}" ]]; then
-            echo "[activate-local] HARD DENY: refusing symlinked harness directory '${d}'" >&2
-            exit 2
-        fi
-    done
-    local agent_files=(
-        "research-airlock.md"
-        "swarm-master.md"
-        "swarm-investigator.md"
-        "swarm-qa-engineer.md"
-        "swarm-grunt.md"
-        "swarm-adversarial-reviewer.md"
-        "swarm-forensic-coroner.md"
-    )
-    local targets=(
-        "${root}/AGENTS.md"
-        "${root}/.ignore"
-        "${root}/.cursorignore"
-        "${root}/.claude/settings.json"
-        "${root}/.cursor/hooks.json"
-        "${root}/.codex/config.toml"
-    )
-    for af in "${agent_files[@]}"; do
-        targets+=(
-            "${root}/.claude/agents/${af}"
-            "${root}/.cursor/agents/${af}"
-            "${root}/.codex/agents/${af}"
-        )
-    done
-    for t in "${targets[@]}"; do
-        if [[ -L "${t}" ]]; then
-            echo "[activate-local] HARD DENY: refusing symlinked harness target '${t}'" >&2
-            exit 2
-        fi
-    done
-    mkdir -p "${root}/.claude/agents" "${root}/.cursor/agents" "${root}/.codex/agents"
-    for t in "${targets[@]}"; do
-        if [[ -e "${t}" ]]; then
-            chmod u+w "${t}" 2>/dev/null || true
-            rm -f "${t}"
-        fi
-    done
-    install -m "${mode}" "${DOTAGENT_ROOT}/dist/AGENTS.md" "${root}/AGENTS.md"
-    install -m "${mode}" "${DOTAGENT_ROOT}/dist/.ignore" "${root}/.ignore"
-    install -m "${mode}" "${DOTAGENT_ROOT}/dist/cursor/.cursorignore" "${root}/.cursorignore"
-    install -m "${mode}" "${DOTAGENT_ROOT}/dist/claude/settings.json" "${root}/.claude/settings.json"
-    for af in "${agent_files[@]}"; do
-        install -m "${mode}" "${DOTAGENT_ROOT}/dist/claude/agents/${af}" "${root}/.claude/agents/${af}"
-        install -m "${mode}" "${DOTAGENT_ROOT}/dist/cursor/agents/${af}" "${root}/.cursor/agents/${af}"
-        install -m "${mode}" "${DOTAGENT_ROOT}/dist/codex/agents/${af}" "${root}/.codex/agents/${af}"
-    done
-    install -m "${mode}" "${DOTAGENT_ROOT}/dist/cursor/hooks.json" "${root}/.cursor/hooks.json"
-    install -m "${mode}" "${DOTAGENT_ROOT}/dist/codex/config.toml" "${root}/.codex/config.toml"
-}
-
-deploy_harness_bundle "${DOTAGENT_ROOT}" "0644"
-if [[ "${TARGET_WORKSPACE}" != "${DOTAGENT_ROOT}" ]]; then
-    deploy_harness_bundle "${TARGET_WORKSPACE}" "0444"
-fi
-
-# 6. Run live self-audit
-"${BIN_DIR}/agent-guard" audit-repo "${DOTAGENT_ROOT}"
-echo "[activate-local] Zero-trust guards (0555), read-only control plane (0444), pre-buffer ASCII sanitizer, tiny step compaction, and global git lockdown active."

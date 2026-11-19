@@ -275,11 +275,17 @@ pub fn validate_two_plus_two_sentences(
 }
 
 fn count_terminal_sentences(text: &str) -> usize {
+    const ABBREVIATIONS: &[&str] = &[
+        "e.g.", "i.e.", "vs.", "etc.", "cf.", "fig.", "sec.", "approx.", "min.", "max.", "no.",
+        "inc.", "ltd.", "mr.", "ms.", "dr.", "st.", "ref.", "vol.", "est.",
+    ];
+
     let trimmed = text.trim();
     if trimmed.is_empty() {
         return 0;
     }
     let bytes = trimmed.as_bytes();
+    let lower = trimmed.to_ascii_lowercase();
     let mut count = 0usize;
     let mut word_chars_in_current = 0usize;
 
@@ -288,7 +294,36 @@ fn count_terminal_sentences(text: &str) -> usize {
             word_chars_in_current += 1;
         }
         if matches!(b, b'.' | b'!' | b'?') {
-            let next_is_boundary = i + 1 == bytes.len() || bytes[i + 1] == b' ';
+            if b == b'.' {
+                // Skip numeric decimals / version numbers such as `1.0`, `v1.2`, `0.4.7`.
+                let prev_is_digit = i > 0 && bytes[i - 1].is_ascii_digit();
+                let next_is_digit = i + 1 < bytes.len() && bytes[i + 1].is_ascii_digit();
+                if prev_is_digit && next_is_digit {
+                    continue;
+                }
+                // Skip periods internal to multi-dot abbreviations like the first dot in `e.g.` or `i.e.`.
+                if i + 2 < bytes.len() && bytes[i + 1].is_ascii_alphabetic() && bytes[i + 2] == b'.'
+                {
+                    continue;
+                }
+                // Skip trailing period of common engineering abbreviations (`e.g.`, `i.e.`, `vs.`, `etc.`, ...).
+                let prefix = &lower[..=i];
+                let is_abbrev = ABBREVIATIONS.iter().any(|abbr| {
+                    if !prefix.ends_with(abbr) {
+                        return false;
+                    }
+                    let start = prefix.len() - abbr.len();
+                    start == 0 || !prefix.as_bytes()[start - 1].is_ascii_alphanumeric()
+                });
+                if is_abbrev {
+                    continue;
+                }
+            }
+
+            let next_is_boundary = i + 1 == bytes.len()
+                || bytes[i + 1].is_ascii_whitespace()
+                || (matches!(bytes[i + 1], b')' | b']' | b'"' | b'\'')
+                    && (i + 2 == bytes.len() || bytes[i + 2].is_ascii_whitespace()));
             if next_is_boundary && word_chars_in_current >= 3 {
                 count += 1;
                 word_chars_in_current = 0;

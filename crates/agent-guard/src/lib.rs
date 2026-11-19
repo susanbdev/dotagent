@@ -16,12 +16,15 @@
 
 pub mod breadcrumbs;
 pub mod budget_guard;
+pub mod cli;
 pub mod cmd_policy;
 pub mod coordinator;
 pub mod crypto;
+pub mod diagnostics;
 pub mod exec_sandbox;
 pub mod injection_scan;
 pub mod json;
+pub mod operator;
 pub mod path_policy;
 pub mod qa_suspects;
 pub mod role_sandbox;
