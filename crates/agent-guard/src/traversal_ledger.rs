@@ -23,9 +23,10 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::breadcrumbs::ExclusiveFileLockGuard;
 use crate::budget_guard::{MAX_TURN_FILE_READS, MAX_TURN_TOKENS, MAX_TURN_TOOL_CALLS};
+use crate::crypto::sha256_hex;
 use crate::json::JsonValue;
-use crate::sha256::sha256_hex;
 
 pub const MAX_REFERENCE_LEVEL: u8 = 2;
 
@@ -57,6 +58,15 @@ pub struct SessionLedger {
 }
 
 impl SessionLedger {
+    /// Acquires an exclusive per-session file lock so concurrent parallel tool hooks
+    /// (`pre-tool`, `post-tool`, `pre-compact`, `user-prompt`) serialize state transitions
+    /// without lost updates or clobbered circuit-breaker flags.
+    pub fn acquire_lock(repo_root: &Path, session_id: &str) -> Option<ExclusiveFileLockGuard> {
+        let key_hash = compute_session_key_hash(repo_root, session_id);
+        let path = ledger_file_path_for_hash(&key_hash);
+        ExclusiveFileLockGuard::acquire(&path).ok()
+    }
+
     pub fn new(repo_root: &Path, session_id: &str) -> Self {
         let clean_sid = sanitize_session_id(session_id);
         let session_key_hash = compute_session_key_hash(repo_root, session_id);
@@ -83,13 +93,26 @@ impl SessionLedger {
         let path = ledger_file_path_for_hash(&key_hash);
         match read_nonsymlink_state_file(&path) {
             Ok(Some(raw)) => {
+                if raw.trim().is_empty() {
+                    let mut halted = Self::new(repo_root, session_id);
+                    halted.trip_circuit_breaker(
+                        "CORRUPT_SESSION_STATE: empty session ledger file rejected (fail-closed)"
+                            .to_string(),
+                    );
+                    return halted;
+                }
                 if let Some(mut loaded) = Self::from_json(&raw) {
                     if loaded.session_key_hash.is_empty() || loaded.session_key_hash == key_hash {
                         loaded.session_key_hash = key_hash;
                         return loaded;
                     }
                 }
-                Self::new(repo_root, session_id)
+                let mut halted = Self::new(repo_root, session_id);
+                halted.trip_circuit_breaker(
+                    "CORRUPT_SESSION_STATE: unreadable or mismatched session ledger JSON (fail-closed)"
+                        .to_string(),
+                );
+                halted
             }
             Ok(None) => Self::new(repo_root, session_id),
             Err(symlink_err) => {
@@ -107,13 +130,32 @@ impl SessionLedger {
             self.session_key_hash.clone()
         };
         let path = ledger_file_path_for_hash(&key_hash);
-        let serialized = self.to_json();
+        // Defense-in-depth monotonic sticky merge: never clear an already-persisted
+        // `halted` or `tainted` bit during an unlocked `save` call.
+        let mut merged = self.clone();
+        if let Ok(Some(existing_raw)) = read_nonsymlink_state_file(&path)
+            && let Some(existing) = Self::from_json(&existing_raw)
+            && (existing.session_key_hash.is_empty() || existing.session_key_hash == key_hash)
+        {
+            if existing.halted && !merged.halted {
+                merged.halted = true;
+                merged.halt_reason = existing.halt_reason;
+            }
+            if existing.tainted && !merged.tainted {
+                merged.tainted = true;
+                merged.taint_reason = existing.taint_reason;
+            }
+        }
+        let serialized = merged.to_json();
         atomic_write_nonsymlink_state_file(&path, serialized.as_bytes())
     }
 
     pub fn reset_for_new_user_prompt(repo_root: &Path, session_id: &str) -> Result<Self, String> {
+        let _lock = Self::acquire_lock(repo_root, session_id);
         let fresh = Self::new(repo_root, session_id);
-        fresh.save(repo_root)?;
+        let path = ledger_file_path_for_hash(&fresh.session_key_hash);
+        let serialized = fresh.to_json();
+        atomic_write_nonsymlink_state_file(&path, serialized.as_bytes())?;
         Ok(fresh)
     }
 

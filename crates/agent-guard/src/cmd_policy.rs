@@ -4402,6 +4402,13 @@ fn parse_shell_script(
             i = next_i;
             continue;
         }
+        if b == b')' {
+            return Err(CommandViolation {
+                code: "UNBALANCED_SUBSHELL",
+                detail: "Unmatched ')' in shell command.".to_string(),
+                halt_session: false,
+            });
+        }
         // Brace group `{ ...; }`
         if b == b'{' || b == b'}' {
             has_compound_list_op = true;
@@ -4462,6 +4469,13 @@ fn parse_shell_script(
                 i += 1;
             }
             let (target_word, next_i) = read_shell_word(script, i, subscripts)?;
+            if next_i <= i {
+                return Err(CommandViolation {
+                    code: "MALFORMED_REDIRECTION",
+                    detail: "Shell redirection missing target operand.".to_string(),
+                    halt_session: false,
+                });
+            }
             if is_multiline_heredoc && !target_word.is_empty() {
                 pending_heredocs.push((target_word.clone(), strip_heredoc_tabs));
             }
@@ -4472,6 +4486,13 @@ fn parse_shell_script(
 
         // Normal word (resolving quotes & escapes, and extracting nested `$(...)` / `` `...` ``)
         let (word, next_i) = read_shell_word(script, i, subscripts)?;
+        if next_i <= i {
+            return Err(CommandViolation {
+                code: "UNEXPECTED_SHELL_TOKEN",
+                detail: "Unexpected shell metacharacter in command.".to_string(),
+                halt_session: false,
+            });
+        }
         i = next_i;
 
         // Leading `KEY=VALUE` before command name
@@ -4632,7 +4653,15 @@ fn extract_balanced_parens(
     while i < bytes.len() {
         let b = bytes[i];
         if b == b'\\' && !in_sq {
-            i += 2;
+            if i + 1 >= bytes.len() {
+                return Err(CommandViolation {
+                    code: "UNTERMINATED_SHELL_ESCAPE",
+                    detail: "Trailing backslash inside subshell.".to_string(),
+                    halt_session: false,
+                });
+            }
+            let ch_len = script[i + 1..].chars().next().map_or(1, char::len_utf8);
+            i += 1 + ch_len;
             continue;
         }
         if b == b'\'' && !in_dq {
@@ -4649,7 +4678,8 @@ fn extract_balanced_parens(
                 }
             }
         }
-        i += 1;
+        let ch_len = script[i..].chars().next().map_or(1, char::len_utf8);
+        i += ch_len;
     }
 
     Err(CommandViolation {

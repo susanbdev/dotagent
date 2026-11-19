@@ -157,6 +157,9 @@ fn collect_scoped_blobs(
             .replace('\\', "/");
 
         if ft.is_dir() {
+            if !scope_patterns.is_empty() && !dir_can_match_any_scope(&rel, scope_patterns) {
+                continue;
+            }
             // Skip any forbidden cache, temp, dependency, secret, or guard-state directory before recursing!
             if validate_path_with_max_depth(
                 canon_repo,
@@ -192,6 +195,43 @@ fn collect_scoped_blobs(
             }
         }
     }
+}
+
+/// Returns `true` iff at least one descendant file inside `dir_rel` could possibly match `patterns`.
+fn dir_can_match_any_scope(dir_rel: &str, patterns: &[String]) -> bool {
+    let clean_dir = dir_rel.trim_start_matches("./").trim_end_matches('/');
+    for pat in patterns {
+        let p = pat.trim().trim_start_matches("./");
+        if matches!(p, "" | "." | "*" | "**") {
+            return true;
+        }
+        if let Some(prefix) = p.strip_suffix("/**") {
+            let base = prefix.trim_end_matches('/');
+            if base.is_empty()
+                || clean_dir == base
+                || clean_dir.starts_with(&format!("{base}/"))
+                || base.starts_with(&format!("{clean_dir}/"))
+            {
+                return true;
+            }
+        } else if let Some(prefix) = p.strip_suffix("/*") {
+            let base = prefix.trim_end_matches('/');
+            // `base/*` matches direct files inside `base`, so we must enter ancestors of `base` and `base` itself,
+            // but never need to recurse into subdirectories deeper than `base`!
+            if base.is_empty() || clean_dir == base || base.starts_with(&format!("{clean_dir}/")) {
+                return true;
+            }
+        } else {
+            let base = p.trim_end_matches('/');
+            if clean_dir == base
+                || clean_dir.starts_with(&format!("{base}/"))
+                || base.starts_with(&format!("{clean_dir}/"))
+            {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// Records the result of `swarm-tool grunt checkpoint-green` into the session capability
@@ -275,11 +315,17 @@ pub fn validate_two_plus_two_sentences(
 }
 
 fn count_terminal_sentences(text: &str) -> usize {
+    const ABBREVIATIONS: &[&str] = &[
+        "e.g.", "i.e.", "vs.", "etc.", "cf.", "fig.", "sec.", "approx.", "min.", "max.", "no.",
+        "inc.", "ltd.", "mr.", "ms.", "dr.", "st.", "ref.", "vol.", "est.",
+    ];
+
     let trimmed = text.trim();
     if trimmed.is_empty() {
         return 0;
     }
     let bytes = trimmed.as_bytes();
+    let lower = trimmed.to_ascii_lowercase();
     let mut count = 0usize;
     let mut word_chars_in_current = 0usize;
 
@@ -288,7 +334,36 @@ fn count_terminal_sentences(text: &str) -> usize {
             word_chars_in_current += 1;
         }
         if matches!(b, b'.' | b'!' | b'?') {
-            let next_is_boundary = i + 1 == bytes.len() || bytes[i + 1] == b' ';
+            if b == b'.' {
+                // Skip numeric decimals / version numbers such as `1.0`, `v1.2`, `0.4.7`.
+                let prev_is_digit = i > 0 && bytes[i - 1].is_ascii_digit();
+                let next_is_digit = i + 1 < bytes.len() && bytes[i + 1].is_ascii_digit();
+                if prev_is_digit && next_is_digit {
+                    continue;
+                }
+                // Skip periods internal to multi-dot abbreviations like the first dot in `e.g.` or `i.e.`.
+                if i + 2 < bytes.len() && bytes[i + 1].is_ascii_alphabetic() && bytes[i + 2] == b'.'
+                {
+                    continue;
+                }
+                // Skip trailing period of common engineering abbreviations (`e.g.`, `i.e.`, `vs.`, `etc.`, ...).
+                let prefix = &lower[..=i];
+                let is_abbrev = ABBREVIATIONS.iter().any(|abbr| {
+                    if !prefix.ends_with(abbr) {
+                        return false;
+                    }
+                    let start = prefix.len() - abbr.len();
+                    start == 0 || !prefix.as_bytes()[start - 1].is_ascii_alphanumeric()
+                });
+                if is_abbrev {
+                    continue;
+                }
+            }
+
+            let next_is_boundary = i + 1 == bytes.len()
+                || bytes[i + 1].is_ascii_whitespace()
+                || (matches!(bytes[i + 1], b')' | b']' | b'"' | b'\'')
+                    && (i + 2 == bytes.len() || bytes[i + 2].is_ascii_whitespace()));
             if next_is_boundary && word_chars_in_current >= 3 {
                 count += 1;
                 word_chars_in_current = 0;

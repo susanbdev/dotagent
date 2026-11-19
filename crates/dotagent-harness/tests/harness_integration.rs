@@ -96,4 +96,24 @@ fn cli_binary_supports_list_and_structured_json_reports() {
         Some("pass")
     );
     assert_eq!(parsed.get("failed").and_then(JsonValue::as_u64), Some(0));
+
+    let bench_out = Command::new(bin)
+        .args(["bench", "--quick", "--json", "--workspace"])
+        .arg(&ws)
+        .output()
+        .expect("run bench --quick --json");
+    assert!(
+        bench_out.status.success(),
+        "bench CLI failed: {}",
+        String::from_utf8_lossy(&bench_out.stderr)
+    );
+    let bench_json =
+        JsonValue::parse(&String::from_utf8_lossy(&bench_out.stdout)).expect("valid bench JSON");
+    assert_eq!(
+        bench_json
+            .get("benchmarks")
+            .and_then(JsonValue::as_array)
+            .map(<[JsonValue]>::len),
+        Some(5)
+    );
 }

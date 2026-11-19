@@ -13,6 +13,10 @@ workspace = true
 name = "agent-guard"
 path = "src/main.rs"
 
+[[bin]]
+name = "dotagent"
+path = "src/bin/dotagent.rs"
+
 [dependencies]
 crc32fast = "1.4"
 hmac = "0.12"

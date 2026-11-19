@@ -11,13 +11,16 @@ members = [
 version = "1.0.0"
 edition = "2024"
 license = "LicenseRef-Proprietary"
-rust-version = "1.85"
+rust-version = "1.88"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
 
 [workspace.lints.clippy]
 all = { level = "deny", priority = -1 }
+collapsible_if = "allow"
+dbg_macro = "deny"
+todo = "deny"
 
 [profile.release]
 opt-level = 3

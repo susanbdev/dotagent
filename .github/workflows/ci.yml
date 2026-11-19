@@ -10,9 +10,13 @@ permissions:
 
 jobs:
   verify-guardrails:
-    name: Rust 2024 Security Kernel & Bundle Verification
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
+    name: Security Kernel & Harness (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
     env:
       CARGO_TERM_COLOR: always
       GIT_CONFIG_NOSYSTEM: "1"
@@ -30,7 +34,7 @@ jobs:
       - name: Apply hardened global Git configuration
         run: cp dist/gitconfig.hardened ~/.gitconfig
 
-      - name: Install Rust 1.85+ (Edition 2024) toolchain
+      - name: Install stable Rust toolchain
         run: |
           rustup toolchain install stable --profile minimal --component rustfmt,clippy
           rustup default stable
@@ -38,14 +42,39 @@ jobs:
       - name: Verify formatting (cargo fmt)
         run: cargo fmt --all -- --check
 
-      - name: Verify strict lints & forbid(unsafe_code) (cargo clippy)
+      - name: Verify strict lints, forbid(unsafe_code), & zero-panic kernel (cargo clippy)
         run: cargo clippy --workspace --all-targets -- -D warnings
 
-      - name: Run unit + 250+ adversarial bypass suite (cargo test)
+      - name: Run unit, 305+ adversarial corpus, Swarm v2, & 5,300+ property fuzz suites
         run: cargo test --workspace
 
       - name: Verify deterministic multi-harness bundles & SHA-256 lock manifest
         run: cargo run --release -p dotagent-compiler -- verify .
 
-      - name: Run static zero-trust repository audit
-        run: cargo run --release -p agent-guard -- audit-repo .
+      - name: Run static zero-trust repository & workflow audit
+        run: cargo run --release -p agent-guard --bin dotagent -- audit-repo .
+
+      - name: Run release-profile latency & throughput microbenchmarks
+        run: |
+          cargo build --release --workspace
+          ./target/release/dotagent-harness bench --quick
+
+  msrv-1-88:
+    name: MSRV 1.88.0 Compatibility Gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      CARGO_TERM_COLOR: always
+      GIT_CONFIG_NOSYSTEM: "1"
+    steps:
+      - name: Checkout repository (zero persisted credentials)
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+          submodules: false
+
+      - name: Install exact Rust 1.88.0 (Edition 2024 + let_chains MSRV)
+        run: rustup toolchain install 1.88.0 --profile minimal
+
+      - name: Check entire workspace against Rust 1.88.0
+        run: cargo +1.88.0 check --workspace --all-targets

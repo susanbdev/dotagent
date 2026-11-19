@@ -1,33 +1,57 @@
-//! External Host Coordinator Unix-Socket Daemon & Client (`spec.md` Section 3.3).
+#![forbid(unsafe_code)]
+
+//! External Host Coordinator Privilege-Separated Monitor & Client (`spec.md` Section 3.3).
 //!
 //! Isolates `<swarm_state_dir>/vault/hmac.key` outside `exec-sandbox` (Linux Landlock LSM /
 //! macOS Seatbelt) so untrusted child processes (`cargo test`, `build.rs`, `pytest`, `awk`)
-//! never have filesystem access to HMAC key material. Privileged Swarm provenance signing and
-//! verification route over `<swarm_state_dir>/ipc/coord.sock` to the host coordinator process.
+//! never have filesystem access to HMAC key material.
+//!
+//! Security Invariants:
+//! 1. **Zero Signing Oracle on Verification**: `verify_event_mac` and `verify_domain_hmac`
+//!    perform constant-time MAC verification inside the coordinator and return `bool` only—never
+//!    exposing raw tags to callers.
+//! 2. **Privilege-Separated Signing Policy**:
+//!    - `PLAN_LOCK_HMAC_DOMAIN` (`dotagent-plan-lock-v1`) signing is **hard-blocked** over IPC
+//!      (restricted exclusively to host-side `Master` with direct vault possession).
+//!    - `CAPABILITY_HMAC_DOMAIN` (`DOTAGENT_SESSION_CAPABILITY_V1`) signing **hard-blocks**
+//!      `role == "master"`, unminted `session_id`s, and any mutation of immutable scope fields
+//!      (`task_id`, `attempt`, `repo_sha256`, `plan_sha256`, `assigned_read_paths`,
+//!      `allowed_write_paths`, `assigned_tests`), permitting only counter/`last_green_tree_oid`
+//!      transitions on an already-minted worker capability.
+//! 3. **Domain Separation & Zeroization**: Event MACs use `BREADCRUMB_EVENT_HMAC_DOMAIN`,
+//!    key bytes live in `ZeroizingKey`, and client streams run on bounded worker threads so
+//!    stalled connections cannot head-of-line block parallel Swarm waves.
 
-use std::fs::{self, File};
+use std::fs;
+#[cfg(target_os = "linux")]
+use std::fs::File;
 use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
 #[cfg(unix)]
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
 
 use crate::breadcrumbs::{
-    ExclusiveFileLockGuard, hex_decode_bytes, load_or_init_vault_hmac_key, swarm_state_dir,
+    BREADCRUMB_EVENT_HMAC_DOMAIN, ExclusiveFileLockGuard, hex_decode_bytes,
+    load_or_init_vault_hmac_key, swarm_state_dir,
 };
+use crate::crypto::{ZeroizingKey, constant_time_eq_bytes, hex_encode};
 use crate::json::JsonValue;
-use crate::swarm_contracts::hex_encode;
 
 type HmacSha256 = Hmac<Sha256>;
 
 const MAX_RPC_LINE_BYTES: usize = 65_536;
 const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 45;
+const MAX_CONCURRENT_IPC_CLIENTS: usize = 16;
+
+const PLAN_LOCK_DOMAIN_BYTES: &[u8] = b"dotagent-plan-lock-v1";
+const CAPABILITY_DOMAIN_BYTES: &[u8] = b"DOTAGENT_SESSION_CAPABILITY_V1";
 
 /// Directory containing ONLY the coordinator Unix domain socket (`coord.sock`),
 /// kept strictly separate from `<swarm_state_dir>/vault/hmac.key`.
@@ -57,8 +81,43 @@ pub fn coordinator_socket_path(repo_root: &Path) -> Result<PathBuf, String> {
     Ok(coordinator_ipc_dir(repo_root)?.join("coord.sock"))
 }
 
+#[cfg(all(unix, not(target_os = "linux")))]
+fn shorten_unix_socket_via_cwd(sock_path: &Path) -> PathBuf {
+    let Ok(cwd) = std::env::current_dir() else {
+        return sock_path.to_path_buf();
+    };
+    let canon_cwd = fs::canonicalize(&cwd).unwrap_or(cwd);
+    let canon_sock = sock_path
+        .parent()
+        .and_then(|p| fs::canonicalize(p).ok())
+        .and_then(|cp| sock_path.file_name().map(|f| cp.join(f)))
+        .unwrap_or_else(|| sock_path.to_path_buf());
+    let cwd_comps: Vec<_> = canon_cwd.components().collect();
+    let sock_comps: Vec<_> = canon_sock.components().collect();
+    let common = cwd_comps
+        .iter()
+        .zip(sock_comps.iter())
+        .take_while(|(a, b)| a == b)
+        .count();
+    if common == 0 {
+        return sock_path.to_path_buf();
+    }
+    let mut rel = PathBuf::new();
+    for _ in common..cwd_comps.len() {
+        rel.push("..");
+    }
+    for comp in &sock_comps[common..] {
+        rel.push(comp.as_os_str());
+    }
+    if rel.as_os_str().len() < sock_path.as_os_str().len() {
+        rel
+    } else {
+        sock_path.to_path_buf()
+    }
+}
+
 #[cfg(unix)]
-fn connect_unix_short_path(sock_path: &Path) -> std::io::Result<UnixStream> {
+pub fn connect_unix_short_path(sock_path: &Path) -> std::io::Result<UnixStream> {
     if sock_path.as_os_str().len() <= 95 {
         return UnixStream::connect(sock_path);
     }
@@ -81,12 +140,16 @@ fn connect_unix_short_path(sock_path: &Path) -> std::io::Result<UnixStream> {
     }
     #[cfg(not(target_os = "linux"))]
     {
-        UnixStream::connect(sock_path)
+        UnixStream::connect(shorten_unix_socket_via_cwd(sock_path))
     }
 }
 
 #[cfg(unix)]
 fn bind_unix_short_path(sock_path: &Path) -> std::io::Result<UnixListener> {
+    if let Some(parent) = sock_path.parent() {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(parent, fs::Permissions::from_mode(0o700));
+    }
     if sock_path.as_os_str().len() <= 95 {
         return UnixListener::bind(sock_path);
     }
@@ -109,7 +172,7 @@ fn bind_unix_short_path(sock_path: &Path) -> std::io::Result<UnixListener> {
     }
     #[cfg(not(target_os = "linux"))]
     {
-        UnixListener::bind(sock_path)
+        UnixListener::bind(shorten_unix_socket_via_cwd(sock_path))
     }
 }
 
@@ -175,13 +238,17 @@ pub fn ping_coordinator(repo_root: &Path) -> bool {
 fn find_agent_guard_binary() -> Option<PathBuf> {
     if let Ok(exe) = std::env::current_exe() {
         if let Some(name) = exe.file_name().and_then(|s| s.to_str()) {
-            if name == "agent-guard" {
+            if name == "agent-guard" || name == "dotagent" {
                 return Some(exe);
             }
             if name == "swarm-tool" {
                 let sibling = exe.with_file_name("agent-guard");
                 if sibling.is_file() {
                     return Some(sibling);
+                }
+                let dotagent_sib = exe.with_file_name("dotagent");
+                if dotagent_sib.is_file() {
+                    return Some(dotagent_sib);
                 }
             }
         }
@@ -199,7 +266,7 @@ fn find_agent_guard_binary() -> Option<PathBuf> {
 
 /// Ensures an out-of-sandbox `agent-guard coordinator` daemon is listening for `repo_root`.
 /// Must be called from the host side (outside `exec-sandbox`) before spawning sandboxed
-/// `swarm-tool` invocations, or lazily by host-side `swarm-tool` calls.
+/// `swarm-tool` invocations.
 pub fn ensure_coordinator_daemon(repo_root: &Path) -> Result<PathBuf, String> {
     let sock_path = coordinator_socket_path(repo_root)?;
     if ping_coordinator(repo_root) {
@@ -280,6 +347,42 @@ pub fn rpc_compute_domain_hmac_hex(
     }
 }
 
+pub fn rpc_verify_domain_hmac(
+    repo_root: &Path,
+    domain: &[u8],
+    payload: &[u8],
+    expected_mac_hex: &str,
+) -> Result<bool, String> {
+    #[cfg(unix)]
+    {
+        let sock_path = coordinator_socket_path(repo_root)?;
+        let req = JsonValue::Object(vec![
+            (
+                "op".to_string(),
+                JsonValue::Str("verify_domain_hmac".to_string()),
+            ),
+            ("domain_hex".to_string(), JsonValue::Str(hex_encode(domain))),
+            (
+                "payload_hex".to_string(),
+                JsonValue::Str(hex_encode(payload)),
+            ),
+            (
+                "expected_mac_hex".to_string(),
+                JsonValue::Str(expected_mac_hex.trim().to_string()),
+            ),
+        ]);
+        let resp = send_rpc_request(&sock_path, &req)?;
+        resp.get("valid")
+            .and_then(JsonValue::as_bool)
+            .ok_or_else(|| "missing valid boolean in coordinator response".to_string())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (repo_root, domain, payload, expected_mac_hex);
+        Err("Unix domain sockets unsupported on this platform".to_string())
+    }
+}
+
 pub fn rpc_compute_raw_hmac_bytes(
     repo_root: &Path,
     canonical_bytes: &[u8],
@@ -299,17 +402,51 @@ pub fn rpc_compute_raw_hmac_bytes(
             .get("mac_hex")
             .and_then(JsonValue::as_str)
             .ok_or_else(|| "missing mac_hex in coordinator response".to_string())?;
-        let decoded = hex_decode_bytes(mac_hex)?;
-        if decoded.len() != 32 {
-            return Err("invalid 32-byte MAC length from coordinator".to_string());
+        let raw = hex_decode_bytes(mac_hex)?;
+        if raw.len() != 32 {
+            return Err("coordinator event_mac returned non-32-byte tag".to_string());
         }
-        let mut out = [0u8; 32];
-        out.copy_from_slice(&decoded);
-        Ok(out)
+        let mut arr = [0u8; 32];
+        arr.copy_from_slice(&raw);
+        Ok(arr)
     }
     #[cfg(not(unix))]
     {
         let _ = (repo_root, canonical_bytes);
+        Err("Unix domain sockets unsupported on this platform".to_string())
+    }
+}
+
+pub fn rpc_verify_event_mac(
+    repo_root: &Path,
+    canonical_bytes: &[u8],
+    expected_mac: &[u8; 32],
+) -> Result<bool, String> {
+    #[cfg(unix)]
+    {
+        let sock_path = coordinator_socket_path(repo_root)?;
+        let req = JsonValue::Object(vec![
+            (
+                "op".to_string(),
+                JsonValue::Str("verify_event_mac".to_string()),
+            ),
+            (
+                "canonical_hex".to_string(),
+                JsonValue::Str(hex_encode(canonical_bytes)),
+            ),
+            (
+                "expected_mac_hex".to_string(),
+                JsonValue::Str(hex_encode(expected_mac)),
+            ),
+        ]);
+        let resp = send_rpc_request(&sock_path, &req)?;
+        resp.get("valid")
+            .and_then(JsonValue::as_bool)
+            .ok_or_else(|| "missing valid boolean in coordinator response".to_string())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (repo_root, canonical_bytes, expected_mac);
         Err("Unix domain sockets unsupported on this platform".to_string())
     }
 }
@@ -345,9 +482,9 @@ pub fn run_coordinator_cli(args: &[String], default_cwd: &Path) -> ExitCode {
             }
         }
 
-        let canon_repo = fs::canonicalize(&repo_root).unwrap_or(repo_root);
+        let canon_repo = Arc::new(fs::canonicalize(&repo_root).unwrap_or(repo_root));
         let key = match load_or_init_vault_hmac_key(&canon_repo) {
-            Ok(k) => Arc::new(k),
+            Ok(k) => Arc::new(ZeroizingKey::new(k)),
             Err(e) => {
                 eprintln!("[agent-guard coordinator] vault key error: {e}");
                 return ExitCode::from(2);
@@ -380,24 +517,36 @@ pub fn run_coordinator_cli(args: &[String], default_cwd: &Path) -> ExitCode {
         let _ = listener.set_nonblocking(true);
 
         let last_activity = Arc::new(AtomicU64::new(now_epoch_secs()));
+        let active_clients = Arc::new(AtomicUsize::new(0));
         loop {
             match listener.accept() {
                 Ok((stream, _addr)) => {
                     last_activity.store(now_epoch_secs(), Ordering::Relaxed);
+                    if active_clients.load(Ordering::Relaxed) >= MAX_CONCURRENT_IPC_CLIENTS {
+                        // Drop excess connection immediately to prevent fd/thread exhaustion
+                        drop(stream);
+                        continue;
+                    }
+                    active_clients.fetch_add(1, Ordering::AcqRel);
                     let key_ref = Arc::clone(&key);
-                    let _ = handle_coordinator_client(stream, &key_ref);
+                    let repo_ref = Arc::clone(&canon_repo);
+                    let active_ref = Arc::clone(&active_clients);
+                    std::thread::spawn(move || {
+                        let _ = handle_coordinator_client(stream, key_ref.as_bytes(), &repo_ref);
+                        active_ref.fetch_sub(1, Ordering::AcqRel);
+                    });
                 }
                 Err(e) if e.kind() == ErrorKind::WouldBlock => {
                     let elapsed =
                         now_epoch_secs().saturating_sub(last_activity.load(Ordering::Relaxed));
-                    if elapsed >= idle_secs {
+                    if elapsed >= idle_secs && active_clients.load(Ordering::Acquire) == 0 {
                         let _ = fs::remove_file(&sock_path);
                         return ExitCode::SUCCESS;
                     }
-                    std::thread::sleep(Duration::from_millis(25));
+                    std::thread::sleep(Duration::from_millis(20));
                 }
                 Err(_) => {
-                    std::thread::sleep(Duration::from_millis(25));
+                    std::thread::sleep(Duration::from_millis(20));
                 }
             }
         }
@@ -405,7 +554,11 @@ pub fn run_coordinator_cli(args: &[String], default_cwd: &Path) -> ExitCode {
 }
 
 #[cfg(unix)]
-fn handle_coordinator_client(mut stream: UnixStream, key: &[u8; 32]) -> Result<(), String> {
+fn handle_coordinator_client(
+    mut stream: UnixStream,
+    key: &[u8; 32],
+    canon_repo: &Path,
+) -> Result<(), String> {
     let _ = stream.set_nonblocking(false);
     let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
     let _ = stream.set_write_timeout(Some(Duration::from_secs(2)));
@@ -417,7 +570,7 @@ fn handle_coordinator_client(mut stream: UnixStream, key: &[u8; 32]) -> Result<(
             .read_line(&mut line)
             .map_err(|e| format!("read error: {e}"))?;
     }
-    let resp = match process_rpc_line(line.trim(), key) {
+    let resp = match process_rpc_line(line.trim(), key, canon_repo) {
         Ok(val) => val,
         Err(err) => JsonValue::Object(vec![
             ("ok".to_string(), JsonValue::Bool(false)),
@@ -433,7 +586,131 @@ fn handle_coordinator_client(mut stream: UnixStream, key: &[u8; 32]) -> Result<(
     Ok(())
 }
 
-fn process_rpc_line(raw: &str, key: &[u8; 32]) -> Result<JsonValue, String> {
+fn compute_domain_tag_raw(
+    key: &[u8; 32],
+    domain: &[u8],
+    payload: &[u8],
+) -> Result<[u8; 32], String> {
+    let mut mac = HmacSha256::new_from_slice(key).map_err(|e| format!("HMAC init error: {e}"))?;
+    mac.update(domain);
+    mac.update(&(payload.len() as u64).to_be_bytes());
+    mac.update(payload);
+    let bytes = mac.finalize().into_bytes();
+    let mut arr = [0u8; 32];
+    arr.copy_from_slice(&bytes);
+    Ok(arr)
+}
+
+/// Parses the immutable scope prefix length of a `CAPABILITY_HMAC_DOMAIN` payload
+/// (`session_id`, `role`, `task_id`, `attempt`, `repo_sha256`, `plan_sha256`,
+/// `assigned_read_paths`, `allowed_write_paths`, `assigned_tests`) and returns
+/// `(session_id, role, immutable_prefix_slice)`.
+fn parse_capability_immutable_prefix(payload: &[u8]) -> Result<(String, String, &[u8]), String> {
+    let mut pos = 0usize;
+    let read_u32 = |buf: &[u8], p: &mut usize| -> Result<u32, String> {
+        let slice = buf
+            .get(*p..*p + 4)
+            .ok_or_else(|| "truncated capability payload u32".to_string())?;
+        *p += 4;
+        Ok(u32::from_be_bytes([slice[0], slice[1], slice[2], slice[3]]))
+    };
+    let read_str = |buf: &[u8], p: &mut usize| -> Result<String, String> {
+        let len = read_u32(buf, p)? as usize;
+        let slice = buf
+            .get(*p..*p + len)
+            .ok_or_else(|| "truncated capability payload string".to_string())?;
+        *p += len;
+        std::str::from_utf8(slice)
+            .map(String::from)
+            .map_err(|_| "non-UTF-8 string in capability payload".to_string())
+    };
+    let skip_vec = |buf: &[u8], p: &mut usize| -> Result<(), String> {
+        let count = read_u32(buf, p)? as usize;
+        for _ in 0..count {
+            let _ = read_str(buf, p)?;
+        }
+        Ok(())
+    };
+
+    let session_id = read_str(payload, &mut pos)?;
+    let role = read_str(payload, &mut pos)?;
+    let _task_id = read_str(payload, &mut pos)?;
+    let _attempt = read_u32(payload, &mut pos)?;
+    let _repo_sha = read_str(payload, &mut pos)?;
+    let _plan_sha = read_str(payload, &mut pos)?;
+    skip_vec(payload, &mut pos)?;
+    skip_vec(payload, &mut pos)?;
+    skip_vec(payload, &mut pos)?;
+
+    Ok((session_id, role, &payload[..pos]))
+}
+
+/// Enforces privilege-separated signing rules before signing any `CAPABILITY_HMAC_DOMAIN`
+/// update over `coord.sock`:
+/// 1. `role == "master"` is hard-blocked (`PRIVILEGED_ROLE_DENIED`).
+/// 2. `<swarm_state_dir>/sessions/<session_id>.json` must ALREADY exist on disk with a valid
+///    `CAPABILITY_HMAC_DOMAIN` tag under `key` (workers can never mint brand-new capabilities).
+/// 3. The immutable scope prefix (`session_id..assigned_tests`) must match the on-disk minted
+///    capability byte-for-byte (workers can never widen `allowed_write_paths`, `assigned_read_paths`,
+///    `role`, `task_id`, or `plan_sha256`—only update runtime counters / `last_green_tree_oid`).
+fn authorize_ipc_capability_resign(
+    key: &[u8; 32],
+    canon_repo: &Path,
+    candidate_payload: &[u8],
+) -> Result<(), String> {
+    let (session_id, role, candidate_immutable) =
+        parse_capability_immutable_prefix(candidate_payload)?;
+    if role == "master" {
+        return Err(
+            "PRIVILEGED_ROLE_DENIED: master capability minting/signing is forbidden over coordinator IPC"
+                .to_string(),
+        );
+    }
+    if session_id.is_empty()
+        || session_id
+            .bytes()
+            .any(|b| !(b.is_ascii_alphanumeric() || b == b'_' || b == b'-'))
+    {
+        return Err("INVALID_CAPABILITY_SESSION_ID".to_string());
+    }
+    let cap_file = swarm_state_dir(canon_repo)?
+        .join("sessions")
+        .join(format!("{session_id}.json"));
+    let raw_disk = fs::read_to_string(&cap_file).map_err(|_| {
+        format!(
+            "UNMINTED_CAPABILITY_DENIED: coordinator refuses to mint unknown session '{session_id}' over IPC"
+        )
+    })?;
+    let (existing, recorded_mac_hex) =
+        crate::role_sandbox::parse_session_capability_record_json(&raw_disk, &session_id).map_err(
+            |e| format!("CORRUPT_ON_DISK_CAPABILITY: existing session '{session_id}' invalid: {e}"),
+        )?;
+    let existing_payload = crate::role_sandbox::encode_capability_mac_payload(&existing);
+    let expected_existing_tag =
+        compute_domain_tag_raw(key, CAPABILITY_DOMAIN_BYTES, &existing_payload)?;
+    let recorded_existing_bytes = hex_decode_bytes(&recorded_mac_hex)
+        .map_err(|_| "invalid hex on existing capability".to_string())?;
+    if !constant_time_eq_bytes(&expected_existing_tag, &recorded_existing_bytes) {
+        return Err(
+            "FORGED_ON_DISK_CAPABILITY: existing capability failed vault MAC check".to_string(),
+        );
+    }
+    let (_ex_sid, _ex_role, existing_immutable) =
+        parse_capability_immutable_prefix(&existing_payload)?;
+    if !constant_time_eq_bytes(candidate_immutable, existing_immutable) {
+        return Err(
+            "CAPABILITY_SCOPE_ESCALATION_DENIED: worker IPC cannot alter role, task, plan, or path scopes"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+pub(crate) fn process_rpc_line(
+    raw: &str,
+    key: &[u8; 32],
+    canon_repo: &Path,
+) -> Result<JsonValue, String> {
     let req = JsonValue::parse(raw).map_err(|e| format!("invalid JSON: {e}"))?;
     let op = req
         .get("op")
@@ -450,13 +727,28 @@ fn process_rpc_line(raw: &str, key: &[u8; 32]) -> Result<JsonValue, String> {
                 .and_then(JsonValue::as_str)
                 .ok_or_else(|| "missing canonical_hex".to_string())?;
             let bytes = hex_decode_bytes(canonical_hex)?;
-            let mut mac =
-                HmacSha256::new_from_slice(key).map_err(|e| format!("HMAC init error: {e}"))?;
-            mac.update(&bytes);
-            let tag = hex_encode(&mac.finalize().into_bytes());
+            let tag = compute_domain_tag_raw(key, BREADCRUMB_EVENT_HMAC_DOMAIN, &bytes)?;
             Ok(JsonValue::Object(vec![
                 ("ok".to_string(), JsonValue::Bool(true)),
-                ("mac_hex".to_string(), JsonValue::Str(tag)),
+                ("mac_hex".to_string(), JsonValue::Str(hex_encode(&tag))),
+            ]))
+        }
+        "verify_event_mac" => {
+            let canonical_hex = req
+                .get("canonical_hex")
+                .and_then(JsonValue::as_str)
+                .ok_or_else(|| "missing canonical_hex".to_string())?;
+            let expected_hex = req
+                .get("expected_mac_hex")
+                .and_then(JsonValue::as_str)
+                .ok_or_else(|| "missing expected_mac_hex".to_string())?;
+            let bytes = hex_decode_bytes(canonical_hex)?;
+            let expected = hex_decode_bytes(expected_hex)?;
+            let actual = compute_domain_tag_raw(key, BREADCRUMB_EVENT_HMAC_DOMAIN, &bytes)?;
+            let valid = constant_time_eq_bytes(&actual, &expected);
+            Ok(JsonValue::Object(vec![
+                ("ok".to_string(), JsonValue::Bool(true)),
+                ("valid".to_string(), JsonValue::Bool(valid)),
             ]))
         }
         "domain_hmac" => {
@@ -470,15 +762,44 @@ fn process_rpc_line(raw: &str, key: &[u8; 32]) -> Result<JsonValue, String> {
                 .ok_or_else(|| "missing payload_hex".to_string())?;
             let domain = hex_decode_bytes(domain_hex)?;
             let payload = hex_decode_bytes(payload_hex)?;
-            let mut mac =
-                HmacSha256::new_from_slice(key).map_err(|e| format!("HMAC init error: {e}"))?;
-            mac.update(&domain);
-            mac.update(&(payload.len() as u64).to_be_bytes());
-            mac.update(&payload);
-            let tag = hex_encode(&mac.finalize().into_bytes());
+
+            if domain.as_slice() == PLAN_LOCK_DOMAIN_BYTES {
+                return Err(
+                    "PRIVILEGED_DOMAIN_DENIED: plan lock signing requires direct host Master vault possession"
+                        .to_string(),
+                );
+            }
+            if domain.as_slice() == CAPABILITY_DOMAIN_BYTES {
+                authorize_ipc_capability_resign(key, canon_repo, &payload)?;
+            }
+
+            let tag = compute_domain_tag_raw(key, &domain, &payload)?;
             Ok(JsonValue::Object(vec![
                 ("ok".to_string(), JsonValue::Bool(true)),
-                ("mac_hex".to_string(), JsonValue::Str(tag)),
+                ("mac_hex".to_string(), JsonValue::Str(hex_encode(&tag))),
+            ]))
+        }
+        "verify_domain_hmac" => {
+            let domain_hex = req
+                .get("domain_hex")
+                .and_then(JsonValue::as_str)
+                .ok_or_else(|| "missing domain_hex".to_string())?;
+            let payload_hex = req
+                .get("payload_hex")
+                .and_then(JsonValue::as_str)
+                .ok_or_else(|| "missing payload_hex".to_string())?;
+            let expected_hex = req
+                .get("expected_mac_hex")
+                .and_then(JsonValue::as_str)
+                .ok_or_else(|| "missing expected_mac_hex".to_string())?;
+            let domain = hex_decode_bytes(domain_hex)?;
+            let payload = hex_decode_bytes(payload_hex)?;
+            let expected = hex_decode_bytes(expected_hex)?;
+            let actual = compute_domain_tag_raw(key, &domain, &payload)?;
+            let valid = constant_time_eq_bytes(&actual, &expected);
+            Ok(JsonValue::Object(vec![
+                ("ok".to_string(), JsonValue::Bool(true)),
+                ("valid".to_string(), JsonValue::Bool(valid)),
             ]))
         }
         other => Err(format!("unknown coordinator op '{other}'")),

@@ -3,13 +3,14 @@
 use std::path::PathBuf;
 use std::process::ExitCode;
 
+use dotagent_harness::bench_suite::{render_bench_report, run_benchmarks};
 use dotagent_harness::{
     HarnessConfig, ReportFormat, SuiteSelection, discover_workspace_root, list_cases,
     render_json_report, render_text_report, run_harness,
 };
 
 const USAGE: &str = "\
-Usage: dotagent-harness [run|list] [options]\n\
+Usage: dotagent-harness [run|list|bench] [options]\n\
 \n\
 Options:\n\
   --suite <all|scenarios|swarm|compiler|bootstrap|corpus>  Select suite (default: all)\n\
@@ -19,7 +20,8 @@ Options:\n\
   --agent-guard-bin <path>                                 Explicit path to agent-guard binary\n\
   --compiler-bin <path>                                    Explicit path to dotagent-compiler binary\n\
   --swarm-tool-bin <path>                                  Explicit path to swarm-tool binary\n\
-  --format <text|json>                                     Output format (default: text)\n\
+  --format <text|json> | --json                            Output format (default: text)\n\
+  --quick                                                  Fast sample count for CI bench smoke runs\n\
   --list                                                   List discovered case IDs without running\n\
   -h, --help                                               Print this usage guide\n";
 
@@ -28,12 +30,26 @@ fn main() -> ExitCode {
     let mut cfg = HarnessConfig::for_workspace(discover_workspace_root());
     let mut format = ReportFormat::Text;
     let mut list_only = false;
+    let mut bench_mode = false;
+    let mut quick_bench = false;
     let mut custom_scenario_path: Option<PathBuf> = None;
 
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
             "run" => i += 1,
+            "bench" | "benchmark" => {
+                bench_mode = true;
+                i += 1;
+            }
+            "--quick" => {
+                quick_bench = true;
+                i += 1;
+            }
+            "--json" => {
+                format = ReportFormat::Json;
+                i += 1;
+            }
             "list" | "--list" => {
                 list_only = true;
                 i += 1;
@@ -141,6 +157,24 @@ fn main() -> ExitCode {
             }
             Err(e) => {
                 eprintln!("[dotagent-harness ERROR] {e}");
+                return ExitCode::from(2);
+            }
+        }
+    }
+
+    if bench_mode {
+        match run_benchmarks(&cfg, quick_bench) {
+            Ok(report) => {
+                let rendered = render_bench_report(&report, format);
+                if format == ReportFormat::Json {
+                    println!("{rendered}");
+                } else {
+                    print!("{rendered}");
+                }
+                return ExitCode::SUCCESS;
+            }
+            Err(e) => {
+                eprintln!("[dotagent-harness BENCH ERROR] {e}");
                 return ExitCode::from(2);
             }
         }
