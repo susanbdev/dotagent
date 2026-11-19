@@ -820,16 +820,38 @@ fn validate_grunt_test_runner_command(
         }
         if matches!(
             lower.as_str(),
-            "--skip" | "-skip" | "--exclude" | "--exclude-regex" | "--ignore"
+            "--skip"
+                | "-skip"
+                | "--exclude"
+                | "--exclude-regex"
+                | "--ignore"
+                | "--ignore-glob"
+                | "--deselect"
+                | "--testpathignorepatterns"
         ) || lower.starts_with("--skip=")
             || lower.starts_with("-skip=")
             || lower.starts_with("--exclude=")
             || lower.starts_with("--exclude-regex=")
             || lower.starts_with("--ignore=")
+            || lower.starts_with("--ignore-glob=")
+            || lower.starts_with("--deselect=")
+            || lower.starts_with("--testpathignorepatterns=")
             || (base == "ctest" && tok == "-E")
         {
             return Err(format!(
                 "INVALID_TEST_RUNNER_COMMAND: test-exclusion flag '{tok}' is forbidden in `checkpoint-green`"
+            ));
+        }
+        if matches!(lower.as_str(), "-exec" | "--exec")
+            || lower.starts_with("-exec=")
+            || lower.starts_with("--exec=")
+            || (base == "go"
+                && (matches!(lower.as_str(), "-c" | "--c" | "-o" | "--o")
+                    || lower.starts_with("-o=")
+                    || lower.starts_with("--o=")))
+        {
+            return Err(format!(
+                "INVALID_TEST_RUNNER_COMMAND: unsafe or non-executing runner flag '{tok}' is forbidden in `checkpoint-green`"
             ));
         }
     }

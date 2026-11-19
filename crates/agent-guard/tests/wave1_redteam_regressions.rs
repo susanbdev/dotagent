@@ -338,17 +338,22 @@ fn wave1_coordinator_blocks_plan_lock_master_mint_and_scope_escalation_over_ipc(
         "Shifted domain prefix must be rejected by closed allowlist: {resp_shift}"
     );
 
-    // 7. `ACTIVE_SLOT_DOMAIN` over IPC must refuse initializing or re-opening sessions!
+    // 7. `ACTIVE_SLOT_DOMAIN` over IPC must enforce REV2 monotonic CAS, lock serialization,
+    //    and refuse initializing or re-opening sessions!
     let active_domain_hex = hex_encode(b"DOTAGENT_ACTIVE_SESSIONS_REGISTRY_V2");
-    let mut forged_active_payload = Vec::new();
-    let push_u32_str = |buf: &mut Vec<u8>, s: &str| {
-        buf.extend_from_slice(&(s.len() as u32).to_be_bytes());
-        buf.extend_from_slice(s.as_bytes());
+    let encode_rev2_active = |rev: u64, open: &[&str]| -> String {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(b"REV2");
+        buf.extend_from_slice(&rev.to_be_bytes());
+        buf.extend_from_slice(&(open.len() as u32).to_be_bytes());
+        for s in open {
+            buf.extend_from_slice(&(s.len() as u32).to_be_bytes());
+            buf.extend_from_slice(s.as_bytes());
+        }
+        buf.extend_from_slice(&0u32.to_be_bytes());
+        hex_encode(&buf)
     };
-    forged_active_payload.extend_from_slice(&1u32.to_be_bytes());
-    push_u32_str(&mut forged_active_payload, "swm_grunt_T1_a1_reopened99");
-    forged_active_payload.extend_from_slice(&0u32.to_be_bytes());
-    let forged_active_hex = hex_encode(&forged_active_payload);
+    let forged_active_hex = encode_rev2_active(2, &["swm_grunt_T1_a1_reopened99"]);
     let resp_uninit = send_rpc(&format!(
         r#"{{"op":"domain_hmac","domain_hex":"{active_domain_hex}","payload_hex":"{forged_active_hex}"}}"#
     ));
@@ -357,23 +362,55 @@ fn wave1_coordinator_blocks_plan_lock_master_mint_and_scope_escalation_over_ipc(
         "Initializing active_sessions over IPC must be blocked: {resp_uninit}"
     );
 
-    let empty_active_bytes = [0u8; 8]; // open_count=0u32, bind_count=0u32
-    let empty_active_mac = compute_host_domain_mac(
+    let rev1_empty_hex = encode_rev2_active(1, &[]);
+    let rev1_empty_bytes = decode_hex_for_test(&rev1_empty_hex);
+    let rev1_empty_mac = compute_host_domain_mac(
         &[0x42u8; 32],
         b"DOTAGENT_ACTIVE_SESSIONS_REGISTRY_V2",
-        &empty_active_bytes,
+        &rev1_empty_bytes,
     );
     fs::write(
         swarm_dir.join("sessions").join("active_sessions.json"),
-        format!(r#"{{"open_sessions":[],"hook_bindings":{{}},"record_mac":"{empty_active_mac}"}}"#),
+        format!(
+            r#"{{"revision":1,"open_sessions":[],"hook_bindings":{{}},"record_mac":"{rev1_empty_mac}"}}"#
+        ),
     )
-    .expect("write empty active_sessions.json");
+    .expect("write rev1 empty active_sessions.json");
     let resp_reopen = send_rpc(&format!(
         r#"{{"op":"domain_hmac","domain_hex":"{active_domain_hex}","payload_hex":"{forged_active_hex}"}}"#
     ));
     assert!(
         resp_reopen.contains("ACTIVE_SESSION_ESCALATION_DENIED"),
         "Opening/re-opening session via IPC active_sessions must be blocked: {resp_reopen}"
+    );
+
+    // Stale CAS revision (rev=1 when disk is already rev=1 -> expected rev=2) must fail closed!
+    let stale_rev_hex = encode_rev2_active(1, &[]);
+    let resp_stale = send_rpc(&format!(
+        r#"{{"op":"domain_hmac","domain_hex":"{active_domain_hex}","payload_hex":"{stale_rev_hex}"}}"#
+    ));
+    assert!(
+        resp_stale.contains("STALE_ACTIVE_SESSIONS_CAS_CONFLICT"),
+        "Stale active_sessions revision must be rejected by CAS check: {resp_stale}"
+    );
+
+    // 8. Legacy pre-v2 unprefixed HMAC tag must fail closed with explicit LEGACY_HMAC_V1_STATE_INVALIDATED!
+    let legacy_v1_mac = {
+        use hmac::{Hmac, Mac};
+        use sha2::Sha256;
+        let mut mac = Hmac::<Sha256>::new_from_slice(&[0x42u8; 32]).expect("hmac");
+        mac.update(b"DOTAGENT_SESSION_CAPABILITY_V1");
+        mac.update(&(base_payload_bytes.len() as u64).to_be_bytes());
+        mac.update(&base_payload_bytes);
+        hex_encode(&mac.finalize().into_bytes())
+    };
+    let base_payload_hex = hex_encode(&base_payload_bytes);
+    let resp_legacy = send_rpc(&format!(
+        r#"{{"op":"verify_domain_hmac","domain_hex":"{cap_domain_hex}","payload_hex":"{base_payload_hex}","expected_mac_hex":"{legacy_v1_mac}"}}"#
+    ));
+    assert!(
+        resp_legacy.contains("LEGACY_HMAC_V1_STATE_INVALIDATED"),
+        "Legacy v1 unprefixed MAC must fail closed with LEGACY_HMAC_V1_STATE_INVALIDATED: {resp_legacy}"
     );
 
     let _ = daemon.kill();
@@ -620,4 +657,94 @@ fn wave2_audit_shell_heredoc_alias_smuggling_and_sandbox_unwrap_regressions() {
         code_ro_get, 0,
         "read-only get_issue must be allowed: {stderr_ro_get}"
     );
+
+    // 7. Copilot review regressions:
+    //    (a) >128 brace alternatives in Glob fails closed (`SHADOW_AUTHORITY_FILE_BLOCKED`) instead of truncating!
+    let mut big_brace_items: Vec<String> = (0..130).map(|n| format!("safe{n}.txt")).collect();
+    big_brace_items.push("AGENTS.md".to_string());
+    let big_glob = format!("docs/{{{}}}", big_brace_items.join(","));
+    let big_glob_json = JsonValue::Object(vec![
+        ("session_id".to_string(), JsonValue::Str("s_bg".to_string())),
+        ("tool_name".to_string(), JsonValue::Str("Glob".to_string())),
+        (
+            "tool_input".to_string(),
+            JsonValue::Object(vec![("pattern".to_string(), JsonValue::Str(big_glob))]),
+        ),
+    ])
+    .to_json_string();
+    let (code_bg, _, stderr_bg) = run_pre_tool(&big_glob_json, &[]);
+    assert_eq!(code_bg, 2);
+    assert!(
+        stderr_bg.contains("SHADOW_AUTHORITY_FILE_BLOCKED"),
+        "expected SHADOW_AUTHORITY_FILE_BLOCKED on >128 brace overflow, got: {stderr_bg}"
+    );
+
+    //    (b) Group/world-accessible `AGENT_GUARD_COORDINATOR_SOCK` parent directory fails closed!
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let open_sock_dir = state.join("open_ipc");
+        fs::create_dir_all(&open_sock_dir).expect("mkdir open_ipc");
+        fs::set_permissions(&open_sock_dir, fs::Permissions::from_mode(0o755))
+            .expect("chmod 0755 open_ipc");
+        let bad_coord = Command::new(&guard_bin)
+            .args(["coordinator", "--repo"])
+            .arg(&ws)
+            .env("HOME", &home)
+            .env("AGENT_GUARD_STATE_DIR", &state)
+            .env(
+                "AGENT_GUARD_COORDINATOR_SOCK",
+                open_sock_dir.join("coord.sock"),
+            )
+            .output()
+            .expect("spawn coordinator with 0755 socket parent");
+        assert_eq!(bad_coord.status.code(), Some(2));
+        assert!(
+            String::from_utf8_lossy(&bad_coord.stderr).contains("INVALID_COORDINATOR_SOCK"),
+            "0755 socket parent must fail closed: {}",
+            String::from_utf8_lossy(&bad_coord.stderr)
+        );
+
+        //    (c) `is_trusted_executable_file` rejects group-writable binaries and group-writable ancestor dirs!
+        let _ = fs::set_permissions(
+            workspace_root().join("target"),
+            fs::Permissions::from_mode(0o755),
+        );
+        let _ = fs::set_permissions(
+            workspace_root().join("target/tw"),
+            fs::Permissions::from_mode(0o755),
+        );
+        let _ = fs::set_permissions(
+            workspace_root().join("target/tw/w2_audit"),
+            fs::Permissions::from_mode(0o755),
+        );
+        let _ = fs::set_permissions(&home, fs::Permissions::from_mode(0o700));
+        let trusted_dir = home.join("bin_ok");
+        fs::create_dir_all(&trusted_dir).expect("mkdir bin_ok");
+        fs::set_permissions(&trusted_dir, fs::Permissions::from_mode(0o755))
+            .expect("chmod 0755 bin_ok");
+        let bin_file = trusted_dir.join("agent-guard");
+        fs::write(&bin_file, b"#!/bin/sh\n").expect("write mock bin");
+        fs::set_permissions(&bin_file, fs::Permissions::from_mode(0o555))
+            .expect("chmod 0555 mock bin");
+        assert!(
+            agent_guard::coordinator::is_trusted_executable_file(&bin_file),
+            "0555 binary in 0755/0700 ancestor chain must be trusted"
+        );
+
+        fs::set_permissions(&bin_file, fs::Permissions::from_mode(0o775))
+            .expect("chmod 0775 mock bin");
+        assert!(
+            !agent_guard::coordinator::is_trusted_executable_file(&bin_file),
+            "group-writable 0775 binary must be rejected"
+        );
+        fs::set_permissions(&bin_file, fs::Permissions::from_mode(0o555))
+            .expect("restore 0555 mock bin");
+        fs::set_permissions(&trusted_dir, fs::Permissions::from_mode(0o775))
+            .expect("chmod 0775 parent dir");
+        assert!(
+            !agent_guard::coordinator::is_trusted_executable_file(&bin_file),
+            "0555 binary inside group-writable 0775 ancestor directory must be rejected"
+        );
+    }
 }

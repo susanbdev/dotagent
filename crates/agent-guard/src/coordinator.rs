@@ -80,6 +80,7 @@ pub fn coordinator_socket_path(repo_root: &Path) -> Result<PathBuf, String> {
         if !trimmed.is_empty() {
             let p = PathBuf::from(trimmed);
             if !p.is_absolute()
+                || p.file_name().is_none()
                 || p.components()
                     .any(|c| matches!(c, std::path::Component::ParentDir))
             {
@@ -87,6 +88,45 @@ pub fn coordinator_socket_path(repo_root: &Path) -> Result<PathBuf, String> {
                     "INVALID_COORDINATOR_SOCK: AGENT_GUARD_COORDINATOR_SOCK must be a normalized absolute path"
                         .to_string(),
                 );
+            }
+            let parent = p.parent().ok_or_else(|| {
+                "INVALID_COORDINATOR_SOCK: AGENT_GUARD_COORDINATOR_SOCK missing parent directory"
+                    .to_string()
+            })?;
+            let pmeta = fs::symlink_metadata(parent).map_err(|e| {
+                format!(
+                    "INVALID_COORDINATOR_SOCK: parent directory '{}' inaccessible: {e}",
+                    parent.display()
+                )
+            })?;
+            if pmeta.file_type().is_symlink() || !pmeta.file_type().is_dir() {
+                return Err(format!(
+                    "INVALID_COORDINATOR_SOCK: parent '{}' must be a regular non-symlink directory",
+                    parent.display()
+                ));
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::{MetadataExt, PermissionsExt};
+                let mode = pmeta.permissions().mode();
+                if (mode & 0o077) != 0 {
+                    return Err(format!(
+                        "INVALID_COORDINATOR_SOCK: parent '{}' has mode {:04o}; custom socket directory must have 0700 private permissions",
+                        parent.display(),
+                        mode & 0o777
+                    ));
+                }
+                let ref_dir = swarm_state_dir(repo_root)?;
+                let expected_uid = fs::symlink_metadata(&ref_dir)
+                    .map(|m| m.uid())
+                    .map_err(|e| format!("failed inspecting swarm state dir owner: {e}"))?;
+                if pmeta.uid() != expected_uid {
+                    return Err(format!(
+                        "INVALID_COORDINATOR_SOCK: parent '{}' uid {} does not match current user uid {expected_uid}",
+                        parent.display(),
+                        pmeta.uid()
+                    ));
+                }
             }
             return Ok(p);
         }
@@ -159,15 +199,29 @@ pub fn connect_unix_short_path(sock_path: &Path) -> std::io::Result<UnixStream> 
 
 #[cfg(unix)]
 fn bind_unix_short_path(sock_path: &Path) -> std::io::Result<UnixListener> {
+    use std::os::unix::fs::PermissionsExt;
+    let parent = sock_path
+        .parent()
+        .ok_or_else(|| std::io::Error::new(ErrorKind::InvalidInput, "missing socket parent"))?;
+    let pmeta = fs::symlink_metadata(parent)?;
+    if pmeta.file_type().is_symlink() || !pmeta.file_type().is_dir() {
+        return Err(std::io::Error::new(
+            ErrorKind::PermissionDenied,
+            "coordinator socket parent must be a regular non-symlink directory",
+        ));
+    }
+    if (pmeta.permissions().mode() & 0o077) != 0 {
+        return Err(std::io::Error::new(
+            ErrorKind::PermissionDenied,
+            "coordinator socket parent directory must have 0700 private permissions",
+        ));
+    }
     if sock_path.as_os_str().len() <= 95 {
         return UnixListener::bind(sock_path);
     }
     #[cfg(target_os = "linux")]
     {
         use std::os::fd::AsRawFd;
-        let parent = sock_path
-            .parent()
-            .ok_or_else(|| std::io::Error::new(ErrorKind::InvalidInput, "missing socket parent"))?;
         let fname = sock_path
             .file_name()
             .ok_or_else(|| std::io::Error::new(ErrorKind::InvalidInput, "missing socket name"))?;
@@ -244,25 +298,53 @@ pub fn ping_coordinator(repo_root: &Path) -> bool {
     }
 }
 
-fn is_trusted_executable_file(path: &Path) -> bool {
+pub fn is_trusted_executable_file(path: &Path) -> bool {
     let Ok(meta) = fs::symlink_metadata(path) else {
         return false;
     };
-    if !meta.file_type().is_file() {
+    if meta.file_type().is_symlink() || !meta.file_type().is_file() {
         return false;
     }
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         let mode = meta.permissions().mode();
-        if (mode & 0o002) != 0 {
+        // Reject both group-writable (0o020) and world-writable (0o002) binaries.
+        if (mode & 0o022) != 0 {
             return false;
         }
-        if let Some(parent) = path.parent()
-            && let Ok(pmeta) = fs::symlink_metadata(parent)
-            && (pmeta.permissions().mode() & 0o002) != 0
-        {
+        // Check every pre-canonicalization directory component so symlinked parent components
+        // inside a group- or world-writable directory cannot redirect to another binary.
+        for anc in path.ancestors().skip(1) {
+            if anc.as_os_str().is_empty() {
+                continue;
+            }
+            let Ok(ameta) = fs::symlink_metadata(anc) else {
+                return false;
+            };
+            if ameta.file_type().is_dir() && (ameta.permissions().mode() & 0o022) != 0 {
+                return false;
+            }
+        }
+        let Ok(canon) = fs::canonicalize(path) else {
             return false;
+        };
+        let Ok(cmeta) = fs::symlink_metadata(&canon) else {
+            return false;
+        };
+        if !cmeta.file_type().is_file() || (cmeta.permissions().mode() & 0o022) != 0 {
+            return false;
+        }
+        for anc in canon.ancestors().skip(1) {
+            if anc.as_os_str().is_empty() {
+                continue;
+            }
+            let Ok(ameta) = fs::metadata(anc) else {
+                return false;
+            };
+            if !ameta.is_dir() || (ameta.permissions().mode() & 0o022) != 0 {
+                return false;
+            }
         }
     }
     true
@@ -647,6 +729,25 @@ pub(crate) fn compute_domain_tag_raw(
     Ok(arr)
 }
 
+/// Checks whether a failed bijective v2 tag matches the pre-v2 unprefixed HMAC encoding.
+/// Never accepts legacy tags--used strictly to emit `LEGACY_HMAC_V1_STATE_INVALIDATED`
+/// upgrade guidance instead of an opaque tamper error.
+pub(crate) fn is_legacy_v1_unprefixed_domain_tag(
+    key: &[u8; 32],
+    domain: &[u8],
+    payload: &[u8],
+    candidate_tag: &[u8],
+) -> bool {
+    let Ok(mut mac) = HmacSha256::new_from_slice(key) else {
+        return false;
+    };
+    mac.update(domain);
+    mac.update(&(payload.len() as u64).to_be_bytes());
+    mac.update(payload);
+    let legacy = mac.finalize().into_bytes();
+    constant_time_eq_bytes(&legacy, candidate_tag)
+}
+
 /// Parses the immutable scope prefix length of a `CAPABILITY_HMAC_DOMAIN` payload
 /// (`session_id`, `role`, `task_id`, `attempt`, `repo_sha256`, `plan_sha256`,
 /// `assigned_read_paths`, `allowed_write_paths`, `assigned_tests`) and returns
@@ -737,6 +838,17 @@ fn authorize_ipc_capability_resign(
     let recorded_existing_bytes = hex_decode_bytes(&recorded_mac_hex)
         .map_err(|_| "invalid hex on existing capability".to_string())?;
     if !constant_time_eq_bytes(&expected_existing_tag, &recorded_existing_bytes) {
+        if is_legacy_v1_unprefixed_domain_tag(
+            key,
+            CAPABILITY_DOMAIN_BYTES,
+            &existing_payload,
+            &recorded_existing_bytes,
+        ) {
+            return Err(
+                "LEGACY_HMAC_V1_STATE_INVALIDATED: session capability uses pre-v2 unprefixed HMAC encoding; run `dotagent activate` or `dotagent session-reset --all`"
+                    .to_string(),
+            );
+        }
         return Err(
             "FORGED_ON_DISK_CAPABILITY: existing capability failed vault MAC check".to_string(),
         );
@@ -752,10 +864,29 @@ fn authorize_ipc_capability_resign(
     Ok(())
 }
 
-type ParsedActiveSlotPayload = (Vec<String>, Vec<(String, String)>);
+type ParsedActiveSlotPayload = (u64, Vec<String>, Vec<(String, String)>);
 
 fn parse_active_slot_payload(payload: &[u8]) -> Result<ParsedActiveSlotPayload, String> {
-    let mut pos = 0usize;
+    if payload.get(..4) != Some(b"REV2") {
+        return Err(
+            "LEGACY_HMAC_V1_STATE_INVALIDATED: active_sessions payload missing REV2 generation header"
+                .to_string(),
+        );
+    }
+    let rev_bytes = payload
+        .get(4..12)
+        .ok_or_else(|| "truncated active_sessions payload revision".to_string())?;
+    let revision = u64::from_be_bytes([
+        rev_bytes[0],
+        rev_bytes[1],
+        rev_bytes[2],
+        rev_bytes[3],
+        rev_bytes[4],
+        rev_bytes[5],
+        rev_bytes[6],
+        rev_bytes[7],
+    ]);
+    let mut pos = 12usize;
     let read_u32 = |buf: &[u8], p: &mut usize| -> Result<u32, String> {
         let slice = buf
             .get(*p..*p + 4)
@@ -788,26 +919,41 @@ fn parse_active_slot_payload(payload: &[u8]) -> Result<ParsedActiveSlotPayload, 
     if pos != payload.len() {
         return Err("trailing bytes in active_sessions payload".to_string());
     }
-    Ok((open_sessions, bindings))
+    Ok((revision, open_sessions, bindings))
 }
 
-/// Prevents sandboxed workers from opening/re-opening sessions over `coord.sock`:
-/// workers may only close already-open sessions or bind hooks to already-open sessions.
-fn authorize_ipc_active_slot_update(
+/// Acquires the registry `ExclusiveFileLockGuard`, verifies monotonic `revision` CAS
+/// (`candidate_rev == existing_rev + 1`) and non-escalation subset rules, signs the new
+/// payload, and atomically persists `active_sessions.json` under the held lock.
+fn commit_ipc_active_slot_update(
     key: &[u8; 32],
     canon_repo: &Path,
     candidate_payload: &[u8],
-) -> Result<(), String> {
-    let (candidate_open, candidate_bindings) = parse_active_slot_payload(candidate_payload)?;
+) -> Result<[u8; 32], String> {
+    let (candidate_rev, candidate_open, candidate_bindings) =
+        parse_active_slot_payload(candidate_payload)?;
     let slot_file = swarm_state_dir(canon_repo)?
         .join("sessions")
         .join("active_sessions.json");
+    if !slot_file.exists() {
+        return Err(
+            "UNINITIALIZED_ACTIVE_SESSIONS_DENIED: coordinator refuses to initialize active_sessions.json over IPC"
+                .to_string(),
+        );
+    }
+    let _slot_lock = ExclusiveFileLockGuard::acquire(&slot_file)?;
     let raw_disk = fs::read_to_string(&slot_file).map_err(|_| {
         "UNINITIALIZED_ACTIVE_SESSIONS_DENIED: coordinator refuses to initialize active_sessions.json over IPC"
             .to_string()
     })?;
     let v =
         JsonValue::parse(&raw_disk).map_err(|e| format!("CORRUPT_ACTIVE_SESSIONS_ON_DISK: {e}"))?;
+    let Some(existing_rev) = v.get("revision").and_then(JsonValue::as_u64) else {
+        return Err(
+            "LEGACY_HMAC_V1_STATE_INVALIDATED: on-disk active_sessions.json missing v2 revision field; run `dotagent activate` or `dotagent session-reset --all`"
+                .to_string(),
+        );
+    };
     let open_arr = v
         .get("open_sessions")
         .and_then(JsonValue::as_array)
@@ -834,6 +980,8 @@ fn authorize_ipc_active_slot_update(
         .ok_or_else(|| "CORRUPT_ACTIVE_SESSIONS_ON_DISK: missing record_mac".to_string())?;
 
     let mut existing_buf = Vec::new();
+    existing_buf.extend_from_slice(b"REV2");
+    existing_buf.extend_from_slice(&existing_rev.to_be_bytes());
     existing_buf.extend_from_slice(&(existing_open.len() as u32).to_be_bytes());
     for sid in &existing_open {
         existing_buf.extend_from_slice(&(sid.len() as u32).to_be_bytes());
@@ -850,7 +998,25 @@ fn authorize_ipc_active_slot_update(
     let recorded_bytes = hex_decode_bytes(recorded_mac_hex)
         .map_err(|_| "invalid hex on active_sessions.json".to_string())?;
     if !constant_time_eq_bytes(&expected_tag, &recorded_bytes) {
+        if is_legacy_v1_unprefixed_domain_tag(
+            key,
+            ACTIVE_SLOT_DOMAIN_BYTES,
+            &existing_buf,
+            &recorded_bytes,
+        ) {
+            return Err(
+                "LEGACY_HMAC_V1_STATE_INVALIDATED: active_sessions.json uses pre-v2 unprefixed HMAC encoding; run `dotagent activate` or `dotagent session-reset --all`"
+                    .to_string(),
+            );
+        }
         return Err("FORGED_ACTIVE_SESSIONS_ON_DISK: vault MAC mismatch".to_string());
+    }
+
+    if Some(candidate_rev) != existing_rev.checked_add(1) {
+        return Err(format!(
+            "STALE_ACTIVE_SESSIONS_CAS_CONFLICT: candidate revision {candidate_rev} does not match expected revision {}",
+            existing_rev.saturating_add(1)
+        ));
     }
 
     for sid in &candidate_open {
@@ -870,7 +1036,27 @@ fn authorize_ipc_active_slot_update(
             ));
         }
     }
-    Ok(())
+
+    let new_tag = compute_domain_tag_raw(key, ACTIVE_SLOT_DOMAIN_BYTES, candidate_payload)?;
+    let new_mac_hex = hex_encode(&new_tag);
+    let mut candidate_bindings_map = std::collections::BTreeMap::new();
+    for (k, t) in candidate_bindings {
+        candidate_bindings_map.insert(k, t);
+    }
+    let body = crate::role_sandbox::serialize_active_sessions_json(
+        candidate_rev,
+        &candidate_open,
+        &candidate_bindings_map,
+        &new_mac_hex,
+    );
+    fs::write(&slot_file, body)
+        .map_err(|e| format!("failed committing active_sessions.json: {e}"))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(&slot_file, fs::Permissions::from_mode(0o600));
+    }
+    Ok(new_tag)
 }
 
 pub(crate) fn process_rpc_line(
@@ -913,6 +1099,19 @@ pub(crate) fn process_rpc_line(
             let expected = hex_decode_bytes(expected_hex)?;
             let actual = compute_domain_tag_raw(key, BREADCRUMB_EVENT_HMAC_DOMAIN, &bytes)?;
             let valid = constant_time_eq_bytes(&actual, &expected);
+            if !valid
+                && is_legacy_v1_unprefixed_domain_tag(
+                    key,
+                    BREADCRUMB_EVENT_HMAC_DOMAIN,
+                    &bytes,
+                    &expected,
+                )
+            {
+                return Err(
+                    "LEGACY_HMAC_V1_STATE_INVALIDATED: breadcrumb record uses pre-v2 unprefixed HMAC encoding; run `dotagent activate` or `dotagent session-reset --all`"
+                        .to_string(),
+                );
+            }
             Ok(JsonValue::Object(vec![
                 ("ok".to_string(), JsonValue::Bool(true)),
                 ("valid".to_string(), JsonValue::Bool(valid)),
@@ -930,7 +1129,7 @@ pub(crate) fn process_rpc_line(
             let domain = hex_decode_bytes(domain_hex)?;
             let payload = hex_decode_bytes(payload_hex)?;
 
-            match domain.as_slice() {
+            let tag = match domain.as_slice() {
                 PLAN_LOCK_DOMAIN_BYTES => {
                     return Err(
                         "PRIVILEGED_DOMAIN_DENIED: plan lock signing requires direct host Master vault possession"
@@ -939,20 +1138,22 @@ pub(crate) fn process_rpc_line(
                 }
                 CAPABILITY_DOMAIN_BYTES => {
                     authorize_ipc_capability_resign(key, canon_repo, &payload)?;
+                    compute_domain_tag_raw(key, &domain, &payload)?
                 }
                 ACTIVE_SLOT_DOMAIN_BYTES => {
-                    authorize_ipc_active_slot_update(key, canon_repo, &payload)?;
+                    commit_ipc_active_slot_update(key, canon_repo, &payload)?
                 }
-                LEDGER_DOMAIN_BYTES | REVIEW_STATE_DOMAIN_BYTES => {}
+                LEDGER_DOMAIN_BYTES | REVIEW_STATE_DOMAIN_BYTES => {
+                    compute_domain_tag_raw(key, &domain, &payload)?
+                }
                 _ => {
                     return Err(
                         "UNRECOGNIZED_HMAC_DOMAIN_DENIED: coordinator refuses to sign unknown or unpermitted HMAC domain"
                             .to_string(),
                     );
                 }
-            }
+            };
 
-            let tag = compute_domain_tag_raw(key, &domain, &payload)?;
             Ok(JsonValue::Object(vec![
                 ("ok".to_string(), JsonValue::Bool(true)),
                 ("mac_hex".to_string(), JsonValue::Str(hex_encode(&tag))),
@@ -990,6 +1191,12 @@ pub(crate) fn process_rpc_line(
             let expected = hex_decode_bytes(expected_hex)?;
             let actual = compute_domain_tag_raw(key, &domain, &payload)?;
             let valid = constant_time_eq_bytes(&actual, &expected);
+            if !valid && is_legacy_v1_unprefixed_domain_tag(key, &domain, &payload, &expected) {
+                return Err(
+                    "LEGACY_HMAC_V1_STATE_INVALIDATED: persisted record uses pre-v2 unprefixed HMAC encoding; run `dotagent activate` or `dotagent session-reset --all`"
+                        .to_string(),
+                );
+            }
             Ok(JsonValue::Object(vec![
                 ("ok".to_string(), JsonValue::Bool(true)),
                 ("valid".to_string(), JsonValue::Bool(valid)),

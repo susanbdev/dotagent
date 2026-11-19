@@ -384,7 +384,10 @@ pub fn validate_workspace_glob_pattern(
     Ok(())
 }
 
-fn expand_brace_candidates(input: &str, max_candidates: usize) -> Vec<String> {
+fn expand_brace_candidates(
+    input: &str,
+    max_candidates: usize,
+) -> Result<Vec<String>, PathViolation> {
     let mut queue: Vec<String> = vec![input.to_string()];
     let mut out: Vec<String> = Vec::new();
     while let Some(cur) = queue.pop() {
@@ -393,23 +396,36 @@ fn expand_brace_candidates(input: &str, max_candidates: usize) -> Vec<String> {
         {
             let prefix = &cur[..inner_open];
             let suffix = &cur[close + 1..];
-            for alt in cur[inner_open + 1..close].split(',') {
-                if queue.len() + out.len() >= max_candidates {
-                    break;
-                }
+            let alts: Vec<&str> = cur[inner_open + 1..close].split(',').collect();
+            if queue.len() + out.len() + alts.len() > max_candidates {
+                return Err(PathViolation {
+                    code: "SHADOW_AUTHORITY_FILE_BLOCKED",
+                    detail: format!(
+                        "Glob pattern '{input}' exceeds maximum brace-expansion bound ({max_candidates} alternatives); refusing potential shadow-authority smuggling."
+                    ),
+                    is_poisoned_zone: false,
+                });
+            }
+            for alt in alts {
                 queue.push(format!("{prefix}{}{suffix}", alt.trim()));
             }
         } else {
-            out.push(cur);
             if out.len() >= max_candidates {
-                break;
+                return Err(PathViolation {
+                    code: "SHADOW_AUTHORITY_FILE_BLOCKED",
+                    detail: format!(
+                        "Glob pattern '{input}' exceeds maximum brace-expansion bound ({max_candidates} alternatives); refusing potential shadow-authority smuggling."
+                    ),
+                    is_poisoned_zone: false,
+                });
             }
+            out.push(cur);
         }
     }
     if out.is_empty() {
         out.push(input.to_string());
     }
-    out
+    Ok(out)
 }
 
 fn check_glob_shadow_authority(
@@ -420,8 +436,9 @@ fn check_glob_shadow_authority(
     let debracketed = lower.replace(['[', ']'], "");
     let raw_tail = debracketed.rsplit('/').next().unwrap_or(&debracketed);
 
-    // Iteratively expand brace alternatives in tail (e.g. `{c,x}laude.{md,txt}` -> `claude.md`, ...)
-    let tail_candidates = expand_brace_candidates(raw_tail, 128);
+    // Iteratively expand brace alternatives in tail (e.g. `{c,x}laude.{md,txt}` -> `claude.md`, ...),
+    // failing closed if combinatorial brace expansion exceeds 128 candidates.
+    let tail_candidates = expand_brace_candidates(raw_tail, 128)?;
 
     let path_targets_rules_dir = debracketed.starts_with(".cursor/rules/")
         || debracketed.contains("/.cursor/rules/")

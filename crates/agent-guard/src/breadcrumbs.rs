@@ -368,7 +368,12 @@ pub fn load_or_init_vault_hmac_key(repo_root: &Path) -> Result<[u8; 32], String>
     let link_res = fs::hard_link(&staging_path, &key_path);
     let _ = fs::remove_file(&staging_path);
     match link_res {
-        Ok(()) => Ok(key),
+        Ok(()) => {
+            let fmt_path = vault_dir.join("hmac.format");
+            let _ = fs::write(&fmt_path, b"bijective-v2\n");
+            set_file_0600(&fmt_path);
+            Ok(key)
+        }
         Err(e) if e.kind() == ErrorKind::AlreadyExists => {
             crate::crypto::zeroize_slice(&mut key);
             let hex = fs::read_to_string(&key_path)
@@ -409,9 +414,21 @@ pub fn verify_event_mac(
     event: &AuthenticatedEvent,
     expected_mac: &[u8; 32],
 ) -> Result<(), String> {
-    let actual = compute_event_mac(key, event)?;
+    let canonical = event.encode_canonical();
+    let actual =
+        crate::coordinator::compute_domain_tag_raw(key, BREADCRUMB_EVENT_HMAC_DOMAIN, &canonical)?;
     if constant_time_eq_bytes(&actual, expected_mac) {
         Ok(())
+    } else if crate::coordinator::is_legacy_v1_unprefixed_domain_tag(
+        key,
+        BREADCRUMB_EVENT_HMAC_DOMAIN,
+        &canonical,
+        expected_mac,
+    ) {
+        Err(
+            "LEGACY_HMAC_V1_STATE_INVALIDATED: breadcrumb record uses pre-v2 unprefixed HMAC encoding; run `dotagent activate` or `dotagent session-reset --all` to reset pre-v2 swarm state"
+                .to_string(),
+        )
     } else {
         Err("HMAC-SHA256 authentication tag mismatch (tampered field or path swap)".to_string())
     }
@@ -595,6 +612,16 @@ pub fn verify_arbitrary_hmac_hex(
                 crate::coordinator::compute_domain_tag_raw(zkey.as_bytes(), domain, payload)?;
             if constant_time_eq_bytes(&actual, &expected_bytes) {
                 Ok(())
+            } else if crate::coordinator::is_legacy_v1_unprefixed_domain_tag(
+                zkey.as_bytes(),
+                domain,
+                payload,
+                &expected_bytes,
+            ) {
+                Err(
+                    "LEGACY_HMAC_V1_STATE_INVALIDATED: persisted record uses pre-v2 unprefixed HMAC encoding; run `dotagent activate` or `dotagent session-reset --all` to reset pre-v2 swarm state"
+                        .to_string(),
+                )
             } else {
                 Err("HMAC authentication tag mismatch".to_string())
             }

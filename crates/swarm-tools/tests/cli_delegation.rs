@@ -914,6 +914,44 @@ fn pr6_cli_capabilities_packet_provenance_and_landlock_vault_coordinator_e2e() {
         String::from_utf8_lossy(&skip_cp.stderr)
     );
 
+    for bad_runner_args in [
+        &[
+            "grunt",
+            "checkpoint-green",
+            "--session",
+            &grunt_sid,
+            "--",
+            "pytest",
+            "--deselect=tests/test_vault_isolated.py::test_ok",
+        ][..],
+        &[
+            "grunt",
+            "checkpoint-green",
+            "--session",
+            &grunt_sid,
+            "--",
+            "go",
+            "test",
+            "-run",
+            "vault_isolation_test",
+            "-exec",
+            "sh",
+        ][..],
+    ] {
+        let bad_cp = Command::new(swarm_tool_bin())
+            .args(bad_runner_args)
+            .current_dir(&repo)
+            .env("AGENT_GUARD_STATE_DIR", &state)
+            .output()
+            .unwrap();
+        assert!(!bad_cp.status.success());
+        assert!(
+            String::from_utf8_lossy(&bad_cp.stderr).contains("INVALID_TEST_RUNNER_COMMAND"),
+            "bad runner args {bad_runner_args:?} stderr: {}",
+            String::from_utf8_lossy(&bad_cp.stderr)
+        );
+    }
+
     // Once closed by Master, replaying `--session <grunt_sid>` must fail closed (`SESSION_CLOSED_OR_INACTIVE`)
     assert!(
         Command::new(swarm_tool_bin())
