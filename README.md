@@ -2,7 +2,7 @@
 
 Deterministic zero-trust security kernel, privilege-separated multi-agent swarm runtime, and reproducible harness compiler for Claude Code, Gemini / Antigravity, Cursor, and OpenAI Codex.
 
-`dotagent` enforces repository containment, pre-buffer 7-bit ASCII sanitization, transitive reference hop limits (`A -> B`), Git/build-tool RCE lockdown, and OS-kernel sandboxing (`#![forbid(unsafe_code)]`, zero production `unwrap`/`expect`/`panic`) with sub-`5 ms` hook latency and zero workflow friction.
+`dotagent` enforces repository containment, pre-buffer 7-bit ASCII sanitization, transitive reference hop limits (`A -> B`), Git/build-tool RCE lockdown, and OS-kernel sandboxing (`#![forbid(unsafe_code)]`, zero production `unwrap`/`expect`/`panic`) with sub-`0.4 ms` in-process (`~1.4 ms` cold-CLI) hook latency, `744 MiB/s` stream sanitization, and zero workflow friction.
 
 ## Architecture & Trust Rings
 
@@ -49,11 +49,11 @@ Reproducible measurements via `./target/release/dotagent-harness bench` (`rustc`
 
 | Benchmark | Iters | `p50` (`us`) | `p95` (`us`) | `p99` (`us`) | Throughput |
 | :--- | ---: | ---: | ---: | ---: | ---: |
-| `pre_tool_read_hook_inproc` | 400 | 3,435 | 4,161 | 4,780 | - |
-| `pre_tool_bash_ast_inproc` | 400 | 3,340 | 3,995 | 5,387 | - |
-| `post_tool_scan_inproc` | 400 | 2,789 | 3,571 | 4,570 | - |
-| `sanitize_stream_64k` | 400 | 286 | 341 | 861 | `218.5 MiB/s` |
-| `cli_pre_tool_cold_start` (spawn + `flock` + JSON) | 50 | 4,154 | 4,892 | 5,658 | - |
+| `pre_tool_read_hook_inproc` | 400 | 364 | 448 | 529 | - |
+| `pre_tool_bash_ast_inproc` | 400 | 274 | 358 | 395 | - |
+| `post_tool_scan_inproc` | 400 | 218 | 289 | 326 | - |
+| `sanitize_stream_64k` | 400 | 84 | 95 | 104 | `744.0 MiB/s` |
+| `cli_pre_tool_cold_start` (spawn + lock + JSON) | 50 | 1,439 | 1,695 | 1,746 | - |
 
 ## 60-Second Zero-Friction Onboarding
 

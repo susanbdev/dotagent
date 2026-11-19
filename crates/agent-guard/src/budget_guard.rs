@@ -10,7 +10,9 @@
 
 use std::fs::File;
 use std::io::Read;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+use std::time::UNIX_EPOCH;
 
 pub const MAX_RAW_FILE_BYTES: u64 = 24_576; // 24 KiB max un-sliced read (tiny context micro-window)
 pub const MAX_SLICED_FILE_BYTES: u64 = 1_048_576; // 1 MiB absolute ceiling even when sliced
@@ -427,6 +429,17 @@ pub fn load_active_profile(repo_root: &Path) -> Result<RuntimeProfile, BudgetVio
     load_profile_by_id(repo_root, &raw_id)
 }
 
+#[derive(Clone)]
+struct CachedProfile {
+    repo_root: PathBuf,
+    profile_id: String,
+    mtime_nanos: u128,
+    file_len: u64,
+    profile: RuntimeProfile,
+}
+
+static PROFILE_CACHE: Mutex<Option<CachedProfile>> = Mutex::new(None);
+
 pub fn load_profile_by_id(
     repo_root: &Path,
     profile_id: &str,
@@ -485,6 +498,22 @@ pub fn load_profile_by_id(
                     detail: format!("Profile '{}' exceeds 16 KiB ceiling.", toml_path.display()),
                 });
             }
+            let mtime_nanos = meta
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
+            if mtime_nanos != 0
+                && let Ok(guard) = PROFILE_CACHE.lock()
+                && let Some(ref entry) = *guard
+                && entry.repo_root == repo_root
+                && entry.profile_id == profile_id
+                && entry.mtime_nanos == mtime_nanos
+                && entry.file_len == meta.len()
+            {
+                return Ok(entry.profile.clone());
+            }
             let file = File::open(&toml_path).map_err(|e| BudgetViolation {
                 code: "UNREADABLE_PROFILE_BLOCKED",
                 detail: format!("Failed opening profile '{}': {e}", toml_path.display()),
@@ -502,7 +531,7 @@ pub fn load_profile_by_id(
                     ),
                 });
             }
-            let mut buf = Vec::new();
+            let mut buf = Vec::with_capacity(fmeta.len() as usize);
             file.take(16_385)
                 .read_to_end(&mut buf)
                 .map_err(|e| BudgetViolation {
@@ -514,6 +543,17 @@ pub fn load_profile_by_id(
                 detail: format!("Profile '{}' is not valid UTF-8.", toml_path.display()),
             })?;
             apply_profile_toml_tightening(&mut profile, &text)?;
+            if mtime_nanos != 0
+                && let Ok(mut guard) = PROFILE_CACHE.lock()
+            {
+                *guard = Some(CachedProfile {
+                    repo_root: repo_root.to_path_buf(),
+                    profile_id: profile_id.to_string(),
+                    mtime_nanos,
+                    file_len: meta.len(),
+                    profile: profile.clone(),
+                });
+            }
         }
     }
 

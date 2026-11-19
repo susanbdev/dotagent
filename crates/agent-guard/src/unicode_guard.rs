@@ -23,6 +23,21 @@ pub struct UnicodeViolation {
 
 pub fn scan_unicode(input: &str, mode: ScanMode) -> Vec<UnicodeViolation> {
     let mut findings = Vec::new();
+
+    if input.is_ascii() {
+        for (byte_idx, &b) in input.as_bytes().iter().enumerate() {
+            if (b < 0x20 && b != b'\t' && b != b'\n' && b != b'\r') || b == 0x7F {
+                findings.push(UnicodeViolation {
+                    code: "CONTROL_ESCAPE_INJECTION",
+                    offset: byte_idx,
+                    detail: format!("Control/terminal escape byte U+{:04X} detected", b as u32),
+                });
+            }
+        }
+        scan_encoded_escapes(input, mode, &mut findings);
+        return findings;
+    }
+
     let mut consecutive_braille_blank = 0usize;
 
     for (byte_idx, ch) in input.char_indices() {
@@ -292,6 +307,12 @@ fn scan_mixed_script_tokens(input: &str, findings: &mut Vec<UnicodeViolation>) {
 
 fn scan_encoded_escapes(input: &str, mode: ScanMode, findings: &mut Vec<UnicodeViolation>) {
     let bytes = input.as_bytes();
+    if !bytes
+        .iter()
+        .any(|&b| matches!(b, b'\\' | b'&' | b'%' | b'$'))
+    {
+        return;
+    }
     let mut i = 0usize;
     let mut line_escape_count = 0usize;
 

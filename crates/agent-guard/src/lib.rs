@@ -114,9 +114,8 @@ impl Decision {
     }
 }
 
-fn discover_git_root_from_trusted_path(cwd: &Path) -> PathBuf {
-    let canon = fs::canonicalize(cwd).unwrap_or_else(|_| lexical_normalize(cwd));
-    let mut cur: &Path = &canon;
+fn discover_git_root_from_canon(canon: &Path) -> PathBuf {
+    let mut cur: &Path = canon;
     loop {
         if cur.join(".git").exists() {
             return cur.to_path_buf();
@@ -129,14 +128,11 @@ fn discover_git_root_from_trusted_path(cwd: &Path) -> PathBuf {
         }
         cur = parent;
     }
-    canon
+    canon.to_path_buf()
 }
 
-/// Discovers the enclosing repository root (directory containing `.git`) or falls back to `cwd`.
-/// Any `AGENT_GUARD_REPO_ROOT` override is honored ONLY when it canonicalizes to the exact
-/// trusted repository root of `cwd` (preventing cross-repository redirection).
-pub fn resolve_repo_root(cwd: &Path) -> PathBuf {
-    let trusted = discover_git_root_from_trusted_path(cwd);
+fn resolve_repo_root_from_canon(canon: &Path) -> PathBuf {
+    let trusted = discover_git_root_from_canon(canon);
     if let Ok(explicit) = std::env::var("AGENT_GUARD_REPO_ROOT") {
         let trimmed = explicit.trim();
         if !trimmed.is_empty() {
@@ -148,6 +144,14 @@ pub fn resolve_repo_root(cwd: &Path) -> PathBuf {
         }
     }
     trusted
+}
+
+/// Discovers the enclosing repository root (directory containing `.git`) or falls back to `cwd`.
+/// Any `AGENT_GUARD_REPO_ROOT` override is honored ONLY when it canonicalizes to the exact
+/// trusted repository root of `cwd` (preventing cross-repository redirection).
+pub fn resolve_repo_root(cwd: &Path) -> PathBuf {
+    let canon = fs::canonicalize(cwd).unwrap_or_else(|_| lexical_normalize(cwd));
+    resolve_repo_root_from_canon(&canon)
 }
 
 /// Handles `UserPromptSubmit`: resets per-turn hop ledger, 128-bit spotlight nonce, and micro-window budget.
@@ -212,7 +216,7 @@ pub fn handle_pre_compact_hook(raw_json: &str, fallback_cwd: &Path) -> Decision 
     let _session_lock = SessionLedger::acquire_lock(&repo_root, &session_id);
     let mut ledger = SessionLedger::load_or_create(&repo_root, &session_id);
     ledger.compact_step(&repo_root);
-    if let Err(e) = ledger.save(&repo_root) {
+    if let Err(e) = ledger.save_locked(&repo_root) {
         return Decision::deny("STATE_WRITE_ERROR", e, false);
     }
     append_audit_jsonl(
@@ -258,7 +262,7 @@ pub fn handle_pre_tool_hook(raw_json: &str, fallback_cwd: &Path) -> Decision {
     let mut ledger = SessionLedger::load_or_create(&repo_root, &session_id);
 
     if let Err(msg) = ledger.record_tool_call_with_limit(profile.max_turn_tool_calls) {
-        let _ = ledger.save(&repo_root);
+        let _ = ledger.save_locked(&repo_root);
         append_audit_jsonl(
             &repo_root,
             &session_id,
@@ -326,7 +330,7 @@ pub fn handle_pre_tool_hook(raw_json: &str, fallback_cwd: &Path) -> Decision {
             halt_session,
         );
     }
-    let _ = ledger.save(&repo_root);
+    let _ = ledger.save_locked(&repo_root);
     decision
 }
 
@@ -1204,7 +1208,9 @@ fn pre_inspect_file_for_ingestion_with_profile(
     // 5. Authorize read in cumulative step budget & register outgoing pointers (`A -> B` or `B -> C`)
     if !is_root_authority {
         let san = neuter_to_clean_ascii(&content);
-        metrics.estimated_tokens = estimate_bpe_tokens(&san.clean_ascii);
+        if san.was_modified {
+            metrics.estimated_tokens = estimate_bpe_tokens(&san.clean_ascii);
+        }
         ledger
             .authorize_and_record_read_with_limits(
                 repo_rel,
@@ -1253,6 +1259,11 @@ pub fn handle_post_tool_hook(raw_json: &str, fallback_cwd: &Path) -> Decision {
         Ok(pair) => pair,
         Err(dec) => return dec,
     };
+    let output_text = extract_tool_response_text(&parsed);
+    if output_text.is_empty() {
+        return Decision::allow();
+    }
+
     let profile = match load_active_profile(&repo_root) {
         Ok(p) => p,
         Err(bv) => return Decision::deny(bv.code, bv.detail, false),
@@ -1260,11 +1271,6 @@ pub fn handle_post_tool_hook(raw_json: &str, fallback_cwd: &Path) -> Decision {
     let session_id = extract_session_id(&parsed);
     let _session_lock = SessionLedger::acquire_lock(&repo_root, &session_id);
     let mut ledger = SessionLedger::load_or_create(&repo_root, &session_id);
-
-    let output_text = extract_tool_response_text(&parsed);
-    if output_text.is_empty() {
-        return Decision::allow();
-    }
 
     let raw_tool_name = extract_tool_name(&parsed);
     let tool_label = if raw_tool_name.is_empty() {
@@ -1286,7 +1292,7 @@ pub fn handle_post_tool_hook(raw_json: &str, fallback_cwd: &Path) -> Decision {
         let uni = scan_unicode(inspect_slice, ScanMode::UntrustedContent);
         if let Some(first) = uni.first() {
             ledger.trip_circuit_breaker(format!("{}: {}", first.code, first.detail));
-            let _ = ledger.save(&repo_root);
+            let _ = ledger.save_locked(&repo_root);
             append_audit_jsonl(
                 &repo_root,
                 &session_id,
@@ -1308,7 +1314,7 @@ pub fn handle_post_tool_hook(raw_json: &str, fallback_cwd: &Path) -> Decision {
         let scan = scan_untrusted_content(inspect_slice, &repo_root, &cwd, false);
         if let Some(halt) = scan.first_halt() {
             ledger.trip_circuit_breaker(format!("{}: {}", halt.code, halt.detail));
-            let _ = ledger.save(&repo_root);
+            let _ = ledger.save_locked(&repo_root);
             append_audit_jsonl(
                 &repo_root,
                 &session_id,
@@ -1328,7 +1334,7 @@ pub fn handle_post_tool_hook(raw_json: &str, fallback_cwd: &Path) -> Decision {
         );
         let compacted_tokens = estimate_bpe_tokens(&compacted.clean_ascii);
         ledger.cumulative_tokens = ledger.cumulative_tokens.saturating_add(compacted_tokens);
-        let _ = ledger.save(&repo_root);
+        let _ = ledger.save_locked(&repo_root);
 
         let wrapped =
             wrap_spotlight_envelope(&compacted.clean_ascii, &ledger.turn_nonce, tool_label);
@@ -1350,7 +1356,7 @@ pub fn handle_post_tool_hook(raw_json: &str, fallback_cwd: &Path) -> Decision {
     }
 
     if let Err(bv) = analyze_text_budget(&output_text, false) {
-        let _ = ledger.save(&repo_root);
+        let _ = ledger.save_locked(&repo_root);
         append_audit_jsonl(
             &repo_root,
             &session_id,
@@ -1366,7 +1372,7 @@ pub fn handle_post_tool_hook(raw_json: &str, fallback_cwd: &Path) -> Decision {
     let uni = scan_unicode(&output_text, ScanMode::UntrustedContent);
     if let Some(first) = uni.first() {
         ledger.trip_circuit_breaker(format!("{}: {}", first.code, first.detail));
-        let _ = ledger.save(&repo_root);
+        let _ = ledger.save_locked(&repo_root);
         append_audit_jsonl(
             &repo_root,
             &session_id,
@@ -1389,7 +1395,7 @@ pub fn handle_post_tool_hook(raw_json: &str, fallback_cwd: &Path) -> Decision {
     let scan = scan_untrusted_content(&output_text, &repo_root, &cwd, false);
     if let Some(halt) = scan.first_halt() {
         ledger.trip_circuit_breaker(format!("{}: {}", halt.code, halt.detail));
-        let _ = ledger.save(&repo_root);
+        let _ = ledger.save_locked(&repo_root);
         append_audit_jsonl(
             &repo_root,
             &session_id,
@@ -1419,7 +1425,7 @@ pub fn handle_post_tool_hook(raw_json: &str, fallback_cwd: &Path) -> Decision {
         )
         && out_tokens > summary_cap
     {
-        let _ = ledger.save(&repo_root);
+        let _ = ledger.save_locked(&repo_root);
         let detail = format!(
             "Subagent return summary ({out_tokens} est. tokens) exceeds airlock cap ({summary_cap} ASCII tokens for profile '{}').",
             profile.profile_id
@@ -1437,7 +1443,7 @@ pub fn handle_post_tool_hook(raw_json: &str, fallback_cwd: &Path) -> Decision {
     let next_total = ledger.cumulative_tokens.saturating_add(out_tokens);
     ledger.cumulative_tokens = next_total;
     if next_total > profile.max_turn_tokens {
-        let _ = ledger.save(&repo_root);
+        let _ = ledger.save_locked(&repo_root);
         let detail = format!(
             "Dynamic tool output (+{out_tokens} est. tokens) pushed step context to {next_total} tokens (> {} hard step ceiling for profile '{}'). Compact step context immediately before continuing.",
             profile.max_turn_tokens, profile.profile_id
@@ -1452,7 +1458,7 @@ pub fn handle_post_tool_hook(raw_json: &str, fallback_cwd: &Path) -> Decision {
         );
         return Decision::deny("TURN_TOKEN_BUDGET_EXCEEDED", detail, false);
     }
-    let _ = ledger.save(&repo_root);
+    let _ = ledger.save_locked(&repo_root);
 
     if sanitized.was_modified {
         let wrapped =
@@ -1571,8 +1577,8 @@ fn scan_accidental_secret_literal(text: &str) -> Option<&'static str> {
 }
 
 fn resolve_validated_cwd(v: &JsonValue, fallback: &Path) -> Result<(PathBuf, PathBuf), Decision> {
-    let trusted_repo = resolve_repo_root(fallback);
     let fallback_canon = fs::canonicalize(fallback).unwrap_or_else(|_| lexical_normalize(fallback));
+    let trusted_repo = resolve_repo_root_from_canon(&fallback_canon);
 
     let claimed_raw = extract_first_str(v, &["cwd", "working_directory"]).or_else(|| {
         v.get("workspace_roots")
@@ -1585,11 +1591,19 @@ fn resolve_validated_cwd(v: &JsonValue, fallback: &Path) -> Result<(PathBuf, Pat
         return Ok((fallback_canon, trusted_repo));
     };
 
+    let candidate_ref = Path::new(raw);
+    if candidate_ref == fallback || candidate_ref == fallback_canon {
+        return Ok((fallback_canon, trusted_repo));
+    }
+
     let candidate = PathBuf::from(raw);
     let candidate_canon =
         fs::canonicalize(&candidate).unwrap_or_else(|_| lexical_normalize(&candidate));
+    if candidate_canon == fallback_canon {
+        return Ok((candidate_canon, trusted_repo));
+    }
     if !candidate_canon.starts_with(&trusted_repo)
-        || discover_git_root_from_trusted_path(&candidate_canon) != trusted_repo
+        || discover_git_root_from_canon(&candidate_canon) != trusted_repo
     {
         return Err(Decision::deny(
             "CROSS_REPO_CWD_SPOOF",

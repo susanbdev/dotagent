@@ -3,6 +3,13 @@
 All notable changes to `dotagent` are documented in this file.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Performance
+- **Sub-Millisecond Lifecycle Hooks (`9x-13x` Lower Latency)**: Eliminated hardware `fsync` stalls on benign per-step `SessionLedger` counter updates while preserving durable `sync_data` flushes whenever `halted` or `tainted` is set, added lock-held `SessionLedger::save_locked`, deduplicated `resolve_validated_cwd` / `resolve_checking_symlinks` VFS `lstat` walks, cached symlink-verified `RuntimeProfile` TOML configs, and bypassed Swarm directory creation/scanning when no Swarm state is active (`pre_tool_read_hook_inproc` `p50`: `3,435 us -> 364 us`; `pre_tool_bash_ast_inproc` `p50`: `3,340 us -> 274 us`; `post_tool_scan_inproc` `p50`: `2,789 us -> 218 us`; `cli_pre_tool_cold_start` `p50`: `4,154 us -> 1,439 us`).
+- **`744 MiB/s` 7-Bit ASCII Stream Sanitizer (`3.4x` Higher Throughput)**: Replaced character-by-character sanitization and `Vec<&str>` line compaction with a 256-byte L1 `ASCII_LUT` span scanner, Stage-2 escape-trigger pass-through elision, byte-indexed CSI/OSC stripping, and zero-allocation head/tail byte slicing (`sanitize_stream_64k` `p50`: `286 us -> 84 us`, `p99`: `861 us -> 104 us`, `218.5 MiB/s -> 744.0 MiB/s`), plus SIMD `is_ascii()` and token-stem prefilters in `unicode_guard` and `injection_scan`.
+- **`2x` Faster Release Builds & Cached CI Matrix**: Removed redundant 5-binary cross-target LTO passes in `Cargo.toml` (`46.2s -> 20.4s` cold `--release` workspace build) and added SHA-pinned `actions/cache` workspace artifact caching with single-pass release binary execution in `.github/workflows/ci.yml`.
+
 ## [1.0.0] - 2026-11-18
 
 ### Security

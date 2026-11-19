@@ -39,6 +39,14 @@ jobs:
           rustup toolchain install stable --profile minimal --component rustfmt,clippy
           rustup default stable
 
+      - name: Cache Cargo workspace build artifacts
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: target
+          key: ${{ runner.os }}-cargo-stable-${{ hashFiles('Cargo.lock', 'Cargo.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-stable-
+
       - name: Verify formatting (cargo fmt)
         run: cargo fmt --all -- --check
 
@@ -48,16 +56,13 @@ jobs:
       - name: Run unit, 305+ adversarial corpus, Swarm v2, & 5,300+ property fuzz suites
         run: cargo test --workspace
 
-      - name: Verify deterministic multi-harness bundles & SHA-256 lock manifest
-        run: cargo run --release -p dotagent-compiler -- verify .
-
-      - name: Run static zero-trust repository & workflow audit
-        run: cargo run --release -p agent-guard --bin dotagent -- audit-repo .
-
-      - name: Run release-profile latency & throughput microbenchmarks
+      - name: Build release binaries & verify bundles, repo audit, and microbenchmarks
         run: |
           cargo build --release --workspace
+          ./target/release/dotagent-compiler verify .
+          ./target/release/dotagent audit-repo .
           ./target/release/dotagent-harness bench --quick
+          rm -rf target/test-workspaces target/tbench-*
 
   msrv-1-88:
     name: MSRV 1.88.0 Compatibility Gate
@@ -75,6 +80,14 @@ jobs:
 
       - name: Install exact Rust 1.88.0 (Edition 2024 + let_chains MSRV)
         run: rustup toolchain install 1.88.0 --profile minimal
+
+      - name: Cache MSRV 1.88.0 check artifacts
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: target
+          key: ${{ runner.os }}-cargo-msrv-1-88-${{ hashFiles('Cargo.lock', 'Cargo.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-msrv-1-88-
 
       - name: Check entire workspace against Rust 1.88.0
         run: cargo +1.88.0 check --workspace --all-targets
