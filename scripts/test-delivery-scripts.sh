@@ -138,6 +138,24 @@ HEAD_RING0="$(git -C "${FIXTURE_REPO}" rev-parse HEAD)"
 (cd "${FIXTURE_REPO}" && assert_exit_code 2 bash "${VERIFY_SCRIPT}" --base "${HW_BASE_SHA}" --head "${HEAD_RING0}" --bootstrap-allow-empty-signers)
 echo "[test-delivery-scripts] ok 5 - touching Cargo.toml without sk-* signature exits 2"
 
+# Case 5b: Unsigned Ring-2 PR on populated HW_BASE_SHA (leaving allowed_hardware_signers untouched) MUST pass
+git -C "${FIXTURE_REPO}" checkout -b case-ring2-on-hw-base "${HW_BASE_SHA}" >/dev/null 2>&1
+echo "// ring2 policy tighten" >> "${FIXTURE_REPO}/crates/agent-guard/src/cmd_policy.rs"
+cat > "${FIXTURE_REPO}/tests/bypass_corpus.toml" <<'EOF'
+vectors = [
+  { id = "v1", kind = "cmd", payload = "cat .env", expected_code = 2 },
+  { id = "v2", kind = "cmd", payload = "ls /tmp", expected_code = 2 },
+  { id = "v3", kind = "cmd", payload = "cat .env.prod", expected_code = 2 },
+  { id = "v4", kind = "cmd", payload = "cat ~/.ssh/id_ed25519", expected_code = 2 }
+]
+EOF
+git -C "${FIXTURE_REPO}" commit -am "feat(policy): unsigned Ring-2 PR on populated anchor" >/dev/null
+HEAD_R2_HW="$(git -C "${FIXTURE_REPO}" rev-parse HEAD)"
+R2_HW_JSON="$(cd "${FIXTURE_REPO}" && bash "${VERIFY_SCRIPT}" --base "${HW_BASE_SHA}" --head "${HEAD_R2_HW}" --json)"
+[[ "${R2_HW_JSON}" == '{"tier":"ring2","hw_signed":false,"new_corpus_vectors":2,"eligible_for_auto_enqueue":true}' ]] \
+    || fail "unsigned Ring-2 PR failed on populated base: ${R2_HW_JSON}"
+echo "[test-delivery-scripts] ok 5b - unsigned Ring-2 PR passes when populated trust anchor is unchanged"
+
 # Case 6: Trailing-comment sk-* smuggling on software ssh-ed25519 key MUST exit 2
 SMUGGLED_SIGNERS="${TEST_ROOT}/smuggled_signers"
 cat > "${SMUGGLED_SIGNERS}" <<'EOF'

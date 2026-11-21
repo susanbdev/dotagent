@@ -131,11 +131,12 @@ def evaluate_range(b_ref: str, h_ref: str):
     if not mb:
         die(f"NO_MERGE_BASE: {b_ref} and {h_ref}")
     hw_ok = verify_commit_hw_sig(h_ref)
+    bs_p = subprocess.run(["git", "show", f"{mb}:scripts/allowed_hardware_signers"], capture_output=True, text=True)
+    mb_signers = parse_signers_text(bs_p.stdout, f"{mb}:scripts/allowed_hardware_signers") if bs_p.returncode == 0 else []
     hs_p = subprocess.run(["git", "show", f"{h_ref}:scripts/allowed_hardware_signers"], capture_output=True, text=True)
-    if hs_p.returncode == 0:
-        head_signers = parse_signers_text(hs_p.stdout, f"{h_ref}:scripts/allowed_hardware_signers")
-        if head_signers and not hw_ok:
-            die("UNAUTHENTICATED_TRUST_ANCHOR_ENROLLMENT: modifying/enrolling active sk-* signers requires a verified hardware signature")
+    head_signers = parse_signers_text(hs_p.stdout, f"{h_ref}:scripts/allowed_hardware_signers") if hs_p.returncode == 0 else []
+    if head_signers != mb_signers and not hw_ok:
+        die("UNAUTHENTICATED_TRUST_ANCHOR_ENROLLMENT: modifying/enrolling active sk-* signers requires a verified hardware signature")
     parts = subprocess.check_output(["git", "-c", "core.quotePath=false", "diff", "--raw", "-z", "--no-renames", "--end-of-options", mb, h_ref]).split(b"\0")
     tier, policy_mod, file_count, idx = "ring2", False, 0, 0
     while idx + 1 < len(parts) and parts[idx]:

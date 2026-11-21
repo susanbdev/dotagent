@@ -48,7 +48,7 @@ jobs:
         run: |
           set -euo pipefail
           GENESIS_PRE_GATE_SHA="0194af29450aa65d1699337ec731d1740efc00e4"
-          PINNED_GENESIS_VERIFIER_SHA256="ea34149d6b9cbee20ced65be6028a04e23672254a47b773f5935ce76b7ae943e"
+          PINNED_GENESIS_VERIFIER_SHA256="3d2d4df39495421f3f1c6d6865dd5b4a55838bd77bb79ee71f52d0ca80ab8d72"
 
           run_trusted_gate() {
             local base_sha="$1"
