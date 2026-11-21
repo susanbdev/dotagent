@@ -89,11 +89,14 @@ jobs:
             push)
               if [[ "${PUSH_BEFORE_SHA}" != "0000000000000000000000000000000000000000" ]] \
                  && git cat-file -e "${PUSH_BEFORE_SHA}^{commit}" 2>/dev/null; then
-                COMMIT_META="$(gh api "repos/${REPO_FULL}/commits/${PUSH_HEAD_SHA}")"
-                PULLS_META="$(gh api "repos/${REPO_FULL}/commits/${PUSH_HEAD_SHA}/pulls")"
-                MQ_PR_INFO="$(python3 - "${COMMIT_META}" "${PULLS_META}" <<'PY'
+                COMMIT_JSON_FILE="${RUNNER_TEMP}/push-commit.json"
+                PULLS_JSON_FILE="${RUNNER_TEMP}/push-pulls.json"
+                gh api "repos/${REPO_FULL}/commits/${PUSH_HEAD_SHA}" > "${COMMIT_JSON_FILE}"
+                gh api "repos/${REPO_FULL}/commits/${PUSH_HEAD_SHA}/pulls" > "${PULLS_JSON_FILE}"
+                MQ_PR_INFO="$(python3 - "${COMMIT_JSON_FILE}" "${PULLS_JSON_FILE}" <<'PY'
           import json, sys
-          c, prs = json.loads(sys.argv[1]), json.loads(sys.argv[2])
+          c = json.load(open(sys.argv[1], "r", encoding="utf-8"))
+          prs = json.load(open(sys.argv[2], "r", encoding="utf-8"))
           verified = (c.get("commit", {}).get("verification") or {}).get("verified") is True
           committer = (c.get("committer") or {}).get("login")
           if verified and committer == "web-flow" and isinstance(prs, list):
@@ -558,7 +561,8 @@ jobs:
           set -euo pipefail
           OWNER="${REPO_FULL%%/*}"
           REPO="${REPO_FULL##*/}"
-          GQL_JSON="$(gh api graphql \
+          GQL_JSON_FILE="${RUNNER_TEMP}/pr-gql.json"
+          gh api graphql \
             -F owner="${OWNER}" \
             -F name="${REPO}" \
             -F pr="${PR_NUMBER}" \
@@ -583,11 +587,11 @@ jobs:
                   }
                 }
               }
-            ')"
+            ' > "${GQL_JSON_FILE}"
 
-          DECISION="$(python3 - "${GQL_JSON}" "${HEAD_SHA}" <<'PY'
+          DECISION="$(python3 - "${GQL_JSON_FILE}" "${HEAD_SHA}" <<'PY'
           import json, sys
-          data, expected_sha = json.loads(sys.argv[1]), sys.argv[2]
+          data, expected_sha = json.load(open(sys.argv[1], "r", encoding="utf-8")), sys.argv[2]
           pr = data["data"]["repository"]["pullRequest"]
           if pr["isDraft"] or pr["headRefOid"] != expected_sha:
               print("skip:stale")
