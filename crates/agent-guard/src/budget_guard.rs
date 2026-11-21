@@ -141,6 +141,24 @@ pub fn inspect_file_budget(
     offset_line: Option<usize>,
     limit_lines: Option<usize>,
 ) -> Result<(String, ContentMetrics), BudgetViolation> {
+    inspect_file_budget_with_limits(
+        path,
+        offset_line,
+        limit_lines,
+        MAX_SLICE_LINES,
+        MAX_RAW_FILE_BYTES,
+        MAX_UNSLICED_LINES,
+    )
+}
+
+pub fn inspect_file_budget_with_limits(
+    path: &Path,
+    offset_line: Option<usize>,
+    limit_lines: Option<usize>,
+    max_slice_lines: usize,
+    max_raw_bytes: u64,
+    max_unsliced_lines: usize,
+) -> Result<(String, ContentMetrics), BudgetViolation> {
     let meta = std::fs::symlink_metadata(path).map_err(|e| BudgetViolation {
         code: "FILE_STAT_ERROR",
         detail: format!("Cannot stat '{}': {e}", path.display()),
@@ -157,13 +175,13 @@ pub fn inspect_file_budget(
     }
 
     let file_len = meta.len();
-    let has_bounded_slice = limit_lines.is_some_and(|l| l > 0 && l <= MAX_SLICE_LINES);
+    let has_bounded_slice = limit_lines.is_some_and(|l| l > 0 && l <= max_slice_lines);
 
-    if !has_bounded_slice && file_len > MAX_RAW_FILE_BYTES {
+    if !has_bounded_slice && file_len > max_raw_bytes {
         return Err(BudgetViolation {
             code: "FILE_BYTE_BUDGET_EXCEEDED",
             detail: format!(
-                "File '{}' is {file_len} bytes (> {MAX_RAW_FILE_BYTES} byte limit). Request a bounded line range (<= {MAX_SLICE_LINES} lines) to prevent context window saturation.",
+                "File '{}' is {file_len} bytes (> {max_raw_bytes} byte limit). Request a bounded line range (<= {max_slice_lines} lines) to prevent context window saturation.",
                 path.display()
             ),
         });
@@ -213,7 +231,7 @@ pub fn inspect_file_budget(
 
     let inspected_text = if has_bounded_slice {
         let start = offset_line.unwrap_or(1).saturating_sub(1);
-        let count = limit_lines.unwrap_or(MAX_SLICE_LINES);
+        let count = limit_lines.unwrap_or(max_slice_lines);
         let mut sliced = String::new();
         for (idx, line) in full_text.lines().skip(start).take(count).enumerate() {
             if idx > 0 {
@@ -226,7 +244,13 @@ pub fn inspect_file_budget(
         full_text
     };
 
-    let metrics = analyze_text_budget(&inspected_text, !has_bounded_slice)?;
+    let metrics = analyze_text_budget_with_limits(
+        &inspected_text,
+        !has_bounded_slice,
+        max_raw_bytes,
+        max_unsliced_lines,
+        max_slice_lines,
+    )?;
     Ok((inspected_text, metrics))
 }
 
@@ -234,13 +258,28 @@ pub fn analyze_text_budget(
     text: &str,
     enforce_unsliced_line_cap: bool,
 ) -> Result<ContentMetrics, BudgetViolation> {
-    if text.len() > MAX_RAW_FILE_BYTES as usize {
+    analyze_text_budget_with_limits(
+        text,
+        enforce_unsliced_line_cap,
+        MAX_RAW_FILE_BYTES,
+        MAX_UNSLICED_LINES,
+        MAX_SLICE_LINES,
+    )
+}
+
+pub fn analyze_text_budget_with_limits(
+    text: &str,
+    enforce_unsliced_line_cap: bool,
+    max_raw_bytes: u64,
+    max_unsliced_lines: usize,
+    max_slice_lines: usize,
+) -> Result<ContentMetrics, BudgetViolation> {
+    if text.len() > max_raw_bytes as usize {
         return Err(BudgetViolation {
             code: "CONTENT_BYTE_BUDGET_EXCEEDED",
             detail: format!(
-                "Content payload is {} bytes (> {} byte context-saturation ceiling).",
+                "Content payload is {} bytes (> {max_raw_bytes} byte context-saturation ceiling).",
                 text.len(),
-                MAX_RAW_FILE_BYTES
             ),
         });
     }
@@ -263,11 +302,11 @@ pub fn analyze_text_budget(
         }
     }
 
-    if enforce_unsliced_line_cap && line_count > MAX_UNSLICED_LINES {
+    if enforce_unsliced_line_cap && line_count > max_unsliced_lines {
         return Err(BudgetViolation {
             code: "LINE_COUNT_BUDGET_EXCEEDED",
             detail: format!(
-                "Content has {line_count} lines (> {MAX_UNSLICED_LINES} unsliced line limit). Read bounded slices (<= {MAX_SLICE_LINES} lines).",
+                "Content has {line_count} lines (> {max_unsliced_lines} unsliced line limit). Read bounded slices (<= {max_slice_lines} lines).",
             ),
         });
     }
@@ -378,8 +417,11 @@ pub struct RuntimeProfile {
     pub max_turn_tokens: usize,
     pub max_turn_file_reads: usize,
     pub max_turn_tool_calls: usize,
+    pub max_direct_discovery_calls: usize,
     pub max_return_summary_ascii_tokens: Option<usize>,
 }
+
+pub const DEFAULT_MAX_DIRECT_DISCOVERY_CALLS: usize = 4;
 
 impl RuntimeProfile {
     pub fn coding_agent_default() -> Self {
@@ -394,6 +436,7 @@ impl RuntimeProfile {
             max_turn_tokens: MAX_TURN_TOKENS,
             max_turn_file_reads: MAX_TURN_FILE_READS,
             max_turn_tool_calls: MAX_TURN_TOOL_CALLS,
+            max_direct_discovery_calls: DEFAULT_MAX_DIRECT_DISCOVERY_CALLS,
             max_return_summary_ascii_tokens: Some(200),
         }
     }
@@ -410,8 +453,19 @@ impl RuntimeProfile {
             max_turn_tokens: 12_000,
             max_turn_file_reads: MAX_TURN_FILE_READS,
             max_turn_tool_calls: MAX_TURN_TOOL_CALLS,
+            max_direct_discovery_calls: MAX_TURN_TOOL_CALLS,
             max_return_summary_ascii_tokens: Some(200),
         }
+    }
+
+    pub fn apply_elevated_lease(&mut self) {
+        self.max_slice_lines = 2_000;
+        self.max_raw_file_bytes = 262_144;
+        self.max_turn_tokens = 64_000;
+        self.max_turn_file_reads = 120;
+        self.max_turn_tool_calls = 120;
+        self.max_direct_discovery_calls = 120;
+        self.max_return_summary_ascii_tokens = Some(2_000);
     }
 }
 
@@ -512,7 +566,13 @@ pub fn load_profile_by_id(
                 && entry.mtime_nanos == mtime_nanos
                 && entry.file_len == meta.len()
             {
-                return Ok(entry.profile.clone());
+                let mut cached = entry.profile.clone();
+                if cached.profile_id == "coding-agent"
+                    && crate::operator::has_active_elevated_lease(repo_root)
+                {
+                    cached.apply_elevated_lease();
+                }
+                return Ok(cached);
             }
             let file = File::open(&toml_path).map_err(|e| BudgetViolation {
                 code: "UNREADABLE_PROFILE_BLOCKED",
@@ -557,6 +617,10 @@ pub fn load_profile_by_id(
         }
     }
 
+    if profile.profile_id == "coding-agent" && crate::operator::has_active_elevated_lease(repo_root)
+    {
+        profile.apply_elevated_lease();
+    }
     Ok(profile)
 }
 
@@ -848,6 +912,17 @@ fn apply_profile_toml_tightening(
                 let n = parse_positive_usize(val, key)?;
                 let cur = profile.max_return_summary_ascii_tokens.unwrap_or(200);
                 profile.max_return_summary_ascii_tokens = Some(cur.min(n.max(16)));
+            }
+            ("isolation", "max_direct_discovery_calls")
+            | ("budgets", "max_direct_discovery_calls")
+            | ("", "max_direct_discovery_calls") => {
+                let n = parse_positive_usize(val, key)?;
+                require_invariant(
+                    n <= MAX_TURN_TOOL_CALLS,
+                    key,
+                    "cannot exceed max_turn_tool_calls",
+                )?;
+                profile.max_direct_discovery_calls = n;
             }
             ("isolation", "disable_auto_memory")
             | ("isolation", "per_repo_state_namespace")

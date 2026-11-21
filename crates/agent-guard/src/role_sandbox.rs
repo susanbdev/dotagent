@@ -1061,10 +1061,31 @@ pub fn enforce_role_pre_tool(
                     false,
                 ));
             }
+            if is_search_tool {
+                let unauth_over_depth = cap.is_none()
+                    && ["max_depth", "MaxDepth", "depth"]
+                        .iter()
+                        .find_map(|k| input.get(k).and_then(JsonValue::as_u64))
+                        .is_some_and(|d| d as usize > crate::path_policy::MAX_DIRECTORY_WALK_DEPTH);
+                if !unauth_over_depth {
+                    return Some(Decision::deny(
+                        "INVESTIGATOR_RAW_SEARCH_FORBIDDEN",
+                        "Swarm Investigator must use `swarm-tool investigator scout --dir <rel_dir> --max-depth 20 [--filter <substr>]` instead of raw filesystem search/listing tools.",
+                        false,
+                    ));
+                }
+            }
             if is_shell_tool {
                 if let Some(cmd) = extract_cmd_arg(input) {
                     if let Some(write_denial) = check_zero_write_role_shell(role, cmd) {
                         return Some(write_denial);
+                    }
+                    if !is_allowed_investigator_shell(cmd) {
+                        return Some(Decision::deny(
+                            "INVESTIGATOR_SHELL_RESTRICTED",
+                            "Swarm Investigator shell access is restricted to single unchained `swarm-tool investigator {scout,emit-fact}` or `agent-guard read-safe` commands.",
+                            false,
+                        ));
                     }
                 }
             }
@@ -1922,7 +1943,7 @@ pub fn path_matches_any_scope(repo_rel: &str, patterns: &[String]) -> bool {
     false
 }
 
-fn tokenize_unchained_shell_words(cmd: &str) -> Option<Vec<String>> {
+pub(crate) fn tokenize_unchained_shell_words(cmd: &str) -> Option<Vec<String>> {
     let mut words = Vec::new();
     let mut cur = String::new();
     let mut in_word = false;
@@ -2019,6 +2040,47 @@ fn is_allowed_master_shell(cmd: &str) -> bool {
             (t.starts_with('-') && !t.starts_with("--output"))
                 || t.chars().all(|c| c.is_ascii_digit())
         });
+    }
+    false
+}
+
+fn is_allowed_investigator_shell(cmd: &str) -> bool {
+    let Some(tokens) = tokenize_unchained_shell_words(cmd.trim()) else {
+        return false;
+    };
+    if tokens.iter().any(|t| t.starts_with("--output")) {
+        return false;
+    }
+    let first_base = tokens[0].rsplit('/').next().unwrap_or(tokens[0].as_str());
+    if first_base == "swarm-tool" {
+        return tokens.get(1).is_some_and(|sub| sub == "investigator")
+            && tokens
+                .get(2)
+                .is_some_and(|op| matches!(op.as_str(), "scout" | "emit-fact"));
+    }
+    if tokens.len() >= 7
+        && tokens[0] == "cargo"
+        && tokens[1] == "run"
+        && ((tokens[2] == "-p" && tokens[3] == "swarm-tools")
+            || (tokens[2] == "--bin" && tokens[3] == "swarm-tool"))
+        && tokens[4] == "--"
+        && tokens[5] == "investigator"
+        && matches!(tokens[6].as_str(), "scout" | "emit-fact")
+    {
+        return true;
+    }
+    if matches!(first_base, "agent-guard" | "dotagent") {
+        return tokens.get(1).is_some_and(|sub| sub == "read-safe") && tokens.len() >= 3;
+    }
+    if tokens.len() >= 7
+        && tokens[0] == "cargo"
+        && tokens[1] == "run"
+        && ((tokens[2] == "-p" && tokens[3] == "agent-guard")
+            || (tokens[2] == "--bin" && matches!(tokens[3].as_str(), "agent-guard" | "dotagent")))
+        && tokens[4] == "--"
+        && tokens[5] == "read-safe"
+    {
+        return true;
     }
     false
 }
@@ -2844,6 +2906,36 @@ fn shell_contains_search_binary(cmd: &str) -> bool {
                 if dequoted_full.contains(sb) {
                     return true;
                 }
+            }
+        }
+    }
+    false
+}
+
+pub(crate) fn shell_leads_with_discovery_binary(cmd: &str) -> bool {
+    for (seg_idx, words) in split_shell_segments_and_words(cmd).into_iter().enumerate() {
+        let (idx, _) = peel_shell_wrappers(&words);
+        if idx >= words.len() {
+            continue;
+        }
+        let base = words[idx]
+            .rsplit('/')
+            .next()
+            .unwrap_or(words[idx].as_str())
+            .to_ascii_lowercase();
+        if matches!(base.as_str(), "find" | "fd" | "fdfind" | "ls" | "tree") {
+            return true;
+        }
+        if matches!(base.as_str(), "rg" | "ripgrep" | "grep" | "egrep" | "fgrep") {
+            if seg_idx == 0 {
+                return true;
+            }
+            let non_flag_args = words[idx + 1..]
+                .iter()
+                .filter(|w| !w.starts_with('-'))
+                .count();
+            if non_flag_args >= 2 {
+                return true;
             }
         }
     }

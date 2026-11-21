@@ -66,6 +66,10 @@ pub fn run_cli_entrypoint() -> ExitCode {
         "doctor" => crate::operator::run_doctor_cli(&args[1..], &cwd),
         "explain" => crate::diagnostics::run_explain_cli(&args[1..]),
         "session-reset" => crate::operator::run_session_reset_cli(&args[1..], &cwd),
+        "elevate" => crate::operator::run_elevate_cli(&args[1..], &cwd),
+        "approve" => crate::sudo_broker::run_approve_cli(&args[1..]),
+        "sudo-request" => crate::sudo_broker::run_sudo_request_cli(&args[1..], &cwd),
+        "sudo-result" => crate::sudo_broker::run_sudo_result_cli(&args[1..]),
         "activate" => crate::operator::run_activate_cli(&args[1..], &cwd),
         "deactivate" => crate::operator::run_deactivate_cli(&args[1..], &cwd),
         "fleet" => crate::fleet::run_fleet_cli(&args[1..], &cwd),
@@ -271,6 +275,8 @@ pub fn run_cli_entrypoint() -> ExitCode {
                  \x20 doctor [--json] [path]                    Run 7-point live security & sandbox health report\n\
                  \x20 explain <CODE|--list> [--json]            Explain any guard code with rationale & remediation\n\
                  \x20 session-reset [--session <id>|--all]      Reset halted session state (interactive human TTY only)\n\
+                 \x20 elevate [--ttl <min>|--status|--off]      Time-boxed local power-user lease (human TTY only)\n\
+                 \x20 approve [req_id|--watch|--list|--reject]  Approve & run queued sudo ticket (human TTY only)\n\
                  \x20 swarm <run|role> ...                      Active multi-worktree DAG wave runner & Swarm CLI\n\
                  \x20 compile <build|verify> [root]             Deterministic Policy-IR & embedded Regorus compiler\n\
                  \x20 harness <run|bench> ...                   Adversarial, contract, & microbenchmark harness\n\

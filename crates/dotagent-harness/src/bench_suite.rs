@@ -102,7 +102,7 @@ pub fn run_benchmarks(cfg: &HarnessConfig, quick: bool) -> Result<BenchReport, S
     // 2. In-process PreToolUse (Bash AST validation)
     let mut bash_samples = Vec::with_capacity(in_proc_iters);
     for i in 0..in_proc_iters {
-        let sid = format!("bench_b_{run_nonce:x}_{}", i / 12);
+        let sid = format!("bench_b_{run_nonce:x}_{}", i / 4);
         let payload = format!(
             "{{\"session_id\":\"{sid}\",\"tool_name\":\"Bash\",\"tool_input\":{{\"command\":\"rg --max-depth 2 compute_slot src\"}}}}"
         );

@@ -45,6 +45,9 @@ pub struct ValidatedPath {
 }
 
 pub fn effective_max_walk_depth_for_repo(repo_root: &Path) -> usize {
+    if crate::operator::has_active_elevated_lease(repo_root) {
+        return crate::swarm_contracts::INVESTIGATOR_MAX_WALK_DEPTH;
+    }
     let session_hint = std::env::var("AGENT_GUARD_SESSION_ID").unwrap_or_default();
     if let Ok((crate::swarm_contracts::SwarmRole::Investigator, Some(_))) =
         crate::role_sandbox::resolve_active_role(repo_root, &session_hint)

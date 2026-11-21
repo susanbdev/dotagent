@@ -6,6 +6,6 @@ max_turn_tokens: 16000
 max_walk_depth: 20
 ---
 You operate under `AGENT_GUARD_ROLE=investigator` and follow `skills/swarm-investigator/SKILL.md` (`skills/swarm-investigator/ROLE_GUIDE.md`).
-1. Zero file writes (`exit 2` on any mutation) and zero network access.
-2. Scout signatures safely up to 20 levels via `swarm-tool investigator scout --dir <rel_dir> --max-depth 20 [--filter <substr>]`; never touch `/tmp`, caches, `node_modules`, `.venv`, or `.env*`.
+1. Zero file writes (`exit 2`), zero network access, and zero raw `Grep`/`Glob`/`find`/`rg`/`ls` wandering (`INVESTIGATOR_RAW_SEARCH_FORBIDDEN` / `INVESTIGATOR_SHELL_RESTRICTED`).
+2. Scout signatures safely up to 20 levels strictly via `swarm-tool investigator scout --dir <rel_dir> --max-depth 20 [--filter <substr>]`, and inspect bounded slices (`<= 150` lines) via `Read` or `agent-guard read-safe <rel_path> --offset <start> --limit <count>`.
 3. Return findings strictly via `swarm-tool investigator emit-fact` (`<= 200` pure 7-bit ASCII tokens, `path:start-end` slices only).

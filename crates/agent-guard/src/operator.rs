@@ -394,6 +394,14 @@ pub fn run_session_reset_cli(args: &[String], cwd: &Path) -> ExitCode {
 }
 
 pub fn run_activate_cli(args: &[String], cwd: &Path) -> ExitCode {
+    if std::env::var("AGENT_GUARD_IN_SANDBOX").as_deref() == Ok("1")
+        || std::env::var("AGENT_GUARD_WORKER_LOCK").as_deref() == Ok("1")
+    {
+        eprintln!(
+            "[AGENT-GUARD HARD DENY :: ACTIVATE_DENIED_IN_SANDBOX] activate cannot be invoked from inside exec-sandbox or a locked worker."
+        );
+        return ExitCode::from(2);
+    }
     let mut workspace: Option<PathBuf> = None;
     let mut dotagent_root: Option<PathBuf> = None;
     let mut bin_dir: Option<PathBuf> = None;
@@ -479,6 +487,14 @@ pub fn run_activate_cli(args: &[String], cwd: &Path) -> ExitCode {
 }
 
 pub fn run_deactivate_cli(args: &[String], _cwd: &Path) -> ExitCode {
+    if std::env::var("AGENT_GUARD_IN_SANDBOX").as_deref() == Ok("1")
+        || std::env::var("AGENT_GUARD_WORKER_LOCK").as_deref() == Ok("1")
+    {
+        eprintln!(
+            "[AGENT-GUARD HARD DENY :: DEACTIVATE_DENIED_IN_SANDBOX] deactivate cannot be invoked from inside exec-sandbox or a locked worker."
+        );
+        return ExitCode::from(2);
+    }
     let mut workspace: Option<PathBuf> = None;
     let mut dry_run = false;
     let mut i = 0usize;
@@ -1280,4 +1296,377 @@ fn execute_deactivate(home: &Path, target_ws: &Path, dry_run: bool) -> Result<Ve
         target_ws.display()
     ));
     Ok(log)
+}
+
+pub const DEFAULT_ELEVATE_TTL_SECS: u64 = 1_800; // 30 minutes default
+pub const MAX_ELEVATE_TTL_SECS: u64 = 14_400; // 4 hours hard ceiling
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ElevatedLease {
+    pub repo_root: String,
+    pub issued_at_unix: u64,
+    pub expires_at_unix: u64,
+}
+
+impl ElevatedLease {
+    pub fn remaining_secs(&self, now_unix: u64) -> u64 {
+        self.expires_at_unix.saturating_sub(now_unix)
+    }
+}
+
+fn current_unix_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+fn elevated_state_dir() -> PathBuf {
+    let sessions = state_base_dir();
+    sessions
+        .parent()
+        .map(|p| p.join("elevated"))
+        .unwrap_or_else(|| sessions.join("elevated"))
+}
+
+fn canonical_repo_key(repo_root: &Path) -> (String, String) {
+    let canon = fs::canonicalize(repo_root).unwrap_or_else(|_| repo_root.to_path_buf());
+    let canon_s = canon.to_string_lossy().into_owned();
+    let hash = crate::crypto::sha256_hex(canon_s.as_bytes());
+    (canon_s, hash)
+}
+
+fn load_or_create_elevated_host_key(dir: &Path) -> Result<[u8; 32], String> {
+    reject_if_symlink(dir, "elevated state directory")?;
+    fs::create_dir_all(dir).map_err(|e| {
+        format!(
+            "failed creating elevated state dir '{}': {e}",
+            dir.display()
+        )
+    })?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(dir, fs::Permissions::from_mode(0o700));
+    }
+    let key_path = dir.join("host.key");
+    reject_if_symlink(&key_path, "elevated host key")?;
+    if key_path.exists() {
+        let raw = fs::read(&key_path).map_err(|e| format!("failed reading host.key: {e}"))?;
+        if raw.len() == 32 {
+            let mut key = [0u8; 32];
+            key.copy_from_slice(&raw);
+            return Ok(key);
+        }
+    }
+    let mut key = [0u8; 32];
+    let mut urandom =
+        fs::File::open("/dev/urandom").map_err(|e| format!("open /dev/urandom: {e}"))?;
+    std::io::Read::read_exact(&mut urandom, &mut key)
+        .map_err(|e| format!("read /dev/urandom: {e}"))?;
+    fs::write(&key_path, key).map_err(|e| format!("write host.key: {e}"))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(&key_path, fs::Permissions::from_mode(0o600));
+    }
+    Ok(key)
+}
+
+fn compute_elevated_lease_mac(
+    key: &[u8; 32],
+    repo_canon: &str,
+    issued_at_unix: u64,
+    expires_at_unix: u64,
+) -> [u8; 32] {
+    let mut payload = Vec::with_capacity(repo_canon.len() + 64);
+    payload.extend_from_slice(b"dotagent.elevated.v1\0");
+    payload.extend_from_slice(key);
+    payload.push(0);
+    payload.extend_from_slice(repo_canon.as_bytes());
+    payload.push(0);
+    payload.extend_from_slice(&issued_at_unix.to_be_bytes());
+    payload.extend_from_slice(&expires_at_unix.to_be_bytes());
+    crate::crypto::sha256_bytes(&payload)
+}
+
+pub fn issue_elevated_lease(repo_root: &Path, ttl_secs: u64) -> Result<ElevatedLease, String> {
+    if ttl_secs == 0 || ttl_secs > MAX_ELEVATE_TTL_SECS {
+        return Err(format!(
+            "TTL must be between 1 and {MAX_ELEVATE_TTL_SECS} seconds (max 240 minutes)"
+        ));
+    }
+    let dir = elevated_state_dir();
+    let key = load_or_create_elevated_host_key(&dir)?;
+    let (repo_canon, repo_hash) = canonical_repo_key(repo_root);
+    let now = current_unix_secs();
+    let expires = now.saturating_add(ttl_secs);
+    let mac = compute_elevated_lease_mac(&key, &repo_canon, now, expires);
+    let mac_hex = crate::crypto::hex_encode(&mac);
+
+    let doc = JsonValue::Object(vec![
+        (
+            "schema".to_string(),
+            JsonValue::Str("dotagent.elevated.v1".to_string()),
+        ),
+        ("repo_root".to_string(), JsonValue::Str(repo_canon.clone())),
+        ("issued_at_unix".to_string(), JsonValue::Uint(now)),
+        ("expires_at_unix".to_string(), JsonValue::Uint(expires)),
+        ("mac".to_string(), JsonValue::Str(mac_hex)),
+    ]);
+    let lease_path = dir.join(format!("{repo_hash}.json"));
+    reject_if_symlink(&lease_path, "elevated lease file")?;
+    fs::write(&lease_path, doc.to_json_string().as_bytes())
+        .map_err(|e| format!("failed writing elevated lease: {e}"))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(&lease_path, fs::Permissions::from_mode(0o600));
+    }
+    Ok(ElevatedLease {
+        repo_root: repo_canon,
+        issued_at_unix: now,
+        expires_at_unix: expires,
+    })
+}
+
+pub fn revoke_elevated_lease(repo_root: &Path) -> Result<bool, String> {
+    let dir = elevated_state_dir();
+    let (_, repo_hash) = canonical_repo_key(repo_root);
+    let lease_path = dir.join(format!("{repo_hash}.json"));
+    reject_if_symlink(&lease_path, "elevated lease file")?;
+    if lease_path.exists() {
+        fs::remove_file(&lease_path).map_err(|e| format!("failed removing lease: {e}"))?;
+        Ok(true)
+    } else {
+        Ok(false)
+    }
+}
+
+pub fn active_elevated_lease_at(repo_root: &Path, now_unix: u64) -> Option<ElevatedLease> {
+    let dir = elevated_state_dir();
+    let dir_meta = fs::symlink_metadata(&dir).ok()?;
+    if dir_meta.file_type().is_symlink() || !dir_meta.file_type().is_dir() {
+        return None;
+    }
+    let key_path = dir.join("host.key");
+    let key_meta = fs::symlink_metadata(&key_path).ok()?;
+    if key_meta.file_type().is_symlink() || !key_meta.file_type().is_file() {
+        return None;
+    }
+    let raw_key = fs::read(&key_path).ok()?;
+    if raw_key.len() != 32 {
+        return None;
+    }
+    let mut key = [0u8; 32];
+    key.copy_from_slice(&raw_key);
+
+    let (repo_canon, repo_hash) = canonical_repo_key(repo_root);
+    let lease_path = dir.join(format!("{repo_hash}.json"));
+    let meta = fs::symlink_metadata(&lease_path).ok()?;
+    if meta.file_type().is_symlink() || !meta.file_type().is_file() {
+        return None;
+    }
+    let raw = fs::read_to_string(&lease_path).ok()?;
+    let parsed = JsonValue::parse(&raw).ok()?;
+    let stored_repo = parsed.get("repo_root")?.as_str()?;
+    if stored_repo != repo_canon {
+        return None;
+    }
+    let issued = parsed.get("issued_at_unix")?.as_u64()?;
+    let expires = parsed.get("expires_at_unix")?.as_u64()?;
+    if expires <= now_unix || expires.saturating_sub(issued) > MAX_ELEVATE_TTL_SECS {
+        let _ = fs::remove_file(&lease_path);
+        return None;
+    }
+    let stored_mac = crate::crypto::hex_decode_32(parsed.get("mac")?.as_str()?).ok()?;
+    let expected_mac = compute_elevated_lease_mac(&key, &repo_canon, issued, expires);
+    if !crate::crypto::constant_time_eq_bytes(&stored_mac, &expected_mac) {
+        return None;
+    }
+    Some(ElevatedLease {
+        repo_root: repo_canon,
+        issued_at_unix: issued,
+        expires_at_unix: expires,
+    })
+}
+
+pub fn active_elevated_lease(repo_root: &Path) -> Option<ElevatedLease> {
+    active_elevated_lease_at(repo_root, current_unix_secs())
+}
+
+pub fn has_active_elevated_lease(repo_root: &Path) -> bool {
+    active_elevated_lease(repo_root).is_some()
+}
+
+/// Interactive human-TTY-only time-boxed local power-user mode (`dotagent elevate [--ttl <min>|--status|--off]`).
+/// Lifts ergonomic caps (discovery cap, depth 2->20, slice 150->2000L, hop A->B->10, local python/node, subagents)
+/// while preserving catastrophic zero-trust walls (`0` sudo, `0` secrets/.env/~/.ssh, `0` force-push/reset --hard, `0` Bidi/injection).
+pub fn run_elevate_cli(args: &[String], cwd: &Path) -> ExitCode {
+    if std::env::var("AGENT_GUARD_IN_SANDBOX").as_deref() == Ok("1")
+        || std::env::var("AGENT_GUARD_WORKER_LOCK").as_deref() == Ok("1")
+    {
+        eprintln!(
+            "[AGENT-GUARD HARD DENY :: ELEVATE_DENIED_IN_SANDBOX] `dotagent elevate` cannot be invoked from inside exec-sandbox or a locked worker."
+        );
+        return ExitCode::from(2);
+    }
+
+    for &marker in crate::telemetry::AGENT_SANDBOX_AND_HARNESS_MARKERS {
+        if std::env::var(marker)
+            .ok()
+            .is_some_and(|v| !v.trim().is_empty())
+        {
+            eprintln!(
+                "[AGENT-GUARD HARD DENY :: ELEVATE_DENIED_IN_HARNESS] `dotagent elevate` is restricted to a standalone human terminal (`{marker}` detected)."
+            );
+            return ExitCode::from(2);
+        }
+    }
+
+    if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
+        eprintln!(
+            "[AGENT-GUARD HARD DENY :: ELEVATE_REQUIRES_HUMAN_TTY] `dotagent elevate` requires an interactive human terminal (stdin/stdout TTY) so AI agents cannot self-elevate."
+        );
+        return ExitCode::from(2);
+    }
+
+    let mut status_only = false;
+    let mut revoke = false;
+    let mut json_mode = false;
+    let mut ttl_mins: u64 = 30;
+    let mut target_dir: Option<PathBuf> = None;
+
+    let mut i = 0usize;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--status" | "status" => {
+                status_only = true;
+                i += 1;
+            }
+            "--off" | "--revoke" | "off" | "revoke" => {
+                revoke = true;
+                i += 1;
+            }
+            "--json" => {
+                json_mode = true;
+                i += 1;
+            }
+            "--ttl" | "-t" => {
+                let Some(raw) = args.get(i + 1) else {
+                    eprintln!("[elevate] missing minutes after --ttl (e.g. `--ttl 30`)");
+                    return ExitCode::from(2);
+                };
+                let trimmed = raw.trim().trim_end_matches('m');
+                let Ok(parsed_mins) = trimmed.parse::<u64>() else {
+                    eprintln!("[elevate] invalid --ttl '{raw}' (expected integer minutes 1..=240)");
+                    return ExitCode::from(2);
+                };
+                ttl_mins = parsed_mins;
+                i += 2;
+            }
+            other if !other.starts_with('-') && target_dir.is_none() => {
+                target_dir = Some(PathBuf::from(other));
+                i += 1;
+            }
+            other => {
+                eprintln!(
+                    "[elevate] unrecognized argument '{other}' (usage: `dotagent elevate [--ttl <1..240>|--status|--off] [--json] [repo]`)"
+                );
+                return ExitCode::from(2);
+            }
+        }
+    }
+
+    let base = target_dir.as_deref().unwrap_or(cwd);
+    let repo_root = resolve_repo_root(base);
+
+    if revoke {
+        match revoke_elevated_lease(&repo_root) {
+            Ok(removed) => {
+                if json_mode {
+                    println!(
+                        "{{\"elevated\":false,\"revoked\":{},\"repo_root\":\"{}\"}}",
+                        removed,
+                        repo_root.display()
+                    );
+                } else if removed {
+                    println!(
+                        "[DOTAGENT ELEVATE OFF] Revoked elevated lease for '{}'; strict micro-window & subagent airlock restored.",
+                        repo_root.display()
+                    );
+                } else {
+                    println!(
+                        "[DOTAGENT ELEVATE OFF] No active elevated lease on '{}'.",
+                        repo_root.display()
+                    );
+                }
+                return ExitCode::SUCCESS;
+            }
+            Err(e) => {
+                eprintln!("[elevate] error revoking lease: {e}");
+                return ExitCode::from(2);
+            }
+        }
+    }
+
+    if status_only {
+        let now = current_unix_secs();
+        if let Some(lease) = active_elevated_lease_at(&repo_root, now) {
+            let rem = lease.remaining_secs(now);
+            if json_mode {
+                println!(
+                    "{{\"elevated\":true,\"remaining_secs\":{rem},\"expires_at_unix\":{},\"repo_root\":\"{}\"}}",
+                    lease.expires_at_unix, lease.repo_root
+                );
+            } else {
+                println!(
+                    "[DOTAGENT ELEVATED ACTIVE] {}m {}s remaining on '{}' (walk<=20, slice<=2000L, step<=64k, hops<=10, local python/node+subagents enabled; sudo/secrets/force-push still hard-blocked).",
+                    rem / 60,
+                    rem % 60,
+                    lease.repo_root
+                );
+            }
+        } else if json_mode {
+            println!(
+                "{{\"elevated\":false,\"remaining_secs\":0,\"repo_root\":\"{}\"}}",
+                repo_root.display()
+            );
+        } else {
+            println!(
+                "[DOTAGENT STANDARD MODE] No active elevated lease on '{}'.",
+                repo_root.display()
+            );
+        }
+        return ExitCode::SUCCESS;
+    }
+
+    if !(1..=240).contains(&ttl_mins) {
+        eprintln!("[elevate] --ttl must be between 1 and 240 minutes");
+        return ExitCode::from(2);
+    }
+
+    match issue_elevated_lease(&repo_root, ttl_mins * 60) {
+        Ok(lease) => {
+            if json_mode {
+                println!(
+                    "{{\"elevated\":true,\"ttl_minutes\":{ttl_mins},\"expires_at_unix\":{},\"repo_root\":\"{}\"}}",
+                    lease.expires_at_unix, lease.repo_root
+                );
+            } else {
+                println!(
+                    "[DOTAGENT ELEVATED GRANTED] {ttl_mins}-minute local power-user lease active on '{}'.\n\
+                     Lifted: direct discovery cap, walk depth (2 -> 20), read slices (150 -> 2000 lines / 256 KiB), step budget (16k -> 64k), hop chain (2 -> 10), local python3/uv/node, & subagents.\n\
+                     Preserved: 0 sudo/su, 0 ~/.ssh|~/.aws|.env* secrets, 0 git reset --hard/push --force/.git/hooks, 0 curl/wget exfil, 0 Bidi/injection.\n\
+                     Revoke anytime with: `dotagent elevate --off`",
+                    lease.repo_root
+                );
+            }
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("[elevate] failed issuing lease: {e}");
+            ExitCode::from(2)
+        }
+    }
 }

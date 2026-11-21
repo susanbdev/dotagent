@@ -55,6 +55,9 @@ pub enum GuardCode {
     SessionResetDeniedInSandbox,
     AmbiguousToolParamAlias,
     UnrecognizedHmacDomainDenied,
+    SubagentAirlockRequired,
+    InvestigatorRawSearchForbidden,
+    InvestigatorShellRestricted,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -464,6 +467,33 @@ const CATALOG: &[CodeExplanation] = &[
         summary: "`coord.sock` rejected an unknown or unpermitted HMAC domain over IPC.",
         rationale: "Restricts vault HMAC signing and verification strictly to length-prefixed, explicitly allowlisted Swarm v2 record domains.",
         remediation: "Use the official `swarm-tool` role subcommands rather than raw `coord.sock` RPC frames.",
+    },
+    CodeExplanation {
+        variant: GuardCode::SubagentAirlockRequired,
+        code: "SUBAGENT_AIRLOCK_REQUIRED",
+        severity: "RECOVERABLE_BOUND",
+        category: "isolation",
+        summary: "Standalone `coding-agent` exceeded its direct surgical discovery allowance without delegating to a read-only airlock subagent.",
+        rationale: "Prevents parent coding sessions from wandering across the filesystem and polluting context with untrusted multi-file prose.",
+        remediation: "Delegate broad repo exploration to read-only `research-airlock` (`research` on Antigravity) returning <= 200 ASCII tokens, or enable the operator escape hatch via `AGENT_GUARD_DIRECT_EXPLORE=1` or `/direct-explore` in your prompt.",
+    },
+    CodeExplanation {
+        variant: GuardCode::InvestigatorRawSearchForbidden,
+        code: "INVESTIGATOR_RAW_SEARCH_FORBIDDEN",
+        severity: "HARD_DENY",
+        category: "swarm",
+        summary: "Swarm `Investigator` attempted raw `Grep`, `Glob`, or directory listing instead of `swarm-tool investigator scout`.",
+        rationale: "Keeps deep codebase scouting deterministic and automatically prunes forbidden/symlinked paths via `swarm-tool investigator scout`.",
+        remediation: "Run `swarm-tool investigator scout --dir <rel_dir> --max-depth 20 [--filter <substr>]` and verify bounded slices via `Read` or `agent-guard read-safe`.",
+    },
+    CodeExplanation {
+        variant: GuardCode::InvestigatorShellRestricted,
+        code: "INVESTIGATOR_SHELL_RESTRICTED",
+        severity: "HARD_DENY",
+        category: "swarm",
+        summary: "Swarm `Investigator` attempted an arbitrary or chained shell command outside its `swarm-tool` / `read-safe` rails.",
+        rationale: "Prevents `Investigator` subagents from looping raw `find`, `ls`, `rg`, or `cat` commands across the repository.",
+        remediation: "Restrict `Investigator` shell calls to single unchained `swarm-tool investigator {scout,emit-fact}` or `agent-guard read-safe` invocations.",
     },
 ];
 
