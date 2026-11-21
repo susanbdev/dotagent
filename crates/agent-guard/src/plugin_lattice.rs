@@ -251,10 +251,8 @@ fn try_eval_rego(name: &str, src: &str, snap_json: &str) -> Result<Outcome, Stri
     if let RegoValue::Number(n) = eval("require_quorum")?
         && let Some(q) = n.as_u64().filter(|&q| q > 0)
     {
-        (level, min_app) = (
-            level.max(VerdictLevel::RequireVoteQuorum),
-            (q as usize).clamp(1, 16),
-        );
+        level = level.max(VerdictLevel::RequireVoteQuorum);
+        min_app = (q as usize).clamp(1, 16);
     }
     Ok((level, min_app, Vec::new(), "PLUGIN_POLICY_DENIED", reason))
 }
@@ -314,24 +312,27 @@ pub fn apply_pre_tool_plugin_lattice(
     match final_level {
         VerdictLevel::Allow => ring0_decision,
         VerdictLevel::EmitSignal => {
-            let esc_tool = JsonValue::Str(snap.tool_name.clone()).to_json_string();
-            eprintln!(
-                "[AGENTPI_EVENT] {{\"schema\":\"dotagent.agentpi.event.v1\",\"event_type\":\"PLUGIN_LATTICE_SIGNAL\",\"risk_level\":\"low\",\"tool_name\":{esc_tool}}}"
-            );
+            let t = JsonValue::Str(snap.tool_name.clone()).to_json_string();
+            let pfx = "{\"schema\":\"dotagent.agentpi.event.v1\",\"event_type\":\"PLUGIN_LATTICE_SIGNAL\"";
+            eprintln!("[AGENTPI_EVENT] {pfx},\"risk_level\":\"low\",\"tool_name\":{t}}}");
             ring0_decision
         }
         VerdictLevel::RequireVoteQuorum => {
             for (q, r, msg) in &quorums {
                 let v = count_verified_quorum_approvals(repo_root, session_id, paths, r);
                 if v < *q {
-                    let detail = format!("{msg} (verified_approvals={v}/{q})");
-                    return Decision::deny("PLUGIN_QUORUM_REQUIRED", detail, false);
+                    return Decision::deny(
+                        "PLUGIN_QUORUM_REQUIRED",
+                        format!("{msg} ({v}/{q})"),
+                        false,
+                    );
                 }
             }
             ring0_decision
         }
         VerdictLevel::RequireHumanTouch => {
-            if verify_plugin_human_touch(repo_root, session_id, &snap.tool_name, paths) {
+            let ok = verify_plugin_human_touch(repo_root, session_id, &snap.tool_name, paths);
+            if ok {
                 ring0_decision
             } else {
                 Decision::deny("PLUGIN_HUMAN_TOUCH_REQUIRED", top_reason, false)
