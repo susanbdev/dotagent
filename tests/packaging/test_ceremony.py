@@ -1,7 +1,6 @@
-"""Integration tests for scripts/sign-release-yk.sh using stubbed git/gh/ssh-keygen/Apple tools."""
+"""Integration tests for scripts/sign-release-yk.sh using stubbed git/gh/yubico-piv-tool/Apple tools."""
 
 import os
-import shutil
 import subprocess
 import unittest
 
@@ -9,8 +8,6 @@ import release_fixture as fx
 from release_fixture import slurp
 
 CEREMONY = os.path.join(fx.ROOT, "scripts", "sign-release-yk.sh")
-FAKE_BLOB = "AAAAGnNrLXNzaC1lZDI1NTE5QG9wZW5zc2guY29tZmFrZWZha2VmYWtl"
-SK_LINE = "sk-ssh-ed25519@openssh.com %s release@susanb.dev\n" % FAKE_BLOB
 
 STUBS = {
     "git": """#!/bin/sh
@@ -34,12 +31,16 @@ case "$1 $2" in
 esac
 exit 0
 """,
-    "ssh-keygen": """#!/bin/sh
-if [ "$1 $2" = "-Y sign" ]; then
-  for last; do :; done
-  printf 'SIG\\n' > "${last}.sig"
-fi
-exit 0
+    "yubico-piv-tool": """#!/bin/sh
+in="" out=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -i) in="$2"; shift 2 ;;
+    -o) out="$2"; shift 2 ;;
+    *) shift ;;
+  esac
+done
+exec /usr/bin/openssl pkeyutl -sign -inkey "${STUB_PRIV_KEY}" -pkeyopt digest:sha256 -in "${in}" -out "${out}"
 """,
     "uname": """#!/bin/sh
 if [ -n "${STUB_DARWIN:-}" ]; then echo Darwin; else exec /usr/bin/uname "$@"; fi
@@ -62,22 +63,17 @@ class CeremonyIntegrationTests(unittest.TestCase):
             with open(path, "w", encoding="ascii") as handle:
                 handle.write(body)
             os.chmod(path, 0o755)
-        self.signer = os.path.join(self.scratch, "signer.pub")
-        with open(self.signer, "w", encoding="ascii") as handle:
-            handle.write(SK_LINE)
-        self.key = os.path.join(self.scratch, "yubikey")
-        with open(self.key, "w", encoding="ascii") as handle:
-            handle.write("handle\n")
-        with open(self.key + ".pub", "w", encoding="ascii") as handle:
-            handle.write(SK_LINE)
-        self.release = fx.build_release(self.scratch, signer_pub=self.signer, sign=False)
+        self.key = fx.make_key(self.scratch, "piv")
+        self.signer = self.key + ".pub"
+        self.release = fx.build_release(self.scratch, key=self.key, signer_pub=self.signer, sign=False)
         self.log = os.path.join(self.scratch, "stub.log")
 
     def ceremony(self, extra_env=None):
         env = {
             "HOME": self.home,
             "PATH": self.stubs + ":" + fx.CLEAN_PATH,
-            "DOTAGENT_SIGN_KEY": self.key,
+            "DOTAGENT_SIGNER_PUB": self.signer,
+            "STUB_PRIV_KEY": self.key,
             "STUB_RELEASE_DIR": self.release["dir"],
             "STUB_LOG": self.log,
         }
@@ -94,7 +90,7 @@ class CeremonyIntegrationTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         uploads = self.uploads()
         self.assertEqual(len(uploads), 1)
-        self.assertIn("SHA256SUMS.sshsig", uploads[0])
+        self.assertIn("SHA256SUMS.sig", uploads[0])
         self.assertNotIn(".pkg", uploads[0])
         verified = [l for l in slurp(self.log).splitlines() if l.startswith("gh attestation verify")]
         self.assertGreaterEqual(len(verified), 10)
@@ -116,20 +112,18 @@ class CeremonyIntegrationTests(unittest.TestCase):
         self.assertFalse(os.path.exists(self.log))
 
     def test_key_not_pinned_in_installer_is_refused(self):
-        other = "sk-ssh-ed25519@openssh.com AAAAGnNrLXNzaC1lZDI1NTE5QG9wZW5zc2guY29tb3RoZXJvdGhlcg== x\n"
-        with open(self.key + ".pub", "w", encoding="ascii") as handle:
-            handle.write(other)
-        result = self.ceremony()
+        other = fx.make_key(self.scratch, "other")
+        result = self.ceremony({"DOTAGENT_SIGNER_PUB": other + ".pub"})
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("pins a different key", result.stderr)
         self.assertEqual(self.uploads(), [])
 
-    def test_software_key_is_refused(self):
-        with open(self.key + ".pub", "w", encoding="ascii") as handle:
-            handle.write("ssh-ed25519 %s x\n" % FAKE_BLOB)
-        result = self.ceremony()
+    def test_mismatched_private_key_fails_self_verify(self):
+        other = fx.make_key(self.scratch, "other")
+        result = self.ceremony({"STUB_PRIV_KEY": other})
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn("hardware", result.stderr)
+        self.assertIn("self-verification", result.stderr)
+        self.assertEqual(self.uploads(), [])
 
     def test_installer_bake_that_disagrees_with_sums_is_refused(self):
         installer = os.path.join(self.release["dir"], "install.sh")

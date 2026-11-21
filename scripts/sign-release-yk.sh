@@ -11,13 +11,13 @@
 #      unless CI provenance checks out
 #   3. (macOS, when identities are configured) lipo's a universal binary set,
 #      codesigns, builds + notarizes + staples dotagent-<tag>-universal-apple-darwin.pkg
-#   4. signs SHA256SUMS (and SHA256SUMS.macos) with the hardware SSH key
-#      (namespace dotagent-release-v1) and self-verifies against the key pinned
-#      inside the released install.sh
+#   4. signs SHA256SUMS (and SHA256SUMS.macos) with the YubiKey PIV P-256 key
+#      and self-verifies against the SPKI pinned inside the released install.sh
 #   5. uploads the new assets; optionally stages install.sh for susanb.dev
 #
-# Required env:
-#   DOTAGENT_SIGN_KEY          path to the sk-ssh-ed25519 key handle (private key never leaves the YubiKey)
+# Optional env (signing):
+#   DOTAGENT_SIGNER_PUB        PEM public key path (default: packaging/release-signer.pub)
+#   DOTAGENT_PIV_SLOT          YubiKey PIV slot (default: 9a)
 # Optional env (macOS .pkg):
 #   DOTAGENT_APP_IDENTITY      "Developer ID Application: ..."
 #   DOTAGENT_INSTALLER_IDENTITY "Developer ID Installer: ..."
@@ -32,8 +32,6 @@ set -euo pipefail
 umask 077
 
 readonly REPO="susanbdev/dotagent"
-readonly NAMESPACE="dotagent-release-v1"
-readonly SIGNER_ID="release@susanb.dev"
 readonly OIDC_ISSUER="https://token.actions.githubusercontent.com"
 readonly WORKFLOW="susanbdev/dotagent/.github/workflows/release.yml"
 
@@ -174,7 +172,7 @@ verify_installer() {
     local tag="$1" dir="$2" baked var target want have
     baked="$(exact_one_line "${dir}/install.sh" 'DOTAGENT_RELEASE_TAG=' | cut -d'"' -f2)"
     [[ "${baked}" == "${tag}" ]] || die "install.sh is baked for ${baked:-nothing}, not ${tag}"
-    exact_one_line "${dir}/install.sh" 'DOTAGENT_SIGNER_LINE=' >/dev/null
+    exact_one_line "${dir}/install.sh" 'DOTAGENT_SIGNER_SPKI=' >/dev/null
     for var in LINUX_X64:x86_64-unknown-linux-musl LINUX_ARM64:aarch64-unknown-linux-musl \
         DARWIN_X64:x86_64-apple-darwin DARWIN_ARM64:aarch64-apple-darwin; do
         target="${var#*:}"
@@ -192,31 +190,45 @@ baked_tag() {
     grep '^DOTAGENT_RELEASE_TAG=' "$1" | cut -d'"' -f2
 }
 
-pinned_blob() {
+pinned_spki() {
     local line
-    line="$(exact_one_line "$1" 'DOTAGENT_SIGNER_LINE=')"
-    printf '%s' "${line}" | tr -s " \"'" '\n' | grep -E '^AAAA' | head -n 1
+    line="$(exact_one_line "$1" 'DOTAGENT_SIGNER_SPKI=')"
+    printf '%s' "${line}" | cut -d"'" -f2
+}
+
+pem_spki() {
+    sed -n '/^-----BEGIN PUBLIC KEY-----$/,/^-----END PUBLIC KEY-----$/{ /^-----/d; p; }' "$1" | tr -d ' \t\r\n'
 }
 
 sign_file() {
-    local file="$1" signers="$2"
-    rm -f "${file}.sig" "${file}.sshsig"
-    ssh-keygen -Y sign -f "${DOTAGENT_SIGN_KEY}" -n "${NAMESPACE}" "${file}"
-    mv "${file}.sig" "${file}.sshsig"
-    ssh-keygen -Y verify -f "${signers}" -I "${SIGNER_ID}" -n "${NAMESPACE}" \
-        -s "${file}.sshsig" < "${file}" >/dev/null || die "self-verification of ${file##*/}.sshsig failed"
+    local file="$1" pub_pem="$2" slot="${DOTAGENT_PIV_SLOT:-9a}"
+    rm -f "${file}.sig" "${file}.sha256"
+    if command -v yubico-piv-tool >/dev/null 2>&1; then
+        openssl dgst -sha256 -binary -out "${file}.sha256" "${file}"
+        yubico-piv-tool -s "${slot}" -a verify-pin -a sign -A ECCP256 -i "${file}.sha256" -o "${file}.sig"
+        rm -f "${file}.sha256"
+    elif command -v pkcs11-tool >/dev/null 2>&1; then
+        pkcs11-tool --sign --login --mechanism ECDSA-SHA256 --input-file "${file}" --output-file "${file}.sig"
+    else
+        die "install yubico-piv-tool or pkcs11-tool (OpenSC) to sign with your YubiKey PIV slot"
+    fi
+    openssl dgst -sha256 -verify "${pub_pem}" -signature "${file}.sig" "${file}" >/dev/null 2>&1 \
+        || die "self-verification of ${file##*/}.sig failed"
 }
 
 main() {
     [[ $# -eq 1 ]] || die "usage: sign-release-yk.sh vX.Y.Z"
     local tag="$1"
     [[ "${tag}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "tag must look like v1.2.3"
-    [[ -n "${DOTAGENT_SIGN_KEY:-}" && -f "${DOTAGENT_SIGN_KEY}" ]] || die "set DOTAGENT_SIGN_KEY to your sk-ssh-ed25519 key handle"
-    [[ -f "${DOTAGENT_SIGN_KEY}.pub" ]] || die "missing ${DOTAGENT_SIGN_KEY}.pub"
-    for t in git gh ssh-keygen tar cut tr grep; do require_tool "${t}"; done
+    for t in git gh openssl tar cut tr grep sed; do require_tool "${t}"; done
 
-    DOTAGENT_SIGN_KEY="$(cd "$(dirname "${DOTAGENT_SIGN_KEY}")" && pwd)/$(basename "${DOTAGENT_SIGN_KEY}")"
     cd "$(dirname "${BASH_SOURCE[0]}")/.."
+    local signer_pub="${DOTAGENT_SIGNER_PUB:-packaging/release-signer.pub}"
+    [[ -f "${signer_pub}" ]] || die "missing signer pubkey ${signer_pub}"
+    local expected_spki
+    expected_spki="$(pem_spki "${signer_pub}")"
+    [[ -n "${expected_spki}" ]] || die "no PEM PUBLIC KEY found in ${signer_pub}"
+
     verify_tag "${tag}"
     local source_digest
     source_digest="$(git rev-parse "${tag}^{commit}")"
@@ -233,27 +245,23 @@ main() {
     verify_sums "${dir}"
     verify_installer "${tag}" "${dir}"
 
-    local pub_type pub_blob signers
-    pub_type="$(cut -d' ' -f1 "${DOTAGENT_SIGN_KEY}.pub")"
-    pub_blob="$(cut -d' ' -f2 "${DOTAGENT_SIGN_KEY}.pub")"
-    [[ "${pub_type}" == "sk-ssh-ed25519@openssh.com" ]] || die "signing key must be a hardware sk-ssh-ed25519@openssh.com key"
-    [[ "$(pinned_blob "${dir}/install.sh")" == "${pub_blob}" ]] \
-        || die "released install.sh pins a different key than DOTAGENT_SIGN_KEY; refusing to sign"
-    signers="${dir}/allowed_signers"
-    printf '%s namespaces="%s" %s %s\n' "${SIGNER_ID}" "${NAMESPACE}" "${pub_type}" "${pub_blob}" > "${signers}"
+    [[ "$(pinned_spki "${dir}/install.sh")" == "${expected_spki}" ]] \
+        || die "released install.sh pins a different key than ${signer_pub}; refusing to sign"
+    local pub_pem="${dir}/signer.pub"
+    printf -- '-----BEGIN PUBLIC KEY-----\n%s\n-----END PUBLIC KEY-----\n' "${expected_spki}" > "${pub_pem}"
 
-    local -a uploads=("${dir}/SHA256SUMS.sshsig")
-    sign_file "${dir}/SHA256SUMS" "${signers}"
+    local -a uploads=("${dir}/SHA256SUMS.sig")
+    sign_file "${dir}/SHA256SUMS" "${pub_pem}"
 
     local pkg="dotagent-${tag}-universal-apple-darwin.pkg"
     if pkg_wanted; then
         build_pkg "${tag}" "${dir}"
         printf '%s  %s\n' "$(hash_file "${dir}/${pkg}")" "${pkg}" > "${dir}/SHA256SUMS.macos"
-        sign_file "${dir}/SHA256SUMS.macos" "${signers}"
-        uploads+=("${dir}/${pkg}" "${dir}/SHA256SUMS.macos" "${dir}/SHA256SUMS.macos.sshsig")
+        sign_file "${dir}/SHA256SUMS.macos" "${pub_pem}"
+        uploads+=("${dir}/${pkg}" "${dir}/SHA256SUMS.macos" "${dir}/SHA256SUMS.macos.sig")
     fi
 
-    note "touch your YubiKey for any further prompts; uploading ${#uploads[@]} assets"
+    note "uploading ${#uploads[@]} assets"
     gh release upload "${tag}" "${uploads[@]}" --repo "${REPO}" --clobber
 
     if [[ -n "${DOTAGENT_WEB_DIR:-}" ]]; then

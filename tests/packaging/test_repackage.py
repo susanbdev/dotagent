@@ -140,17 +140,21 @@ class RepackageTests(unittest.TestCase):
             handle.write("# nothing here\n")
         result = fx.run_repackage(self.archives, placeholder, os.path.join(self.scratch, "o"))
         self.assertEqual(result.returncode, 2)
-        self.assertIn("empty", result.stderr)
+        self.assertIn("PEM PUBLIC KEY", result.stderr)
 
-    def test_software_key_needs_explicit_opt_in(self):
-        out = os.path.join(self.scratch, "o")
-        command = [
-            "python3", "-B", os.path.join(fx.PACKAGING, "repackage.py"),
-            "--archives", self.archives, "--tag", fx.TAG, "--signers", self.key + ".pub", "--out", out,
-        ]
-        result = subprocess.run(command, capture_output=True, text=True)
+    def test_non_p256_key_is_rejected(self):
+        ed_priv = os.path.join(self.scratch, "ed.pem")
+        ed_pub = os.path.join(self.scratch, "ed.pub")
+        subprocess.run(["openssl", "genpkey", "-algorithm", "Ed25519", "-out", ed_priv], check=True, capture_output=True)
+        subprocess.run(["openssl", "pkey", "-in", ed_priv, "-pubout", "-out", ed_pub], check=True, capture_output=True)
+        result = fx.run_repackage(self.archives, ed_pub, os.path.join(self.scratch, "o"))
         self.assertEqual(result.returncode, 2)
-        self.assertIn("hardware", result.stderr)
+        self.assertIn("P-256", result.stderr)
+
+    def test_committed_release_signer_pub_is_valid(self):
+        pub = os.path.join(fx.PACKAGING, "release-signer.pub")
+        result = fx.run_repackage(self.archives, pub, os.path.join(self.scratch, "o"))
+        self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_hostile_archive_member_is_rejected(self):
         target = "x86_64-unknown-linux-musl"

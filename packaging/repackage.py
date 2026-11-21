@@ -73,12 +73,9 @@ TARGETS = {
         "deb": None,
     },
 }
-SIGNER_ID = "release@susanb.dev"
-SIGNER_NAMESPACE = "dotagent-release-v1"
 SUMMARY = "Zero-trust guard, compiler and harness for AI coding agents"
 HOMEPAGE = "https://susanb.dev/dotagent"
 REPO_URL = "https://github.com/susanbdev/dotagent"
-SIGNER_TYPES = ("sk-ssh-ed25519@openssh.com", "ssh-ed25519")
 
 
 class RepackageError(Exception):
@@ -145,30 +142,41 @@ def check_parity(trees):
             raise RepackageError("shared trees differ between %s and %s" % (reference_target, target))
 
 
-def normalize_signer(raw, allow_software):
-    """Turn a public key line or allowed_signers line into the pinned signer line."""
+P256_SPKI_PREFIX = bytes.fromhex("3059301306072a8648ce3d020106082a8648ce3d03010703420004")
+
+
+def parse_signer_pem(raw):
+    """Extract and validate an ECDSA P-256 SPKI PEM public key as canonical single-line base64."""
+    assert_ascii("signers file", raw)
+    in_block = False
+    body = []
     for line in raw.splitlines():
-        line = line.strip()
-        if not line or line.startswith("#"):
-            continue
-        assert_ascii("signers file", line)
-        tokens = line.split()
-        for idx, token in enumerate(tokens):
-            if token in SIGNER_TYPES and idx + 1 < len(tokens):
-                if token == "ssh-ed25519" and not allow_software:
-                    raise RepackageError("release key must be a hardware sk-ssh-ed25519@openssh.com key")
-                blob = tokens[idx + 1]
-                if not re.fullmatch(r"[A-Za-z0-9+/]+={0,2}", blob):
-                    raise RepackageError("malformed public key blob")
-                return '%s namespaces="%s" %s %s' % (SIGNER_ID, SIGNER_NAMESPACE, token, blob)
-        raise RepackageError("no ed25519 key found in signers file")
-    raise RepackageError("signers file is empty")
+        stripped = line.strip()
+        if not in_block:
+            if not stripped or stripped.startswith("#"):
+                continue
+            if stripped == "-----BEGIN PUBLIC KEY-----":
+                in_block = True
+                continue
+            raise RepackageError("release signer must be a PEM PUBLIC KEY block")
+        if stripped == "-----END PUBLIC KEY-----":
+            try:
+                der = base64.b64decode("".join(body), validate=True)
+            except Exception as exc:
+                raise RepackageError("malformed PEM base64 in signers file") from exc
+            if len(der) != 91 or not der.startswith(P256_SPKI_PREFIX):
+                raise RepackageError("release signer must be an ECDSA P-256 SPKI public key")
+            return base64.b64encode(der).decode("ascii")
+        if not re.fullmatch(r"[A-Za-z0-9+/=]+", stripped):
+            raise RepackageError("malformed PEM body in signers file")
+        body.append(stripped)
+    raise RepackageError("no PEM PUBLIC KEY found in signers file")
 
 
-def render_installer(template_path, tag, digests, signer):
+def render_installer(template_path, tag, digests, signer_spki):
     with open(template_path, "r", encoding="ascii", newline="") as handle:
         text = handle.read()
-    values = {"RELEASE_TAG": tag, "ALLOWED_SIGNERS": signer}
+    values = {"RELEASE_TAG": tag, "SIGNER_SPKI": signer_spki}
     for target, digest in digests.items():
         values["SHA256_" + target.upper().replace("-", "_")] = digest
     for key, value in values.items():
@@ -515,7 +523,7 @@ def run_repackage(args):
     template = os.path.join(here, "install.sh.in")
     config = os.path.join(here, "nfpm.yaml")
     with open(args.signers, "r", encoding="ascii") as handle:
-        signer = normalize_signer(handle.read(), args.allow_software_key)
+        signer = parse_signer_pem(handle.read())
 
     archive_paths = []
     digests = {}
@@ -553,11 +561,10 @@ def parse_args(argv):
     parser = argparse.ArgumentParser(description="Deterministically repackage dotagent release archives")
     parser.add_argument("--archives", required=True, help="directory holding the 4 release archives")
     parser.add_argument("--tag", required=True, help="release tag, for example v2.1.0")
-    parser.add_argument("--signers", required=True, help="file with the YubiKey sk-ssh-ed25519 public key")
+    parser.add_argument("--signers", required=True, help="file with the YubiKey PIV ECDSA P-256 PEM public key")
     parser.add_argument("--out", required=True, help="output directory (recreated)")
     parser.add_argument("--license", default="LicenseRef-Proprietary", help="SPDX expression for package metadata")
     parser.add_argument("--nfpm", default=None, help="path to nfpm (default: PATH lookup)")
-    parser.add_argument("--allow-software-key", action="store_true", help="accept ssh-ed25519 (tests only)")
     return parser.parse_args(argv)
 
 

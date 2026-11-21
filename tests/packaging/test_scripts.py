@@ -115,14 +115,14 @@ class CeremonyTests(unittest.TestCase):
         self.assertEqual(self.run_ceremony().returncode, 1)
 
     def test_rejects_malformed_tag(self):
-        result = self.run_ceremony("main", env={"DOTAGENT_SIGN_KEY": "/dev/null"})
+        result = self.run_ceremony("main")
         self.assertEqual(result.returncode, 1)
         self.assertIn("tag must look like", result.stderr)
 
-    def test_requires_signing_key(self):
-        result = self.run_ceremony("v1.2.3")
+    def test_requires_signer_pubkey(self):
+        result = self.run_ceremony("v1.2.3", env={"DOTAGENT_SIGNER_PUB": "/nonexistent"})
         self.assertEqual(result.returncode, 1)
-        self.assertIn("DOTAGENT_SIGN_KEY", result.stderr)
+        self.assertIn("missing signer pubkey", result.stderr)
 
 
 class HygieneTests(unittest.TestCase):

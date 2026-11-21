@@ -99,23 +99,18 @@ class InstallerTests(unittest.TestCase):
         self.assert_untouched()
 
     def test_missing_signature_is_rejected(self):
-        os.remove(os.path.join(self.release["dir"], "SHA256SUMS.sshsig"))
+        os.remove(os.path.join(self.release["dir"], "SHA256SUMS.sig"))
         result = self.install()
         self.assertNotEqual(result.returncode, 0)
         self.assert_untouched()
 
-    def test_namespace_confusion_is_rejected(self):
-        sums = os.path.join(self.release["dir"], "SHA256SUMS")
-        os.remove(sums + ".sshsig")
-        subprocess.run(
-            ["ssh-keygen", "-Y", "sign", "-f", self.release["key"], "-n", "git", sums],
-            check=True,
-            capture_output=True,
-        )
-        os.replace(sums + ".sig", sums + ".sshsig")
+    def test_signature_for_other_key_is_rejected(self):
+        other = fx.make_key(self.scratch, "other")
+        fx.sign_file(os.path.join(self.release["dir"], "SHA256SUMS"), other)
         result = self.install()
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("signature is NOT valid", result.stderr)
+        self.assert_untouched()
 
     def test_agent_guard_session_refuses_with_exit_2(self):
         result = self.install(extra_env={"AGENT_GUARD_SESSION": "1"})
@@ -220,7 +215,7 @@ class InstallerTests(unittest.TestCase):
         base = "https://github.com/susanbdev/dotagent/releases/download/%s/" % fx.TAG
         self.assertEqual(
             urls,
-            [base + PREFIX + ".tar.gz", base + "SHA256SUMS", base + "SHA256SUMS.sshsig"],
+            [base + PREFIX + ".tar.gz", base + "SHA256SUMS", base + "SHA256SUMS.sig"],
         )
 
     def test_fetch_uses_strict_curl_flags(self):

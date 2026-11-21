@@ -104,7 +104,12 @@ def build_archives(dest, tag=TAG, shared_marker="one", skew_target=None, fmt=tar
 def make_key(directory, name="key"):
     path = os.path.join(directory, name)
     subprocess.run(
-        ["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-C", "release@susanb.dev", "-f", path],
+        ["openssl", "ecparam", "-name", "prime256v1", "-genkey", "-noout", "-out", path],
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["openssl", "pkey", "-in", path, "-pubout", "-out", path + ".pub"],
         check=True,
         capture_output=True,
     )
@@ -124,22 +129,20 @@ def run_repackage(archives, signers, out, tag=TAG, extra_args=()):
         signers,
         "--out",
         out,
-        "--allow-software-key",
     ]
     command.extend(extra_args)
     return subprocess.run(command, capture_output=True, text=True, env={"PATH": CLEAN_PATH, "HOME": os.path.expanduser("~")})
 
 
 def sign_file(path, key):
-    for stale in (path + ".sig", path + ".sshsig"):
-        if os.path.exists(stale):
-            os.remove(stale)
+    sig = path + ".sig"
+    if os.path.exists(sig):
+        os.remove(sig)
     subprocess.run(
-        ["ssh-keygen", "-Y", "sign", "-f", key, "-n", "dotagent-release-v1", path],
+        ["openssl", "dgst", "-sha256", "-sign", key, "-out", sig, path],
         check=True,
         capture_output=True,
     )
-    os.replace(path + ".sig", path + ".sshsig")
 
 
 def build_release(scratch, key=None, signer_pub=None, sign=True, fmt=tarfile.GNU_FORMAT):

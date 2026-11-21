@@ -1,9 +1,6 @@
 # dotagent release signer (PUBLIC key only). The installer pins this key.
-#
-# Replace the line below with the public half of the YubiKey SSH key, i.e. the
-# single line from `ssh-keygen -K` / ~/.ssh/id_ed25519_sk.pub:
-#
-#   sk-ssh-ed25519@openssh.com AAAA... release@susanb.dev
-#
-# Until a real key is committed here, packaging/repackage.py fails closed and
-# no release (install.sh, wheels, npm, brew, deb/rpm/apk) can be produced.
+# YubiKey PIV ECDSA P-256 public key (SPKI PEM).
+-----BEGIN PUBLIC KEY-----
+MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEkJH276bJ8VCBYX+WLGScda3HudV/
+gvtxEh7M6Lcm4vmNQowgEwa3FXhsvyQjPz6vSB6TlI4ryhXRiuqk9iNY+w==
+-----END PUBLIC KEY-----

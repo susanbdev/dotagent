@@ -30,9 +30,7 @@ DOTAGENT_SHA256_LINUX_X64="@SHA256_X86_64_UNKNOWN_LINUX_MUSL@"
 DOTAGENT_SHA256_LINUX_ARM64="@SHA256_AARCH64_UNKNOWN_LINUX_MUSL@"
 DOTAGENT_SHA256_DARWIN_X64="@SHA256_X86_64_APPLE_DARWIN@"
 DOTAGENT_SHA256_DARWIN_ARM64="@SHA256_AARCH64_APPLE_DARWIN@"
-DOTAGENT_SIGNER_LINE='@ALLOWED_SIGNERS@'
-DOTAGENT_SIGNER_ID="release@susanb.dev"
-DOTAGENT_SIGNER_NAMESPACE="dotagent-release-v1"
+DOTAGENT_SIGNER_SPKI='@SIGNER_SPKI@'
 DOTAGENT_BINARIES=(dotagent agent-guard agent-guard-sh dotagent-compiler swarm-tool dotagent-harness)
 
 DOTAGENT_STAGE=""
@@ -175,14 +173,13 @@ dotagent_check_sums() {
 }
 
 dotagent_check_sig() {
-    local sums="$1" sig="$2" signers="${DOTAGENT_STAGE}/allowed_signers"
-    command -v ssh-keygen >/dev/null 2>&1 || dotagent_die "ssh-keygen (OpenSSH 8.2+) is required to verify the release signature"
-    case "${DOTAGENT_SIGNER_LINE}" in
+    local sums="$1" sig="$2" pub="${DOTAGENT_STAGE}/signer.pub"
+    command -v openssl >/dev/null 2>&1 || dotagent_die "openssl is required to verify the release signature"
+    case "${DOTAGENT_SIGNER_SPKI}" in
         ""|"@"*) dotagent_die "this installer has no baked release signer (unrendered template?)" ;;
     esac
-    printf '%s\n' "${DOTAGENT_SIGNER_LINE}" > "${signers}"
-    ssh-keygen -Y verify -f "${signers}" -I "${DOTAGENT_SIGNER_ID}" \
-        -n "${DOTAGENT_SIGNER_NAMESPACE}" -s "${sig}" < "${sums}" >/dev/null 2>&1 \
+    printf -- '-----BEGIN PUBLIC KEY-----\n%s\n-----END PUBLIC KEY-----\n' "${DOTAGENT_SIGNER_SPKI}" > "${pub}"
+    openssl dgst -sha256 -verify "${pub}" -signature "${sig}" "${sums}" >/dev/null 2>&1 \
         || dotagent_die "SHA256SUMS signature is NOT valid for the pinned release key"
 }
 
@@ -329,9 +326,9 @@ dotagent_install_main() {
     dotagent_note "installing dotagent ${tag} for ${target}"
     dotagent_fetch "${base}/${archive}" "${stage}/${archive}" 52428800
     dotagent_fetch "${base}/SHA256SUMS" "${stage}/SHA256SUMS" 1048576
-    dotagent_fetch "${base}/SHA256SUMS.sshsig" "${stage}/SHA256SUMS.sshsig" 65536
+    dotagent_fetch "${base}/SHA256SUMS.sig" "${stage}/SHA256SUMS.sig" 4096
 
-    dotagent_check_sig "${stage}/SHA256SUMS" "${stage}/SHA256SUMS.sshsig"
+    dotagent_check_sig "${stage}/SHA256SUMS" "${stage}/SHA256SUMS.sig"
     dotagent_check_sums "${stage}/SHA256SUMS" "${stage}/${archive}"
 
     if [[ "${want_attest}" -eq 1 ]]; then
