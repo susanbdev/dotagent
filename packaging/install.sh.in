@@ -1,0 +1,368 @@
+#!/usr/bin/env bash
+# dotagent installer -- https://susanb.dev/dotagent/install.sh
+#
+#   curl -fsSL https://susanb.dev/dotagent/install.sh | bash
+#   curl -fsSL https://susanb.dev/dotagent/install.sh | bash -s -- --activate --workspace "$HOME"
+#
+# Security model (this file is a TEMPLATE; packaging/repackage.py bakes the
+# release tag, the four archive SHA-256 digests and the release signer line):
+#   1. Every statement lives inside a function; the single top-level call is the
+#      LAST line, so a truncated stream parses to nothing or fails to parse.
+#   2. Refuses to run inside a guarded agent session (any AGENT_GUARD_* env).
+#   3. Hostile environment scrubbed; PATH pinned to system directories.
+#   4. Private 0700 staging dir inside ~/.local/state/agent-guard (never /tmp).
+#   5. HTTPS-only fetch of immutable, tag-pinned GitHub release assets (no
+#      "latest" lookups, no mutable API).
+#   6. Archive SHA-256 must equal the digest baked into this script AND the
+#      line in SHA256SUMS, and SHA256SUMS must carry a valid SSHSIG made by the
+#      baked hardware release key (namespace dotagent-release-v1).
+#   7. Archive member names/types audited BEFORE extraction (no absolute paths,
+#      "..", links, devices); extraction never restores owner or mode bits.
+#   8. Extracted `dotagent self-verify` must pass; binaries are swapped in
+#      atomically (write temp file, chmod 0555, rename) so a running binary
+#      never hits ETXTBSY and a half-written binary is never visible.
+#
+# Flags: --activate  --workspace <dir>  --bin-dir <dir>  --system
+#        --require-attestation  --help
+
+DOTAGENT_RELEASE_TAG="@RELEASE_TAG@"
+DOTAGENT_SHA256_LINUX_X64="@SHA256_X86_64_UNKNOWN_LINUX_MUSL@"
+DOTAGENT_SHA256_LINUX_ARM64="@SHA256_AARCH64_UNKNOWN_LINUX_MUSL@"
+DOTAGENT_SHA256_DARWIN_X64="@SHA256_X86_64_APPLE_DARWIN@"
+DOTAGENT_SHA256_DARWIN_ARM64="@SHA256_AARCH64_APPLE_DARWIN@"
+DOTAGENT_SIGNER_LINE='@ALLOWED_SIGNERS@'
+DOTAGENT_SIGNER_ID="release@susanb.dev"
+DOTAGENT_SIGNER_NAMESPACE="dotagent-release-v1"
+DOTAGENT_BINARIES="dotagent agent-guard agent-guard-sh dotagent-compiler swarm-tool dotagent-harness"
+
+DOTAGENT_STAGE=""
+DOTAGENT_TARGET=""
+DOTAGENT_ORIG_PATH=""
+
+dotagent_die() {
+    printf '[dotagent install] FATAL: %s\n' "$1" >&2
+    exit "${2:-1}"
+}
+
+dotagent_note() {
+    printf '[dotagent install] %s\n' "$1" >&2
+}
+
+dotagent_cleanup() {
+    local stage="${DOTAGENT_STAGE}"
+    DOTAGENT_STAGE=""
+    case "${stage}" in
+        "${HOME}"/.local/state/agent-guard/.stage.*)
+            chmod -R u+rwX "${stage}" 2>/dev/null || true
+            rm -rf "${stage}" 2>/dev/null || true
+            ;;
+    esac
+}
+
+dotagent_scrub_env() {
+    local name
+    DOTAGENT_ORIG_PATH="${PATH:-}"
+    while IFS= read -r name; do
+        case "${name}" in
+            AGENT_GUARD_*)
+                dotagent_die "refusing to run inside a guarded agent session (${name} is set); run this from a human terminal" 2
+                ;;
+        esac
+    done < <(compgen -e)
+
+    unset LD_PRELOAD LD_LIBRARY_PATH LD_AUDIT BASH_ENV ENV CDPATH TAR_OPTIONS GZIP \
+        GZIP_OPT SSH_ASKPASS CURL_HOME GIT_SSH GIT_SSH_COMMAND GREP_OPTIONS \
+        CURL_CA_BUNDLE SSL_CERT_FILE SSL_CERT_DIR
+    while IFS= read -r name; do
+        case "${name}" in
+            DYLD_*|BASH_FUNC_*|LD_*) unset "${name}" ;;
+        esac
+    done < <(compgen -e)
+    IFS=$' \t\n'
+    export PATH="/usr/bin:/bin:/usr/sbin:/sbin"
+    export LC_ALL=C
+    umask 077
+}
+
+dotagent_pick_target() {
+    local os arch
+    os="$(uname -s)"
+    arch="$(uname -m)"
+    case "${os}" in
+        Linux)
+            case "${arch}" in
+                x86_64|amd64) DOTAGENT_TARGET="x86_64-unknown-linux-musl" ;;
+                aarch64|arm64) DOTAGENT_TARGET="aarch64-unknown-linux-musl" ;;
+                *) dotagent_die "unsupported Linux architecture: ${arch}" ;;
+            esac
+            ;;
+        Darwin)
+            if [[ "${arch}" == "x86_64" ]] \
+                && [[ "$(sysctl -n hw.optional.arm64 2>/dev/null || true)" == "1" ]]; then
+                arch="arm64"
+            fi
+            case "${arch}" in
+                x86_64) DOTAGENT_TARGET="x86_64-apple-darwin" ;;
+                arm64) DOTAGENT_TARGET="aarch64-apple-darwin" ;;
+                *) dotagent_die "unsupported macOS architecture: ${arch}" ;;
+            esac
+            ;;
+        *) dotagent_die "unsupported operating system: ${os} (Windows is not supported yet)" ;;
+    esac
+}
+
+dotagent_baked_digest() {
+    case "$1" in
+        x86_64-unknown-linux-musl) printf '%s' "${DOTAGENT_SHA256_LINUX_X64}" ;;
+        aarch64-unknown-linux-musl) printf '%s' "${DOTAGENT_SHA256_LINUX_ARM64}" ;;
+        x86_64-apple-darwin) printf '%s' "${DOTAGENT_SHA256_DARWIN_X64}" ;;
+        aarch64-apple-darwin) printf '%s' "${DOTAGENT_SHA256_DARWIN_ARM64}" ;;
+        *) dotagent_die "no baked digest for target $1" ;;
+    esac
+}
+
+dotagent_sha256() {
+    local file="$1" out
+    if command -v sha256sum >/dev/null 2>&1; then
+        out="$(sha256sum "${file}")"
+    elif command -v shasum >/dev/null 2>&1; then
+        out="$(shasum -a 256 "${file}")"
+    else
+        dotagent_die "no sha256 tool found (need sha256sum or shasum)"
+    fi
+    printf '%s' "${out%% *}"
+}
+
+# The ONLY network call. Tests override this function; nothing else fetches.
+dotagent_fetch() {
+    local url="$1" dest="$2" cap="$3"
+    command -v curl >/dev/null 2>&1 || dotagent_die "curl not found in the system PATH"
+    curl -q --proto '=https' --proto-redir '=https' --tlsv1.2 \
+        --fail --silent --show-error --location --max-redirs 5 \
+        --max-filesize "${cap}" --connect-timeout 10 --max-time 300 \
+        --output "${dest}" -- "${url}" </dev/null
+}
+
+dotagent_make_stage() {
+    local state="${HOME}/.local/state/agent-guard" rand
+    mkdir -p "${state}"
+    chmod 0700 "${state}"
+    rand="$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')"
+    [[ "${#rand}" -eq 32 ]] || dotagent_die "failed gathering randomness"
+    DOTAGENT_STAGE="${state}/.stage.$$.${rand}"
+    mkdir -m 0700 "${DOTAGENT_STAGE}"
+    [[ -d "${DOTAGENT_STAGE}" && ! -L "${DOTAGENT_STAGE}" ]] || dotagent_die "staging dir is not a plain directory"
+    [[ -O "${DOTAGENT_STAGE}" ]] || dotagent_die "staging dir is not owned by the current user"
+}
+
+dotagent_check_sums() {
+    local sums="$1" archive="$2" actual baked line_count listed
+    actual="$(dotagent_sha256 "${archive}")"
+    baked="$(dotagent_baked_digest "${DOTAGENT_TARGET}")"
+    [[ "${baked}" =~ ^[0-9a-f]{64}$ ]] || dotagent_die "this installer has no valid baked digest (unrendered template?)"
+    [[ "${actual}" == "${baked}" ]] || dotagent_die "archive SHA-256 does not match digest baked into installer"
+
+    line_count="$(grep -c -F -- "  ${archive##*/}" "${sums}" || true)"
+    [[ "${line_count}" == "1" ]] || dotagent_die "SHA256SUMS must list ${archive##*/} exactly once"
+    listed="$(grep -F -- "  ${archive##*/}" "${sums}")"
+    listed="${listed%% *}"
+    [[ "${listed}" == "${actual}" ]] || dotagent_die "archive SHA-256 does not match SHA256SUMS"
+}
+
+dotagent_check_sig() {
+    local sums="$1" sig="$2" signers="${DOTAGENT_STAGE}/allowed_signers"
+    command -v ssh-keygen >/dev/null 2>&1 || dotagent_die "ssh-keygen (OpenSSH 8.1+) is required to verify the release signature"
+    case "${DOTAGENT_SIGNER_LINE}" in
+        ""|"@"*) dotagent_die "this installer has no baked release signer (unrendered template?)" ;;
+    esac
+    printf '%s\n' "${DOTAGENT_SIGNER_LINE}" > "${signers}"
+    ssh-keygen -Y verify -f "${signers}" -I "${DOTAGENT_SIGNER_ID}" \
+        -n "${DOTAGENT_SIGNER_NAMESPACE}" -s "${sig}" < "${sums}" >/dev/null 2>&1 \
+        || dotagent_die "SHA256SUMS signature is NOT valid for the pinned release key"
+}
+
+dotagent_audit_archive() {
+    local archive="$1" prefix="$2" name kind
+    tar -tzf "${archive}" >/dev/null 2>&1 || dotagent_die "archive is not a readable gzip tarball"
+    while IFS= read -r kind; do
+        case "${kind:0:1}" in
+            -|d) ;;
+            *) dotagent_die "archive contains a link, device or special entry: refusing" ;;
+        esac
+    done < <(tar -tvzf "${archive}")
+    while IFS= read -r name; do
+        case "${name}" in
+            "${prefix}"|"${prefix}/"|"${prefix}/"*) ;;
+            *) dotagent_die "archive member outside expected root: refusing" ;;
+        esac
+        case "/${name%/}/" in
+            */../*|*//*) dotagent_die "archive member contains traversal: refusing" ;;
+        esac
+        if [[ ! "${name}" =~ ^[A-Za-z0-9._+/-]+$ ]]; then
+            dotagent_die "archive member has an unexpected character in its name: refusing"
+        fi
+    done < <(tar -tzf "${archive}")
+}
+
+dotagent_extract() {
+    local archive="$1" dest="$2" prefix="$3" odd bin
+    mkdir -m 0700 "${dest}"
+    tar -xzf "${archive}" -C "${dest}" --no-same-owner --no-same-permissions
+    [[ -d "${dest}/${prefix}" && ! -L "${dest}/${prefix}" ]] || dotagent_die "archive root missing after extraction"
+    odd="$(find "${dest}" ! -type f ! -type d -print -quit)"
+    [[ -z "${odd}" ]] || dotagent_die "extraction produced a non-regular entry: refusing"
+    for bin in ${DOTAGENT_BINARIES}; do
+        [[ -f "${dest}/${prefix}/bin/${bin}" && ! -L "${dest}/${prefix}/bin/${bin}" ]] \
+            || dotagent_die "archive is missing binary ${bin}"
+    done
+}
+
+dotagent_seal_tree() {
+    local root="$1"
+    find "${root}" -type d -exec chmod 0555 {} +
+    find "${root}" -type f -exec chmod 0444 {} +
+    find "${root}/bin" -type f -exec chmod 0555 {} +
+}
+
+dotagent_swap_dir() {
+    local fresh="$1" final="$2" old
+    if [[ -e "${final}" || -L "${final}" ]]; then
+        old="${final}.old.$$"
+        chmod -R u+rwX "${final}" 2>/dev/null || true
+        mv "${final}" "${old}"
+        mv "${fresh}" "${final}"
+        chmod -R u+rwX "${old}" 2>/dev/null || true
+        rm -rf "${old}"
+    else
+        mv "${fresh}" "${final}"
+    fi
+}
+
+dotagent_swap_file() {
+    local src="$1" dest="$2" tmp
+    tmp="${dest%/*}/.${dest##*/}.tmp.$$"
+    cp "${src}" "${tmp}"
+    chmod 0555 "${tmp}"
+    mv -f "${tmp}" "${dest}"
+}
+
+dotagent_usage() {
+    # shellcheck disable=SC2016
+    printf '%s\n' \
+        'usage: install.sh [--activate] [--workspace DIR] [--bin-dir DIR] [--system] [--require-attestation]' \
+        '  --activate             run agent-guard activate after installing' \
+        '  --workspace DIR        workspace for --activate (default: $HOME)' \
+        '  --bin-dir DIR          binary directory (default: ~/.local/bin, or /usr/local/bin with --system)' \
+        '  --system               root install into /opt/dotagent (must already be root; never calls sudo)' \
+        '  --require-attestation  also run gh attestation verify (fails if gh is unavailable)' >&2
+}
+
+dotagent_install_main() {
+    local activate=0 system=0 want_attest=0 workspace="" bin_dir=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --activate) activate=1; shift ;;
+            --system) system=1; shift ;;
+            --require-attestation) want_attest=1; shift ;;
+            --workspace) [[ $# -ge 2 ]] || { dotagent_usage; exit 2; }; workspace="$2"; shift 2 ;;
+            --bin-dir) [[ $# -ge 2 ]] || { dotagent_usage; exit 2; }; bin_dir="$2"; shift 2 ;;
+            -h|--help) dotagent_usage; exit 0 ;;
+            *) dotagent_usage; dotagent_die "unrecognized argument" 2 ;;
+        esac
+    done
+
+    set -euo pipefail
+    dotagent_scrub_env
+    trap dotagent_cleanup EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM HUP
+
+    : "${HOME:?HOME must be set}"
+    case "${HOME}" in /*) ;; *) dotagent_die "HOME must be an absolute path" ;; esac
+    case "${DOTAGENT_RELEASE_TAG}" in
+        "@"*) dotagent_die "unrendered installer template: refusing" ;;
+    esac
+    [[ "${DOTAGENT_RELEASE_TAG}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || dotagent_die "malformed release tag baked into installer"
+
+    local euid
+    euid="$(id -u)"
+    if [[ "${system}" -eq 1 ]]; then
+        [[ "${euid}" -eq 0 ]] || dotagent_die "--system requires an existing root shell (this installer never invokes sudo)"
+    elif [[ "${euid}" -eq 0 ]]; then
+        dotagent_die "refusing to install into a root home; run as your user or pass --system"
+    fi
+
+    local share_root bin_final
+    if [[ "${system}" -eq 1 ]]; then
+        share_root="/opt/dotagent"
+        bin_final="${bin_dir:-/usr/local/bin}"
+    else
+        share_root="${HOME}/.local/share/dotagent/${DOTAGENT_RELEASE_TAG}"
+        bin_final="${bin_dir:-${HOME}/.local/bin}"
+    fi
+    case "${bin_final}" in /*) ;; *) dotagent_die "--bin-dir must be absolute" ;; esac
+
+    dotagent_pick_target
+    dotagent_make_stage
+
+    local tag="${DOTAGENT_RELEASE_TAG}" target="${DOTAGENT_TARGET}"
+    local prefix="dotagent-${tag}-${target}"
+    local archive="${prefix}.tar.gz"
+    local base="https://github.com/susanbdev/dotagent/releases/download/${tag}"
+    local stage="${DOTAGENT_STAGE}"
+
+    dotagent_note "installing dotagent ${tag} for ${target}"
+    dotagent_fetch "${base}/${archive}" "${stage}/${archive}" 52428800
+    dotagent_fetch "${base}/SHA256SUMS" "${stage}/SHA256SUMS" 1048576
+    dotagent_fetch "${base}/SHA256SUMS.sshsig" "${stage}/SHA256SUMS.sshsig" 65536
+
+    dotagent_check_sig "${stage}/SHA256SUMS" "${stage}/SHA256SUMS.sshsig"
+    dotagent_check_sums "${stage}/SHA256SUMS" "${stage}/${archive}"
+
+    if [[ "${want_attest}" -eq 1 ]]; then
+        local gh_bin="" cand
+        for cand in /opt/homebrew/bin/gh /usr/local/bin/gh /usr/bin/gh; do
+            if [[ -x "${cand}" ]]; then gh_bin="${cand}"; break; fi
+        done
+        [[ -n "${gh_bin}" ]] || dotagent_die "--require-attestation set but gh was not found"
+        "${gh_bin}" attestation verify "${stage}/${archive}" --owner susanbdev </dev/null \
+            || dotagent_die "GitHub build-provenance attestation failed"
+    fi
+
+    dotagent_audit_archive "${stage}/${archive}" "${prefix}"
+    dotagent_extract "${stage}/${archive}" "${stage}/ex" "${prefix}"
+    local payload="${stage}/ex/${prefix}"
+
+    "${payload}/bin/dotagent" self-verify --subject "${stage}/${archive}" --sums "${stage}/SHA256SUMS" </dev/null \
+        || dotagent_die "dotagent self-verify failed"
+
+    # Place the payload tree (docs, dist, profiles, skills, bin) next to its parent, then rename.
+    local parent="${share_root%/*}"
+    mkdir -p "${parent}" "${bin_final}"
+    local fresh="${parent}/.${share_root##*/}.new.$$"
+    rm -rf "${fresh}"
+    cp -R "${payload}" "${fresh}"
+    dotagent_seal_tree "${fresh}"
+    dotagent_swap_dir "${fresh}" "${share_root}"
+
+    local bin
+    for bin in ${DOTAGENT_BINARIES}; do
+        dotagent_swap_file "${share_root}/bin/${bin}" "${bin_final}/${bin}"
+    done
+    dotagent_note "installed to ${share_root}; binaries in ${bin_final}"
+
+    if [[ "${activate}" -eq 1 ]]; then
+        local ws="${workspace:-${HOME}}"
+        "${bin_final}/dotagent-compiler" verify "${share_root}" </dev/null
+        PATH="${bin_final}:${DOTAGENT_ORIG_PATH}" "${bin_final}/agent-guard" activate \
+            --dotagent-root "${share_root}" --workspace "${ws}" --bin-dir "${bin_final}" </dev/null
+    else
+        dotagent_note "run: ${bin_final}/agent-guard activate --dotagent-root ${share_root} --workspace \"\$HOME\" --bin-dir ${bin_final}"
+    fi
+    case ":${DOTAGENT_ORIG_PATH}:" in
+        *":${bin_final}:"*) ;;
+        *) dotagent_note "note: ${bin_final} is not on your PATH" ;;
+    esac
+}
+
+dotagent_install_main "$@"

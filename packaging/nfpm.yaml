@@ -1,0 +1,41 @@
+# nfpm config for the dotagent system packages (.deb, .rpm, .apk).
+# Driven by packaging/repackage.py, which exports NFPM_VERSION, NFPM_ARCH,
+# NFPM_STAGE (a pre-sealed /opt/dotagent tree: dirs 0555, files 0444, bin 0555)
+# and SOURCE_DATE_EPOCH. Nothing is compiled here.
+name: dotagent
+arch: ${NFPM_ARCH}
+platform: linux
+version: ${NFPM_VERSION}
+section: utils
+priority: optional
+maintainer: susanbdev <release@susanb.dev>
+description: Zero-trust guard, compiler and harness for AI coding agents.
+homepage: https://susanb.dev/dotagent
+license: LicenseRef-Proprietary
+mtime: "2023-11-14T22:13:20Z"
+contents:
+  - src: ${NFPM_STAGE}
+    dst: /opt/dotagent
+    type: tree
+    file_info:
+      owner: root
+      group: root
+      mtime: "2023-11-14T22:13:20Z"
+  - src: /opt/dotagent/bin/dotagent
+    dst: /usr/bin/dotagent
+    type: symlink
+  - src: /opt/dotagent/bin/agent-guard
+    dst: /usr/bin/agent-guard
+    type: symlink
+  - src: /opt/dotagent/bin/agent-guard-sh
+    dst: /usr/bin/agent-guard-sh
+    type: symlink
+  - src: /opt/dotagent/bin/dotagent-compiler
+    dst: /usr/bin/dotagent-compiler
+    type: symlink
+  - src: /opt/dotagent/bin/swarm-tool
+    dst: /usr/bin/swarm-tool
+    type: symlink
+  - src: /opt/dotagent/bin/dotagent-harness
+    dst: /usr/bin/dotagent-harness
+    type: symlink

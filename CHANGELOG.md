@@ -3,6 +3,15 @@
 All notable changes to `dotagent` are documented in this file.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- **Universal distribution (`packaging/`)**: deterministic stdlib `repackage.py` turning the four attested release archives into a hardened `install.sh` (baked SHA-256 digests + pinned YubiKey SSHSIG signer, EOF function gate, `AGENT_GUARD_*` refusal, pre-extraction tar audit, atomic binary swap), four PyPI wheels, four npm platform packages + root package (zero lifecycle scripts), a Homebrew formula, and `.deb`/`.rpm`/`.apk` via `nfpm`, plus a `FROM scratch` OCI image definition.
+- **Release workflow**: `repackage-ecosystem`, `publish-ghcr`, `publish-pypi`, `publish-npm`, and `publish-homebrew` jobs (OIDC trusted publishing, SHA-pinned actions); every release asset including `install.sh` is covered by SLSA build provenance.
+- **`scripts/sign-release-yk.sh`**: local YubiKey ceremony (attestation-gated, macOS universal `.pkg` notarization, SSHSIG over `SHA256SUMS`).
+- **`scripts/activate-local.sh --from-prebuilt <dir>`** installs verified release binaries without invoking Cargo; `cargo binstall` metadata added to every binary crate.
+- `tests/packaging/`: installer, repackager, ceremony and workflow-hygiene tests (truncated stream, tampered archive, forged/namespace-confused SSHSIG, tar traversal/link/device rejection, running-binary atomic replace, byte-identical repackaging).
+
 ## [2.0.0] - 2026-11-20
 
 ### Added

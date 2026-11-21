@@ -75,6 +75,23 @@ What `dotagent activate` guarantees:
 - **GUI IDE Hook Pinning**: Rewrites hook commands to absolute `~/.local/bin/agent-guard` paths on external workspaces and `~/.gemini/settings.json` so GUI apps (Cursor, Claude Desktop, VS Code) never fail when launched outside an interactive shell `PATH`, while configuring `~/.bashrc` and `~/.zshenv`.
 - **Instant Self-Remediation**: Every `[agent-guard HARD DENY :: <CODE>]` diagnostic includes an actionable `Remediation:` line and maps to `dotagent explain <CODE>`.
 
+## Install Channels (prebuilt, attested, no recompilation)
+
+Every channel repackages the same four attested release archives (`x86_64`/`aarch64` x `linux-musl`/`apple-darwin`); nothing is rebuilt. Windows is not supported yet.
+
+| Channel | Command | Trust anchor |
+| --- | --- | --- |
+| Installer | `curl -fsSL https://susanb.dev/dotagent/install.sh \| bash` | baked SHA-256 + YubiKey SSHSIG on `SHA256SUMS` (`ssh-keygen -Y verify`) |
+| Homebrew | `brew install susanbdev/tap/dotagent` | pinned SHA-256 in formula + GitHub attestation |
+| PyPI / uv | `uv tool install dotagent` (or `pip install dotagent`) | Trusted Publishing + PEP 740 attestations |
+| npm | `npm i -g @susanbdev/dotagent` (no install scripts) | Trusted Publishing + npm provenance |
+| cargo | `cargo binstall --git https://github.com/susanbdev/dotagent dotagent-compiler agent-guard` | GitHub attestation |
+| Linux packages | `.deb` / `.rpm` / `.apk` from the release page (`root:root 0555` `/opt/dotagent`) | GitHub attestation + SSHSIG |
+| macOS | `dotagent-<tag>-universal-apple-darwin.pkg` (Developer ID signed, notarized) | Apple + SSHSIG (`SHA256SUMS.macos`) |
+| OCI | `docker pull ghcr.io/susanbdev/dotagent:<version>` | GitHub attestation |
+
+Installer flags (pass after `bash -s --`): `--activate --workspace DIR`, `--bin-dir DIR`, `--system` (existing root shell only), `--require-attestation`. The installer refuses to run inside a guarded agent session. Verify any asset by hand with `gh attestation verify <file> --owner susanbdev`. Release maintainers: `packaging/` holds the repackager, installer template and nfpm/OCI definitions; `scripts/sign-release-yk.sh <tag>` is the YubiKey ceremony (see its header for the required environment).
+
 ## Unified `dotagent` Operator CLI
 
 `dotagent` is a single multicall binary providing operator workflows alongside low-level lifecycle hooks:

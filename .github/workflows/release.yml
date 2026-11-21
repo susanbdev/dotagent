@@ -169,6 +169,11 @@ jobs:
           cargo run --release --locked -p dotagent-compiler -- verify .
           cargo run --release --locked -p agent-guard --bin dotagent -- audit-repo .
 
+      - name: Run packaging tests (installer, repackager, ceremony script)
+        run: |
+          python3 -B -m unittest discover -s tests/packaging -v
+          shellcheck packaging/install.sh.in scripts/sign-release-yk.sh scripts/activate-local.sh
+
   build-archives:
     name: Build & Smoke-Test Archive (${{ matrix.target }})
     if: startsWith(github.ref, 'refs/tags/v')
@@ -302,10 +307,49 @@ jobs:
           path: release-out/*.tar.gz
           if-no-files-found: error
 
+  repackage-ecosystem:
+    name: Repackage (installer, wheels, npm, Homebrew, deb/rpm/apk)
+    needs: build-archives
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout tag (zero persisted credentials)
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+          submodules: false
+
+      - name: Download all target archives
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          path: archives
+          merge-multiple: true
+
+      - name: Install nfpm (module-proxy checksum verified, no curl)
+        run: go install github.com/goreleaser/nfpm/v2/cmd/nfpm@v2.49.0
+
+      - name: Repackage without recompiling
+        run: |
+          set -euo pipefail
+          python3 -B packaging/repackage.py \
+            --archives archives \
+            --tag "${GITHUB_REF_NAME}" \
+            --signers packaging/release-signer.pub \
+            --out release-extra \
+            --nfpm "$(go env GOPATH)/bin/nfpm"
+          cat release-extra/SHA256SUMS
+
+      - name: Upload repackaged assets
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: release-extra
+          path: release-extra
+          if-no-files-found: error
+
   publish-attested-release:
     name: SHA256SUMS, SLSA Provenance, & GitHub Release
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: build-archives
+    needs: repackage-ecosystem
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     permissions:
@@ -331,22 +375,29 @@ jobs:
       - name: Download all smoke-tested target archives
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
-          path: artifacts
+          pattern: archive-*
+          path: release
           merge-multiple: true
 
-      - name: Generate SHA256SUMS
+      - name: Download repackaged assets
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release-extra
+          path: extra
+
+      - name: Assemble flat release directory and re-verify SHA256SUMS
         run: |
           set -euo pipefail
-          cd artifacts
-          sha256sum dotagent-*.tar.gz | sort -k2 > SHA256SUMS
-          cat SHA256SUMS
+          find extra -mindepth 2 -type f -exec cp -t release {} +
+          cp extra/SHA256SUMS release/SHA256SUMS
+          cd release
+          sha256sum -c SHA256SUMS
+          ls -1
 
-      - name: Generate SLSA build provenance attestation
+      - name: Generate SLSA build provenance attestation (every asset)
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
-          subject-path: |
-            artifacts/dotagent-*.tar.gz
-            artifacts/SHA256SUMS
+          subject-path: release/*
 
       - name: Publish GitHub Release assets
         env:
@@ -354,8 +405,7 @@ jobs:
         run: |
           set -euo pipefail
           gh release create "${GITHUB_REF_NAME}" \
-            artifacts/dotagent-*.tar.gz \
-            artifacts/SHA256SUMS \
+            release/* \
             --title "dotagent ${GITHUB_REF_NAME}" \
             --generate-notes \
             --verify-tag
@@ -434,3 +484,162 @@ jobs:
               --subject "${VERIFY_DIR}/${f}" \
               --provenance "${VERIFY_DIR}/statement-${t}.json"
           done
+
+  publish-ghcr:
+    name: Publish OCI image (ghcr.io, provenance attested)
+    needs: publish-attested-release
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    steps:
+      - name: Checkout tag (zero persisted credentials)
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+          submodules: false
+
+      - name: Download Linux archives
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: archive-*-linux-musl
+          path: archives
+          merge-multiple: true
+
+      - name: Stage /opt/dotagent per architecture via dotagent fleet build-image
+        run: |
+          set -euo pipefail
+          mkdir -p unpacked
+          for archive in archives/*.tar.gz; do tar -xzf "${archive}" -C unpacked --no-same-owner; done
+          runner="unpacked/dotagent-${GITHUB_REF_NAME}-x86_64-unknown-linux-musl/bin/dotagent"
+          for pair in amd64:x86_64-unknown-linux-musl arm64:aarch64-unknown-linux-musl; do
+            arch="${pair%%:*}"
+            root="unpacked/dotagent-${GITHUB_REF_NAME}-${pair#*:}"
+            "${runner}" fleet build-image \
+              --out "oci-stage/stage-${arch}/opt/dotagent" \
+              --dotagent-root "${root}" \
+              --bin-dir "${root}/bin"
+          done
+
+      - name: Build and push multi-arch image
+        id: build
+        env:
+          GHCR_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          printf '%s' "${GHCR_TOKEN}" | docker login ghcr.io -u "${GITHUB_ACTOR}" --password-stdin
+          docker buildx build \
+            --file packaging/Containerfile.oci \
+            --platform linux/amd64,linux/arm64 \
+            --tag "ghcr.io/susanbdev/dotagent:${GITHUB_REF_NAME#v}" \
+            --metadata-file build-metadata.json \
+            --push \
+            oci-stage
+          digest="$(python3 -B -c 'import json; print(json.load(open("build-metadata.json"))["containerimage.digest"])')"
+          printf 'digest=%s\n' "${digest}" >> "${GITHUB_OUTPUT}"
+
+      - name: Attest image provenance (pushed to registry)
+        uses: actions/attest-build-provenance@c074443f1aee8d4aeeae555aebba3282517eb71b # v2
+        with:
+          subject-name: ghcr.io/susanbdev/dotagent
+          subject-digest: ${{ steps.build.outputs.digest }}
+          push-to-registry: true
+
+  publish-pypi:
+    name: Publish wheels to PyPI (Trusted Publishing)
+    needs: publish-attested-release
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment: release-pypi
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Download repackaged assets
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: release-extra
+          path: extra
+
+      - name: Publish with keyless OIDC and PEP 740 attestations
+        uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086 # release/v1
+        with:
+          packages-dir: extra/pypi
+          attestations: true
+
+  publish-npm:
+    name: Publish packages to npm (Trusted Publishing + provenance)
+    needs: publish-attested-release
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment: release-npm
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Download repackaged assets
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: release-extra
+          path: extra
+
+      - name: Install Node 24 (npm >= 11.5.1 for OIDC trusted publishing)
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: "24"
+          registry-url: "https://registry.npmjs.org"
+
+      - name: Publish platform packages first, root package last
+        run: |
+          set -euo pipefail
+          for pkg in extra/npm/susanbdev-dotagent-*-*.tgz; do
+            npm publish "${pkg}" --provenance --access public --ignore-scripts
+          done
+          for pkg in extra/npm/susanbdev-dotagent-[0-9]*.tgz; do
+            npm publish "${pkg}" --provenance --access public --ignore-scripts
+          done
+
+  publish-homebrew:
+    name: Update Homebrew tap
+    needs: publish-attested-release
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment: release-homebrew
+    permissions:
+      contents: read
+    steps:
+      - name: Download repackaged assets
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: release-extra
+          path: extra
+
+      - name: Mint short-lived tap token (GitHub App, scoped to homebrew-tap only)
+        id: app
+        uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2
+        with:
+          app-id: ${{ vars.HOMEBREW_APP_ID }}
+          private-key: ${{ secrets.HOMEBREW_APP_KEY }}
+          owner: susanbdev
+          repositories: homebrew-tap
+
+      - name: Commit formula to tap
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+          GIT_AUTHOR_NAME: dotagent-release
+          GIT_AUTHOR_EMAIL: release@susanb.dev
+          GIT_COMMITTER_NAME: dotagent-release
+          GIT_COMMITTER_EMAIL: release@susanb.dev
+        run: |
+          set -euo pipefail
+          gh auth setup-git
+          gh repo clone susanbdev/homebrew-tap tap
+          mkdir -p tap/Formula
+          cp extra/brew/dotagent.rb tap/Formula/dotagent.rb
+          cd tap
+          git add Formula/dotagent.rb
+          git commit -m "dotagent ${GITHUB_REF_NAME}"
+          git push origin HEAD
