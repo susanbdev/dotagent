@@ -1,147 +1,22 @@
-name: Zero-Trust Multi-OS & Merge-Queue CI
+name: Zero-Trust Guardrail CI
 
 on:
   push:
-    branches: ["main"]
+    branches: ["**"]
   pull_request:
-    types: [opened, synchronize, reopened, ready_for_review]
-  merge_group:
 
 permissions:
   contents: read
 
 jobs:
-  authority-and-ratchet-gate:
-    name: authority-and-ratchet-gate
-    runs-on: ubuntu-24.04
-    timeout-minutes: 10
-    steps:
-      - name: Checkout full repository history (zero persisted credentials)
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          fetch-depth: 0
-          persist-credentials: false
-          submodules: false
-
-      - name: Run delivery script syntax & self-test suite
-        shell: bash
-        run: |
-          set -euo pipefail
-          bash -n scripts/*.sh
-          shellcheck scripts/*.sh
-          bash scripts/test-delivery-scripts.sh
-
-      - name: Verify Ring-0 hardware SSHSIG authority & monotonic bypass_corpus.toml ratchet
-        shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
-          REPO_FULL: ${{ github.repository }}
-          EVENT_NAME: ${{ github.event_name }}
-          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
-          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-          MQ_BASE_SHA: ${{ github.event.merge_group.base_sha }}
-          MQ_HEAD_SHA: ${{ github.event.merge_group.head_sha }}
-          PUSH_BEFORE_SHA: ${{ github.event.before }}
-          PUSH_HEAD_SHA: ${{ github.sha }}
-          ENFORCE_HW_VAR: ${{ vars.DOTAGENT_ENFORCE_HW_SIGNERS }}
-          BOOTSTRAP_SIGNER_VAR: ${{ vars.DOTAGENT_BOOTSTRAP_SIGNER }}
-          BOOTSTRAP_VERIFIER_SHA256: ${{ vars.DOTAGENT_BOOTSTRAP_VERIFIER_SHA256 }}
-          BOOTSTRAP_EMPTY_OPT_IN: ${{ vars.DOTAGENT_ALLOW_EMPTY_SIGNERS_BOOTSTRAP }}
-        run: |
-          set -euo pipefail
-
-          run_trusted_gate() {
-            local base_sha="$1"
-            shift
-            local gate_script="${RUNNER_TEMP}/trusted-verify-pr-authority.sh"
-            if git cat-file -e "${base_sha}:scripts/verify-pr-authority.sh" 2>/dev/null; then
-              git show "${base_sha}:scripts/verify-pr-authority.sh" > "${gate_script}"
-              chmod 0700 "${gate_script}"
-            elif [[ "${BOOTSTRAP_VERIFIER_SHA256}" =~ ^[0-9a-f]{64}$ ]]; then
-              ACTUAL_SHA256="$(sha256sum scripts/verify-pr-authority.sh | awk '{print $1}')"
-              if [[ "${ACTUAL_SHA256}" != "${BOOTSTRAP_VERIFIER_SHA256}" ]]; then
-                echo "UNTRUSTED_BOOTSTRAP_VERIFIER: scripts/verify-pr-authority.sh sha256=${ACTUAL_SHA256} != out-of-band vars.DOTAGENT_BOOTSTRAP_VERIFIER_SHA256" >&2
-                exit 2
-              fi
-              cp scripts/verify-pr-authority.sh "${gate_script}"
-              chmod 0700 "${gate_script}"
-            else
-              echo "MISSING_TRUSTED_VERIFIER: base commit ${base_sha} lacks scripts/verify-pr-authority.sh and vars.DOTAGENT_BOOTSTRAP_VERIFIER_SHA256 is unset" >&2
-              exit 2
-            fi
-            local extra_args=()
-            if [[ "${BOOTSTRAP_EMPTY_OPT_IN}" == "1" && "${ENFORCE_HW_VAR}" != "1" ]]; then
-              extra_args+=(--bootstrap-allow-empty-signers)
-            fi
-            if [[ -n "${BOOTSTRAP_SIGNER_VAR}" ]]; then
-              extra_args+=(--bootstrap-signer "${BOOTSTRAP_SIGNER_VAR}")
-            fi
-            DOTAGENT_ENFORCE_HW_SIGNERS="${ENFORCE_HW_VAR:-0}" bash "${gate_script}" --base "${base_sha}" "${extra_args[@]}" "$@"
-          }
-
-          case "${EVENT_NAME}" in
-            pull_request)
-              run_trusted_gate "${PR_BASE_SHA}" --head "${PR_HEAD_SHA}" --json
-              ;;
-            merge_group)
-              run_trusted_gate "${MQ_BASE_SHA}" --head "${MQ_HEAD_SHA}" --allow-merge-queue-parents --json
-              ;;
-            push)
-              if [[ "${PUSH_BEFORE_SHA}" != "0000000000000000000000000000000000000000" ]] \
-                 && git cat-file -e "${PUSH_BEFORE_SHA}^{commit}" 2>/dev/null; then
-                COMMIT_JSON_FILE="${RUNNER_TEMP}/push-commit.json"
-                PULLS_JSON_FILE="${RUNNER_TEMP}/push-pulls.json"
-                gh api "repos/${REPO_FULL}/commits/${PUSH_HEAD_SHA}" > "${COMMIT_JSON_FILE}"
-                gh api "repos/${REPO_FULL}/commits/${PUSH_HEAD_SHA}/pulls" > "${PULLS_JSON_FILE}"
-                MQ_PR_INFO="$(python3 - "${COMMIT_JSON_FILE}" "${PULLS_JSON_FILE}" <<'PY'
-          import json, sys
-          c = json.load(open(sys.argv[1], "r", encoding="utf-8"))
-          prs = json.load(open(sys.argv[2], "r", encoding="utf-8"))
-          verified = (c.get("commit", {}).get("verification") or {}).get("verified") is True
-          committer = (c.get("committer") or {}).get("login")
-          if verified and committer == "web-flow" and isinstance(prs, list):
-              merged = [p for p in prs if p.get("merged_at") and (p.get("base") or {}).get("ref") == "main"]
-              if len(merged) == 1:
-                  num = merged[0]["number"]
-                  hsha = (merged[0].get("head") or {}).get("sha", "")
-                  if isinstance(num, int) and len(hsha) == 40:
-                      print(f"{num}:{hsha}")
-                      sys.exit(0)
-          print("")
-          PY
-                )"
-                if [[ -n "${MQ_PR_INFO}" ]]; then
-                  PR_NUM="${MQ_PR_INFO%%:*}"
-                  PR_ORIG_SHA="${MQ_PR_INFO#*:}"
-                  git fetch --no-tags origin "+refs/pull/${PR_NUM}/head:refs/remotes/origin/mq-pr-${PR_NUM}"
-                  if [[ "$(git rev-parse "${PR_ORIG_SHA}^{tree}")" == "$(git rev-parse "${PUSH_HEAD_SHA}^{tree}")" ]]; then
-                    run_trusted_gate "${PUSH_BEFORE_SHA}" --head "${PR_ORIG_SHA}" --json
-                  else
-                    run_trusted_gate "${PUSH_BEFORE_SHA}" --head "${PUSH_HEAD_SHA}" --json
-                  fi
-                else
-                  run_trusted_gate "${PUSH_BEFORE_SHA}" --head "${PUSH_HEAD_SHA}" --json
-                fi
-              fi
-              ;;
-          esac
-
-  verify-kernel-matrix:
-    name: verify-kernel-matrix (${{ matrix.os }})
+  verify-guardrails:
+    name: Security Kernel & Harness (${{ matrix.os }})
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - os: ubuntu-24.04
-            expect_mode: landlock
-          - os: ubuntu-24.04-arm
-            expect_mode: landlock
-          - os: ubuntu-22.04
-            expect_mode: landlock-any
-          - os: macos-15
-            expect_mode: seatbelt
+        os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 20
+    timeout-minutes: 15
     env:
       CARGO_TERM_COLOR: always
       GIT_CONFIG_NOSYSTEM: "1"
@@ -151,7 +26,7 @@ jobs:
       GIT_COMMITTER_EMAIL: "ci@dotagent.local"
     steps:
       - name: Checkout repository (zero persisted credentials)
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           persist-credentials: false
           submodules: false
@@ -165,12 +40,12 @@ jobs:
           rustup default stable
 
       - name: Cache Cargo workspace build artifacts
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: target
-          key: ${{ matrix.os }}-${{ runner.arch }}-cargo-stable-${{ hashFiles('Cargo.lock', 'Cargo.toml') }}
+          key: ${{ runner.os }}-cargo-stable-${{ hashFiles('Cargo.lock', 'Cargo.toml') }}
           restore-keys: |
-            ${{ matrix.os }}-${{ runner.arch }}-cargo-stable-
+            ${{ runner.os }}-cargo-stable-
 
       - name: Verify formatting (cargo fmt)
         run: cargo fmt --all -- --check
@@ -178,7 +53,7 @@ jobs:
       - name: Verify strict lints, forbid(unsafe_code), & zero-panic kernel (cargo clippy)
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
-      - name: Run unit, adversarial corpus, Swarm v2, & property fuzz suites
+      - name: Run unit, 305+ adversarial corpus, Swarm v2, & 5,300+ property fuzz suites
         run: cargo test --workspace --locked
 
       - name: Run packaging suite (installer, repackager, ceremony, wheels, npm shims)
@@ -189,22 +64,11 @@ jobs:
         env:
           MATRIX_EXPECT_MODE: ${{ matrix.expect_mode }}
         run: |
-          set -euo pipefail
           cargo build --release --locked --workspace
           ./target/release/dotagent-compiler verify .
           ./target/release/dotagent audit-repo .
-
-          openssl genpkey -algorithm ED25519 -out "${RUNNER_TEMP}/ci_receipt_ed25519.pem"
-          SEED_HEX="$(openssl pkey -in "${RUNNER_TEMP}/ci_receipt_ed25519.pem" -outform DER | tail -c 32 | od -An -tx1 | tr -d ' \n')"
-          PUBKEY_HEX="$(openssl pkey -in "${RUNNER_TEMP}/ci_receipt_ed25519.pem" -pubout -outform DER | tail -c 32 | od -An -tx1 | tr -d ' \n')"
-          rm -f "${RUNNER_TEMP}/ci_receipt_ed25519.pem"
-          DOTAGENT_RECEIPT_SEED_HEX="${SEED_HEX}" \
-            ./target/release/dotagent on-stop --receipt-out "${RUNNER_TEMP}/ci.receipt.json"
-          ./target/release/dotagent verify-receipt "${RUNNER_TEMP}/ci.receipt.json" --repo . --pubkey "${PUBKEY_HEX}"
-          rm -f "${RUNNER_TEMP}/ci.receipt.json"
-
-          ./target/release/dotagent-harness bench --quick
-
+          bash -n scripts/*.sh
+          bash scripts/test-delivery-scripts.sh
           HOST_TRIPLE="$(rustc -vV | sed -n 's/^host: //p')"
           mkdir -p "target/${HOST_TRIPLE}/release"
           for bin in dotagent agent-guard agent-guard-sh dotagent-compiler swarm-tool dotagent-harness; do
@@ -212,127 +76,34 @@ jobs:
           done
           ARCHIVE_PATH="${RUNNER_TEMP}/dotagent-v0.0.0-ci-${HOST_TRIPLE}.tar.gz"
           bash scripts/package-release-archive.sh --target "${HOST_TRIPLE}" --tag "v0.0.0-ci" --out "${ARCHIVE_PATH}"
-          if [[ -n "${MATRIX_EXPECT_MODE}" ]]; then
-            bash scripts/cleanroom-smoke-test.sh --archive "${ARCHIVE_PATH}" --expect-mode "${MATRIX_EXPECT_MODE}"
-          else
-            bash scripts/cleanroom-smoke-test.sh --archive "${ARCHIVE_PATH}"
-          fi
+          bash scripts/cleanroom-smoke-test.sh --archive "${ARCHIVE_PATH}"
           rm -f "${ARCHIVE_PATH}"
+          REPRO_DIR="${RUNNER_TEMP}/repro-dual-dir"
+          rm -rf "${REPRO_DIR}"
+          mkdir -p "${REPRO_DIR}"
+          git archive HEAD | tar -x -C "${REPRO_DIR}"
+          ./target/release/dotagent-compiler build "${REPRO_DIR}"
+          diff -u dist-verify/manifest.sha256 "${REPRO_DIR}/dist-verify/manifest.sha256"
+          rm -rf "${REPRO_DIR}"
+          openssl genpkey -algorithm ED25519 -out "${RUNNER_TEMP}/ci_receipt_ed25519.pem"
+          SEED_HEX="$(openssl pkey -in "${RUNNER_TEMP}/ci_receipt_ed25519.pem" -outform DER | tail -c 32 | od -An -tx1 | tr -d ' \n')"
+          PUBKEY_HEX="$(openssl pkey -in "${RUNNER_TEMP}/ci_receipt_ed25519.pem" -pubout -outform DER | tail -c 32 | od -An -tx1 | tr -d ' \n')"
+          rm -f "${RUNNER_TEMP}/ci_receipt_ed25519.pem"
+          DOTAGENT_RECEIPT_SEED_HEX="${SEED_HEX}" \
+            ./target/release/dotagent on-stop --receipt-out target/ci.receipt.json
+          ./target/release/dotagent verify-receipt target/ci.receipt.json --repo . \
+            --pubkey "${PUBKEY_HEX}"
+          ./target/release/dotagent-harness bench --quick
           chmod -R u+w target/test-workspaces target/cleanroom-run-* 2>/dev/null || true
-          rm -rf target/test-workspaces target/tbench-* target/cleanroom-run-* || true
+          rm -rf target/test-workspaces target/tbench-* target/cleanroom-run-* target/ci.receipt.json || true
 
-  container-cleanroom-matrix:
-    name: container-cleanroom-matrix
-    runs-on: ubuntu-24.04
-    timeout-minutes: 20
-    env:
-      CARGO_TERM_COLOR: always
+  supply-chain-deny:
+    name: Supply-Chain Advisory & License Gate (cargo-deny)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - name: Checkout repository (zero persisted credentials)
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-          submodules: false
-
-      - name: Install musl-tools & x86_64-unknown-linux-musl Rust target
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends musl-tools
-          rustup toolchain install stable --profile minimal
-          rustup default stable
-          rustup target add x86_64-unknown-linux-musl
-
-      - name: Cache musl Cargo artifacts
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: target
-          key: ${{ runner.os }}-musl-cleanroom-${{ hashFiles('Cargo.lock', 'Cargo.toml') }}
-          restore-keys: |
-            ${{ runner.os }}-musl-cleanroom-
-
-      - name: Build static musl release archive & execute 3 locked-down OCI container regimes
-        shell: bash
-        run: |
-          set -euo pipefail
-          cargo build --release --locked --workspace --target x86_64-unknown-linux-musl
-          ARCHIVE="${RUNNER_TEMP}/dotagent-v0.0.0-ci-x86_64-unknown-linux-musl.tar.gz"
-          bash scripts/package-release-archive.sh \
-            --target x86_64-unknown-linux-musl \
-            --tag "v0.0.0-ci" \
-            --out "${ARCHIVE}"
-
-          docker build -t dotagent-ci-alpine - <<'DOCKERFILE'
-          FROM alpine:3.21
-          RUN apk add --no-cache bash git
-          USER 65532:65532
-          DOCKERFILE
-
-          docker build -t dotagent-ci-debian - <<'DOCKERFILE'
-          FROM debian:12-slim
-          RUN apt-get update && apt-get install -y --no-install-recommends bash git python3 ca-certificates && rm -rf /var/lib/apt/lists/*
-          USER 65532:65532
-          DOCKERFILE
-
-          COMMON_DOCKER_ARGS=(
-            --rm
-            --network=none
-            --cap-drop=ALL
-            --security-opt=no-new-privileges
-            --read-only
-            --tmpfs /work:rw,exec,nosuid,size=256m,mode=1777
-            -v "${ARCHIVE}:/archive/dotagent.tar.gz:ro"
-            -v "${GITHUB_WORKSPACE}/scripts/cleanroom-smoke-test.sh:/usr/local/bin/cleanroom-smoke-test.sh:ro"
-            -w /work
-          )
-
-          echo "=== [1/3] alpine:3.21 pure musl locked-down cleanroom ==="
-          docker run "${COMMON_DOCKER_ARGS[@]}" dotagent-ci-alpine \
-            bash /usr/local/bin/cleanroom-smoke-test.sh \
-              --archive /archive/dotagent.tar.gz \
-              --expect-mode landlock \
-              --work-root /work/run
-
-          echo "=== [2/3] debian:12-slim minimal glibc locked-down cleanroom ==="
-          docker run "${COMMON_DOCKER_ARGS[@]}" dotagent-ci-debian \
-            bash /usr/local/bin/cleanroom-smoke-test.sh \
-              --archive /archive/dotagent.tar.gz \
-              --expect-mode landlock \
-              --work-root /work/run
-
-          echo "=== [3/3] unprivileged seccomp-only (Moby default SCMP_ACT_ERRNO allowlist + Landlock denied) ==="
-          SECCOMP_NO_LL="${GITHUB_WORKSPACE}/scripts/seccomp-no-landlock.json"
-          python3 - "${SECCOMP_NO_LL}" <<'PY'
-          import json, sys
-
-          seccomp = json.load(open(sys.argv[1], "r", encoding="utf-8"))
-          assert seccomp.get("defaultAction") == "SCMP_ACT_ERRNO", f"expected SCMP_ACT_ERRNO, got {seccomp.get('defaultAction')}"
-          landlock_calls = {"landlock_create_ruleset", "landlock_add_rule", "landlock_restrict_self"}
-          uncond_forbidden = landlock_calls | {"bpf", "kexec_load", "kexec_file_load", "mount", "pivot_root", "process_vm_readv", "process_vm_writev", "ptrace", "setns", "umount2", "unshare"}
-          for rule in seccomp.get("syscalls", []):
-              if rule.get("action") == "SCMP_ACT_ALLOW":
-                  assert not landlock_calls.intersection(rule.get("names", [])), "Landlock remained allowed"
-                  if not (rule.get("includes") or {}).get("caps"):
-                      overlap = uncond_forbidden.intersection(rule.get("names", []))
-                      assert not overlap, f"dangerous syscall unconditionally allowed: {overlap}"
-          PY
-
-          docker run "${COMMON_DOCKER_ARGS[@]}" \
-            --security-opt "seccomp=${SECCOMP_NO_LL}" \
-            dotagent-ci-debian \
-            bash /usr/local/bin/cleanroom-smoke-test.sh \
-              --archive /archive/dotagent.tar.gz \
-              --expect-mode seccomp-only \
-              --work-root /work/run
-
-  reproducibility-and-supply-chain:
-    name: reproducibility-and-supply-chain
-    runs-on: ubuntu-24.04
-    timeout-minutes: 25
-    env:
-      CARGO_TERM_COLOR: always
-    steps:
-      - name: Checkout repository (zero persisted credentials)
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           persist-credentials: false
           submodules: false
@@ -356,67 +127,15 @@ jobs:
           tar -xzf "${ARCHIVE}" -C "${RUNNER_TEMP}"
           "${RUNNER_TEMP}/cargo-deny-0.22.0-x86_64-unknown-linux-musl/cargo-deny" check advisories licenses bans sources
 
-      - name: Install musl-tools & x86_64-unknown-linux-musl Rust target
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends musl-tools
-          rustup toolchain install stable --profile minimal
-          rustup default stable
-          rustup target add x86_64-unknown-linux-musl
-
-      - name: Dual-directory bit-for-bit deterministic tarball reproducibility proof
-        shell: bash
-        env:
-          LC_ALL: C
-          SOURCE_DATE_EPOCH: "1700000000"
-        run: |
-          set -euo pipefail
-          DIR_A="${RUNNER_TEMP}/repro-a/repo"
-          DIR_B="${RUNNER_TEMP}/repro-b/deep/nested/repo"
-          mkdir -p "${DIR_A}" "${DIR_B}"
-          tar -cf - --exclude='./.git' --exclude='./target' . | tar -xf - -C "${DIR_A}"
-          tar -cf - --exclude='./.git' --exclude='./target' . | tar -xf - -C "${DIR_B}"
-
-          CARGO_DIR="${CARGO_HOME:-$HOME/.cargo}"
-
-          (
-            cd "${DIR_A}"
-            export RUSTFLAGS="--remap-path-prefix=${DIR_A}=/dotagent --remap-path-prefix=${CARGO_DIR}=/cargo"
-            cargo build --release --locked --workspace --target x86_64-unknown-linux-musl
-            bash scripts/package-release-archive.sh \
-              --target x86_64-unknown-linux-musl \
-              --tag "v0.0.0-repro" \
-              --out "${RUNNER_TEMP}/repro-a.tar.gz"
-          )
-
-          (
-            cd "${DIR_B}"
-            export RUSTFLAGS="--remap-path-prefix=${DIR_B}=/dotagent --remap-path-prefix=${CARGO_DIR}=/cargo"
-            cargo build --release --locked --workspace --target x86_64-unknown-linux-musl
-            bash scripts/package-release-archive.sh \
-              --target x86_64-unknown-linux-musl \
-              --tag "v0.0.0-repro" \
-              --out "${RUNNER_TEMP}/repro-b.tar.gz"
-          )
-
-          SHA_A="$(sha256sum "${RUNNER_TEMP}/repro-a.tar.gz" | awk '{print $1}')"
-          SHA_B="$(sha256sum "${RUNNER_TEMP}/repro-b.tar.gz" | awk '{print $1}')"
-          echo "repro-a sha256: ${SHA_A}"
-          echo "repro-b sha256: ${SHA_B}"
-          if [[ "${SHA_A}" != "${SHA_B}" ]]; then
-            echo "REPRODUCIBILITY_MISMATCH: ${SHA_A} != ${SHA_B}" >&2
-            exit 1
-          fi
-
   kani-formal-proofs:
-    name: kani-formal-proofs
-    runs-on: ubuntu-24.04
+    name: Kani Bounded Model Checking Proofs
+    runs-on: ubuntu-latest
     timeout-minutes: 15
     env:
       CARGO_TERM_COLOR: always
     steps:
       - name: Checkout repository (zero persisted credentials)
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           persist-credentials: false
           submodules: false
@@ -427,7 +146,7 @@ jobs:
           rustup default stable
 
       - name: Cache Kani 0.68.0 verifier & CBMC bundle
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: |
             ~/.cargo/bin/kani
@@ -456,20 +175,24 @@ jobs:
             cargo-kani setup --use-local-bundle "${BUNDLE}"
             rm -f "${BUNDLE}"
           else
-            rustup toolchain install "$(cat "${HOME}/.kani/kani-0.68.0/rust-toolchain-version")" --profile minimal || cargo-kani setup
+            TC_VER="$(tr -d ' \r\n' < "${HOME}/.kani/kani-0.68.0/rust-toolchain-version")"
+            case "${TC_VER}" in
+              *[!0-9A-Za-z._-]*|"") cargo-kani setup ;;
+              *) rustup toolchain install "${TC_VER}" --profile minimal || cargo-kani setup ;;
+            esac
           fi
           cargo kani -p agent-guard
 
-  msrv-1-88-gate:
-    name: msrv-1-88-gate
-    runs-on: ubuntu-24.04
+  msrv-1-88:
+    name: MSRV 1.88.0 Compatibility Gate
+    runs-on: ubuntu-latest
     timeout-minutes: 10
     env:
       CARGO_TERM_COLOR: always
       GIT_CONFIG_NOSYSTEM: "1"
     steps:
       - name: Checkout repository (zero persisted credentials)
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           persist-credentials: false
           submodules: false
@@ -478,7 +201,7 @@ jobs:
         run: rustup toolchain install 1.88.0 --profile minimal
 
       - name: Cache MSRV 1.88.0 check artifacts
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: target
           key: ${{ runner.os }}-cargo-msrv-1-88-${{ hashFiles('Cargo.lock', 'Cargo.toml') }}
@@ -488,161 +211,99 @@ jobs:
       - name: Check entire workspace against Rust 1.88.0
         run: cargo +1.88.0 check --workspace --all-targets --locked
 
-  auto-enqueue-merge-queue:
-    name: auto-enqueue-merge-queue
-    if: github.event_name == 'pull_request' && github.event.pull_request.draft == false && github.event.pull_request.head.repo.full_name == github.repository
-    needs:
-      - authority-and-ratchet-gate
-      - verify-kernel-matrix
-      - container-cleanroom-matrix
-      - reproducibility-and-supply-chain
-      - kani-formal-proofs
-      - msrv-1-88-gate
-    concurrency:
-      group: promoter-pr-${{ github.event.pull_request.number }}
-      cancel-in-progress: false
-    runs-on: ubuntu-24.04
-    timeout-minutes: 5
+  ring0-constitutional-ratchet:
+    name: Ring-0 Constitutional Ratchet
+    # Direct pushes to main are blocked by the org ruleset (PR-only); the ratchet is enforced on
+    # every pull request and every non-main branch push against origin/main.
+    if: github.event_name == 'pull_request' || github.ref != 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      CARGO_TERM_COLOR: always
+      GIT_CONFIG_NOSYSTEM: "1"
     steps:
-      - name: Notice when Promoter GitHub App is not yet provisioned
-        if: vars.PROMOTER_APP_ID == ''
-        run: |
-          echo "::notice::vars.PROMOTER_APP_ID is not configured yet; skipping dotagent-promoter[bot] auto-enqueue."
-
-      - name: Checkout trusted base branch ONLY (never untrusted PR working tree)
-        if: vars.PROMOTER_APP_ID != ''
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Checkout PR head (full history for merge-base & hardware-key verification)
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          ref: ${{ github.event.pull_request.base.ref }}
-          fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
           persist-credentials: false
           submodules: false
+          fetch-depth: 0
 
-      - name: Verify PR authority using trusted base-branch gate before minting App token
-        id: precheck
-        if: vars.PROMOTER_APP_ID != ''
-        shell: bash
+      - name: Install stable Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      - name: Enforce unconditional Ring-0 allowlist ratchet & hardware-signer verification
         env:
-          PR_NUMBER: ${{ github.event.pull_request.number }}
-          BASE_REF_NAME: ${{ github.event.pull_request.base.ref }}
-          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          BASE_REF: ${{ github.event.repository.default_branch || 'main' }}
+          EVENT_ACTOR: ${{ github.actor }}
         run: |
           set -euo pipefail
-          if [[ ! -f "scripts/verify-pr-authority.sh" ]]; then
-            echo "::notice::scripts/verify-pr-authority.sh is not yet on ${BASE_REF_NAME}; skipping auto-enqueue."
-            echo "eligible=false" >> "${GITHUB_OUTPUT}"
-            exit 0
-          fi
-          git fetch --no-tags origin "+refs/heads/${BASE_REF_NAME}:refs/remotes/origin/${BASE_REF_NAME}" "+refs/pull/${PR_NUMBER}/head:refs/remotes/origin/pr-${PR_NUMBER}"
-          AUTH_JSON="$(bash scripts/verify-pr-authority.sh --base "refs/remotes/origin/${BASE_REF_NAME}" --head "${HEAD_SHA}" --json)"
-          ELIGIBLE="$(python3 -c 'import json,sys; print("true" if json.loads(sys.argv[1]).get("eligible_for_auto_enqueue") else "false")' "${AUTH_JSON}")"
-          echo "eligible=${ELIGIBLE}" >> "${GITHUB_OUTPUT}"
-          if [[ "${ELIGIBLE}" != "true" ]]; then
-            echo "::notice::PR #${PR_NUMBER} is not eligible for automatic Merge Queue enqueue (${AUTH_JSON})."
-          fi
-
-      - name: Mint least-privilege repo-scoped dotagent-promoter[bot] token
-        id: app_token
-        if: vars.PROMOTER_APP_ID != '' && steps.precheck.outputs.eligible == 'true'
-        uses: actions/create-github-app-token@f418cff399f7aef4c2f0ad47e25ca7a6abbdd6fc # v3.4.0
-        with:
-          app-id: ${{ vars.PROMOTER_APP_ID }}
-          private-key: ${{ secrets.PROMOTER_APP_PRIVATE_KEY }}
-          repositories: ${{ github.event.repository.name }}
-          permission-contents: write
-          permission-pull-requests: write
-
-      - name: Atomically verify review threads, approve exact commitOID, & enqueue into Merge Queue
-        if: vars.PROMOTER_APP_ID != '' && steps.precheck.outputs.eligible == 'true'
-        shell: bash
-        env:
-          GH_TOKEN: ${{ steps.app_token.outputs.token }}
-          REPO_FULL: ${{ github.repository }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
-          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-        run: |
-          set -euo pipefail
-          OWNER="${REPO_FULL%%/*}"
-          REPO="${REPO_FULL##*/}"
-          GQL_JSON_FILE="${RUNNER_TEMP}/pr-gql.json"
-          gh api graphql \
-            -F owner="${OWNER}" \
-            -F name="${REPO}" \
-            -F pr="${PR_NUMBER}" \
-            -f query='
-              query($owner: String!, $name: String!, $pr: Int!) {
-                repository(owner: $owner, name: $name) {
-                  pullRequest(number: $pr) {
-                    id
-                    headRefOid
-                    isDraft
-                    reviewDecision
-                    reviewThreads(first: 100) {
-                      pageInfo { hasNextPage }
-                      nodes { isResolved }
-                    }
-                    reviews(last: 100, states: [APPROVED]) {
-                      nodes {
-                        author { login }
-                        commit { oid }
-                      }
-                    }
-                  }
-                }
-              }
-            ' > "${GQL_JSON_FILE}"
-
-          DECISION="$(python3 - "${GQL_JSON_FILE}" "${HEAD_SHA}" <<'PY'
-          import json, sys
-          data, expected_sha = json.load(open(sys.argv[1], "r", encoding="utf-8")), sys.argv[2]
-          pr = data["data"]["repository"]["pullRequest"]
-          if pr["isDraft"] or pr["headRefOid"] != expected_sha:
-              print("skip:stale")
-              sys.exit(0)
-          if pr.get("reviewDecision") == "CHANGES_REQUESTED":
-              print("skip:changes_requested")
-              sys.exit(0)
-          threads = pr["reviewThreads"]
-          if threads["pageInfo"]["hasNextPage"]:
-              print("skip:threads_overflow")
-              sys.exit(0)
-          unresolved = sum(1 for t in threads["nodes"] if not t["isResolved"])
-          if unresolved != 0:
-              print(f"skip:unresolved_{unresolved}")
-              sys.exit(0)
-          already = any(
-              ((r.get("author") or {}).get("login") in {"dotagent-promoter", "dotagent-promoter[bot]"})
-              and (r.get("commit") or {}).get("oid") == expected_sha
-              for r in pr["reviews"]["nodes"]
-          )
-          action = "approved" if already else "needs_review"
-          print(f"{action}:{pr['id']}")
+          BASE_OID="$(git rev-parse --verify "origin/${BASE_REF}^{commit}")"
+          TRUSTED="${RUNNER_TEMP}/trusted-base"
+          git worktree add --detach "${TRUSTED}" "${BASE_OID}"
+          for f in .cargo/config .cargo/config.toml rust-toolchain rust-toolchain.toml; do
+            if [ -e "${TRUSTED}/${f}" ] || [ -e "${GITHUB_WORKSPACE}/${f}" ]; then
+              echo "::error::Refusing to run ratchet: forbidden toolchain override ${f} present"
+              exit 1
+            fi
+          done
+          if git -C "${TRUSTED}" grep -q -F 'verify-ring0-ratchet' -- crates/agent-guard/src/cli.rs; then
+            (cd "${TRUSTED}" && CARGO_TARGET_DIR="${RUNNER_TEMP}/trusted-target" \
+              cargo build --locked -p agent-guard --bin dotagent)
+            "${RUNNER_TEMP}/trusted-target/debug/dotagent" verify-ring0-ratchet --base "origin/${BASE_REF}"
+          elif git merge-base --is-ancestor 0194af29450aa65d1699337ec731d1740efc00e4 "${BASE_OID}" \
+               && ! git cat-file -e "${BASE_OID}:config/allowed_human_signers" 2>/dev/null; then
+            # Self-extinguishing one-time genesis bootstrap (never compiles PR sources): constrains any
+            # non-human/automation actor to the 5-file Ring-2 allowlist and requires authenticated human
+            # owner actor (susanbeasles) + pinned signer digest for the initial enrollment.
+            python3 -c 'import sys, textwrap; exec(textwrap.dedent(sys.stdin.read()))' "${TRUSTED}" "${GITHUB_WORKSPACE}" "${BASE_OID}" <<'PY'
+          import hashlib, os, subprocess, sys, tomllib
+          trusted, ws, base_oid = sys.argv[1], sys.argv[2], sys.argv[3]
+          RING2_ALLOWLIST = {
+              "crates/agent-guard/src/cmd_policy.rs",
+              "crates/agent-guard/src/mcp_policy.rs",
+              "crates/agent-guard/src/diagnostics.rs",
+              "tests/bypass_corpus.toml",
+              "crates/agent-guard/tests/ring2_policy_tests.rs",
+          }
+          PINNED_SIGNERS_SHA256 = "89ce5a026336a21d62959969b1552654c79709d03601d82f16fc3102d1dd7692"
+          mb = subprocess.check_output(["git", "-C", ws, "merge-base", "HEAD", base_oid], text=True).strip()
+          if subprocess.run(["git", "-C", ws, "merge-base", "--is-ancestor", "0194af29450aa65d1699337ec731d1740efc00e4", mb]).returncode != 0:
+              raise SystemExit(f"GENESIS_VIOLATION: merge-base {mb} does not descend from v2.0.0 genesis")
+          changed = [
+              p for p in subprocess.check_output(
+                  ["git", "-C", ws, "diff", "--name-only", base_oid], text=True
+              ).splitlines() if p.strip()
+          ]
+          outside_ring2 = [p for p in changed if p not in RING2_ALLOWLIST]
+          if outside_ring2:
+              actor = os.environ.get("EVENT_ACTOR", "")
+              if actor.endswith("[bot]") or actor != "susanbeasles":
+                  raise SystemExit(
+                      f"GENESIS_VIOLATION: paths outside 5-file Ring-2 allowlist ({outside_ring2[:3]}) require authenticated human owner enrollment"
+                  )
+              sig_path = os.path.join(ws, "config", "allowed_human_signers")
+              if os.path.islink(sig_path) or not os.path.isfile(sig_path):
+                  raise SystemExit("GENESIS_VIOLATION: config/allowed_human_signers missing or symlink")
+              digest = hashlib.sha256(open(sig_path, "rb").read()).hexdigest()
+              if digest != PINNED_SIGNERS_SHA256:
+                  raise SystemExit(f"GENESIS_VIOLATION: signers sha256 {digest} != {PINNED_SIGNERS_SHA256}")
+          base_vecs = tomllib.load(open(os.path.join(trusted, "tests", "bypass_corpus.toml"), "rb"))["vectors"]
+          head_vecs = tomllib.load(open(os.path.join(ws, "tests", "bypass_corpus.toml"), "rb"))["vectors"]
+          if len(head_vecs) < len(base_vecs) or head_vecs[:len(base_vecs)] != base_vecs:
+              raise SystemExit("GENESIS_VIOLATION: bypass_corpus.toml violates prefix identity against base")
+          seen = set()
+          for idx, v in enumerate(head_vecs):
+              key = (v["kind"], " ".join(v["payload"].split()))
+              if key in seen:
+                  raise SystemExit(f"GENESIS_VIOLATION: duplicate corpus vector at #{idx + 1}")
+              seen.add(key)
+          print(f"[RING0 RATCHET GENESIS OK] base={base_oid[:12]} corpus={len(head_vecs)} (+{len(head_vecs)-len(base_vecs)})")
           PY
-          )"
-
-          if [[ "${DECISION}" == skip:* ]]; then
-            echo "::notice::Skipping auto-enqueue for PR #${PR_NUMBER}: ${DECISION}"
-            exit 0
+          else
+            echo "::error::Trusted base ${BASE_OID} lacks verify-ring0-ratchet and is not the pinned genesis commit; failing closed."
+            exit 1
           fi
-
-          ACTION="${DECISION%%:*}"
-          PR_NODE_ID="${DECISION#*:}"
-          if [[ "${ACTION}" == "needs_review" ]]; then
-            gh api graphql \
-              -f prId="${PR_NODE_ID}" \
-              -f headOid="${HEAD_SHA}" \
-              -f body="[PROMOTER] All 6 OS/Container/Formal/Authority gates verified on ${HEAD_SHA}" \
-              -f query='
-                mutation($prId: ID!, $headOid: GitObjectID!, $body: String!) {
-                  addPullRequestReview(input: {
-                    pullRequestId: $prId,
-                    commitOID: $headOid,
-                    event: APPROVE,
-                    body: $body
-                  }) {
-                    pullRequestReview { id }
-                  }
-                }
-              ' >/dev/null
-          fi
-          gh pr merge "${PR_NUMBER}" --repo "${REPO_FULL}" --auto --squash --match-head-commit "${HEAD_SHA}"

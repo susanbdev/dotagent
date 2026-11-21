@@ -111,6 +111,7 @@ fn verify_corpus(workspace_root: &Path) -> Result<String, String> {
                     scan_untrusted_content(&vec_item.payload, &sb.repo_dir, &sb.repo_dir, false);
                 !uni.is_empty() || inj.first_halt().is_some() || !inj.findings.is_empty()
             }
+            "mcp" => agent_guard::ring0_ratchet::mcp_corpus_vector_blocked(&vec_item.payload),
             other => {
                 return Err(format!(
                     "unknown vector kind '{other}' at vector #{}",
@@ -145,64 +146,9 @@ fn verify_corpus(workspace_root: &Path) -> Result<String, String> {
 }
 
 fn parse_corpus_vectors(raw: &str) -> Result<Vec<VectorEntry>, String> {
-    let mut out = Vec::new();
-    for (line_no, line) in raw.lines().enumerate() {
-        let trimmed = line.trim();
-        if !trimmed.starts_with('{') {
-            continue;
-        }
-        let kind = extract_field(trimmed, "kind")
-            .ok_or_else(|| format!("bypass_corpus.toml line {}: missing kind", line_no + 1))?;
-        let payload = extract_field(trimmed, "payload")
-            .ok_or_else(|| format!("bypass_corpus.toml line {}: missing payload", line_no + 1))?;
-        out.push(VectorEntry { kind, payload });
-    }
-    Ok(out)
-}
-
-fn extract_field(line: &str, key: &str) -> Option<String> {
-    let marker = format!("{key} = \"");
-    let start = line.find(&marker)? + marker.len();
-    let bytes = line.as_bytes();
-    let mut i = start;
-    let mut out = String::new();
-    while i < bytes.len() {
-        if bytes[i] == b'"' {
-            return Some(out);
-        }
-        if bytes[i] == b'\\' {
-            i += 1;
-            let esc = *bytes.get(i)?;
-            i += 1;
-            match esc {
-                b'"' => out.push('"'),
-                b'\\' => out.push('\\'),
-                b'n' => out.push('\n'),
-                b'r' => out.push('\r'),
-                b't' => out.push('\t'),
-                b'u' => {
-                    let hex = std::str::from_utf8(bytes.get(i..i + 4)?).ok()?;
-                    let cp = u32::from_str_radix(hex, 16).ok()?;
-                    out.push(char::from_u32(cp)?);
-                    i += 4;
-                }
-                b'U' => {
-                    let hex = std::str::from_utf8(bytes.get(i..i + 8)?).ok()?;
-                    let cp = u32::from_str_radix(hex, 16).ok()?;
-                    out.push(char::from_u32(cp)?);
-                    i += 8;
-                }
-                other => {
-                    out.push('\\');
-                    out.push(other as char);
-                }
-            }
-        } else {
-            let tail = std::str::from_utf8(&bytes[i..]).ok()?;
-            let ch = tail.chars().next()?;
-            out.push(ch);
-            i += ch.len_utf8();
-        }
-    }
-    None
+    let pairs = agent_guard::ring0_ratchet::parse_bypass_corpus_vectors_ordered(raw)?;
+    Ok(pairs
+        .into_iter()
+        .map(|(kind, payload)| VectorEntry { kind, payload })
+        .collect())
 }

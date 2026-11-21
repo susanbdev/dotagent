@@ -1,0 +1,168 @@
+name: Autonomous Constitutional Friction Loop
+
+on:
+  schedule:
+    - cron: "0 */6 * * *"
+  workflow_dispatch:
+    inputs:
+      min_votes:
+        description: "Minimum unique untainted root-session votes required"
+        required: false
+        default: "3"
+      min_buckets:
+        description: "Minimum distinct (repo_id, utc_day) buckets required"
+        required: false
+        default: "2"
+      runner:
+        description: "Agent CLI runner preset (claude | codex | gemini)"
+        required: false
+        default: "claude"
+      dry_run:
+        description: "Preview eligible clusters without creating branches or PRs"
+        required: false
+        default: "false"
+
+concurrency:
+  group: dotagent-friction-loop
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  constitutional-friction-loop:
+    name: Constitutional Friction Triage & Auto-Improvement
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      CARGO_TERM_COLOR: always
+      GIT_CONFIG_NOSYSTEM: "1"
+      GIT_AUTHOR_NAME: "dotagent-loop[bot]"
+      GIT_AUTHOR_EMAIL: "dotagent-loop[bot]@users.noreply.github.com"
+      GIT_COMMITTER_NAME: "dotagent-loop[bot]"
+      GIT_COMMITTER_EMAIL: "dotagent-loop[bot]@users.noreply.github.com"
+      DOTAGENT_AUTONOMOUS_LOOP: "1"
+    steps:
+      - name: Checkout repository (full history for Ring-0 Ratchet)
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+          submodules: false
+          fetch-depth: 0
+
+      - name: Apply hardened global Git configuration
+        run: cp dist/gitconfig.hardened ~/.gitconfig
+
+      - name: Install stable Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal --component rustfmt,clippy
+          rustup default stable
+
+      - name: Build release zero-trust binaries
+        run: cargo build --release --locked --workspace
+
+      - name: Mint short-lived non-bypass GitHub App token & run 6-Stage Airlocked Loop
+        env:
+          APP_ID: ${{ secrets.DOTAGENT_LOOP_APP_ID }}
+          APP_PRIVATE_KEY: ${{ secrets.DOTAGENT_LOOP_APP_PRIVATE_KEY }}
+          FALLBACK_LOOP_TOKEN: ${{ secrets.DOTAGENT_LOOP_GITHUB_TOKEN }}
+          DOTAGENT_TELEMETRY_VERIFY_KEY: ${{ secrets.DOTAGENT_TELEMETRY_VERIFY_KEY }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          INPUT_MIN_VOTES: ${{ inputs.min_votes || '3' }}
+          INPUT_MIN_BUCKETS: ${{ inputs.min_buckets || '2' }}
+          INPUT_RUNNER: ${{ inputs.runner || 'claude' }}
+          INPUT_DRY_RUN: ${{ inputs.dry_run || 'false' }}
+        run: |
+          set -euo pipefail
+          LOOP_TOKEN=""
+          if [ -n "${APP_ID}" ] && [ -n "${APP_PRIVATE_KEY}" ]; then
+            LOOP_TOKEN="$(python3 - <<'PY'
+          import base64, json, os, subprocess, tempfile, time, urllib.request
+
+          app_id = os.environ["APP_ID"].strip()
+          pem = os.environ["APP_PRIVATE_KEY"]
+          repo = os.environ["GITHUB_REPOSITORY"]
+          now = int(time.time())
+
+          def b64u(data: bytes) -> str:
+              return base64.urlsafe_b64encode(data).rstrip(b"=").decode("ascii")
+
+          hdr = b64u(json.dumps({"alg": "RS256", "typ": "JWT"}, separators=(",", ":")).encode())
+          pay = b64u(json.dumps({"iat": now - 30, "exp": now + 540, "iss": app_id}, separators=(",", ":")).encode())
+          signing_input = f"{hdr}.{pay}".encode("ascii")
+
+          with tempfile.NamedTemporaryFile("w", delete=True, dir=os.environ["RUNNER_TEMP"]) as kf:
+              os.chmod(kf.name, 0o600)
+              kf.write(pem)
+              kf.flush()
+              sig = subprocess.check_output(
+                  ["openssl", "dgst", "-sha256", "-sign", kf.name],
+                  input=signing_input,
+              )
+          jwt_tok = f"{hdr}.{pay}.{b64u(sig)}"
+
+          req_inst = urllib.request.Request(
+              f"https://api.github.com/repos/{repo}/installation",
+              headers={
+                  "Authorization": f"Bearer {jwt_tok}",
+                  "Accept": "application/vnd.github+json",
+                  "User-Agent": "dotagent-loop",
+              },
+          )
+          inst_id = json.loads(urllib.request.urlopen(req_inst, timeout=30).read())["id"]
+
+          req_tok = urllib.request.Request(
+              f"https://api.github.com/app/installations/{inst_id}/access_tokens",
+              # Downscoped: NO workflows / statuses / administration / checks permission, so the
+              # loop token can neither push .github/workflows changes nor forge commit statuses.
+              data=json.dumps({
+                  "repositories": [repo.split("/", 1)[1]],
+                  "permissions": {
+                      "contents": "write",
+                      "pull_requests": "write",
+                      "issues": "write",
+                  },
+              }).encode(),
+              method="POST",
+              headers={
+                  "Authorization": f"Bearer {jwt_tok}",
+                  "Accept": "application/vnd.github+json",
+                  "User-Agent": "dotagent-loop",
+              },
+          )
+          tok = json.loads(urllib.request.urlopen(req_tok, timeout=30).read())["token"]
+          print(tok)
+          PY
+            )"
+          elif [ -n "${FALLBACK_LOOP_TOKEN}" ]; then
+            LOOP_TOKEN="${FALLBACK_LOOP_TOKEN}"
+          fi
+
+          if [ -z "${LOOP_TOKEN}" ]; then
+            echo "[friction-loop] Neither DOTAGENT_LOOP_APP_ID/PRIVATE_KEY nor DOTAGENT_LOOP_GITHUB_TOKEN is configured yet; skipping live loop cleanly."
+            exit 0
+          fi
+          echo "::add-mask::${LOOP_TOKEN}"
+
+          unset APP_PRIVATE_KEY FALLBACK_LOOP_TOKEN
+          EXTRA_FLAGS=()
+          if [ "${INPUT_DRY_RUN}" = "true" ]; then
+            EXTRA_FLAGS+=("--dry-run")
+          fi
+          # Hand the token over through a 0600 file the loop reads and unlinks immediately, so
+          # it never sits in the environment of sandboxed stages or child processes.
+          TOKEN_FILE="$(umask 077; mktemp "${RUNNER_TEMP}/dotagent-loop-token.XXXXXX")"
+          trap 'rm -f "${TOKEN_FILE}"' EXIT
+          printf '%s' "${LOOP_TOKEN}" > "${TOKEN_FILE}"
+          unset LOOP_TOKEN
+          DOTAGENT_LOOP_GITHUB_TOKEN_FILE="${TOKEN_FILE}" \
+            ./target/release/dotagent feedback run-loop \
+              --repo "${GITHUB_REPOSITORY}" \
+              --min-votes "${INPUT_MIN_VOTES}" \
+              --min-buckets "${INPUT_MIN_BUCKETS}" \
+              --max-merges-per-run 1 \
+              --runner "${INPUT_RUNNER}" \
+              "${EXTRA_FLAGS[@]}"

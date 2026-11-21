@@ -1,0 +1,5 @@
+# Ring-0 Fleet Telemetry Batch Verification Keys (`susanbdev/dotagent`)
+# Format: `<node_or_key_id> <64-lower-hex-ed25519-verifying-key>`
+# `dotagent feedback run-loop` verifies detached `dotagent:sync-sig:v2` Ed25519 signatures on
+# GitHub Issue batch comments against keys listed here (plus optional `DOTAGENT_TELEMETRY_VERIFY_KEY`).
+# Enroll fleet node pubkeys generated via `DOTAGENT_TELEMETRY_SIGNING_KEY` below:

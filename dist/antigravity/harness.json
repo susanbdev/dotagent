@@ -11,6 +11,11 @@
     "dotagent",
     "verify-receipt"
   ],
+  "feedbackSubmit": [
+    "dotagent",
+    "feedback",
+    "submit"
+  ],
   "budgets": {
     "maxSliceLines": 150,
     "maxRawFileBytes": 24576,

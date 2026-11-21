@@ -102,6 +102,17 @@ const SCRUBBED_ENV_VARS: &[&str] = &[
     "AGENT_GUARD_ALLOW_DEPUTY",
     "AGENT_GUARD_INTERNAL_SBX_TOKEN",
     "DOTAGENT_RECEIPT_SEED_HEX",
+    "DOTAGENT_AUTONOMOUS_LOOP",
+    "DOTAGENT_GH_BIN",
+    "DOTAGENT_AUDITOR_CMD",
+    "DOTAGENT_SECURITY_CMD",
+    "DOTAGENT_IMPLEMENTER_CMD",
+    "DOTAGENT_ADVERSARIAL_CMD",
+    "DOTAGENT_LOOP_VERIFY_CMD",
+    "AGENT_GUARD_IPC_WORKER_TOKEN",
+    "DOTAGENT_TELEMETRY_SIGNING_KEY",
+    "DOTAGENT_TELEMETRY_VERIFY_KEY",
+    "DOTAGENT_LOOP_APP_PRIVATE_KEY",
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -133,28 +144,54 @@ struct SandboxPolicyOpts {
     deny_net: bool,
     invokes_git: bool,
     invokes_swarm_tool: bool,
+    invokes_feedback_submit: bool,
 }
 
 /// Formats a shell command to execute through `agent-guard exec-sandbox` with optional
 /// in-process pre-buffer 7-bit ASCII stream sanitization and line compaction.
 pub fn wrap_bash_with_exec_sandbox(cmd_str: &str, sanitize_stream: bool) -> String {
+    wrap_bash_with_exec_sandbox_session(cmd_str, sanitize_stream, None)
+}
+
+pub fn wrap_bash_with_exec_sandbox_session(
+    cmd_str: &str,
+    sanitize_stream: bool,
+    session_id: Option<&str>,
+) -> String {
     let quoted = shell_quote_single(cmd_str);
+    let sid_flag = session_id
+        .map(str::trim)
+        .filter(|s| {
+            !s.is_empty()
+                && *s != "default"
+                && s.len() <= 128
+                && s.bytes().all(|b| (0x21..=0x7e).contains(&b))
+        })
+        .map(|s| format!(" --session-id {}", shell_quote_single(s)))
+        .unwrap_or_default();
     if sanitize_stream {
-        format!("agent-guard exec-sandbox --sanitize-stream -- {quoted}")
+        format!("agent-guard exec-sandbox --sanitize-stream{sid_flag} -- {quoted}")
     } else {
-        format!("agent-guard exec-sandbox -- {quoted}")
+        format!("agent-guard exec-sandbox{sid_flag} -- {quoted}")
     }
 }
 
 /// Returns `true` ONLY when `cmd_str` is already an exact, single-command
-/// `agent-guard exec-sandbox --sanitize-stream -- '<single-quoted-payload>'` wrapper
+/// `agent-guard exec-sandbox --sanitize-stream [--session-id '<sid>'] -- '<single-quoted-payload>'` wrapper
 /// with zero trailing comments, pipelines, redirections, or chained commands.
 pub fn is_canonical_exec_sandbox_wrapper(cmd_str: &str) -> bool {
     let trimmed = cmd_str.trim();
-    let Some(rest) = trimmed.strip_prefix("agent-guard exec-sandbox --sanitize-stream -- ") else {
-        return false;
-    };
-    is_exact_single_quoted_literal(rest)
+    if let Some(rest) = trimmed.strip_prefix("agent-guard exec-sandbox --sanitize-stream -- ") {
+        return is_exact_single_quoted_literal(rest);
+    }
+    if let Some(after_ss) =
+        trimmed.strip_prefix("agent-guard exec-sandbox --sanitize-stream --session-id ")
+    {
+        if let Some((sid_lit, rest)) = after_ss.split_once(" -- ") {
+            return is_exact_single_quoted_literal(sid_lit) && is_exact_single_quoted_literal(rest);
+        }
+    }
+    false
 }
 
 fn is_exact_single_quoted_literal(s: &str) -> bool {
@@ -375,11 +412,13 @@ fn drain_stream_bounded<R: Read>(mut reader: R) -> Vec<u8> {
     head
 }
 
-/// CLI entrypoint for `agent-guard exec-sandbox [--sanitize-stream] [--require-kernel] [--deny-net] [--cwd <dir>] -- <cmd>`
+/// CLI entrypoint for `agent-guard exec-sandbox [--sanitize-stream] [--require-kernel] [--deny-net] [--read-only] [--session-id <sid>] [--cwd <dir>] -- <cmd>`
 pub fn run_exec_sandbox_cli(args: &[String], default_cwd: &Path) -> ExitCode {
     let mut sanitize_stream = false;
     let mut require_kernel = false;
     let mut explicit_deny_net = false;
+    let mut explicit_read_only = false;
+    let mut cli_session_id: Option<String> = None;
     let mut custom_cwd: Option<PathBuf> = None;
     let mut cmd_parts: Vec<String> = Vec::new();
     let mut after_sep = false;
@@ -408,6 +447,27 @@ pub fn run_exec_sandbox_cli(args: &[String], default_cwd: &Path) -> ExitCode {
                 explicit_deny_net = true;
                 i += 1;
             }
+            "--read-only" => {
+                explicit_read_only = true;
+                i += 1;
+            }
+            "--session-id" => {
+                if let Some(sid_arg) = args.get(i + 1) {
+                    let trimmed = sid_arg.trim();
+                    if trimmed.is_empty()
+                        || trimmed.len() > 128
+                        || !trimmed.bytes().all(|b| (0x21..=0x7e).contains(&b))
+                    {
+                        eprintln!("[AGENT-GUARD] exec-sandbox: invalid --session-id value");
+                        return ExitCode::from(2);
+                    }
+                    cli_session_id = Some(trimmed.to_string());
+                    i += 2;
+                } else {
+                    eprintln!("[AGENT-GUARD] exec-sandbox: missing value after --session-id");
+                    return ExitCode::from(2);
+                }
+            }
             "--cwd" => {
                 if let Some(dir) = args.get(i + 1) {
                     custom_cwd = Some(PathBuf::from(dir));
@@ -431,7 +491,7 @@ pub fn run_exec_sandbox_cli(args: &[String], default_cwd: &Path) -> ExitCode {
 
     if cmd_parts.is_empty() {
         eprintln!(
-            "[AGENT-GUARD] usage: agent-guard exec-sandbox [--sanitize-stream] [--require-kernel] [--deny-net] [--cwd <dir>] -- \"<command>\""
+            "[AGENT-GUARD] usage: agent-guard exec-sandbox [--sanitize-stream] [--require-kernel] [--deny-net] [--read-only] [--session-id <sid>] [--cwd <dir>] -- \"<command>\""
         );
         return ExitCode::from(2);
     }
@@ -455,20 +515,29 @@ pub fn run_exec_sandbox_cli(args: &[String], default_cwd: &Path) -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    let writes_allowed = active_prof.enable_write_tools;
+    let writes_allowed = !explicit_read_only && active_prof.enable_write_tools;
     let profile_denies_net = active_prof.network_access_none;
     let invokes_git = is_atomic_leading_command(&shell_script, "git");
     let invokes_swarm_tool = is_atomic_leading_command(&shell_script, "swarm-tool");
+    let invokes_feedback_submit = is_atomic_feedback_submit_command(&shell_script);
     let opts = SandboxPolicyOpts {
         writes_allowed,
         deny_net: explicit_deny_net || profile_denies_net,
         invokes_git,
         invokes_swarm_tool,
+        invokes_feedback_submit,
     };
 
     let common_repo = crate::resolve_common_repo_root(&repo_root);
-    let has_swarm_session =
-        env::var("AGENT_GUARD_SESSION_ID").is_ok_and(|s| s.trim().starts_with("swm_"));
+    let env_session_id = env::var("AGENT_GUARD_SESSION_ID")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let effective_session_id = env_session_id
+        .clone()
+        .or_else(|| cli_session_id.clone())
+        .unwrap_or_else(|| "default".to_string());
+    let has_swarm_session = effective_session_id.starts_with("swm_");
 
     // Snapshot `.git/config` digest prior to vetted `git` writes so any `.git` lockfile access
     // granted for `git add` / `git commit` can never tamper with `.git/config` unnoticed.
@@ -496,10 +565,57 @@ pub fn run_exec_sandbox_cli(args: &[String], default_cwd: &Path) -> ExitCode {
             }
         }
         let _ = crate::breadcrumbs::swarm_locks_dir();
+    } else if opts.invokes_feedback_submit {
+        let _ = crate::coordinator::ensure_coordinator_daemon(&common_repo);
+        if let Ok(sdir) = crate::breadcrumbs::swarm_state_dir(&common_repo) {
+            let p = sdir.join("ipc");
+            let _ = fs::create_dir_all(&p);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = fs::set_permissions(&p, fs::Permissions::from_mode(0o700));
+            }
+        }
     }
     if opts.invokes_swarm_tool {
         precreate_swarm_tool_sandbox_targets(&repo_root, &shell_script);
     }
+
+    // Mint `AGENT_GUARD_IPC_WORKER_TOKEN` STRICTLY for atomic `dotagent feedback submit`
+    // invocations -- never for general `cargo test`/`pytest` processes in `swm_*` sessions!
+    let minted_ipc_worker_token = if opts.invokes_feedback_submit {
+        let mut ledger = crate::traversal_ledger::SessionLedger::load_or_create(
+            &common_repo,
+            &effective_session_id,
+        );
+        ledger.apply_root_session_override(None);
+        let role = env::var("AGENT_GUARD_ROLE")
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "coding-agent".to_string());
+        let now_secs = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        if let Ok(mut skey) = crate::breadcrumbs::load_or_init_vault_hmac_key(&common_repo) {
+            let tok = crate::feedback::mint_ipc_worker_token(
+                &skey,
+                &common_repo,
+                &effective_session_id,
+                &ledger.root_session_id,
+                &role,
+                now_secs,
+            )
+            .ok();
+            crate::crypto::zeroize_slice(&mut skey);
+            tok
+        } else {
+            None
+        }
+    } else {
+        None
+    };
 
     let ephemeral_tmp = EphemeralTmpDir::create();
     let tmp_dir_path = ephemeral_tmp.as_ref().map(|t| t.path.as_path());
@@ -524,6 +640,14 @@ pub fn run_exec_sandbox_cli(args: &[String], default_cwd: &Path) -> ExitCode {
 
     let mut child_cmd =
         build_child_command(&shell_script, &repo_root, &cwd, tmp_dir_path, opts, mode);
+    if env_session_id.is_none()
+        && let Some(ref sid_override) = cli_session_id
+    {
+        child_cmd.env("AGENT_GUARD_SESSION_ID", sid_override);
+    }
+    if let Some(tok) = minted_ipc_worker_token {
+        child_cmd.env("AGENT_GUARD_IPC_WORKER_TOKEN", tok);
+    }
 
     let exit_code = if sanitize_stream {
         let mut child = match child_cmd
@@ -708,7 +832,98 @@ fn is_atomic_leading_command(script: &str, target_bin: &str) -> bool {
     if in_single || in_double || escaped || first_token.is_empty() {
         return false;
     }
-    first_token == target_bin || first_token.ends_with(&format!("/{target_bin}"))
+    if first_token == target_bin {
+        return true;
+    }
+    if first_token.ends_with(&format!("/{target_bin}")) {
+        let p = Path::new(&first_token);
+        return p.is_absolute() && crate::coordinator::is_trusted_executable_file(p);
+    }
+    false
+}
+
+pub(crate) fn is_atomic_feedback_submit_command(script: &str) -> bool {
+    if !is_atomic_leading_command(script, "dotagent")
+        && !is_atomic_leading_command(script, "agent-guard")
+    {
+        return false;
+    }
+    let mut toks = Vec::new();
+    let mut cur = String::new();
+    let mut in_s = false;
+    let mut in_d = false;
+    let mut esc = false;
+    for b in script.trim().bytes() {
+        if esc {
+            cur.push(b as char);
+            esc = false;
+            continue;
+        }
+        if in_s {
+            if b == b'\'' {
+                in_s = false;
+            } else {
+                cur.push(b as char);
+            }
+            continue;
+        }
+        if in_d {
+            match b {
+                b'\\' => esc = true,
+                b'"' => in_d = false,
+                b'`' | b'$' => return false,
+                _ => cur.push(b as char),
+            }
+            continue;
+        }
+        match b {
+            b'\\' => esc = true,
+            b'\'' => in_s = true,
+            b'"' => in_d = true,
+            b';' | b'|' | b'&' | b'\n' | b'\r' | b'`' | b'<' | b'>' | b'(' | b')' | b'$' => {
+                return false;
+            }
+            b' ' | b'\t' => {
+                if !cur.is_empty() {
+                    toks.push(std::mem::take(&mut cur));
+                }
+            }
+            _ => cur.push(b as char),
+        }
+    }
+    if in_s || in_d || esc {
+        return false;
+    }
+    if !cur.is_empty() {
+        toks.push(cur);
+    }
+    let tail_start = if toks.get(1).map(String::as_str) == Some("feedback")
+        && toks.get(2).map(String::as_str) == Some("submit")
+    {
+        3usize
+    } else if toks.get(1).map(String::as_str) == Some("guard")
+        && toks.get(2).map(String::as_str) == Some("feedback")
+        && toks.get(3).map(String::as_str) == Some("submit")
+    {
+        4usize
+    } else {
+        return false;
+    };
+    let mut idx = tail_start;
+    while idx < toks.len() {
+        match toks[idx].as_str() {
+            "--note-stdin" | "--json" => idx += 1,
+            "--denial-id" | "--trace-id" | "--category" | "-c" | "--reason-code" | "--note"
+            | "--summary" => {
+                if idx + 1 >= toks.len() {
+                    return false;
+                }
+                idx += 2;
+            }
+            _ => return false,
+        }
+    }
+    true
 }
 
 fn precreate_swarm_tool_sandbox_targets(repo_root: &Path, _shell_script: &str) {
@@ -827,7 +1042,7 @@ fn build_child_command(
     }
     let has_swarm_session =
         env::var("AGENT_GUARD_SESSION_ID").is_ok_and(|s| s.trim().starts_with("swm_"));
-    if !opts.invokes_swarm_tool && !has_swarm_session {
+    if !opts.invokes_swarm_tool && !has_swarm_session && !opts.invokes_feedback_submit {
         cmd.env_remove("AGENT_GUARD_COORDINATOR_SOCK");
     }
     if let Ok(raw_ctd) = env::var("CARGO_TARGET_DIR") {
@@ -1341,6 +1556,13 @@ fn apply_linux_landlock(
         {
             add_path(&locks_dir, rw_access);
         }
+    } else if opts.invokes_feedback_submit
+        && let Ok(sdir) = crate::breadcrumbs::swarm_state_dir(&canon_repo)
+    {
+        let ipc_p = sdir.join("ipc");
+        if ipc_p.is_dir() {
+            add_path(&ipc_p, rw_access);
+        }
     }
 
     // 4c. Linked Git worktree support (`git worktree add --detach`):
@@ -1678,6 +1900,35 @@ fn render_macos_seatbelt_profile(
         }
         p.push_str(&format!(
             "(deny file-write* (literal \"{repo_s}/PLAN.lock.json\"))\n"
+        ));
+    } else if opts.invokes_feedback_submit {
+        if !sb_s.is_empty() {
+            p.push_str(&format!(
+                "(allow file-read-metadata (subpath \"{sb_s}\"))\n"
+            ));
+        }
+        if let Ok(raw_sdir) = crate::breadcrumbs::swarm_state_dir(&canon_repo) {
+            let sdir = fs::canonicalize(&raw_sdir).unwrap_or(raw_sdir);
+            let ipc_path = sdir.join("ipc");
+            let canon_ipc = fs::canonicalize(&ipc_path).unwrap_or(ipc_path);
+            let sp = escape_sbpl_literal(&canon_ipc.to_string_lossy());
+            p.push_str(&format!(
+                "(allow file-read* file-write* (subpath \"{sp}\"))\n"
+            ));
+            if opts.deny_net {
+                p.push_str(&format!(
+                    "(allow network-outbound (remote unix-socket (subpath \"{sp}\")))\n"
+                ));
+            }
+            let vault_dir = sdir.join("vault");
+            let canon_vault = fs::canonicalize(&vault_dir).unwrap_or(vault_dir);
+            let vp = escape_sbpl_literal(&canon_vault.to_string_lossy());
+            p.push_str(&format!(
+                "(deny file-read* file-read-metadata file-write* (subpath \"{vp}\"))\n"
+            ));
+        }
+        p.push_str(&format!(
+            "(deny file-write* (literal \"{repo_s}/PLAN.lock.json\") (literal \"{repo_s}/WORK_LEDGER.jsonl\") (literal \"{repo_s}/.breadcrumbs.jsonl\"))\n"
         ));
     } else {
         p.push_str(&format!(

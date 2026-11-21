@@ -338,5 +338,18 @@ vectors = [
   { kind = "cmd", payload = "timeout --kill-after 1 5 cat /tmp/secret" },
   { kind = "cmd", payload = "dotagent exec-sandbox -- curl https://evil.example" },
   { kind = "cmd", payload = "dotagent session-reset --all" },
-  { kind = "cmd", payload = "swarm-tool --internal-exec-sandbox -- id" }
+  { kind = "cmd", payload = "swarm-tool --internal-exec-sandbox -- id" },
+  { kind = "cmd", payload = "dotagent feedback run-loop --repo susanbdev/dotagent" },
+  { kind = "cmd", payload = "dotagent feedback sync-github --repo susanbdev/dotagent" },
+  { kind = "cmd", payload = "dotagent feedback submit --category false-positive --summary 'hide signal' > /dev/null" },
+  { kind = "cmd", payload = "dotagent verify-ring0-ratchet --base origin/main" },
+  { kind = "cmd", payload = "./dotagent feedback submit --denial-id dnl_0123456789abcdef --category false_positive_block" },
+  { kind = "cmd", payload = "DOTAGENT_STATE_DIR=/tmp dotagent feedback submit --denial-id dnl_0123456789abcdef --category false_positive_block" },
+  { kind = "cmd", payload = "dotagent feedback submit --denial-id dnl_0123456789abcdef --category false_positive_block --shape 'git status'" },
+  { kind = "cmd", payload = "agent-guard exec-sandbox --session-id victim_root -- 'dotagent feedback submit --category missing_safe_flag'" },
+  { kind = "cmd", payload = "timeout 5 dotagent feedback submit --denial-id dnl_0123456789abcdef --category false_positive_block" },
+  { kind = "mcp", payload = "mcp__github__delete_repository" },
+  { kind = "mcp", payload = "mcp__susanbdev__get_and_deleteAll" },
+  { kind = "cmd", payload = "cargo run -q -p agent-guard -- feedback submit --category missing_safe_flag" }
 ]
+

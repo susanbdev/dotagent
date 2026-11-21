@@ -122,6 +122,36 @@ fn analyze_recursive(
         });
     }
 
+    // Standalone `dotagent feedback` lockdown: `feedback submit` must run as a single top-level
+    // unpiped, unredirected, unwrapped command with zero env prefixes so `[AGENTPI_EVENT]`
+    // stdout frames can never be piped/suppressed and env/wrapper hijacking is impossible.
+    let has_feedback_subcmd = commands.iter().any(command_invokes_feedback);
+    let is_direct_feedback = commands.len() == 1
+        && commands[0].env_vars.is_empty()
+        && commands[0]
+            .argv
+            .first()
+            .is_some_and(|b| matches!(basename(b), "dotagent" | "agent-guard"))
+        && (commands[0].argv.get(1).map(String::as_str) == Some("feedback")
+            || (commands[0].argv.get(1).map(String::as_str) == Some("guard")
+                && commands[0].argv.get(2).map(String::as_str) == Some("feedback")));
+    if has_feedback_subcmd
+        && (depth > 0
+            || !subscripts.is_empty()
+            || has_compound_list_op
+            || !is_direct_feedback
+            || !commands[0].redirs.is_empty()
+            || commands[0].piped_stdin)
+    {
+        return Err(CommandViolation {
+            code: "INVALID_FEEDBACK_BALLOT",
+            detail:
+                "`dotagent feedback submit` must execute as a single standalone top-level command without wrappers (`command`/`env`/`timeout`/`nohup`), env prefixes, pipes, subshells, chaining, or redirections."
+                    .to_string(),
+            halt_session: false,
+        });
+    }
+
     // Compound `gh` lockdown: `gh` may ONLY run at top level (no subshells/command substitutions),
     // with zero compound list operators (`&&`, `||`, `;`, `&`, multi-line), either standalone or
     // as the first stage of a pipeline piped strictly to `jq`, `tr`, `head`, or `tail`.
@@ -210,6 +240,28 @@ fn analyze_recursive(
     }
 
     Ok(())
+}
+
+/// Fail-closed detector for `dotagent feedback` / `agent-guard guard feedback` anywhere in argv.
+/// Scans every argv position (not only the leading binary after wrapper peeling) so wrappers such
+/// as `env`, `timeout`, `nohup`, `xargs`, or `sudo` can never smuggle a ballot past the standalone
+/// lockdown; the over-approximation only ever adds friction to ballot submission.
+fn command_invokes_feedback(cmd: &ParsedCommand) -> bool {
+    // Non-adjacent forms (`cargo run -p agent-guard -- feedback ...`, `agent-guard --x feedback`)
+    // are caught too: any `feedback` token after any dotagent/agent-guard token counts.
+    let argv = &cmd.argv;
+    argv.iter()
+        .position(|a| {
+            matches!(
+                basename(a.trim_matches(|c| c == '\'' || c == '"')),
+                "dotagent" | "agent-guard"
+            )
+        })
+        .is_some_and(|first| {
+            argv[first + 1..]
+                .iter()
+                .any(|a| a.trim_matches(|c| c == '\'' || c == '"') == "feedback")
+        })
 }
 
 fn command_invokes_bin(cmd: &ParsedCommand, target: &str) -> bool {
@@ -902,6 +954,7 @@ fn check_single_command(
                     | "fleet"
                     | "self-verify"
                     | "verify-receipt"
+                    | "verify-ring0-ratchet"
                     | "receipt-pubkey"
                     | "mcp-gateway"
             ) {
@@ -912,6 +965,156 @@ fn check_single_command(
                             .to_string(),
                     halt_session: true,
                 });
+            }
+            if sub == "feedback" {
+                if depth > 0 {
+                    return Err(CommandViolation {
+                        code: "INVALID_FEEDBACK_BALLOT",
+                        detail: "`dotagent feedback submit` may not run inside subshells, substitutions, or nested scripts."
+                            .to_string(),
+                        halt_session: false,
+                    });
+                }
+                let raw_bin = cmd.argv.first().map(String::as_str).unwrap_or("");
+                if raw_bin.contains('/') {
+                    let p = Path::new(raw_bin);
+                    let canonical_root = std::fs::canonicalize(repo_root)
+                        .unwrap_or_else(|_| repo_root.to_path_buf());
+                    let canonical_bin = std::fs::canonicalize(p).ok();
+                    let untrusted = !p.is_absolute()
+                        || raw_bin.contains("..")
+                        || p.starts_with(repo_root)
+                        || p.starts_with(cwd)
+                        || canonical_bin.as_ref().is_none_or(|c| {
+                            c.starts_with(&canonical_root)
+                                || !crate::coordinator::is_trusted_executable_file(c)
+                        });
+                    if untrusted {
+                        return Err(CommandViolation {
+                            code: "SELF_TAMPERING_BLOCKED",
+                            detail: format!(
+                                "Relative, workspace-local, or untrusted binary path `{raw_bin}` is forbidden for `dotagent feedback`; invoke canonical installed `dotagent`."
+                            ),
+                            halt_session: true,
+                        });
+                    }
+                }
+                if !cmd.env_vars.is_empty() {
+                    return Err(CommandViolation {
+                        code: "INVALID_FEEDBACK_BALLOT",
+                        detail: "`dotagent feedback submit` forbids environment-variable prefixes."
+                            .to_string(),
+                        halt_session: false,
+                    });
+                }
+                if sub_args.get(1).map(String::as_str) != Some("submit") {
+                    return Err(CommandViolation {
+                        code: "SELF_TAMPERING_BLOCKED",
+                        detail:
+                            "Agents may only invoke `dotagent feedback submit`; `status`, `sync-github`, `triage`, and `run-loop` are hard-blocked (`SELF_TAMPERING_BLOCKED`)."
+                                .to_string(),
+                        halt_session: true,
+                    });
+                }
+                if !cmd.redirs.is_empty() {
+                    return Err(CommandViolation {
+                        code: "INVALID_FEEDBACK_BALLOT",
+                        detail:
+                            "`dotagent feedback submit` must not redirect stdout/stderr so `[AGENTPI_EVENT]` telemetry remains visible."
+                                .to_string(),
+                        halt_session: false,
+                    });
+                }
+                let mut fidx = 2usize;
+                let mut saw_category = false;
+                while fidx < sub_args.len() {
+                    match sub_args[fidx].as_str() {
+                        "--denial-id" => {
+                            let Some(val) = sub_args.get(fidx + 1) else {
+                                return Err(CommandViolation {
+                                    code: "INVALID_FEEDBACK_BALLOT",
+                                    detail: "`--denial-id` missing value.".to_string(),
+                                    halt_session: false,
+                                });
+                            };
+                            if !crate::feedback::is_valid_denial_or_trace_id(val) {
+                                return Err(CommandViolation {
+                                    code: "INVALID_FEEDBACK_BALLOT",
+                                    detail: format!(
+                                        "Invalid `--denial-id '{val}'` (expected `dnl_<16-hex>` or `trc_<16-hex>`)."
+                                    ),
+                                    halt_session: false,
+                                });
+                            }
+                            fidx += 2;
+                        }
+                        "--category" | "-c" => {
+                            let Some(val) = sub_args.get(fidx + 1) else {
+                                return Err(CommandViolation {
+                                    code: "INVALID_FEEDBACK_BALLOT",
+                                    detail: "`--category` missing value.".to_string(),
+                                    halt_session: false,
+                                });
+                            };
+                            if crate::feedback::FeedbackCategory::parse(val).is_none()
+                                || !val.bytes().all(|b| {
+                                    b.is_ascii_lowercase()
+                                        || b.is_ascii_digit()
+                                        || b == b'_'
+                                        || b == b'-'
+                                })
+                            {
+                                return Err(CommandViolation {
+                                    code: "INVALID_FEEDBACK_BALLOT",
+                                    detail: format!("Invalid `--category '{val}'`."),
+                                    halt_session: false,
+                                });
+                            }
+                            saw_category = true;
+                            fidx += 2;
+                        }
+                        "--reason-code" => {
+                            let Some(val) = sub_args.get(fidx + 1) else {
+                                return Err(CommandViolation {
+                                    code: "INVALID_FEEDBACK_BALLOT",
+                                    detail: "`--reason-code` missing value.".to_string(),
+                                    halt_session: false,
+                                });
+                            };
+                            if !crate::feedback::is_valid_reason_code_token(val) {
+                                return Err(CommandViolation {
+                                    code: "INVALID_FEEDBACK_BALLOT",
+                                    detail: format!(
+                                        "Invalid `--reason-code '{val}'` (only [A-Za-z0-9_.-] tokens <= 64 chars allowed)."
+                                    ),
+                                    halt_session: false,
+                                });
+                            }
+                            fidx += 2;
+                        }
+                        "--json" => {
+                            fidx += 1;
+                        }
+                        other => {
+                            return Err(CommandViolation {
+                                code: "INVALID_FEEDBACK_BALLOT",
+                                detail: format!(
+                                    "Disallowed CLI flag `{other}` on `dotagent feedback submit`; pass only token-safe `--denial-id`, `--category`, and optional `--reason-code` (use MCP `dotagent_submit_friction` for free-text notes)."
+                                ),
+                                halt_session: false,
+                            });
+                        }
+                    }
+                }
+                if !saw_category {
+                    return Err(CommandViolation {
+                        code: "INVALID_FEEDBACK_BALLOT",
+                        detail: "`dotagent feedback submit` requires `--category <cat>`."
+                            .to_string(),
+                        halt_session: false,
+                    });
+                }
+                return Ok(());
             }
             if sub == "swarm" {
                 let mut forwarded = Vec::with_capacity(sub_args.len());
@@ -999,8 +1202,17 @@ fn check_single_command(
                             after_sep = true;
                             idx += 1;
                         }
-                        "--sanitize-stream" | "--require-kernel" | "--deny-net" => {
+                        "--sanitize-stream" | "--require-kernel" | "--deny-net" | "--read-only" => {
                             idx += 1;
+                        }
+                        "--session-id" => {
+                            return Err(CommandViolation {
+                                code: "SELF_TAMPERING_BLOCKED",
+                                detail:
+                                    "`agent-guard exec-sandbox --session-id` is reserved for the PreToolUse hook wrapper; agents may not assert session identity."
+                                        .to_string(),
+                                halt_session: true,
+                            });
                         }
                         "--cwd" => {
                             let Some(dir) = sub_args.get(idx + 1) else {
@@ -1172,12 +1384,15 @@ fn check_env_assignment(
 ) -> Result<(), CommandViolation> {
     let ku = key.to_ascii_uppercase();
     if ku.starts_with("AGENT_GUARD")
+        || ku.starts_with("DOTAGENT_")
+        || ku.starts_with("AGENTPI_")
         || ku.starts_with("GIT_")
         || ku.starts_with("LD_")
         || ku.starts_with("DYLD_")
         || matches!(
             ku.as_str(),
-            "BASH_ENV"
+            "HOME"
+                | "BASH_ENV"
                 | "ENV"
                 | "PROMPT_COMMAND"
                 | "IFS"

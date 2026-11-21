@@ -414,7 +414,7 @@ fn set_mode(path: &Path, mode: u32) {
     let _ = (path, mode);
 }
 
-fn verify_operator_not_in_agent_sandbox(cmd_label: &str) -> Result<(), String> {
+pub(crate) fn verify_operator_not_in_agent_sandbox(cmd_label: &str) -> Result<(), String> {
     for marker in crate::telemetry::AGENT_SANDBOX_AND_HARNESS_MARKERS {
         if let Ok(val) = std::env::var(marker)
             && !val.trim().is_empty()
@@ -429,6 +429,208 @@ fn verify_operator_not_in_agent_sandbox(cmd_label: &str) -> Result<(), String> {
     Ok(())
 }
 
+fn trusted_git_cmd(cwd: &Path) -> Result<std::process::Command, String> {
+    let git_bin = [
+        "/usr/bin/git",
+        "/opt/homebrew/bin/git",
+        "/usr/local/bin/git",
+    ]
+    .into_iter()
+    .map(Path::new)
+    .find(|p| crate::coordinator::is_trusted_executable_file(p))
+    .ok_or_else(|| {
+        "no trusted system git executable found in /usr/bin, /opt/homebrew/bin, or /usr/local/bin"
+            .to_string()
+    })?;
+    let mut cmd = std::process::Command::new(git_bin);
+    cmd.current_dir(cwd)
+        .env_remove("GIT_EXTERNAL_DIFF")
+        .env_remove("GIT_DIFF_OPTS")
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_INDEX_FILE")
+        .env_remove("GIT_OBJECT_DIRECTORY")
+        .env_remove("GIT_ALTERNATE_OBJECT_DIRECTORIES")
+        .env_remove("GIT_COMMON_DIR")
+        .env_remove("GIT_CONFIG_PARAMETERS")
+        .env_remove("GIT_CONFIG_GLOBAL")
+        .env_remove("GIT_CONFIG_SYSTEM")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_CONFIG_COUNT", "2")
+        .env("GIT_CONFIG_KEY_0", "core.hooksPath")
+        .env("GIT_CONFIG_VALUE_0", "/dev/null")
+        .env("GIT_CONFIG_KEY_1", "core.fsmonitor")
+        .env("GIT_CONFIG_VALUE_1", "false");
+    Ok(cmd)
+}
+
+fn verify_bundle_rollout_provenance(bundle_root: &Path) -> Result<(), String> {
+    use std::process::Command;
+    if let Err(errs) = audit_repository(bundle_root) {
+        return Err(format!(
+            "bundle repository failed audit: {}",
+            errs.join("; ")
+        ));
+    }
+    let st = trusted_git_cmd(bundle_root)?
+        .args(["status", "--porcelain=v1", "-z", "-uall"])
+        .output()
+        .map_err(|e| format!("git status on bundle failed: {e}"))?;
+    if !st.status.success() || st.stdout.iter().any(|b| *b != 0) {
+        return Err(
+            "bundle repository has uncommitted or untracked changes (rollout requires clean HEAD)"
+                .to_string(),
+        );
+    }
+    let head_out = trusted_git_cmd(bundle_root)?
+        .args(["rev-parse", "--verify", "HEAD"])
+        .output()
+        .map_err(|e| format!("git rev-parse HEAD failed: {e}"))?;
+    let head_oid = String::from_utf8_lossy(&head_out.stdout).trim().to_string();
+    if head_oid.is_empty() {
+        return Err("unable to resolve bundle HEAD commit".to_string());
+    }
+
+    // 1. Accept if HEAD has an annotated tag carrying an SSH signature that verifies against the
+    //    bundle's committed `config/allowed_human_signers` keyring (GPG keyrings are ignored).
+    let signers_path = bundle_root.join("config/allowed_human_signers");
+    let signers_ok = fs::symlink_metadata(&signers_path)
+        .is_ok_and(|m| m.file_type().is_file() && !m.file_type().is_symlink());
+    if signers_ok
+        && let Ok(mut tag_cmd) = trusted_git_cmd(bundle_root)
+        && let Ok(tags_out) = tag_cmd.args(["tag", "--points-at", "HEAD"]).output()
+        && tags_out.status.success()
+    {
+        for tag in String::from_utf8_lossy(&tags_out.stdout)
+            .lines()
+            .map(str::trim)
+            .filter(|s| !s.is_empty() && !s.starts_with('-'))
+        {
+            let is_ssh_signed = trusted_git_cmd(bundle_root).is_ok_and(|mut c| {
+                c.args(["cat-file", "tag", tag]).output().is_ok_and(|o| {
+                    o.status.success()
+                        && String::from_utf8_lossy(&o.stdout)
+                            .contains("-----BEGIN SSH SIGNATURE-----")
+                })
+            });
+            if !is_ssh_signed {
+                continue;
+            }
+            if trusted_git_cmd(bundle_root).is_ok_and(|mut c| {
+                c.env("GIT_CONFIG_COUNT", "3")
+                    .env("GIT_CONFIG_KEY_2", "gpg.ssh.allowedSignersFile")
+                    .env("GIT_CONFIG_VALUE_2", &signers_path)
+                    .args(["verify-tag", "--end-of-options", tag])
+                    .output()
+                    .is_ok_and(|o| o.status.success())
+            }) {
+                return Ok(());
+            }
+        }
+    }
+
+    // 2. Otherwise HEAD must already be on `susanbdev/dotagent` main (so it passed the PR-time
+    //    7-check ruleset, including the Ring-0 ratchet and the Copilot gate status, which only
+    //    attach to PR head commits) AND every main-push CI check-run on HEAD must be green.
+    let gh = crate::feedback_loop::resolve_gh_bin();
+    let cmp_ep = format!("repos/susanbdev/dotagent/compare/main...{head_oid}");
+    let cmp_out = Command::new(&gh)
+        .args(["api", &cmp_ep])
+        .output()
+        .map_err(|e| format!("gh api compare failed: {e}"))?;
+    if !cmp_out.status.success() {
+        return Err(format!(
+            "HEAD '{head_oid}' lacks a pinned-signer tag and main ancestry could not be verified"
+        ));
+    }
+    let cmp = JsonValue::parse(String::from_utf8_lossy(&cmp_out.stdout).trim())
+        .map_err(|e| format!("invalid compare JSON: {e}"))?;
+    let cmp_status = cmp.get("status").and_then(JsonValue::as_str).unwrap_or("");
+    if !matches!(cmp_status, "identical" | "behind") {
+        return Err(format!(
+            "HEAD '{head_oid}' is not contained in susanbdev/dotagent main (compare status '{cmp_status}')"
+        ));
+    }
+
+    let ep = format!("repos/susanbdev/dotagent/commits/{head_oid}/check-runs?per_page=100");
+    let cr_out = Command::new(&gh)
+        .args(["api", "--paginate", "--slurp", &ep])
+        .output()
+        .map_err(|e| format!("gh api check-runs failed: {e}"))?;
+    if !cr_out.status.success() {
+        return Err(format!(
+            "HEAD '{head_oid}' lacks verified signed tag and GitHub check-runs query failed"
+        ));
+    }
+    let v = JsonValue::parse(String::from_utf8_lossy(&cr_out.stdout).trim())
+        .map_err(|e| format!("invalid check-runs JSON: {e}"))?;
+    let pages = v
+        .as_array()
+        .ok_or_else(|| "check-runs --slurp output is not an array".to_string())?;
+    let mut latest: BTreeMap<String, (u64, String, String)> = BTreeMap::new();
+    for page in pages {
+        let runs = page
+            .get("check_runs")
+            .and_then(JsonValue::as_array)
+            .ok_or_else(|| "missing check_runs array".to_string())?;
+        for r in runs {
+            let name = r.get("name").and_then(JsonValue::as_str).unwrap_or("");
+            let id = r.get("id").and_then(JsonValue::as_u64).unwrap_or(0);
+            let status = r.get("status").and_then(JsonValue::as_str).unwrap_or("");
+            let concl = r
+                .get("conclusion")
+                .and_then(JsonValue::as_str)
+                .unwrap_or("");
+            match latest.get_mut(name) {
+                Some((prev_id, prev_st, prev_concl)) if id >= *prev_id => {
+                    *prev_id = id;
+                    *prev_st = status.to_string();
+                    *prev_concl = concl.to_string();
+                }
+                Some(_) => {}
+                None => {
+                    latest.insert(
+                        name.to_string(),
+                        (id, status.to_string(), concl.to_string()),
+                    );
+                }
+            }
+        }
+    }
+    for (name, (_, status, concl)) in &latest {
+        // The Ring-0 ratchet job is intentionally skipped on main pushes (enforced at PR time).
+        let skipped_ok = name == "Ring-0 Constitutional Ratchet" && concl == "skipped";
+        if status != "completed" || (concl != "success" && !skipped_ok) {
+            return Err(format!(
+                "HEAD '{head_oid}' check-run '{name}' is {status}/{concl} (all must be green)"
+            ));
+        }
+    }
+    for &req in MAIN_PUSH_REQUIRED_CHECK_RUNS {
+        match latest.get(req) {
+            Some((_, st, c)) if st == "completed" && c == "success" => {}
+            _ => {
+                return Err(format!(
+                    "HEAD '{head_oid}' is missing required green main-push check-run '{req}'"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// CI check-runs that execute on every `main` push (the remaining two of the 7 required gates,
+/// `Ring-0 Constitutional Ratchet` and the `Ring-0 & Copilot Gate` status, are PR-head-only and
+/// are implied by main ancestry under the org ruleset).
+const MAIN_PUSH_REQUIRED_CHECK_RUNS: &[&str] = &[
+    "Security Kernel & Harness (ubuntu-latest)",
+    "Security Kernel & Harness (macos-latest)",
+    "Supply-Chain Advisory & License Gate (cargo-deny)",
+    "Kani Bounded Model Checking Proofs",
+    "MSRV 1.88.0 Compatibility Gate",
+];
+
 /// CLI entrypoint: `dotagent fleet <audit|doctor|sync|build-image> ...`
 pub fn run_fleet_cli(args: &[String], cwd: &Path) -> ExitCode {
     if let Err(msg) = verify_operator_not_in_agent_sandbox("dotagent fleet") {
@@ -437,8 +639,13 @@ pub fn run_fleet_cli(args: &[String], cwd: &Path) -> ExitCode {
     }
 
     let sub = args.first().map(String::as_str).unwrap_or("audit");
+    if sub == "configure-github" {
+        return crate::github_governance::run_configure_github_cli(&args[1..]);
+    }
     let json_mode = args.iter().any(|a| a == "--json");
     let dry_run = args.iter().any(|a| a == "--dry-run");
+    let require_provenance = args.iter().any(|a| a == "--require-provenance")
+        || std::env::var("DOTAGENT_FLEET_REQUIRE_PROVENANCE").as_deref() == Ok("1");
     let mut org_root: Option<PathBuf> = None;
     let mut dotagent_root: Option<PathBuf> = None;
     let mut bin_dir: Option<PathBuf> = None;
@@ -463,7 +670,7 @@ pub fn run_fleet_cli(args: &[String], cwd: &Path) -> ExitCode {
                 out_dir = Some(PathBuf::from(&args[i + 1]));
                 i += 2;
             }
-            "--json" | "--dry-run" => i += 1,
+            "--json" | "--dry-run" | "--require-provenance" | "--allow-unverified-local" => i += 1,
             other if !other.starts_with('-') && org_root.is_none() => {
                 org_root = Some(PathBuf::from(other));
                 i += 1;
@@ -485,6 +692,17 @@ pub fn run_fleet_cli(args: &[String], cwd: &Path) -> ExitCode {
                 );
                 return ExitCode::from(2);
             };
+            // Immutable images are rollout artifacts: provenance is mandatory unless the operator
+            // explicitly opts into an unverified local developer build.
+            let allow_unverified = args.iter().any(|a| a == "--allow-unverified-local");
+            if !allow_unverified
+                && let Err(prov_err) = verify_bundle_rollout_provenance(&resolved_bundle)
+            {
+                eprintln!(
+                    "[dotagent fleet build-image] HARD DENY: PROVENANCE_REQUIRED: {prov_err} (pass --allow-unverified-local for developer-only images)"
+                );
+                return ExitCode::from(2);
+            }
             match build_immutable_dotagent_image(&resolved_bundle, bin_dir.as_deref(), &stage) {
                 Ok(manifest) => {
                     println!(
@@ -502,8 +720,11 @@ pub fn run_fleet_cli(args: &[String], cwd: &Path) -> ExitCode {
         }
         "audit" | "doctor" => {
             let target_org = org_root.unwrap_or_else(|| cwd.to_path_buf());
-            let canon_agents_sha = fs::read(resolved_bundle.join("dist/AGENTS.md"))
+            let dist_agents = resolved_bundle.join("dist/AGENTS.md");
+            let canon_agents_sha = fs::symlink_metadata(&dist_agents)
                 .ok()
+                .filter(|m| !m.file_type().is_symlink() && m.file_type().is_file())
+                .and_then(|_| fs::read(&dist_agents).ok())
                 .map(|b| sha256_hex(&b));
             match audit_fleet_parallel(&target_org, canon_agents_sha.as_deref(), sub == "doctor") {
                 Ok(reports) => {
@@ -547,10 +768,16 @@ pub fn run_fleet_cli(args: &[String], cwd: &Path) -> ExitCode {
         "sync" => {
             let Some(target_org) = org_root else {
                 eprintln!(
-                    "[dotagent fleet] usage: dotagent fleet sync --root <org_dir> [--dotagent-root <dir>] [--dry-run]"
+                    "[dotagent fleet] usage: dotagent fleet sync --root <org_dir> [--dotagent-root <dir>] [--require-provenance] [--dry-run]"
                 );
                 return ExitCode::from(2);
             };
+            if require_provenance
+                && let Err(prov_err) = verify_bundle_rollout_provenance(&resolved_bundle)
+            {
+                eprintln!("[dotagent fleet sync] HARD DENY: {prov_err}");
+                return ExitCode::from(2);
+            }
             let Ok(home_raw) = std::env::var("HOME") else {
                 eprintln!("[dotagent fleet sync] HOME environment variable is not set");
                 return ExitCode::from(2);
@@ -830,7 +1057,10 @@ pub fn verify_artifact_digest_slsa_and_signature(
             ));
         }
 
-        if let Some(pred) = stmt.get("predicate") {
+        let Some(pred) = stmt.get("predicate").filter(|p| p.as_object().is_some()) else {
+            return Err("SLSA_MISSING_PREDICATE: statement.predicate must be a JSON object".into());
+        };
+        {
             let builder_id = pred
                 .get("runDetails")
                 .and_then(|rd| rd.get("builder"))

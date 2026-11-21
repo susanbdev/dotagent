@@ -117,7 +117,7 @@ def load_vecs(ref: str):
 def vec_identity(v: dict) -> str:
     if "kind" in v or "payload" in v:
         k, pl = v.get("kind"), v.get("payload")
-        if k not in {"cmd", "read_path", "write_path", "glob", "content"} or not isinstance(pl, str) or not pl.strip():
+        if k not in {"cmd", "read_path", "write_path", "glob", "content", "mcp"} or not isinstance(pl, str) or not pl.strip():
             die(f"CORPUS_SCHEMA_ERROR: invalid kind/payload in {v}")
         return f"kp:{k}:{pl}"
     cmd = v.get("command")
