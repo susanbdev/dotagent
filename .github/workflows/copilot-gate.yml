@@ -65,8 +65,16 @@ jobs:
           if git -C "${TRUSTED}" grep -q -F 'verify-ring0-ratchet' -- crates/agent-guard/src/cli.rs; then
             (cd "${TRUSTED}" && CARGO_TARGET_DIR="${RUNNER_TEMP}/trusted-target" \
               cargo build --locked -p agent-guard --bin dotagent)
-            "${RUNNER_TEMP}/trusted-target/debug/dotagent" verify-ring0-ratchet \
-              --base "origin/${BASE_REF}"
+            case "${GITHUB_HEAD_REF:-}" in
+              friction-loop/*|agent-feedback/*)
+                "${RUNNER_TEMP}/trusted-target/debug/dotagent" verify-ring0-ratchet \
+                  --base "origin/${BASE_REF}" --require-ratchet
+                ;;
+              *)
+                "${RUNNER_TEMP}/trusted-target/debug/dotagent" verify-ring0-ratchet \
+                  --base "origin/${BASE_REF}" --corpus-only
+                ;;
+            esac
           elif git merge-base --is-ancestor 0194af29450aa65d1699337ec731d1740efc00e4 "${BASE_OID}" \
                && ! git cat-file -e "${BASE_OID}:config/allowed_human_signers" 2>/dev/null; then
             # Self-extinguishing one-time genesis bootstrap (never compiles PR sources): constrains any
