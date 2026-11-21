@@ -13,13 +13,14 @@
 //!   so linked `git worktree` checkouts stay clean.
 //! - `F17`: Idempotent `event_id` (`record_mac`) deduplication on flush.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs::{self, File, OpenOptions};
 use std::io::{ErrorKind, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use sha2::{Digest, Sha256};
 
@@ -667,19 +668,30 @@ fn append_spool_frame_unlocked(
     spool_path: &Path,
     record: &SignedBreadcrumbRecord,
 ) -> Result<(), String> {
-    let json_bytes = record.to_json_line().into_bytes();
-    let len = u32::try_from(json_bytes.len())
-        .map_err(|_| "breadcrumb record exceeds u32 frame limit".to_string())?;
-    let crc = crc32fast::hash(&json_bytes);
+    append_spool_frames_batch_unlocked(spool_path, std::slice::from_ref(record))
+}
 
-    let mut frame = Vec::with_capacity(8 + json_bytes.len() + 1);
-    frame.extend_from_slice(&len.to_be_bytes());
-    frame.extend_from_slice(&crc.to_be_bytes());
-    frame.extend_from_slice(&json_bytes);
-    frame.push(b'\n');
+fn append_spool_frames_batch_unlocked(
+    spool_path: &Path,
+    records: &[SignedBreadcrumbRecord],
+) -> Result<(), String> {
+    if records.is_empty() {
+        return Ok(());
+    }
+    let mut buf = Vec::with_capacity(records.len().saturating_mul(384));
+    for record in records {
+        let json_bytes = record.to_json_line().into_bytes();
+        let len = u32::try_from(json_bytes.len())
+            .map_err(|_| "breadcrumb record exceeds u32 frame limit".to_string())?;
+        let crc = crc32fast::hash(&json_bytes);
+        buf.extend_from_slice(&len.to_be_bytes());
+        buf.extend_from_slice(&crc.to_be_bytes());
+        buf.extend_from_slice(&json_bytes);
+        buf.push(b'\n');
+    }
 
     let mut file = open_append_nofollow(spool_path)?;
-    file.write_all(&frame)
+    file.write_all(&buf)
         .map_err(|e| format!("failed writing spool frame: {e}"))?;
     file.sync_data()
         .map_err(|e| format!("failed fsyncing spool frame: {e}"))?;
@@ -788,9 +800,81 @@ pub fn recover_spool_frames(spool_path: &Path) -> Result<SpoolRecoveryReport, St
     })
 }
 
+type PendingOutcomeSlot = Arc<(
+    Mutex<Option<Result<SignedBreadcrumbRecord, String>>>,
+    Condvar,
+)>;
+
+struct PendingBreadcrumb {
+    session_id: String,
+    task_id: String,
+    plan_sha256: [u8; 32],
+    op: EventOp,
+    canonical_rel_path: String,
+    trail_path: PathBuf,
+    line_range: Option<(u64, u64)>,
+    doc_sha256: [u8; 32],
+    slot: PendingOutcomeSlot,
+}
+
+struct SpoolGroupQueue {
+    mu: Mutex<(VecDeque<PendingBreadcrumb>, bool)>,
+}
+
+struct GroupLeaderGuard<'a> {
+    group: &'a SpoolGroupQueue,
+    active: bool,
+}
+
+impl Drop for GroupLeaderGuard<'_> {
+    fn drop(&mut self) {
+        if !self.active {
+            return;
+        }
+        let mut st = self.group.mu.lock().unwrap_or_else(|e| e.into_inner());
+        let drained: Vec<PendingBreadcrumb> = st.0.drain(..).collect();
+        st.1 = false;
+        drop(st);
+        for item in drained {
+            deliver_pending_outcome(
+                &item.slot,
+                Err("breadcrumb group leader aborted unexpectedly".to_string()),
+            );
+        }
+    }
+}
+
+fn deliver_pending_outcome(
+    slot: &PendingOutcomeSlot,
+    outcome: Result<SignedBreadcrumbRecord, String>,
+) {
+    let (mu, cv) = &**slot;
+    let mut g = mu.lock().unwrap_or_else(|e| e.into_inner());
+    *g = Some(outcome);
+    drop(g);
+    cv.notify_one();
+}
+
+fn spool_group_queue(key: &(PathBuf, PathBuf, PathBuf)) -> Arc<SpoolGroupQueue> {
+    type GroupMap = BTreeMap<(PathBuf, PathBuf, PathBuf), Arc<SpoolGroupQueue>>;
+    static GROUPS: OnceLock<Mutex<GroupMap>> = OnceLock::new();
+    let map_mu = GROUPS.get_or_init(|| Mutex::new(BTreeMap::new()));
+    let mut map = map_mu.lock().unwrap_or_else(|e| e.into_inner());
+    Arc::clone(map.entry(key.clone()).or_insert_with(|| {
+        Arc::new(SpoolGroupQueue {
+            mu: Mutex::new((VecDeque::new(), false)),
+        })
+    }))
+}
+
 /// Appends a signed event to the session spool AND flushes idempotently (`event_id` dedup)
 /// into `<parent_dir>/.breadcrumbs.jsonl`, ensuring `.breadcrumbs.jsonl` is listed in
 /// `git rev-parse --git-path info/exclude` (`F16` worktree-safe).
+///
+/// Concurrent in-process writers targeting the same `(common_repo, local_root, spool_path)`
+/// coalesce via group commit under the cross-process `ExclusiveFileLockGuard(&spool_path)`,
+/// preserving cross-process exclusion, contiguous `seq_no`, MAC-chain continuity, and
+/// ordered `.breadcrumbs.jsonl` trail projection with a single `fdatasync` pair per batch.
 #[allow(clippy::too_many_arguments)]
 pub fn append_breadcrumb_for_path(
     repo_root: &Path,
@@ -804,49 +888,191 @@ pub fn append_breadcrumb_for_path(
 ) -> Result<SignedBreadcrumbRecord, String> {
     let local_root = fs::canonicalize(repo_root).unwrap_or_else(|_| repo_root.to_path_buf());
     let common_repo = crate::resolve_common_repo_root(&local_root);
-    let repo_sha256 = sha256_digest(common_repo.to_string_lossy().as_bytes());
-
     let spool_path = spool_file_path(&common_repo, session_id)?;
-    let _spool_lock = ExclusiveFileLockGuard::acquire(&spool_path)?;
+    let trail_path = trail_path_for_rel_path(&local_root, canonical_rel_path)?;
+    let _ = ensure_git_info_exclude(&local_root);
 
-    let recovery = recover_spool_frames(&spool_path)?;
-    let (seq_no, prev_event_mac) = match recovery.valid_records.last() {
+    let slot: PendingOutcomeSlot = Arc::new((Mutex::new(None), Condvar::new()));
+    let pending = PendingBreadcrumb {
+        session_id: session_id.to_string(),
+        task_id: task_id.to_string(),
+        plan_sha256,
+        op,
+        canonical_rel_path: canonical_rel_path.to_string(),
+        trail_path,
+        line_range,
+        doc_sha256,
+        slot: Arc::clone(&slot),
+    };
+
+    let group_key = (common_repo.clone(), local_root.clone(), spool_path.clone());
+    let group = spool_group_queue(&group_key);
+    let become_leader = {
+        let mut st = group.mu.lock().unwrap_or_else(|e| e.into_inner());
+        st.0.push_back(pending);
+        if st.1 {
+            false
+        } else {
+            st.1 = true;
+            true
+        }
+    };
+
+    if become_leader {
+        let mut leader_guard = GroupLeaderGuard {
+            group: &group,
+            active: true,
+        };
+        let repo_sha256 = sha256_digest(common_repo.to_string_lossy().as_bytes());
+        let in_sandbox = std::env::var("AGENT_GUARD_IN_SANDBOX").ok().as_deref() == Some("1");
+        let root_trail = local_root.join(".breadcrumbs.jsonl");
+
+        loop {
+            let spool_lock_res = ExclusiveFileLockGuard::acquire(&spool_path);
+            let batch: Vec<PendingBreadcrumb> = {
+                let mut st = group.mu.lock().unwrap_or_else(|e| e.into_inner());
+                if st.0.is_empty() {
+                    st.1 = false;
+                    leader_guard.active = false;
+                    break;
+                }
+                let take_n = st.0.len().min(64);
+                st.0.drain(..take_n).collect()
+            };
+
+            let spool_lock = match spool_lock_res {
+                Ok(lk) => lk,
+                Err(e) => {
+                    for item in batch {
+                        deliver_pending_outcome(&item.slot, Err(e.clone()));
+                    }
+                    continue;
+                }
+            };
+
+            let batch_outcomes = process_breadcrumb_batch_locked(
+                &common_repo,
+                &spool_path,
+                &root_trail,
+                repo_sha256,
+                in_sandbox,
+                &batch,
+            );
+            drop(spool_lock);
+
+            for (item, outcome) in batch.into_iter().zip(batch_outcomes) {
+                deliver_pending_outcome(&item.slot, outcome);
+            }
+
+            let mut st = group.mu.lock().unwrap_or_else(|e| e.into_inner());
+            if st.0.is_empty() {
+                st.1 = false;
+                leader_guard.active = false;
+                break;
+            }
+        }
+    }
+
+    let (mu, cv) = &*slot;
+    let mut ready = mu.lock().unwrap_or_else(|e| e.into_inner());
+    while ready.is_none() {
+        ready = cv.wait(ready).unwrap_or_else(|e| e.into_inner());
+    }
+    ready
+        .take()
+        .unwrap_or_else(|| Err("missing breadcrumb batch outcome".to_string()))
+}
+
+fn process_breadcrumb_batch_locked(
+    common_repo: &Path,
+    spool_path: &Path,
+    root_trail: &Path,
+    repo_sha256: [u8; 32],
+    in_sandbox: bool,
+    batch: &[PendingBreadcrumb],
+) -> Vec<Result<SignedBreadcrumbRecord, String>> {
+    let recovery = match recover_spool_frames(spool_path) {
+        Ok(r) => r,
+        Err(e) => return vec![Err(e); batch.len()],
+    };
+    let (mut seq_no, mut prev_event_mac) = match recovery.valid_records.last() {
         Some(prev) => (prev.event.seq_no.saturating_add(1), prev.record_mac),
         None => (1, [0u8; 32]),
     };
 
-    let event = AuthenticatedEvent {
-        schema_version: AUTH_EVENT_SCHEMA_V1,
-        repo_sha256,
-        plan_sha256,
-        session_id: session_id.to_string(),
-        task_id: task_id.to_string(),
-        seq_no,
-        prev_event_mac,
-        op,
-        canonical_rel_path: canonical_rel_path.to_string(),
-        line_range,
-        doc_sha256,
+    let cached_key = if !in_sandbox {
+        load_or_init_vault_hmac_key(common_repo)
+            .ok()
+            .map(crate::crypto::ZeroizingKey::new)
+    } else {
+        None
     };
-    let record_mac = compute_event_mac_for_repo(&common_repo, &event)?;
-    let signed = SignedBreadcrumbRecord { event, record_mac };
 
-    append_spool_frame_unlocked(&spool_path, &signed)?;
-    let _ = ensure_git_info_exclude(&local_root);
+    let mut signed_batch = Vec::with_capacity(batch.len());
+    for item in batch {
+        let event = AuthenticatedEvent {
+            schema_version: AUTH_EVENT_SCHEMA_V1,
+            repo_sha256,
+            plan_sha256: item.plan_sha256,
+            session_id: item.session_id.clone(),
+            task_id: item.task_id.clone(),
+            seq_no,
+            prev_event_mac,
+            op: item.op,
+            canonical_rel_path: item.canonical_rel_path.clone(),
+            line_range: item.line_range,
+            doc_sha256: item.doc_sha256,
+        };
+        let mac_res = match cached_key.as_ref() {
+            Some(zkey) => compute_event_mac(zkey, &event),
+            None => compute_event_mac_for_repo(common_repo, &event),
+        };
+        let record_mac = match mac_res {
+            Ok(m) => m,
+            Err(e) => return vec![Err(e); batch.len()],
+        };
+        seq_no = seq_no.saturating_add(1);
+        prev_event_mac = record_mac;
+        signed_batch.push(SignedBreadcrumbRecord { event, record_mac });
+    }
 
-    let trail_path = trail_path_for_rel_path(&local_root, canonical_rel_path)?;
-    if let Err(e) = flush_records_idempotent(&trail_path, std::slice::from_ref(&signed)) {
-        let root_trail = local_root.join(".breadcrumbs.jsonl");
-        if std::env::var("AGENT_GUARD_IN_SANDBOX").ok().as_deref() == Some("1")
-            && trail_path != root_trail
-        {
-            flush_records_idempotent(&root_trail, std::slice::from_ref(&signed))?;
-        } else {
-            return Err(e);
+    if let Err(e) = append_spool_frames_batch_unlocked(spool_path, &signed_batch) {
+        return vec![Err(e); batch.len()];
+    }
+
+    let mut trail_order: Vec<PathBuf> = Vec::new();
+    for item in batch {
+        if !trail_order.contains(&item.trail_path) {
+            trail_order.push(item.trail_path.clone());
+        }
+    }
+    let mut trail_errors: BTreeMap<PathBuf, String> = BTreeMap::new();
+    for tp in &trail_order {
+        let for_trail: Vec<SignedBreadcrumbRecord> = batch
+            .iter()
+            .zip(&signed_batch)
+            .filter(|(it, _)| &it.trail_path == tp)
+            .map(|(_, s)| s.clone())
+            .collect();
+        if let Err(e) = flush_records_idempotent(tp, &for_trail) {
+            if in_sandbox && tp != root_trail {
+                if let Err(re) = flush_records_idempotent(root_trail, &for_trail) {
+                    trail_errors.insert(tp.clone(), re);
+                }
+            } else {
+                trail_errors.insert(tp.clone(), e);
+            }
         }
     }
 
-    Ok(signed)
+    batch
+        .iter()
+        .zip(signed_batch)
+        .map(|(it, signed)| match trail_errors.get(&it.trail_path) {
+            Some(err) => Err(err.clone()),
+            None => Ok(signed),
+        })
+        .collect()
 }
 
 pub fn record_quorum_approval_breadcrumb(
@@ -879,21 +1105,44 @@ pub fn record_quorum_approval_breadcrumb(
         Some(prev) => (prev.event.seq_no.saturating_add(1), prev.record_mac),
         None => (1, [0u8; 32]),
     };
-    let clean_rel = target_rel_path.trim().trim_start_matches("./");
-    let doc_sha256 = if clean_rel == "*" {
-        [0u8; 32]
+    let raw_rel = target_rel_path.trim();
+    let (clean_rel, doc_sha256) = if raw_rel == "*" {
+        if cap.role != crate::swarm_contracts::SwarmRole::Master
+            && !cap.assigned_read_paths.is_empty()
+            && !cap
+                .assigned_read_paths
+                .iter()
+                .any(|p| matches!(p.trim(), "*" | "**"))
+        {
+            return Err(format!(
+                "reviewer '{reviewer_session_id}' lacks wildcard assigned_read_paths scope"
+            ));
+        }
+        ("*".to_string(), [0u8; 32])
     } else {
-        let target_full = local_root.join(clean_rel);
+        let (target_full, norm_rel) =
+            crate::stop_receipt::clean_smoke_rel_nonsymlink(&local_root, raw_rel)?;
+        if cap.role != crate::swarm_contracts::SwarmRole::Master
+            && !cap.assigned_read_paths.is_empty()
+            && !cap.assigned_read_paths.iter().any(|p| {
+                let cp = p.trim().trim_start_matches("./");
+                cp == "*" || cp == "**" || crate::path_policy::glob_match_path(cp, &norm_rel)
+            })
+        {
+            return Err(format!(
+                "quorum target '{norm_rel}' is outside reviewer '{reviewer_session_id}' assigned_read_paths"
+            ));
+        }
         let tmeta = fs::symlink_metadata(&target_full)
-            .map_err(|e| format!("quorum approval target '{clean_rel}' must exist on disk: {e}"))?;
+            .map_err(|e| format!("quorum approval target '{norm_rel}' must exist on disk: {e}"))?;
         if tmeta.file_type().is_symlink() || !tmeta.file_type().is_file() {
             return Err(format!(
-                "quorum approval target '{clean_rel}' must be a regular non-symlink file"
+                "quorum approval target '{norm_rel}' must be a regular non-symlink file"
             ));
         }
         let bytes = fs::read(&target_full)
-            .map_err(|e| format!("failed reading quorum target '{clean_rel}': {e}"))?;
-        sha256_digest(&bytes)
+            .map_err(|e| format!("failed reading quorum target '{norm_rel}': {e}"))?;
+        (norm_rel, sha256_digest(&bytes))
     };
     let event = AuthenticatedEvent {
         schema_version: AUTH_EVENT_SCHEMA_V1,
@@ -904,7 +1153,7 @@ pub fn record_quorum_approval_breadcrumb(
         seq_no,
         prev_event_mac,
         op: EventOp::ReviewApprove,
-        canonical_rel_path: clean_rel.to_string(),
+        canonical_rel_path: clean_rel.clone(),
         line_range: None,
         doc_sha256,
     };
@@ -913,7 +1162,7 @@ pub fn record_quorum_approval_breadcrumb(
     append_spool_frame_unlocked(&spool_path, &signed)?;
     let _ = ensure_git_info_exclude(&local_root);
     let root_trail = local_root.join(".breadcrumbs.jsonl");
-    let target_trail = trail_path_for_rel_path(&local_root, clean_rel)
+    let target_trail = trail_path_for_rel_path(&local_root, &clean_rel)
         .ok()
         .filter(|tp| tp.parent().is_some_and(Path::is_dir))
         .unwrap_or_else(|| root_trail.clone());
@@ -949,11 +1198,15 @@ pub fn count_verified_quorum_approvals(
     };
     let mut min_verified: Option<usize> = None;
     for target in targets {
-        let clean_t = target.trim().trim_start_matches("./");
-        let expected_doc = if clean_t == "*" {
-            [0u8; 32]
+        let raw_t = target.trim();
+        let (clean_t, expected_doc) = if raw_t == "*" {
+            ("*".to_string(), [0u8; 32])
         } else {
-            let tf = canon_repo.join(clean_t);
+            let Ok((tf, norm_t)) =
+                crate::stop_receipt::clean_smoke_rel_nonsymlink(&canon_repo, raw_t)
+            else {
+                return 0;
+            };
             let Ok(tm) = fs::symlink_metadata(&tf) else {
                 return 0;
             };
@@ -963,11 +1216,11 @@ pub fn count_verified_quorum_approvals(
             let Ok(bytes) = fs::read(&tf) else {
                 return 0;
             };
-            sha256_digest(&bytes)
+            (norm_t, sha256_digest(&bytes))
         };
         let mut trails = vec![canon_repo.join(".breadcrumbs.jsonl")];
         if clean_t != "*"
-            && let Ok(tp) = trail_path_for_rel_path(&canon_repo, clean_t)
+            && let Ok(tp) = trail_path_for_rel_path(&canon_repo, &clean_t)
             && !trails.contains(&tp)
         {
             trails.push(tp);
@@ -1010,6 +1263,17 @@ pub fn count_verified_quorum_approvals(
                     || rec.event.plan_sha256 != exp_plan
                     || rec.event.task_id != actor_cap.task_id
                     || cap.plan_sha256 != actor_cap.plan_sha256
+                {
+                    continue;
+                }
+                if cap.role != SwarmRole::Master
+                    && !cap.assigned_read_paths.is_empty()
+                    && !cap.assigned_read_paths.iter().any(|p| {
+                        let cp = p.trim().trim_start_matches("./");
+                        cp == "*"
+                            || cp == "**"
+                            || (clean_t != "*" && crate::path_policy::glob_match_path(cp, &clean_t))
+                    })
                 {
                     continue;
                 }
@@ -1084,8 +1348,96 @@ pub fn trail_path_for_rel_path(
     Ok(trail_dir.join(".breadcrumbs.jsonl"))
 }
 
+struct FifoWaiterState {
+    locked: bool,
+    next_id: u64,
+    waiters: VecDeque<u64>,
+    last_released: Option<Instant>,
+}
+
+struct FifoWaiterQueue {
+    mu: Mutex<FifoWaiterState>,
+    cv: Condvar,
+}
+
+struct InProcFifoGuard {
+    queue: Arc<FifoWaiterQueue>,
+}
+
+impl Drop for InProcFifoGuard {
+    fn drop(&mut self) {
+        let mut st = self.queue.mu.lock().unwrap_or_else(|e| e.into_inner());
+        st.locked = false;
+        st.last_released = Some(Instant::now());
+        drop(st);
+        self.queue.cv.notify_all();
+    }
+}
+
+fn in_proc_fifo_queue(lock_path: &Path) -> Arc<FifoWaiterQueue> {
+    static QUEUES: OnceLock<Mutex<BTreeMap<PathBuf, Arc<FifoWaiterQueue>>>> = OnceLock::new();
+    let map_mu = QUEUES.get_or_init(|| Mutex::new(BTreeMap::new()));
+    let mut map = map_mu.lock().unwrap_or_else(|e| e.into_inner());
+    Arc::clone(map.entry(lock_path.to_path_buf()).or_insert_with(|| {
+        Arc::new(FifoWaiterQueue {
+            mu: Mutex::new(FifoWaiterState {
+                locked: false,
+                next_id: 1,
+                waiters: VecDeque::new(),
+                last_released: None,
+            }),
+            cv: Condvar::new(),
+        })
+    }))
+}
+
+fn acquire_in_proc_fifo(
+    lock_path: &Path,
+    deadline: Instant,
+) -> Result<(InProcFifoGuard, bool), String> {
+    let queue = in_proc_fifo_queue(lock_path);
+    let mut st = queue.mu.lock().unwrap_or_else(|e| e.into_inner());
+    if !st.locked && st.waiters.is_empty() {
+        st.locked = true;
+        let hot_reacquire = st
+            .last_released
+            .is_some_and(|t| t.elapsed() < Duration::from_micros(350));
+        drop(st);
+        return Ok((InProcFifoGuard { queue }, hot_reacquire));
+    }
+
+    let my_id = st.next_id;
+    st.next_id = st.next_id.wrapping_add(1);
+    st.waiters.push_back(my_id);
+    loop {
+        if !st.locked && st.waiters.front() == Some(&my_id) {
+            st.waiters.pop_front();
+            st.locked = true;
+            drop(st);
+            return Ok((InProcFifoGuard { queue }, false));
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            st.waiters.retain(|&w| w != my_id);
+            drop(st);
+            queue.cv.notify_all();
+            return Err(format!(
+                "timed out acquiring exclusive lock '{}'",
+                lock_path.display()
+            ));
+        }
+        let rem = deadline.saturating_duration_since(now);
+        let (next_st, _) = queue
+            .cv
+            .wait_timeout(st, rem)
+            .unwrap_or_else(|e| e.into_inner());
+        st = next_st;
+    }
+}
+
 pub struct ExclusiveFileLockGuard {
     lock_path: PathBuf,
+    _in_proc: InProcFifoGuard,
 }
 
 impl ExclusiveFileLockGuard {
@@ -1100,46 +1452,98 @@ impl ExclusiveFileLockGuard {
         };
         let digest_hex = hex_encode(&sha256_digest(norm.to_string_lossy().as_bytes()));
         let lock_path = locks_dir.join(format!("{}.lock", &digest_hex[..32]));
-        for attempt in 0..300u32 {
+        let want_path = locks_dir.join(format!("{}.want", &digest_hex[..32]));
+        let started = Instant::now();
+        let deadline = started + Duration::from_secs(3);
+
+        let (in_proc, hot_reacquire) = acquire_in_proc_fifo(&lock_path, deadline)?;
+        if hot_reacquire && fs::symlink_metadata(&want_path).is_ok() {
+            // Another OS process is actively waiting on this lock: yield long enough for its
+            // sub-millisecond seniority poll to win `create_new` cleanly (preventing process hogging).
+            thread::sleep(Duration::from_millis(4));
+        }
+
+        let self_pid = std::process::id();
+        let self_proc_tok = proc_instance_token_for_pid(self_pid);
+        let mut registered_want = false;
+        loop {
             match OpenOptions::new()
                 .write(true)
                 .create_new(true)
                 .open(&lock_path)
             {
                 Ok(mut f) => {
-                    let _ = writeln!(f, "pid={}", std::process::id());
-                    return Ok(Self { lock_path });
+                    match &self_proc_tok {
+                        Some(tok) => {
+                            let _ = writeln!(f, "pid={self_pid} proc={tok}");
+                        }
+                        None => {
+                            let _ = writeln!(f, "pid={self_pid}");
+                        }
+                    }
+                    if registered_want {
+                        let _ = fs::remove_file(&want_path);
+                    }
+                    return Ok(Self {
+                        lock_path,
+                        _in_proc: in_proc,
+                    });
                 }
                 Err(e) if e.kind() == ErrorKind::AlreadyExists => {
-                    // Recover stale lock older than 30 seconds ONLY when the recorded holder PID
-                    // is no longer alive (preventing split-brain lock stealing under slow runs),
-                    // using atomic rename so concurrent waiters never delete a newly acquired lock.
+                    if !registered_want {
+                        let _ = OpenOptions::new()
+                            .create(true)
+                            .write(true)
+                            .truncate(false)
+                            .open(&want_path);
+                        registered_want = true;
+                    }
+                    let min_reclaim_age = if cfg!(target_os = "linux") {
+                        Duration::from_millis(250)
+                    } else {
+                        Duration::from_secs(30)
+                    };
                     if let Ok(meta) = fs::metadata(&lock_path)
                         && let Ok(modified) = meta.modified()
-                        && modified
-                            .elapsed()
-                            .is_ok_and(|age| age > Duration::from_secs(30))
-                        && is_lock_holder_dead(&lock_path)
+                        && let Ok(age) = modified.elapsed()
+                        && age > min_reclaim_age
+                        && is_lock_holder_dead(&lock_path, age)
                     {
-                        let reclaim_tmp = locks_dir.join(format!(
-                            ".reclaim.{}.{}",
-                            &digest_hex[..16],
-                            std::process::id()
-                        ));
+                        let reclaim_tmp =
+                            locks_dir.join(format!(".reclaim.{}.{}", &digest_hex[..16], self_pid));
                         if fs::rename(&lock_path, &reclaim_tmp).is_ok() {
                             let _ = fs::remove_file(&reclaim_tmp);
                             continue;
                         }
                     }
-                    if attempt == 299 {
+                    let now = Instant::now();
+                    if now >= deadline {
+                        if registered_want {
+                            let _ = fs::remove_file(&want_path);
+                        }
                         return Err(format!(
                             "timed out acquiring exclusive lock '{}'",
                             lock_path.display()
                         ));
                     }
-                    thread::sleep(Duration::from_millis(10));
+                    // Seniority-priority polling: longer-waiting processes poll faster than
+                    // newly arrived contenders so cross-process acquisition approximates FIFO.
+                    let waited = now.saturating_duration_since(started);
+                    let step_wait = if waited >= Duration::from_millis(120) {
+                        Duration::from_micros(80)
+                    } else if waited >= Duration::from_millis(40) {
+                        Duration::from_micros(180)
+                    } else if waited >= Duration::from_millis(12) {
+                        Duration::from_micros(450)
+                    } else {
+                        Duration::from_millis(1)
+                    };
+                    thread::sleep(step_wait.min(deadline.saturating_duration_since(now)));
                 }
                 Err(e) => {
+                    if registered_want {
+                        let _ = fs::remove_file(&want_path);
+                    }
                     return Err(format!(
                         "failed creating exclusive lock '{}': {e}",
                         lock_path.display()
@@ -1147,10 +1551,6 @@ impl ExclusiveFileLockGuard {
                 }
             }
         }
-        Err(format!(
-            "failed acquiring exclusive lock '{}'",
-            lock_path.display()
-        ))
     }
 }
 
@@ -1160,26 +1560,58 @@ impl Drop for ExclusiveFileLockGuard {
     }
 }
 
-fn is_lock_holder_dead(lock_path: &Path) -> bool {
-    let Ok(raw) = fs::read_to_string(lock_path) else {
-        return true;
-    };
-    let Some(pid_str) = raw.trim().strip_prefix("pid=") else {
-        return true;
-    };
-    let Ok(pid) = pid_str.trim().parse::<u32>() else {
-        return true;
-    };
-    if pid == 0 {
-        return true;
-    }
+fn proc_instance_token_for_pid(pid: u32) -> Option<String> {
     #[cfg(target_os = "linux")]
     {
-        !Path::new(&format!("/proc/{pid}")).exists()
+        use std::os::unix::fs::MetadataExt;
+        let proc_dir = PathBuf::from(format!("/proc/{pid}"));
+        let meta = fs::metadata(&proc_dir).ok()?;
+        let stat_raw = fs::read_to_string(proc_dir.join("stat")).ok()?;
+        let after_comm = stat_raw.rsplit_once(')')?.1;
+        // Field 3 is right after ") ", so index 19 (0-based) is field 22 (`starttime`).
+        let start_ticks = after_comm.split_whitespace().nth(19)?;
+        Some(format!("{}:{}:{}", meta.dev(), meta.ino(), start_ticks))
     }
     #[cfg(not(target_os = "linux"))]
     {
         let _ = pid;
+        None
+    }
+}
+
+fn is_lock_holder_dead(lock_path: &Path, age: Duration) -> bool {
+    let Ok(raw) = fs::read_to_string(lock_path) else {
+        return true;
+    };
+    let mut parts = raw.split_whitespace();
+    let Some(pid_kv) = parts.next() else {
+        return true;
+    };
+    let Some(pid_str) = pid_kv.strip_prefix("pid=") else {
+        return true;
+    };
+    let Ok(pid) = pid_str.parse::<u32>() else {
+        return true;
+    };
+    if pid == 0 || pid == std::process::id() {
+        // Because `acquire_in_proc_fifo` serializes all threads in `std::process::id()`,
+        // seeing our own PID in an on-disk lock file proves a dead PID-namespace/PID-reuse orphan.
+        return true;
+    }
+    let recorded_proc = parts.next().and_then(|s| s.strip_prefix("proc="));
+    #[cfg(target_os = "linux")]
+    {
+        let Some(live_tok) = proc_instance_token_for_pid(pid) else {
+            return true;
+        };
+        match recorded_proc {
+            Some(exp_tok) => exp_tok != live_tok,
+            None => age > Duration::from_secs(30),
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (recorded_proc, age);
         true
     }
 }
@@ -1436,54 +1868,70 @@ pub fn verify_breadcrumbs_file(repo_root: &Path, trail_path: &Path) -> Result<us
     Ok(count)
 }
 
-/// Uses a zero-subprocess fast path when `.git` is a regular directory and `.git/info/exclude`
-/// already lists `.breadcrumbs.jsonl`, falling back to `git rev-parse --git-path info/exclude`
-/// so linked `git worktree` repos resolve their shared gitdir exclude file properly (`F16`).
+/// Uses a zero-subprocess path when `.git` is a regular directory or standard `gitdir:` worktree
+/// pointer, falling back to ceiling-bounded `git rev-parse --git-path info/exclude` so linked
+/// `git worktree` repos resolve their shared gitdir exclude file without escaping `repo_root` (`F16`).
 pub fn ensure_git_info_exclude(repo_root: &Path) -> Result<Option<PathBuf>, String> {
     let dot_git = repo_root.join(".git");
-    if let Ok(meta) = fs::symlink_metadata(&dot_git)
-        && meta.file_type().is_dir()
-    {
+    let Ok(meta) = fs::symlink_metadata(&dot_git) else {
+        return Ok(None);
+    };
+    if meta.file_type().is_symlink() {
+        return Err(format!(
+            "refusing symlink .git entry '{}'",
+            dot_git.display()
+        ));
+    }
+
+    let exclude_path = if meta.file_type().is_dir() {
         let direct_exclude = dot_git.join("info").join("exclude");
         if let Ok(existing) = fs::read_to_string(&direct_exclude)
             && existing.lines().any(|l| l.trim() == ".breadcrumbs.jsonl")
         {
             return Ok(Some(direct_exclude));
         }
-    }
-
-    let out = Command::new("git")
-        .arg("-C")
-        .arg(repo_root)
-        .args(["rev-parse", "--git-path", "info/exclude"])
-        .output();
-
-    let exclude_path = match out {
-        Ok(o) if o.status.success() => {
-            let raw = String::from_utf8_lossy(&o.stdout).trim().to_string();
-            if raw.is_empty() {
-                return Ok(None);
+        direct_exclude
+    } else if meta.file_type().is_file() {
+        if let Some(wt_exclude) = resolve_worktree_exclude_path(repo_root, &dot_git) {
+            if let Ok(existing) = fs::read_to_string(&wt_exclude)
+                && existing.lines().any(|l| l.trim() == ".breadcrumbs.jsonl")
+            {
+                return Ok(Some(wt_exclude));
             }
-            let p = PathBuf::from(&raw);
-            if p.is_absolute() {
-                p
-            } else {
-                repo_root.join(p)
+            wt_exclude
+        } else {
+            let mut cmd = Command::new("git");
+            cmd.arg("-C")
+                .arg(repo_root)
+                .args(["rev-parse", "--git-path", "info/exclude"]);
+            if let Some(parent) = repo_root.parent() {
+                cmd.env("GIT_CEILING_DIRECTORIES", parent);
+            }
+            match cmd.output() {
+                Ok(o) if o.status.success() => {
+                    let raw = String::from_utf8_lossy(&o.stdout).trim().to_string();
+                    if raw.is_empty() {
+                        return Ok(None);
+                    }
+                    let p = PathBuf::from(&raw);
+                    if p.is_absolute() {
+                        p
+                    } else {
+                        repo_root.join(p)
+                    }
+                }
+                _ => return Ok(None),
             }
         }
-        _ => {
-            if dot_git.is_dir() {
-                dot_git.join("info").join("exclude")
-            } else {
-                return Ok(None);
-            }
-        }
+    } else {
+        return Ok(None);
     };
 
     if let Some(parent) = exclude_path.parent() {
         fs::create_dir_all(parent)
             .map_err(|e| format!("failed creating git info dir '{}': {e}", parent.display()))?;
     }
+    let _exclude_lock = ExclusiveFileLockGuard::acquire(&exclude_path)?;
     let existing = fs::read_to_string(&exclude_path).unwrap_or_default();
     if !existing.lines().any(|l| l.trim() == ".breadcrumbs.jsonl") {
         let mut f = OpenOptions::new()
@@ -1498,6 +1946,47 @@ pub fn ensure_git_info_exclude(repo_root: &Path) -> Result<Option<PathBuf>, Stri
             .map_err(|e| format!("failed writing exclude rule: {e}"))?;
     }
     Ok(Some(exclude_path))
+}
+
+fn resolve_worktree_exclude_path(repo_root: &Path, dot_git_file: &Path) -> Option<PathBuf> {
+    let raw = fs::read_to_string(dot_git_file).ok()?;
+    let gitdir_raw = raw
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("gitdir:"))?
+        .trim();
+    if gitdir_raw.is_empty() {
+        return None;
+    }
+    let gitdir = {
+        let p = PathBuf::from(gitdir_raw);
+        if p.is_absolute() {
+            p
+        } else {
+            repo_root.join(p)
+        }
+    };
+    if !gitdir.is_dir() {
+        return None;
+    }
+    let common_dir = match fs::read_to_string(gitdir.join("commondir")) {
+        Ok(cd) => {
+            let trimmed = cd.trim();
+            if trimmed.is_empty() {
+                gitdir
+            } else {
+                let cp = PathBuf::from(trimmed);
+                if cp.is_absolute() {
+                    cp
+                } else {
+                    gitdir.join(cp)
+                }
+            }
+        }
+        Err(_) => gitdir,
+    };
+    common_dir
+        .is_dir()
+        .then(|| common_dir.join("info").join("exclude"))
 }
 
 fn set_dir_0700(path: &Path) {

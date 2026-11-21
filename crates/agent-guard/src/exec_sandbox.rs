@@ -769,8 +769,28 @@ pub fn run_exec_sandbox_cli(args: &[String], default_cwd: &Path) -> ExitCode {
             .and_then(|_| fs::read(&git_cfg_path).ok())
             .map(|b| sha256_bytes(&b));
         if post_digest != Some(expected_digest) {
-            if let Some(ref orig_bytes) = pre_git_cfg_bytes {
-                let _ = restore_git_config_atomic(&git_cfg_path, orig_bytes, pre_git_cfg_mode);
+            let restored_ok = pre_git_cfg_bytes.as_deref().is_some_and(|orig_bytes| {
+                restore_git_config_atomic(&git_cfg_path, orig_bytes, pre_git_cfg_mode).is_ok()
+                    && fs::symlink_metadata(&git_cfg_path)
+                        .ok()
+                        .filter(|m| !m.file_type().is_symlink() && m.file_type().is_file())
+                        .and_then(|_| fs::read(&git_cfg_path).ok())
+                        .is_some_and(|b| sha256_bytes(&b) == expected_digest)
+            });
+            if !restored_ok {
+                let mut ledger = crate::traversal_ledger::SessionLedger::load_or_create(
+                    &common_repo,
+                    &effective_session_id,
+                );
+                ledger.trip_circuit_breaker(
+                    "GIT_CONFIG_RESTORE_FAILED: .git/config tampered and atomic restore failed"
+                        .to_string(),
+                );
+                let _ = ledger.save_locked(&common_repo);
+                eprintln!(
+                    "[AGENT-GUARD HARD DENY :: GIT_CONFIG_RESTORE_FAILED] .git/config changed during sandbox execution and atomic restore failed; session halted!"
+                );
+                return ExitCode::from(2);
             }
             eprintln!(
                 "[AGENT-GUARD HARD DENY :: GIT_CONFIG_TAMPERED] .git/config changed during sandbox execution; atomically restored!"
@@ -782,7 +802,28 @@ pub fn run_exec_sandbox_cli(args: &[String], default_cwd: &Path) -> ExitCode {
         && !pre_git_cfg_existed
         && fs::symlink_metadata(&git_cfg_path).is_ok()
     {
-        let _ = fs::remove_file(&git_cfg_path);
+        if let Ok(meta) = fs::symlink_metadata(&git_cfg_path) {
+            if meta.file_type().is_dir() && !meta.file_type().is_symlink() {
+                let _ = fs::remove_dir_all(&git_cfg_path);
+            } else {
+                let _ = fs::remove_file(&git_cfg_path);
+            }
+        }
+        if fs::symlink_metadata(&git_cfg_path).is_ok() {
+            let mut ledger = crate::traversal_ledger::SessionLedger::load_or_create(
+                &common_repo,
+                &effective_session_id,
+            );
+            ledger.trip_circuit_breaker(
+                "GIT_CONFIG_RESTORE_FAILED: unauthorized .git/config could not be removed"
+                    .to_string(),
+            );
+            let _ = ledger.save_locked(&common_repo);
+            eprintln!(
+                "[AGENT-GUARD HARD DENY :: GIT_CONFIG_RESTORE_FAILED] unauthorized .git/config created and removal failed; session halted!"
+            );
+            return ExitCode::from(2);
+        }
         eprintln!(
             "[AGENT-GUARD HARD DENY :: GIT_CONFIG_TAMPERED] unauthorized .git/config created during sandbox execution!"
         );
@@ -1210,6 +1251,24 @@ fn build_child_command(
     cmd.env("HISTFILE", "/dev/null");
     cmd.env("PAGER", "cat");
     cmd.env("GIT_PAGER", "cat");
+
+    let canon_ws = fs::canonicalize(repo_root).unwrap_or_else(|_| repo_root.to_path_buf());
+    if let Some(os_path) = env::var_os("PATH") {
+        let filtered: Vec<PathBuf> = env::split_paths(&os_path)
+            .filter(|d| {
+                !d.as_os_str().is_empty()
+                    && d.is_absolute()
+                    && !d.starts_with(repo_root)
+                    && !d.starts_with(cwd)
+                    && !fs::canonicalize(d).is_ok_and(|c| c.starts_with(&canon_ws))
+            })
+            .collect();
+        if filtered.is_empty() {
+            cmd.env("PATH", "/usr/local/bin:/usr/bin:/bin");
+        } else if let Ok(joined) = env::join_paths(filtered) {
+            cmd.env("PATH", joined);
+        }
+    }
 
     if let Some(tmp) = ephemeral_tmp {
         cmd.env("TMPDIR", tmp);

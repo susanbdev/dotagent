@@ -174,6 +174,8 @@ fn review_regressions_sshsig_app_quorum_binding_and_repo_local_bin_blocks() {
     save_session_capability(&canon, &rev).expect("save rev");
     record_quorum_approval_breadcrumb(&canon, "swm_rev1", "t1", "migrations/001.sql")
         .expect("approve");
+    assert!(record_quorum_approval_breadcrumb(&canon, "swm_rev1", "t1", "../outside.sql").is_err());
+    assert!(record_quorum_approval_breadcrumb(&canon, "swm_rev1", "t1", "AGENTS.md").is_err());
     assert_eq!(
         count_verified_quorum_approvals(&canon, "swm_grunt1", &["migrations/001.sql".into()], &[]),
         1
@@ -298,4 +300,45 @@ fn review_regressions_smoke_jsonc_committed_stub_fleet_and_plugin_evade() {
         ),
         "got {dec:?}"
     );
+
+    assert!(agent_guard::crypto::base64_decode_clean("YW=h", 64).is_err());
+    assert!(agent_guard::crypto::base64_decode_clean("Y===h", 64).is_err());
+    assert_eq!(
+        agent_guard::crypto::base64_decode_clean("YWI=", 64).expect("valid pad 1"),
+        b"ab"
+    );
+    assert!(evaluate_shell_command("'.\\sub\\dotagent' doctor", &repo, &repo, false).is_err());
+    assert!(
+        evaluate_shell_command(
+            "'.\\sub\\dotagent.exe' feedback submit",
+            &repo,
+            &repo,
+            false
+        )
+        .is_err()
+    );
+    assert!(evaluate_shell_command("PATH=. dotagent doctor", &repo, &repo, false).is_err());
+
+    let rego_conflict = "package dotagent.plugin\ndeny := true\ndeny := false\n";
+    let c_sha = sha256_hex(rego_conflict.as_bytes());
+    fs::write(repo.join("profiles/plugins/evade.rego"), rego_conflict).expect("rego conflict");
+    fs::write(
+        repo.join("profiles/coding-agent.toml"),
+        format!("profile_id = \"coding-agent\"\n[plugins]\n\"evade.rego\" = \"{c_sha}\"\n"),
+    )
+    .expect("profile conflict");
+    let c_dec = agent_guard::handle_pre_tool_hook(
+        &format!(
+            "{{\"session_id\":\"s_reg_plugin2\",\"cwd\":\"{}\",\"tool_name\":\"Read\",\"tool_input\":{{\"file_path\":\"AGENTS.md\",\"offset\":1,\"limit\":5}}}}",
+            repo.display()
+        ),
+        &repo,
+    );
+    assert!(matches!(
+        c_dec,
+        agent_guard::Decision::Deny {
+            code: "PLUGIN_EVALUATION_ERROR",
+            ..
+        }
+    ));
 }

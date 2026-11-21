@@ -85,12 +85,11 @@ impl HookSnapshot {
         let kb = |k: &str, v: bool| (k.to_string(), JsonValue::Bool(v));
         let ku = |k: &str, v: u64| (k.to_string(), JsonValue::Uint(v));
         let arr = |k: &str, xs: &[String]| {
-            let items = xs.iter().cloned().map(JsonValue::Str).collect();
-            (k.to_string(), JsonValue::Array(items))
+            (
+                k.to_string(),
+                JsonValue::Array(xs.iter().cloned().map(JsonValue::Str).collect()),
+            )
         };
-        let d60 = u64::from(self.recent_denial_count_60s);
-        let banom = u64::from(self.ballot_anomaly_count);
-        let qapp = self.active_quorum_approvals as u64;
         JsonValue::Object(vec![
             kv("phase", &self.phase),
             kv("repo_id", &self.repo_id),
@@ -102,9 +101,15 @@ impl HookSnapshot {
             arr("target_rel_paths", &self.target_rel_paths),
             kb("tainted", self.tainted),
             ku("step_count", u64::from(self.step_count)),
-            ku("recent_denial_count_60s", d60),
-            ku("ballot_anomaly_count", banom),
-            ku("active_quorum_approvals", qapp),
+            ku(
+                "recent_denial_count_60s",
+                u64::from(self.recent_denial_count_60s),
+            ),
+            ku("ballot_anomaly_count", u64::from(self.ballot_anomaly_count)),
+            ku(
+                "active_quorum_approvals",
+                self.active_quorum_approvals as u64,
+            ),
         ])
     }
 }
@@ -217,19 +222,24 @@ fn try_eval_rego(name: &str, src: &str, snap_json: &str) -> Result<Outcome, Stri
         .set_input_json(snap_json)
         .map_err(|e| format!("Rego input error: {e}"))?;
     let mut level = VerdictLevel::Allow;
-    let mut min_app = match engine.eval_rule(format!("data.{pkg}.min_approvals")) {
-        Ok(RegoValue::Number(n)) => n.as_u64().unwrap_or(2) as usize,
-        _ => 2usize,
-    }
-    .clamp(1, 16);
-    let reason = match engine.eval_rule(format!("data.{pkg}.reason")) {
-        Ok(RegoValue::String(s)) => s.as_ref().to_string(),
-        _ => format!("Rego plugin '{name}' escalated verdict."),
+    let mut eval = |r: &str| -> Result<RegoValue, String> {
+        match engine.eval_rule(format!("data.{pkg}.{r}")) {
+            Ok(v) => Ok(v),
+            Err(e) if e.to_string().contains("not a valid rule path") => Ok(RegoValue::Undefined),
+            Err(e) => Err(format!("Rego eval error on '{r}' in '{name}': {e}")),
+        }
     };
-    match engine
-        .eval_rule(format!("data.{pkg}.verdict"))
-        .map_err(|e| format!("Rego eval error in '{name}': {e}"))?
-    {
+    let mut min_app = match eval("min_approvals")? {
+        RegoValue::Number(n) => (n.as_u64().unwrap_or(2) as usize).clamp(1, 16),
+        RegoValue::Undefined => 2usize,
+        _ => return Err(format!("Non-numeric min_approvals in '{name}'.")),
+    };
+    let reason = match eval("reason")? {
+        RegoValue::String(s) => s.as_ref().to_string(),
+        RegoValue::Undefined => format!("Rego plugin '{name}' escalated verdict."),
+        _ => return Err(format!("Non-string reason in '{name}'.")),
+    };
+    match eval("verdict")? {
         RegoValue::String(s) => {
             let (lvl, opt_n) = VerdictLevel::parse_tag(s.as_ref())
                 .ok_or_else(|| format!("Invalid Rego verdict '{s}' in '{name}'."))?;
@@ -238,18 +248,19 @@ fn try_eval_rego(name: &str, src: &str, snap_json: &str) -> Result<Outcome, Stri
         RegoValue::Undefined => {}
         _ => return Err(format!("Non-string Rego verdict in '{name}'.")),
     }
-    if matches!(
-        engine.eval_rule(format!("data.{pkg}.deny")),
-        Ok(RegoValue::Bool(true))
-    ) {
-        level = level.max(VerdictLevel::Deny);
+    match eval("deny")? {
+        RegoValue::Bool(true) => level = level.max(VerdictLevel::Deny),
+        RegoValue::Set(s) if !s.is_empty() => level = level.max(VerdictLevel::Deny),
+        RegoValue::Bool(false) | RegoValue::Set(_) | RegoValue::Undefined => {}
+        _ => return Err(format!("Non-bool Rego deny in '{name}'.")),
     }
-    if let Ok(RegoValue::Number(n)) = engine.eval_rule(format!("data.{pkg}.require_quorum"))
-        && let Some(q) = n.as_u64()
-        && q > 0
+    if let RegoValue::Number(n) = eval("require_quorum")?
+        && let Some(q) = n.as_u64().filter(|&q| q > 0)
     {
-        level = level.max(VerdictLevel::RequireVoteQuorum);
-        min_app = (q as usize).clamp(1, 16);
+        (level, min_app) = (
+            level.max(VerdictLevel::RequireVoteQuorum),
+            (q as usize).clamp(1, 16),
+        );
     }
     Ok((level, min_app, Vec::new(), "PLUGIN_POLICY_DENIED", reason))
 }

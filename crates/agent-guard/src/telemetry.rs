@@ -896,26 +896,12 @@ pub fn run_operator_feedback_triage_cli(args: &[String], cwd: &Path) -> ExitCode
     };
     let read_state_file = |name: &str| -> Result<String, String> {
         let p = fdir.join(name);
-        let meta = match fs::symlink_metadata(&p) {
-            Ok(m) => m,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(String::new()),
-            Err(e) => return Err(format!("stat failed on '{name}': {e}")),
-        };
-        if meta.file_type().is_symlink() || !meta.file_type().is_file() || meta.len() > 16_777_216 {
-            return Err(format!("'{name}' is a symlink, non-regular, or >16 MiB"));
+        if let Ok(m) = fs::symlink_metadata(&p)
+            && m.len() > 16_777_216
+        {
+            return Err(format!("'{name}' exceeds 16 MiB cap"));
         }
-        let f = File::open(&p).map_err(|e| format!("open failed on '{name}': {e}"))?;
-        let fm = f
-            .metadata()
-            .map_err(|e| format!("fstat failed on '{name}': {e}"))?;
-        if !fm.is_file() || fm.len() > 16_777_216 {
-            return Err(format!("'{name}' descriptor failed regular-file check"));
-        }
-        let mut s = String::new();
-        f.take(16_777_217)
-            .read_to_string(&mut s)
-            .map_err(|e| format!("read failed on '{name}': {e}"))?;
-        Ok(s)
+        Ok(crate::traversal_ledger::read_nonsymlink_state_file(&p)?.unwrap_or_default())
     };
     let (ballots_raw, quar_raw) = match (
         read_state_file("ballots.jsonl"),

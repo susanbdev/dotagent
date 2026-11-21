@@ -318,31 +318,83 @@ fn consume_sshsig_once(pem: &str) -> Result<(), crate::sshsig_touch::GuardError>
     use crate::breadcrumbs::ExclusiveFileLockGuard;
     use crate::sshsig_touch::GuardError;
     use std::io::Write as _;
-    let digest = crate::crypto::sha256_hex(pem.trim().as_bytes());
+    let (_, rest) = pem
+        .split_once("-----BEGIN SSH SIGNATURE-----")
+        .ok_or_else(|| GuardError::new("SSHSIG_MALFORMED", "missing BEGIN SSH SIGNATURE"))?;
+    let (body_b64, _) = rest
+        .split_once("-----END SSH SIGNATURE-----")
+        .ok_or_else(|| GuardError::new("SSHSIG_MALFORMED", "missing END SSH SIGNATURE"))?;
+    let wire_bytes = crate::crypto::base64_decode_clean(body_b64, 16_384)
+        .map_err(|m| GuardError::new("SSHSIG_MALFORMED", m))?;
+    let digest = crate::crypto::sha256_hex(&wire_bytes);
     let dir = crate::feedback::feedback_state_dir().map_err(|e| GuardError::new("SSHSIG_IO", e))?;
     let _lock = ExclusiveFileLockGuard::acquire(&dir.join("consumed_sshsig.lock"))
         .map_err(|e| GuardError::new("SSHSIG_IO", e))?;
     let log_path = dir.join("consumed_sshsig.log");
-    if let Ok(m) = fs::symlink_metadata(&log_path)
-        && (m.file_type().is_symlink() || !m.file_type().is_file())
-    {
-        return Err(GuardError::new(
-            "SSHSIG_SYMLINK_TAMPER",
-            "consumed_sshsig.log is symlink or non-regular file",
-        ));
-    }
-    let existing = fs::read_to_string(&log_path).unwrap_or_default();
+    let pre_meta = match fs::symlink_metadata(&log_path) {
+        Ok(m) => {
+            if m.file_type().is_symlink() || !m.file_type().is_file() {
+                return Err(GuardError::new(
+                    "SSHSIG_SYMLINK_TAMPER",
+                    "consumed_sshsig.log is symlink or non-regular file",
+                ));
+            }
+            Some(m)
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => return Err(GuardError::new("SSHSIG_IO", e.to_string())),
+    };
+    let existing = crate::traversal_ledger::read_nonsymlink_state_file(&log_path)
+        .map_err(|e| GuardError::new("SSHSIG_SYMLINK_TAMPER", e))?
+        .unwrap_or_default();
     if existing.lines().any(|l| l.trim() == digest) {
         return Err(GuardError::new(
             "SSHSIG_REPLAY_DETECTED",
             "SSHSIG signature was already consumed",
         ));
     }
-    let mut f = fs::OpenOptions::new()
-        .create(true)
-        .append(true)
+    let mut opts = fs::OpenOptions::new();
+    opts.create(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    #[cfg(any(
+        all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ),
+        target_os = "macos"
+    ))]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.custom_flags(crate::traversal_ledger::O_NOFOLLOW_FLAG);
+    }
+    let mut f = opts
         .open(&log_path)
+        .map_err(|e| GuardError::new("SSHSIG_SYMLINK_TAMPER", e.to_string()))?;
+    let post_meta = f
+        .metadata()
         .map_err(|e| GuardError::new("SSHSIG_IO", e.to_string()))?;
+    if !post_meta.is_file() {
+        return Err(GuardError::new(
+            "SSHSIG_SYMLINK_TAMPER",
+            "consumed_sshsig.log opened non-regular file",
+        ));
+    }
+    #[cfg(unix)]
+    if let Some(pm) = pre_meta {
+        use std::os::unix::fs::MetadataExt;
+        if pm.dev() != post_meta.dev() || pm.ino() != post_meta.ino() {
+            return Err(GuardError::new(
+                "SSHSIG_SYMLINK_TAMPER",
+                "consumed_sshsig.log inode changed during open",
+            ));
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = pre_meta;
     writeln!(f, "{digest}")
         .and_then(|()| f.sync_all())
         .map_err(|e| GuardError::new("SSHSIG_IO", e.to_string()))

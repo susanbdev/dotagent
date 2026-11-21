@@ -153,13 +153,15 @@ pub fn base64_decode_clean(b64: &str, max_b64_bytes: usize) -> Result<Vec<u8>, &
     let mut out = Vec::with_capacity((clean.len() / 4) * 3);
     let (quads, _) = clean.as_chunks::<4>();
     for (idx, ch) in quads.iter().enumerate() {
-        let pad = ch.iter().rev().take_while(|&&c| c == b'=').count();
-        if pad > 2 || (pad > 0 && idx + 1 != quads.len()) || (pad == 2 && ch[2] != b'=') {
-            return Err("invalid base64 padding");
-        }
+        let pad = match (ch[0] == b'=', ch[1] == b'=', ch[2] == b'=', ch[3] == b'=') {
+            (false, false, false, false) => 0usize,
+            (false, false, false, true) if idx + 1 == quads.len() => 1usize,
+            (false, false, true, true) if idx + 1 == quads.len() => 2usize,
+            _ => return Err("invalid base64 padding"),
+        };
         let (a, b) = (val(ch[0])?, val(ch[1])?);
-        let c = if ch[2] == b'=' { 0 } else { val(ch[2])? };
-        let d = if ch[3] == b'=' { 0 } else { val(ch[3])? };
+        let c = if pad == 2 { 0 } else { val(ch[2])? };
+        let d = if pad >= 1 { 0 } else { val(ch[3])? };
         let t = (u32::from(a) << 18) | (u32::from(b) << 12) | (u32::from(c) << 6) | u32::from(d);
         out.push(((t >> 16) & 0xff) as u8);
         if pad < 2 {

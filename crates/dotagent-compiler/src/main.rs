@@ -483,44 +483,48 @@ fn validate_profiles(
     if dir_meta.file_type().is_symlink() || !dir_meta.file_type().is_dir() {
         return Err("profiles/ must be a regular non-symlink directory".to_string());
     }
-    if let Ok(entries) = fs::read_dir(&profiles_dir) {
-        for entry in entries.flatten() {
-            let p = entry.path();
-            let ft = entry
-                .file_type()
-                .map_err(|e| format!("cannot inspect '{}': {e}", p.display()))?;
-            let name = entry.file_name().to_string_lossy().into_owned();
-            if ft.is_dir() && name == "plugins" && !ft.is_symlink() {
-                if let Ok(plug_entries) = fs::read_dir(&p) {
-                    for pe in plug_entries.flatten() {
-                        let pn = pe.file_name().to_string_lossy().into_owned();
-                        let pft = pe.file_type().map_err(|e| {
-                            format!("cannot inspect '{}': {e}", pe.path().display())
-                        })?;
-                        if pft.is_symlink()
-                            || !pft.is_file()
-                            || pn.starts_with('.')
-                            || !(pn.ends_with(".rego") || pn.ends_with(".toml"))
-                        {
-                            return Err(format!(
-                                "forbidden or hidden entry 'profiles/plugins/{pn}' inside profiles/plugins/"
-                            ));
-                        }
-                    }
+    let entries = fs::read_dir(&profiles_dir)
+        .map_err(|e| format!("cannot read profiles dir '{}': {e}", profiles_dir.display()))?;
+    for entry_res in entries {
+        let entry = entry_res
+            .map_err(|e| format!("cannot read entry in '{}': {e}", profiles_dir.display()))?;
+        let p = entry.path();
+        let ft = entry
+            .file_type()
+            .map_err(|e| format!("cannot inspect '{}': {e}", p.display()))?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if ft.is_dir() && name == "plugins" && !ft.is_symlink() {
+            let plug_entries = fs::read_dir(&p)
+                .map_err(|e| format!("cannot read plugins dir '{}': {e}", p.display()))?;
+            for pe_res in plug_entries {
+                let pe =
+                    pe_res.map_err(|e| format!("cannot read entry in '{}': {e}", p.display()))?;
+                let pn = pe.file_name().to_string_lossy().into_owned();
+                let pft = pe
+                    .file_type()
+                    .map_err(|e| format!("cannot inspect '{}': {e}", pe.path().display()))?;
+                if pft.is_symlink()
+                    || !pft.is_file()
+                    || pn.starts_with('.')
+                    || !(pn.ends_with(".rego") || pn.ends_with(".toml"))
+                {
+                    return Err(format!(
+                        "forbidden or hidden entry 'profiles/plugins/{pn}' inside profiles/plugins/"
+                    ));
                 }
-                continue;
             }
-            if ft.is_symlink() || !ft.is_file() {
-                return Err(format!(
-                    "non-regular or symlinked entry '{}' inside profiles/ is forbidden",
-                    p.display()
-                ));
-            }
-            if !REQUIRED_PROFILES.contains(&name.as_str()) {
-                return Err(format!(
-                    "unexpected untracked profile 'profiles/{name}' (must be declared in REQUIRED_PROFILES)"
-                ));
-            }
+            continue;
+        }
+        if ft.is_symlink() || !ft.is_file() {
+            return Err(format!(
+                "non-regular or symlinked entry '{}' inside profiles/ is forbidden",
+                p.display()
+            ));
+        }
+        if !REQUIRED_PROFILES.contains(&name.as_str()) {
+            return Err(format!(
+                "unexpected untracked profile 'profiles/{name}' (must be declared in REQUIRED_PROFILES)"
+            ));
         }
     }
 
@@ -601,16 +605,30 @@ fn validate_profiles(
         hashes.insert(format!("profiles/{required}"), sha256_hex(text.as_bytes()));
     }
     let plug_dir = profiles_dir.join("plugins");
-    if plug_dir.is_dir()
-        && let Ok(plug_entries) = fs::read_dir(&plug_dir)
-    {
-        for pe in plug_entries.flatten() {
-            let pn = pe.file_name().to_string_lossy().into_owned();
-            if !hashes.contains_key(&format!("profiles/plugins/{pn}")) {
-                return Err(format!(
-                    "unpinned plugin 'profiles/plugins/{pn}' must be SHA-256 pinned in profiles/*.toml"
-                ));
+    match fs::symlink_metadata(&plug_dir) {
+        Ok(pm) => {
+            if pm.file_type().is_symlink() || !pm.file_type().is_dir() {
+                return Err("profiles/plugins must be a regular non-symlink directory".to_string());
             }
+            let plug_entries = fs::read_dir(&plug_dir)
+                .map_err(|e| format!("cannot read plugins dir '{}': {e}", plug_dir.display()))?;
+            for pe_res in plug_entries {
+                let pe = pe_res
+                    .map_err(|e| format!("cannot read entry in '{}': {e}", plug_dir.display()))?;
+                let pn = pe.file_name().to_string_lossy().into_owned();
+                if !hashes.contains_key(&format!("profiles/plugins/{pn}")) {
+                    return Err(format!(
+                        "unpinned plugin 'profiles/plugins/{pn}' must be SHA-256 pinned in profiles/*.toml"
+                    ));
+                }
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            return Err(format!(
+                "cannot stat plugins dir '{}': {e}",
+                plug_dir.display()
+            ));
         }
     }
     Ok((hashes, profile_irs))

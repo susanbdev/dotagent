@@ -118,30 +118,42 @@ pub fn verify_repo_smoke_gate(repo_root: &Path) -> Result<SmokeGateReport, Strin
     let (mut req_artifacts, mut exempt) = (Vec::new(), Vec::new());
     let (mut scan_facade, mut detect_wrangler, mut cfg_sha) = (true, true, "NONE".to_string());
 
-    if let Ok(meta) = fs::symlink_metadata(&cfg_path) {
-        if meta.file_type().is_symlink() || !meta.file_type().is_file() || meta.len() > 32_768 {
-            return Err("SMOKE_CONFIG_INVALID: .dotagent-smoke.toml invalid or oversized".into());
-        }
-        let raw = fs::read(&cfg_path).map_err(|e| format!("SMOKE_CONFIG_INVALID: {e}"))?;
-        if raw.iter().any(|&b| b >= 0x80 || b == 0) {
-            return Err("SMOKE_CONFIG_INVALID: .dotagent-smoke.toml non-ASCII".into());
-        }
-        cfg_sha = sha256_hex(&raw);
-        for raw_line in String::from_utf8_lossy(&raw).lines() {
-            let line = raw_line.split('#').next().unwrap_or("").trim();
-            if line.is_empty() || line.starts_with('[') {
-                continue;
+    match fs::symlink_metadata(&cfg_path) {
+        Ok(meta) => {
+            if meta.file_type().is_symlink() || !meta.file_type().is_file() || meta.len() > 32_768 {
+                return Err(
+                    "SMOKE_CONFIG_INVALID: .dotagent-smoke.toml invalid or oversized".into(),
+                );
             }
-            let (k, v) = line
-                .split_once('=')
-                .ok_or("SMOKE_CONFIG_INVALID: bad line")?;
-            match (k.trim(), v.trim()) {
-                ("required_artifacts", val) => req_artifacts = parse_str_array(val)?,
-                ("allowed_facade_globs", val) => exempt = parse_str_array(val)?,
-                ("scan_facade_tokens", val) => scan_facade = val == "true",
-                ("wrangler_auto_detect", val) => detect_wrangler = val == "true",
-                (other, _) => return Err(format!("SMOKE_CONFIG_INVALID: unknown key '{other}'")),
+            let raw = fs::read(&cfg_path).map_err(|e| format!("SMOKE_CONFIG_INVALID: {e}"))?;
+            if raw.iter().any(|&b| b >= 0x80 || b == 0) {
+                return Err("SMOKE_CONFIG_INVALID: .dotagent-smoke.toml non-ASCII".into());
             }
+            cfg_sha = sha256_hex(&raw);
+            for raw_line in String::from_utf8_lossy(&raw).lines() {
+                let line = raw_line.split('#').next().unwrap_or("").trim();
+                if line.is_empty() || line.starts_with('[') {
+                    continue;
+                }
+                let (k, v) = line
+                    .split_once('=')
+                    .ok_or("SMOKE_CONFIG_INVALID: bad line")?;
+                match (k.trim(), v.trim()) {
+                    ("required_artifacts", val) => req_artifacts = parse_str_array(val)?,
+                    ("allowed_facade_globs", val) => exempt = parse_str_array(val)?,
+                    ("scan_facade_tokens", val) => scan_facade = val == "true",
+                    ("wrangler_auto_detect", val) => detect_wrangler = val == "true",
+                    (other, _) => {
+                        return Err(format!("SMOKE_CONFIG_INVALID: unknown key '{other}'"));
+                    }
+                }
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            return Err(format!(
+                "SMOKE_CONFIG_INVALID: cannot stat .dotagent-smoke.toml: {e}"
+            ));
         }
     }
 
@@ -150,16 +162,19 @@ pub fn verify_repo_smoke_gate(repo_root: &Path) -> Result<SmokeGateReport, Strin
         verify_smoke_artifact(&canon, rel, ".dotagent-smoke.toml", &mut verified)?;
     }
 
-    if detect_wrangler && let Ok(rd) = fs::read_dir(&canon) {
-        let mut cfgs: Vec<(String, PathBuf)> = rd
-            .flatten()
-            .filter_map(|e| {
-                let n = e.file_name().to_string_lossy().into_owned();
-                let w = n.starts_with("wrangler")
-                    && (n.ends_with(".toml") || n.ends_with(".jsonc") || n.ends_with(".json"));
-                w.then(|| (n, e.path()))
-            })
-            .collect();
+    if detect_wrangler {
+        let rd = fs::read_dir(&canon)
+            .map_err(|e| format!("SMOKE_CONFIG_INVALID: cannot read repo root: {e}"))?;
+        let mut cfgs: Vec<(String, PathBuf)> = Vec::new();
+        for entry_res in rd {
+            let e = entry_res.map_err(|er| format!("SMOKE_CONFIG_INVALID: dir entry: {er}"))?;
+            let n = e.file_name().to_string_lossy().into_owned();
+            if n.starts_with("wrangler")
+                && (n.ends_with(".toml") || n.ends_with(".jsonc") || n.ends_with(".json"))
+            {
+                cfgs.push((n, e.path()));
+            }
+        }
         cfgs.sort_by(|a, b| a.0.cmp(&b.0));
         for (cfg_name, p) in cfgs {
             let m = fs::symlink_metadata(&p)
@@ -180,10 +195,10 @@ pub fn verify_repo_smoke_gate(repo_root: &Path) -> Result<SmokeGateReport, Strin
             for w in collect_wasm_refs(&text, "") {
                 verify_smoke_artifact(&canon, &w, &cfg_name, &mut verified)?;
             }
-            if let Ok(shim) = fs::read_to_string(&main_full) {
-                for w in collect_wasm_refs(&shim, &pdir) {
-                    verify_smoke_artifact(&canon, &w, &main_rel, &mut verified)?;
-                }
+            let shim = fs::read_to_string(&main_full)
+                .map_err(|e| format!("SMOKE_ARTIFACT_MISSING: cannot read '{main_rel}': {e}"))?;
+            for w in collect_wasm_refs(&shim, &pdir) {
+                verify_smoke_artifact(&canon, &w, &main_rel, &mut verified)?;
             }
         }
     }
@@ -193,12 +208,15 @@ pub fn verify_repo_smoke_gate(repo_root: &Path) -> Result<SmokeGateReport, Strin
             if !is_non_test_source(&rel, &exempt) {
                 continue;
             }
-            let Ok((full, norm)) = clean_smoke_rel_nonsymlink(&canon, &rel) else {
+            if matches!(
+                fs::symlink_metadata(canon.join(rel.trim_start_matches("./"))),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound
+            ) {
                 continue;
-            };
-            let Ok(text) = fs::read_to_string(&full) else {
-                continue;
-            };
+            }
+            let (full, norm) = clean_smoke_rel_nonsymlink(&canon, &rel)?;
+            let text = fs::read_to_string(&full)
+                .map_err(|e| format!("SMOKE_CONFIG_INVALID: cannot read '{norm}': {e}"))?;
             let stripped = strip_code_comments_preserve_lines(&text, false);
             for (idx, (raw_l, code_l)) in text.lines().zip(stripped.lines()).enumerate() {
                 let nw: String = code_l
