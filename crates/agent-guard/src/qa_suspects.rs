@@ -666,6 +666,128 @@ pub fn verify_attribution_against_plan(
     Ok(())
 }
 
+/// Enforces live-contract QA discipline before unlocking `Grunt` waves:
+/// 1. Validates `rules` against `plan` (`verify_attribution_against_plan`).
+/// 2. Scans `tests/` to reject `#[ignore]`, `test.skip(...)`, or `it.skip(...)` on attributed tests.
+/// 3. Requires every `SecurityCritical` or `StatefulCore` task in `plan` to have at least one
+///    attributed integration/boundary test (`boundary_interfaces` non-empty, `e2e`/`integration`/`live`
+///    test name, or test body located under `tests/`).
+pub fn verify_live_integration_contracts(
+    repo_root: &Path,
+    rules: &[TestAttributionRule],
+    plan: &LockedPlan,
+) -> Result<(), String> {
+    verify_attribution_against_plan(rules, plan)?;
+
+    let canon_repo = fs::canonicalize(repo_root).unwrap_or_else(|_| repo_root.to_path_buf());
+    let mut test_files = Vec::new();
+    let tests_dir = canon_repo.join("tests");
+    if let Ok(meta) = fs::symlink_metadata(&tests_dir)
+        && !meta.file_type().is_symlink()
+        && meta.file_type().is_dir()
+    {
+        collect_integration_test_sources(&tests_dir, 0, &mut test_files);
+    }
+
+    let attributed_names: BTreeSet<&str> = rules.iter().map(|r| r.test_name.as_str()).collect();
+    let mut names_found_in_tests_dir = BTreeSet::new();
+
+    for (rel_path, content) in &test_files {
+        let mut prev_ignored = false;
+        for raw_line in content.lines() {
+            let trimmed = raw_line.trim();
+            if trimmed.starts_with("#[ignore")
+                || trimmed.starts_with("@unittest.skip")
+                || trimmed.starts_with("@pytest.mark.skip")
+            {
+                prev_ignored = true;
+                continue;
+            }
+            for &tname in &attributed_names {
+                if trimmed.contains(tname) {
+                    names_found_in_tests_dir.insert(tname.to_string());
+                    let is_js_or_py_inline_skip = (trimmed.contains("test.skip(")
+                        || trimmed.contains("it.skip(")
+                        || trimmed.contains("self.skipTest(")
+                        || trimmed.contains("pytest.skip("))
+                        && trimmed.contains(tname);
+                    let is_annotated_skip = prev_ignored
+                        && (trimmed.contains(&format!("fn {tname}"))
+                            || trimmed.contains(&format!("def {tname}")));
+                    if is_js_or_py_inline_skip || is_annotated_skip {
+                        return Err(format!(
+                            "SKIPPED_ATTRIBUTED_TEST_FORBIDDEN: attributed test '{tname}' is marked ignored/skipped in '{rel_path}'"
+                        ));
+                    }
+                }
+            }
+            if !trimmed.is_empty()
+                && !trimmed.starts_with("#[")
+                && !trimmed.starts_with('@')
+                && !trimmed.starts_with("//")
+                && !trimmed.starts_with('#')
+            {
+                prev_ignored = false;
+            }
+        }
+    }
+
+    for task in &plan.tasks {
+        if !matches!(
+            task.domain_risk,
+            DomainRisk::SecurityCritical | DomainRisk::StatefulCore
+        ) {
+            continue;
+        }
+        let has_live_or_integration = rules.iter().any(|r| {
+            let covers_task = r.primary_suspect == task.task_id
+                || r.secondary_suspects.iter().any(|s| s == &task.task_id);
+            covers_task && names_found_in_tests_dir.contains(&r.test_name)
+        });
+        if !has_live_or_integration {
+            return Err(format!(
+                "MISSING_LIVE_INTEGRATION_CONTRACT: high-risk task '{}' ({:?}) has no attributed on-disk integration/e2e test in tests/",
+                task.task_id, task.domain_risk
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+fn collect_integration_test_sources(dir: &Path, depth: usize, out: &mut Vec<(String, String)>) {
+    if depth > 4 {
+        return;
+    }
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let p = entry.path();
+        let Ok(ft) = entry.file_type() else {
+            continue;
+        };
+        if ft.is_symlink() {
+            continue;
+        }
+        if ft.is_dir() {
+            collect_integration_test_sources(&p, depth + 1, out);
+        } else if ft.is_file() {
+            let ext = p
+                .extension()
+                .and_then(|e| e.to_str())
+                .unwrap_or("")
+                .to_ascii_lowercase();
+            if matches!(ext.as_str(), "toml" | "json" | "md" | "lock" | "txt") {
+                continue;
+            }
+            if let Ok(text) = fs::read_to_string(&p) {
+                out.push((p.to_string_lossy().into_owned(), text));
+            }
+        }
+    }
+}
+
 /// Deterministic fault-isolation solver (`F27`).
 pub fn triangulate_faults(
     rules: &[TestAttributionRule],

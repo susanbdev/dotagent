@@ -533,8 +533,21 @@ pub fn run_exec_sandbox_cli(args: &[String], default_cwd: &Path) -> ExitCode {
         .ok()
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty());
+    let resolved_cli_swarm_sid = if let Some(ref cli_sid) = cli_session_id {
+        if cli_sid.starts_with("swm_") {
+            Some(cli_sid.clone())
+        } else {
+            crate::role_sandbox::lookup_bound_hook_capability(&common_repo, cli_sid)
+                .ok()
+                .flatten()
+                .map(|c| c.session_id)
+        }
+    } else {
+        None
+    };
     let effective_session_id = env_session_id
         .clone()
+        .or_else(|| resolved_cli_swarm_sid.clone())
         .or_else(|| cli_session_id.clone())
         .unwrap_or_else(|| "default".to_string());
     let has_swarm_session = effective_session_id.starts_with("swm_");
@@ -621,7 +634,8 @@ pub fn run_exec_sandbox_cli(args: &[String], default_cwd: &Path) -> ExitCode {
     let tmp_dir_path = ephemeral_tmp.as_ref().map(|t| t.path.as_path());
 
     // Apply OS kernel sandbox to THIS process prior to spawning `bash` on Linux (inherited across fork/exec!).
-    let (mode, net_filter_res) = apply_current_process_sandbox(&repo_root, tmp_dir_path, opts);
+    let (mode, net_filter_res) =
+        apply_current_process_sandbox(&repo_root, tmp_dir_path, opts, &effective_session_id);
     if require_kernel && !mode.is_kernel_enforced() {
         eprintln!(
             "[AGENT-GUARD HARD DENY :: KERNEL_SANDBOX_UNAVAILABLE] Host kernel does not enforce Landlock/Seatbelt VFS containment (mode={}).",
@@ -640,10 +654,12 @@ pub fn run_exec_sandbox_cli(args: &[String], default_cwd: &Path) -> ExitCode {
 
     let mut child_cmd =
         build_child_command(&shell_script, &repo_root, &cwd, tmp_dir_path, opts, mode);
-    if env_session_id.is_none()
-        && let Some(ref sid_override) = cli_session_id
-    {
-        child_cmd.env("AGENT_GUARD_SESSION_ID", sid_override);
+    if env_session_id.is_none() {
+        if let Some(ref swm_sid) = resolved_cli_swarm_sid {
+            child_cmd.env("AGENT_GUARD_SESSION_ID", swm_sid);
+        } else if let Some(ref sid_override) = cli_session_id {
+            child_cmd.env("AGENT_GUARD_SESSION_ID", sid_override);
+        }
     }
     if let Some(tok) = minted_ipc_worker_token {
         child_cmd.env("AGENT_GUARD_IPC_WORKER_TOKEN", tok);
@@ -1321,13 +1337,14 @@ fn apply_current_process_sandbox(
     repo_root: &Path,
     ephemeral_tmp: Option<&Path>,
     opts: SandboxPolicyOpts,
+    session_hint: &str,
 ) -> (KernelSandboxMode, Result<(), String>) {
     #[cfg(target_os = "linux")]
     {
         if opts.deny_net {
             let _ = probe_linux_unshare_netns();
         }
-        let mode = apply_linux_landlock(repo_root, ephemeral_tmp, opts);
+        let mode = apply_linux_landlock(repo_root, ephemeral_tmp, opts, session_hint);
         let net_res = if opts.deny_net {
             apply_linux_seccomp_net_filter()
         } else {
@@ -1337,7 +1354,7 @@ fn apply_current_process_sandbox(
     }
     #[cfg(target_os = "macos")]
     {
-        let _ = (repo_root, ephemeral_tmp, opts);
+        let _ = (repo_root, ephemeral_tmp, opts, session_hint);
         let mode = if Path::new("/usr/bin/sandbox-exec").is_file() {
             KernelSandboxMode::MacosSeatbeltEnforced
         } else {
@@ -1347,8 +1364,101 @@ fn apply_current_process_sandbox(
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
-        let _ = (repo_root, ephemeral_tmp, opts);
+        let _ = (repo_root, ephemeral_tmp, opts, session_hint);
         (KernelSandboxMode::FallbackEnvAndAstOnly, Ok(()))
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn precreate_capability_write_targets(canon_repo: &Path, session_hint: &str) {
+    use crate::swarm_contracts::SwarmRole;
+
+    let Ok((role, Some(cap))) = crate::role_sandbox::resolve_active_role(canon_repo, session_hint)
+    else {
+        return;
+    };
+    if !matches!(role, SwarmRole::Grunt | SwarmRole::QaEngineer) {
+        return;
+    }
+
+    let mut patterns = cap.allowed_write_paths.clone();
+    if role == SwarmRole::QaEngineer {
+        patterns.extend(cap.assigned_tests.iter().cloned());
+        if patterns.is_empty() {
+            patterns.push("tests/**".to_string());
+            patterns.push("test_attribution.toml".to_string());
+        }
+    }
+
+    for raw_pat in &patterns {
+        let cleaned = raw_pat.trim().trim_start_matches("./");
+        if cleaned.is_empty()
+            || cleaned == "."
+            || cleaned == "*"
+            || cleaned == "**"
+            || cleaned.contains('\\')
+            || cleaned.contains('\0')
+        {
+            continue;
+        }
+        let segs: Vec<&str> = cleaned.split('/').filter(|s| !s.is_empty()).collect();
+        if segs.is_empty() || segs.iter().any(|&s| s == "." || s == "..") {
+            continue;
+        }
+        let first = segs[0];
+        if first == ".git"
+            || first.contains(['*', '?', '['])
+            || is_secret_or_forbidden_root_entry(first)
+            || is_immutable_control_root_entry(first)
+            || is_swarm_mutable_root_artifact(first)
+        {
+            continue;
+        }
+
+        if segs.len() == 1 {
+            if role == SwarmRole::QaEngineer && !crate::role_sandbox::is_qa_writable_path(first) {
+                continue;
+            }
+            let root_file = canon_repo.join(first);
+            if !root_file.exists() && fs::symlink_metadata(&root_file).is_err() {
+                let _ = fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&root_file);
+            }
+            continue;
+        }
+
+        let dir_segs = &segs[..segs.len() - 1];
+        let mut cur = canon_repo.to_path_buf();
+        let mut aborted = false;
+        for &dseg in dir_segs {
+            if dseg.contains(['*', '?', '['])
+                || is_secret_or_forbidden_root_entry(dseg)
+                || is_immutable_control_root_entry(dseg)
+            {
+                aborted = true;
+                break;
+            }
+            cur.push(dseg);
+            match fs::symlink_metadata(&cur) {
+                Ok(meta) => {
+                    if meta.file_type().is_symlink() || !meta.file_type().is_dir() {
+                        aborted = true;
+                        break;
+                    }
+                }
+                Err(_) => {
+                    if fs::create_dir(&cur).is_err() {
+                        aborted = true;
+                        break;
+                    }
+                }
+            }
+        }
+        if aborted {
+            continue;
+        }
     }
 }
 
@@ -1357,6 +1467,7 @@ fn apply_linux_landlock(
     repo_root: &Path,
     ephemeral_tmp: Option<&Path>,
     opts: SandboxPolicyOpts,
+    session_hint: &str,
 ) -> KernelSandboxMode {
     use landlock::{
         ABI, Access, AccessFs, AccessNet, BitFlags, CompatLevel, Compatible, Ruleset, RulesetAttr,
@@ -1522,8 +1633,8 @@ fn apply_linux_landlock(
     // 4b. Granular Swarm state access:
     //     `<swarm_state_dir>/vault` (`hmac.key`, `stop_receipt_ed25519.pub`) is UNCONDITIONALLY OMITTED (`EACCES`)!
     let canon_repo = fs::canonicalize(repo_root).unwrap_or_else(|_| repo_root.to_path_buf());
-    let has_swarm_session =
-        env::var("AGENT_GUARD_SESSION_ID").is_ok_and(|s| s.trim().starts_with("swm_"));
+    let has_swarm_session = session_hint.trim().starts_with("swm_")
+        || env::var("AGENT_GUARD_SESSION_ID").is_ok_and(|s| s.trim().starts_with("swm_"));
     if opts.invokes_swarm_tool {
         if let Ok(sdir) = crate::breadcrumbs::swarm_state_dir(&canon_repo) {
             for allowed_sub in ["ipc", "sessions", "spools", "ledger"] {
@@ -1636,6 +1747,10 @@ fn apply_linux_landlock(
     //    - `repo_root` itself gets `ReadDir` ONLY so unlisted/secret root files (`.env*`) cannot be read
     //      and immutable root control files (`AGENTS.md`) cannot be overwritten or unlinked!
     add_path(&canon_repo, dir_list_access);
+
+    if opts.writes_allowed {
+        precreate_capability_write_targets(&canon_repo, session_hint);
+    }
 
     // Pre-create `target` if writes are allowed and `Cargo.toml` exists so `cargo` can build even
     // on a fresh clean checkout where `target/` did not yet exist prior to `restrict_self()`.

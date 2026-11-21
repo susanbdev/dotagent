@@ -452,6 +452,23 @@ impl SessionLedger {
         max_file_reads: usize,
         max_turn_tokens: usize,
     ) -> Result<u8, (&'static str, String)> {
+        self.authorize_and_record_read_with_scope(
+            rel_path,
+            estimated_tokens,
+            max_file_reads,
+            max_turn_tokens,
+            false,
+        )
+    }
+
+    pub fn authorize_and_record_read_with_scope(
+        &mut self,
+        rel_path: &str,
+        estimated_tokens: usize,
+        max_file_reads: usize,
+        max_turn_tokens: usize,
+        capability_preapproved: bool,
+    ) -> Result<u8, (&'static str, String)> {
         if let Err(msg) = self.check_not_halted() {
             return Err(("SESSION_CIRCUIT_BREAKER_HALTED", msg));
         }
@@ -462,16 +479,17 @@ impl SessionLedger {
             } else {
                 MAX_REFERENCE_LEVEL
             };
-        if let Some(existing) = self.nodes.get(rel_path) {
-            if existing.level > max_ref_level {
-                return Err((
-                    "TRANSITIVE_DEPTH_EXCEEDED",
-                    format!(
-                        "Transitive reference chain '{} -> {rel_path}' reaches level {} (> max {max_ref_level} levels: A -> B allowed, B -> C forbidden). Stop immediately and ask the user.",
-                        existing.chain, existing.level
-                    ),
-                ));
-            }
+        if !capability_preapproved
+            && let Some(existing) = self.nodes.get(rel_path)
+            && existing.level > max_ref_level
+        {
+            return Err((
+                "TRANSITIVE_DEPTH_EXCEEDED",
+                format!(
+                    "Transitive reference chain '{} -> {rel_path}' reaches level {} (> max {max_ref_level} levels: A -> B allowed, B -> C forbidden). Stop immediately and ask the user.",
+                    existing.chain, existing.level
+                ),
+            ));
         }
 
         let already_read = self.nodes.get(rel_path).is_some_and(|n| n.was_read);
@@ -501,6 +519,10 @@ impl SessionLedger {
 
         let assigned_level = if let Some(node) = self.nodes.get_mut(rel_path) {
             node.was_read = true;
+            if capability_preapproved && node.level > MAX_REFERENCE_LEVEL {
+                node.level = 1;
+                node.chain = rel_path.to_string();
+            }
             node.level
         } else {
             self.nodes.insert(

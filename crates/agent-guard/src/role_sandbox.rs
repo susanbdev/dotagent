@@ -402,13 +402,19 @@ pub fn bind_hook_session_to_swarm_session(
     if hs.is_empty() || hs == "default" || hs.starts_with("swm_") {
         return Ok(());
     }
+    let cap = load_session_capability(repo_root, swarm_session_id)?;
     let path = active_session_slot_path(repo_root)?;
     for attempt in 0..8u8 {
         let guard = ExclusiveFileLockGuard::acquire(&path)?;
         let mut reg = load_registry_unlocked(repo_root, &path)?;
-        if reg.open_sessions.iter().any(|s| s == swarm_session_id)
-            && reg.hook_bindings.get(hs).map(String::as_str) != Some(swarm_session_id)
-        {
+        let is_bindable = cap.role == SwarmRole::Master
+            || reg.open_sessions.iter().any(|s| s == swarm_session_id);
+        if !is_bindable {
+            return Err(format!(
+                "SESSION_CLOSED_OR_INACTIVE: session '{swarm_session_id}' is closed or inactive; cannot bind hook session"
+            ));
+        }
+        if reg.hook_bindings.get(hs).map(String::as_str) != Some(swarm_session_id) {
             reg.hook_bindings
                 .insert(hs.to_string(), swarm_session_id.to_string());
             reg.revision = reg
@@ -429,6 +435,34 @@ pub fn bind_hook_session_to_swarm_session(
     Err("active_sessions CAS retry limit exceeded".to_string())
 }
 
+/// Resets closed `sessions/swm_*.json` records and re-signs `active_sessions.json` under the
+/// current vault HMAC key after an explicit host vault epoch rotation.
+pub fn reset_closed_sessions_for_rotated_epoch(repo_root: &Path) -> Result<(), String> {
+    let dir = sessions_dir(repo_root)?;
+    if let Ok(entries) = fs::read_dir(&dir) {
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if let Ok(meta) = fs::symlink_metadata(&p)
+                && !meta.file_type().is_symlink()
+                && meta.file_type().is_file()
+                && p.extension().is_some_and(|e| e == "json")
+                && let Some(stem) = p.file_stem().and_then(|s| s.to_str())
+                && stem.starts_with("swm_")
+            {
+                let _ = fs::remove_file(&p);
+            }
+        }
+    }
+    let slot_path = active_session_slot_path(repo_root)?;
+    let guard = ExclusiveFileLockGuard::acquire(&slot_path)?;
+    let fresh_reg = ActiveSessionRegistry {
+        revision: 1,
+        open_sessions: Vec::new(),
+        hook_bindings: BTreeMap::new(),
+    };
+    commit_registry_with_lock(repo_root, &slot_path, guard, &fresh_reg)
+}
+
 /// Loads all currently open non-Master session capabilities in deterministic registration order.
 pub fn load_open_session_capabilities(repo_root: &Path) -> Result<Vec<SessionCapability>, String> {
     let path = active_session_slot_path(repo_root)?;
@@ -441,7 +475,7 @@ pub fn load_open_session_capabilities(repo_root: &Path) -> Result<Vec<SessionCap
     Ok(out)
 }
 
-fn lookup_bound_hook_capability(
+pub fn lookup_bound_hook_capability(
     repo_root: &Path,
     hook_session_id: &str,
 ) -> Result<Option<SessionCapability>, String> {
@@ -452,10 +486,11 @@ fn lookup_bound_hook_capability(
     let path = active_session_slot_path(repo_root)?;
     let _guard = ExclusiveFileLockGuard::acquire(&path)?;
     let reg = load_registry_unlocked(repo_root, &path)?;
-    if let Some(target_sid) = reg.hook_bindings.get(hs)
-        && reg.open_sessions.iter().any(|s| s == target_sid)
-    {
-        return Ok(Some(load_session_capability(repo_root, target_sid)?));
+    if let Some(target_sid) = reg.hook_bindings.get(hs) {
+        let cap = load_session_capability(repo_root, target_sid)?;
+        if cap.role == SwarmRole::Master || reg.open_sessions.iter().any(|s| s == target_sid) {
+            return Ok(Some(cap));
+        }
     }
     Ok(None)
 }
@@ -490,6 +525,11 @@ pub fn session_capability_path(repo_root: &Path, session_id: &str) -> Result<Pat
     }
     Ok(sessions_dir(repo_root)?.join(format!("{safe}.json")))
 }
+
+/// Sentinel `plan_sha256` bound onto Phase-1 read-only `Investigator` discovery sessions
+/// minted prior to locking `PLAN.lock.json`.
+pub const DISCOVERY_PHASE_PLAN_SHA256: &str =
+    "0000000000000000000000000000000000000000000000000000000000000000";
 
 pub fn mint_session_capability(
     repo_root: &Path,
@@ -559,6 +599,97 @@ pub fn mint_session_capability(
         plan_bytes,
         EventOp::SessionMint,
         "PLAN.lock.json",
+        None,
+        plan_bytes,
+    );
+
+    Ok(cap)
+}
+
+/// Mints a Phase-1 read-only `Investigator` capability BEFORE `PLAN.lock.json` exists so
+/// `Swarm Master` can delegate codebase scouting (`scout` + `emit-fact`) without breaking
+/// its zero-source-read quarantine. Hard-enforces `allowed_write_paths = []` and `assigned_tests = []`.
+pub fn mint_discovery_investigator_capability(
+    repo_root: &Path,
+    task_id: &str,
+    attempt: u32,
+    read_scope: &[String],
+) -> Result<SessionCapability, String> {
+    let trimmed_task = task_id.trim();
+    if trimmed_task.is_empty() {
+        return Err("discovery session task_id cannot be empty".to_string());
+    }
+    let canon_repo = crate::resolve_common_repo_root(repo_root);
+    let repo_sha256 = hex_encode(&sha256_digest(canon_repo.to_string_lossy().as_bytes()));
+    let plan_sha256 = load_locked_plan(&canon_repo)
+        .map(|p| p.plan_sha256)
+        .unwrap_or_else(|_| DISCOVERY_PHASE_PLAN_SHA256.to_string());
+
+    let mut assigned_read_paths = Vec::new();
+    for raw_pat in read_scope {
+        let cleaned = raw_pat.trim().trim_start_matches("./").to_string();
+        if cleaned.is_empty() {
+            continue;
+        }
+        if cleaned != "**" && cleaned != "*" {
+            let probe = cleaned
+                .trim_end_matches("/**")
+                .trim_end_matches("/*")
+                .trim_end_matches('/');
+            if !probe.is_empty()
+                && let Err(pv) = check_forbidden_zones_lexical(probe, raw_pat)
+            {
+                return Err(format!("{}: {}", pv.code, pv.detail));
+            }
+        }
+        assigned_read_paths.push(cleaned);
+    }
+    if assigned_read_paths.is_empty() {
+        assigned_read_paths.push("**".to_string());
+    }
+
+    let seed = format!(
+        "{}:{}:investigator:discovery:{}:{}",
+        repo_sha256, plan_sha256, trimmed_task, attempt
+    );
+    let short_tag = &hex_encode(&sha256_digest(seed.as_bytes()))[..10];
+    let clean_task: String = trimmed_task
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+        .collect();
+    let session_id = format!(
+        "swm_investigator_{}_a{}_{}",
+        clean_task,
+        attempt.max(1),
+        short_tag
+    );
+
+    let cap = SessionCapability {
+        session_id: session_id.clone(),
+        role: SwarmRole::Investigator,
+        task_id: trimmed_task.to_string(),
+        attempt: attempt.max(1),
+        repo_sha256,
+        plan_sha256: plan_sha256.clone(),
+        assigned_read_paths,
+        allowed_write_paths: Vec::new(),
+        assigned_tests: Vec::new(),
+        last_green_tree_oid: None,
+        consecutive_test_failures: 0,
+        blocked_scope_attempts: 0,
+        malicious_flags: 0,
+    };
+    save_session_capability(&canon_repo, &cap)?;
+    set_active_session_slot(&canon_repo, &session_id)?;
+
+    let plan_bytes = hex_decode_32(&plan_sha256).unwrap_or([0u8; 32]);
+    let _ = append_breadcrumb_for_path(
+        &canon_repo,
+        &session_id,
+        trimmed_task,
+        plan_bytes,
+        EventOp::SessionMint,
+        "AGENTS.md",
         None,
         plan_bytes,
     );
@@ -1916,6 +2047,162 @@ fn is_grunt_path_in_read_scope(repo_rel: &str, cap: &SessionCapability) -> bool 
         || path_matches_any_scope(repo_rel, &cap.assigned_tests)
 }
 
+/// Returns `true` when `repo_rel` is explicitly pre-authorized by a verified `SessionCapability`
+/// for a compartmentalized worker (`Grunt`, `QaEngineer`, `AdversarialReviewer`, or narrowly-scoped
+/// `Investigator`), allowing the worker to read all `Master`-assigned task files without false
+/// `A -> B -> C` backtick hop denials between assigned files.
+pub fn is_capability_preapproved_read_path(
+    role: SwarmRole,
+    cap: Option<&SessionCapability>,
+    repo_rel: &str,
+) -> bool {
+    let Some(c) = cap else {
+        return false;
+    };
+    match role {
+        SwarmRole::Grunt => is_grunt_path_in_read_scope(repo_rel, c),
+        SwarmRole::QaEngineer => {
+            is_qa_writable_path(repo_rel)
+                || path_matches_any_scope(repo_rel, &c.assigned_read_paths)
+                || path_matches_any_scope(repo_rel, &c.assigned_tests)
+        }
+        SwarmRole::AdversarialReviewer => {
+            path_matches_any_scope(repo_rel, &c.assigned_read_paths)
+                || path_matches_any_scope(repo_rel, &c.allowed_write_paths)
+                || path_matches_any_scope(repo_rel, &c.assigned_tests)
+        }
+        SwarmRole::Investigator => {
+            !c.assigned_read_paths.is_empty()
+                && c.assigned_read_paths.iter().all(|p| p != "**" && p != "*")
+                && path_matches_any_scope(repo_rel, &c.assigned_read_paths)
+        }
+        SwarmRole::Master | SwarmRole::ForensicCoroner | SwarmRole::StandardCoding => false,
+    }
+}
+
+/// Inspects an incoming `PreToolUse` shell invocation when the harness could not pass OS
+/// `AGENT_GUARD_SESSION_ID` env vars to a subagent: if the tool call is a single unchained
+/// `swarm-tool <ns> ... --session <swm_id>` (or `--master-session` / `--coroner-session` / `attach <swm_id>`),
+/// cryptographically verifies `<swm_id>`, checks `<ns>` role parity, and binds `hook_session_id -> <swm_id>`
+/// in `active_sessions.json` so concurrent parallel subagents never collide on `AMBIGUOUS_CONCURRENT_SWARM_SESSIONS`.
+pub fn try_auto_bind_hook_from_swarm_tool_call(
+    repo_root: &Path,
+    hook_session_id: &str,
+    tool_name: &str,
+    input: &JsonValue,
+) -> Result<Option<SessionCapability>, String> {
+    let hs = hook_session_id.trim();
+    if hs.is_empty() || hs == "default" || hs.starts_with("swm_") {
+        return Ok(None);
+    }
+    let norm = tool_name.to_ascii_lowercase();
+    let is_shell = matches!(
+        norm.as_str(),
+        "bash"
+            | "sh"
+            | "shell"
+            | "run_command"
+            | "run_shell_command"
+            | "execute_command"
+            | "beforeshellexecution"
+    ) || (norm.is_empty()
+        && (input.get("command").is_some() || input.get("CommandLine").is_some()));
+    if !is_shell {
+        return Ok(None);
+    }
+    let Some(cmd) = extract_cmd_arg(input) else {
+        return Ok(None);
+    };
+    let Some(tokens) = tokenize_unchained_shell_words(cmd.trim()) else {
+        return Ok(None);
+    };
+    let Some((ns, sub_tokens)) = extract_swarm_tool_ns_and_args(&tokens) else {
+        return Ok(None);
+    };
+    let expected_role = match ns {
+        "master" => SwarmRole::Master,
+        "investigator" => SwarmRole::Investigator,
+        "qa" => SwarmRole::QaEngineer,
+        "grunt" => SwarmRole::Grunt,
+        "reviewer" => SwarmRole::AdversarialReviewer,
+        "coroner" => SwarmRole::ForensicCoroner,
+        _ => return Ok(None),
+    };
+
+    let mut candidate_sid: Option<&str> = None;
+    let mut i = 0usize;
+    while i < sub_tokens.len() {
+        let tok = sub_tokens[i].as_str();
+        if matches!(tok, "--session" | "--master-session" | "--coroner-session") {
+            if let Some(val) = sub_tokens.get(i + 1) {
+                candidate_sid = Some(val.as_str());
+                break;
+            }
+        } else if let Some(val) = tok
+            .strip_prefix("--session=")
+            .or_else(|| tok.strip_prefix("--master-session="))
+            .or_else(|| tok.strip_prefix("--coroner-session="))
+        {
+            candidate_sid = Some(val);
+            break;
+        }
+        i += 1;
+    }
+    if candidate_sid.is_none()
+        && sub_tokens.first().is_some_and(|s| s == "attach")
+        && let Some(pos_sid) = sub_tokens.get(1).filter(|s| s.starts_with("swm_"))
+    {
+        candidate_sid = Some(pos_sid.as_str());
+    }
+
+    let Some(raw_sid) = candidate_sid.map(str::trim).filter(|s| !s.is_empty()) else {
+        return Ok(None);
+    };
+    let cap = load_session_capability(repo_root, raw_sid)?;
+    if cap.role != expected_role {
+        return Err(format!(
+            "ROLE_CAPABILITY_MISMATCH: session '{}' has role '{}', cannot bind via 'swarm-tool {ns}'",
+            cap.session_id,
+            cap.role.as_str_id()
+        ));
+    }
+    bind_hook_session_to_swarm_session(repo_root, hs, &cap.session_id)?;
+    Ok(Some(cap))
+}
+
+fn extract_swarm_tool_ns_and_args(tokens: &[String]) -> Option<(&str, &[String])> {
+    let first = tokens.first()?.as_str();
+    let base = first.rsplit('/').next().unwrap_or(first);
+    if base == "swarm-tool" {
+        let ns = tokens.get(1)?.as_str();
+        return Some((ns, tokens.get(2..).unwrap_or(&[])));
+    }
+    if matches!(base, "dotagent" | "agent-guard") {
+        if tokens.get(1).map(String::as_str) == Some("swarm") {
+            let ns = tokens.get(2)?.as_str();
+            return Some((ns, tokens.get(3..).unwrap_or(&[])));
+        }
+        if tokens.get(1).map(String::as_str) == Some("guard")
+            && tokens.get(2).map(String::as_str) == Some("swarm")
+        {
+            let ns = tokens.get(3)?.as_str();
+            return Some((ns, tokens.get(4..).unwrap_or(&[])));
+        }
+    }
+    if base == "cargo"
+        && tokens.get(1).map(String::as_str) == Some("run")
+        && ((tokens.get(2).map(String::as_str) == Some("-p")
+            && tokens.get(3).map(String::as_str) == Some("swarm-tools"))
+            || (tokens.get(2).map(String::as_str) == Some("--bin")
+                && tokens.get(3).map(String::as_str) == Some("swarm-tool")))
+        && tokens.get(4).map(String::as_str) == Some("--")
+    {
+        let ns = tokens.get(5)?.as_str();
+        return Some((ns, tokens.get(6..).unwrap_or(&[])));
+    }
+    None
+}
+
 pub fn path_matches_any_scope(repo_rel: &str, patterns: &[String]) -> bool {
     if patterns.is_empty() {
         return false;
@@ -2056,7 +2343,7 @@ fn is_allowed_investigator_shell(cmd: &str) -> bool {
         return tokens.get(1).is_some_and(|sub| sub == "investigator")
             && tokens
                 .get(2)
-                .is_some_and(|op| matches!(op.as_str(), "scout" | "emit-fact"));
+                .is_some_and(|op| matches!(op.as_str(), "scout" | "emit-fact" | "attach"));
     }
     if tokens.len() >= 7
         && tokens[0] == "cargo"
@@ -2065,24 +2352,28 @@ fn is_allowed_investigator_shell(cmd: &str) -> bool {
             || (tokens[2] == "--bin" && tokens[3] == "swarm-tool"))
         && tokens[4] == "--"
         && tokens[5] == "investigator"
-        && matches!(tokens[6].as_str(), "scout" | "emit-fact")
+        && matches!(tokens[6].as_str(), "scout" | "emit-fact" | "attach")
     {
         return true;
     }
     if matches!(first_base, "agent-guard" | "dotagent") {
+        if tokens.get(1).is_some_and(|sub| sub == "swarm")
+            && tokens.get(2).is_some_and(|ns| ns == "investigator")
+            && tokens
+                .get(3)
+                .is_some_and(|op| matches!(op.as_str(), "scout" | "emit-fact" | "attach"))
+        {
+            return true;
+        }
         return tokens.get(1).is_some_and(|sub| sub == "read-safe") && tokens.len() >= 3;
     }
-    if tokens.len() >= 7
+    tokens.len() >= 7
         && tokens[0] == "cargo"
         && tokens[1] == "run"
         && ((tokens[2] == "-p" && tokens[3] == "agent-guard")
             || (tokens[2] == "--bin" && matches!(tokens[3].as_str(), "agent-guard" | "dotagent")))
         && tokens[4] == "--"
         && tokens[5] == "read-safe"
-    {
-        return true;
-    }
-    false
 }
 
 fn strip_shell_quotes_and_escapes(s: &str) -> String {

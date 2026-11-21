@@ -22,15 +22,16 @@ use agent_guard::path_policy::{PathAccess, validate_path};
 use agent_guard::qa_suspects::{
     compute_task_coverage_targets, load_locked_plan, parse_and_validate_dag_json,
     parse_attribution_toml, plan_lock_state_path, save_locked_plan, triangulate_faults,
-    verify_attribution_against_plan,
+    verify_attribution_against_plan, verify_live_integration_contracts,
 };
 use agent_guard::resolve_repo_root;
 use agent_guard::role_sandbox::{
-    check_role_shell_read_scope, check_role_shell_write_scope, clear_active_session_slot,
-    close_open_session, evaluate_reviewer_verdict, list_session_capabilities,
-    load_active_session_slot, load_open_session_capabilities, load_session_capability,
-    lookup_pinned_package_doc, mint_session_capability, parse_and_validate_worker_packet,
-    path_matches_any_scope, scout_repo_signatures,
+    bind_hook_session_to_swarm_session, check_role_shell_read_scope, check_role_shell_write_scope,
+    clear_active_session_slot, close_open_session, evaluate_reviewer_verdict,
+    list_session_capabilities, load_active_session_slot, load_open_session_capabilities,
+    load_session_capability, lookup_pinned_package_doc, mint_discovery_investigator_capability,
+    mint_session_capability, parse_and_validate_worker_packet, path_matches_any_scope,
+    reset_closed_sessions_for_rotated_epoch, scout_repo_signatures,
 };
 use agent_guard::swarm_contracts::{
     EventOp, ReviewVerdictOutcome, SessionCapability, SuspectVerdict, SwarmRole, WorkerPacket,
@@ -38,7 +39,7 @@ use agent_guard::swarm_contracts::{
 };
 use agent_guard::work_ledger::{
     classify_session_smells, compute_scoped_tree_oid, load_work_ledger_entries,
-    record_test_checkpoint, submit_work_ledger_entry,
+    record_test_checkpoint, submit_work_ledger_entry_with_opts,
 };
 
 fn main() -> ExitCode {
@@ -225,15 +226,29 @@ fn enforce_ambient_role_namespace(
     if let Ok(env_sid) = std::env::var("AGENT_GUARD_SESSION_ID") {
         let sid = env_sid.trim();
         if !sid.is_empty() {
-            let cap = load_session_capability(repo_root, sid)?;
-            if cap.role != expected_role {
-                return Err(format!(
-                    "ROLE_CAPABILITY_MISMATCH: active session '{}' has role '{}', cannot invoke 'swarm-tool {role_ns}'",
-                    cap.session_id,
-                    cap.role.as_str_id()
-                ));
+            if sid.starts_with("swm_") {
+                let cap = load_session_capability(repo_root, sid)?;
+                if cap.role != expected_role {
+                    return Err(format!(
+                        "ROLE_CAPABILITY_MISMATCH: active session '{}' has role '{}', cannot invoke 'swarm-tool {role_ns}'",
+                        cap.session_id,
+                        cap.role.as_str_id()
+                    ));
+                }
+                env_cap = Some(cap);
+            } else if let Some(cap) =
+                agent_guard::role_sandbox::lookup_bound_hook_capability(repo_root, sid)?
+            {
+                if cap.role != expected_role {
+                    return Err(format!(
+                        "ROLE_CAPABILITY_MISMATCH: bound hook session '{}' maps to '{}' with role '{}', cannot invoke 'swarm-tool {role_ns}'",
+                        sid,
+                        cap.session_id,
+                        cap.role.as_str_id()
+                    ));
+                }
+                env_cap = Some(cap);
             }
-            env_cap = Some(cap);
         }
     }
 
@@ -244,7 +259,16 @@ fn enforce_ambient_role_namespace(
                     .to_string(),
             );
         }
-        let master_flag_cap = flag_val(sub_args, "--master-session")
+        let is_master_attach = sub_args.first().is_some_and(|s| s == "attach");
+        let master_flag_sid = flag_val(sub_args, "--master-session").or_else(|| {
+            if is_master_attach {
+                flag_val(sub_args, "--session")
+                    .or_else(|| sub_args.get(1).filter(|s| s.starts_with("swm_")).cloned())
+            } else {
+                None
+            }
+        });
+        let master_flag_cap = master_flag_sid
             .map(|sid| load_capability_for_role(repo_root, &sid, SwarmRole::Master, "master"))
             .transpose()?;
         let has_signed_master_cap = env_cap.is_some() || master_flag_cap.is_some();
@@ -299,7 +323,14 @@ fn load_capability_for_role(
     expected_role: SwarmRole,
     role_ns: &str,
 ) -> Result<SessionCapability, String> {
-    let cap = load_session_capability(repo_root, session_id)?;
+    let cap = if !session_id.starts_with("swm_")
+        && let Some(bound) =
+            agent_guard::role_sandbox::lookup_bound_hook_capability(repo_root, session_id)?
+    {
+        bound
+    } else {
+        load_session_capability(repo_root, session_id)?
+    };
     if cap.role != expected_role {
         return Err(format!(
             "ROLE_CAPABILITY_MISMATCH: session '{}' has role '{}', cannot invoke 'swarm-tool {role_ns}'",
@@ -317,6 +348,21 @@ fn load_capability_for_role(
         }
     }
     Ok(cap)
+}
+
+fn resolve_env_swarm_or_bound_sid(repo_root: &Path) -> Option<String> {
+    let raw = std::env::var("AGENT_GUARD_SESSION_ID").ok()?;
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if trimmed.starts_with("swm_") {
+        return Some(trimmed.to_string());
+    }
+    agent_guard::role_sandbox::lookup_bound_hook_capability(repo_root, trimmed)
+        .ok()
+        .flatten()
+        .map(|c| c.session_id)
 }
 
 fn resolve_worker_capability(
@@ -337,11 +383,19 @@ fn resolve_worker_capability(
                     None
                 }
             })
-            .or_else(|| std::env::var("AGENT_GUARD_SESSION_ID").ok())
+            .or_else(|| resolve_env_swarm_or_bound_sid(repo_root))
             .filter(|s| !s.trim().is_empty())
     } else {
+        let is_attach = args.first().is_some_and(|s| s == "attach");
         flag_val(args, "--session")
-            .or_else(|| std::env::var("AGENT_GUARD_SESSION_ID").ok())
+            .or_else(|| {
+                if is_attach {
+                    args.get(1).filter(|s| s.starts_with("swm_")).cloned()
+                } else {
+                    None
+                }
+            })
+            .or_else(|| resolve_env_swarm_or_bound_sid(repo_root))
             .filter(|s| !s.trim().is_empty())
     };
 
@@ -475,12 +529,23 @@ fn run_master(repo_root: &Path, cwd: &Path, args: &[String]) -> Result<(), Strin
                 );
             }
             let explicit_rotate = args.iter().any(|a| a == "--rotate-epoch");
-            let fresh_plan = load_locked_plan(repo_root).is_err()
-                && load_open_session_capabilities(repo_root)
-                    .map(|caps| caps.is_empty())
-                    .unwrap_or(true);
+            let open_caps = load_open_session_capabilities(repo_root).unwrap_or_default();
+            if explicit_rotate && !open_caps.is_empty() {
+                return Err(
+                    "EPOCH_ROTATE_OPEN_SESSIONS: close all open worker sessions before rotating vault HMAC epoch"
+                        .to_string(),
+                );
+            }
+            let has_any_prior_caps = list_session_capabilities(repo_root)
+                .map(|caps| !caps.is_empty())
+                .unwrap_or(false);
+            let fresh_plan =
+                load_locked_plan(repo_root).is_err() && open_caps.is_empty() && !has_any_prior_caps;
             if explicit_rotate || (!allow_amend && fresh_plan) {
                 let _ = agent_guard::coordinator::rotate_vault_hmac_epoch(repo_root)?;
+                if explicit_rotate {
+                    reset_closed_sessions_for_rotated_epoch(repo_root)?;
+                }
             }
             let saved_path = save_locked_plan(repo_root, &plan, allow_amend)?;
             let out = JsonValue::Object(vec![
@@ -507,17 +572,47 @@ fn run_master(repo_root: &Path, cwd: &Path, args: &[String]) -> Result<(), Strin
                 .ok_or_else(|| "missing --role <master|investigator|qa-engineer|grunt|adversarial-reviewer|forensic-coroner>".to_string())?;
             let role = SwarmRole::from_str_id(&role_str)
                 .ok_or_else(|| format!("invalid role '{role_str}'"))?;
-            let task_id =
-                flag_val(args, "--task").ok_or_else(|| "missing --task <task_id>".to_string())?;
+            let is_discovery = args.iter().any(|a| a == "--discovery")
+                || flag_val(args, "--phase")
+                    .is_some_and(|p| p.eq_ignore_ascii_case("discovery"));
             let attempt = flag_val(args, "--attempt")
                 .and_then(|s| s.parse::<u32>().ok())
                 .unwrap_or(1);
 
-            let cap = mint_session_capability(repo_root, role, &task_id, attempt)?;
+            let cap = if is_discovery {
+                if role != SwarmRole::Investigator {
+                    return Err(format!(
+                        "DISCOVERY_ROLE_FORBIDDEN: --phase discovery is restricted strictly to read-only 'investigator' scouts (got '{}')",
+                        role.as_str_id()
+                    ));
+                }
+                let task_id = flag_val(args, "--task").unwrap_or_else(|| "DISCOVERY".to_string());
+                let mut scopes = flag_vals_multi(args, "--scope");
+                let mut flat_scopes = Vec::new();
+                for s in scopes.drain(..) {
+                    flat_scopes.extend(split_csv(&s));
+                }
+                mint_discovery_investigator_capability(repo_root, &task_id, attempt, &flat_scopes)?
+            } else {
+                let task_id = flag_val(args, "--task")
+                    .ok_or_else(|| "missing --task <task_id>".to_string())?;
+                mint_session_capability(repo_root, role, &task_id, attempt)?
+            };
             let out = JsonValue::Object(vec![
                 (
                     "status".to_string(),
                     JsonValue::Str("SESSION_MINTED".to_string()),
+                ),
+                (
+                    "phase".to_string(),
+                    JsonValue::Str(
+                        if is_discovery {
+                            "discovery"
+                        } else {
+                            "execution"
+                        }
+                        .to_string(),
+                    ),
                 ),
                 (
                     "session_id".to_string(),
@@ -558,6 +653,19 @@ fn run_master(repo_root: &Path, cwd: &Path, args: &[String]) -> Result<(), Strin
             ]);
             println!("{}", out.to_json_string());
             Ok(())
+        }
+        "attach" => {
+            let sid = flag_val(args, "--master-session")
+                .or_else(|| flag_val(args, "--session"))
+                .or_else(|| args.get(1).filter(|s| s.starts_with("swm_")).cloned())
+                .or_else(|| std::env::var("AGENT_GUARD_SESSION_ID").ok())
+                .filter(|s| !s.trim().is_empty())
+                .ok_or_else(|| {
+                    "usage: swarm-tool master attach --session <swm_master_id> [--hook-session <uuid>]"
+                        .to_string()
+                })?;
+            let cap = load_capability_for_role(repo_root, sid.trim(), SwarmRole::Master, "master")?;
+            emit_attach_session_response(repo_root, &cap, args)
         }
         "ingest-packet" => {
             let arg = args.get(1).ok_or_else(|| {
@@ -682,10 +790,50 @@ fn run_master(repo_root: &Path, cwd: &Path, args: &[String]) -> Result<(), Strin
     }
 }
 
+fn emit_attach_session_response(
+    repo_root: &Path,
+    cap: &SessionCapability,
+    args: &[String],
+) -> Result<(), String> {
+    if let Some(hook_sid) = flag_val(args, "--hook-session")
+        .or_else(|| std::env::var("AGENT_GUARD_HOOK_SESSION_ID").ok())
+        .or_else(|| {
+            std::env::var("AGENT_GUARD_SESSION_ID")
+                .ok()
+                .filter(|s| !s.trim().is_empty() && !s.trim().starts_with("swm_"))
+        })
+        .filter(|s| !s.trim().is_empty())
+    {
+        bind_hook_session_to_swarm_session(repo_root, hook_sid.trim(), &cap.session_id)?;
+    }
+    let out = JsonValue::Object(vec![
+        (
+            "status".to_string(),
+            JsonValue::Str("SESSION_ATTACHED".to_string()),
+        ),
+        (
+            "session_id".to_string(),
+            JsonValue::Str(cap.session_id.clone()),
+        ),
+        (
+            "role".to_string(),
+            JsonValue::Str(cap.role.as_str_id().to_string()),
+        ),
+        ("task_id".to_string(), JsonValue::Str(cap.task_id.clone())),
+        (
+            "attempt".to_string(),
+            JsonValue::Number(f64::from(cap.attempt)),
+        ),
+    ]);
+    println!("{}", out.to_json_string());
+    Ok(())
+}
+
 fn run_investigator(repo_root: &Path, args: &[String]) -> Result<(), String> {
     let cap = resolve_worker_capability(repo_root, args, SwarmRole::Investigator, "investigator")?;
     let sub = args.first().map(String::as_str).unwrap_or("--help");
     match sub {
+        "attach" => emit_attach_session_response(repo_root, &cap, args),
         "scout" => {
             let dir = flag_val(args, "--dir").unwrap_or_else(|| ".".to_string());
             let depth = flag_val(args, "--max-depth")
@@ -748,14 +896,15 @@ fn run_investigator(repo_root: &Path, args: &[String]) -> Result<(), String> {
             println!("{serialized}");
             Ok(())
         }
-        _ => Err("usage: swarm-tool investigator <scout|emit-fact> ...".to_string()),
+        _ => Err("usage: swarm-tool investigator <attach|scout|emit-fact> ...".to_string()),
     }
 }
 
 fn run_qa(repo_root: &Path, cwd: &Path, args: &[String]) -> Result<(), String> {
-    let _cap = resolve_worker_capability(repo_root, args, SwarmRole::QaEngineer, "qa")?;
+    let cap = resolve_worker_capability(repo_root, args, SwarmRole::QaEngineer, "qa")?;
     let sub = args.first().map(String::as_str).unwrap_or("--help");
     match sub {
+        "attach" => emit_attach_session_response(repo_root, &cap, args),
         "coverage-targets" => {
             let plan = if let Some(plan_arg) = flag_val(args, "--plan") {
                 let valid = validate_path(repo_root, cwd, &plan_arg, PathAccess::Read)
@@ -793,7 +942,7 @@ fn run_qa(repo_root: &Path, cwd: &Path, args: &[String]) -> Result<(), String> {
         "verify-attribution" => {
             let attr_arg = args
                 .get(1)
-                .ok_or_else(|| "usage: swarm-tool qa verify-attribution <test_attribution.toml> [--plan <dag.json>]".to_string())?;
+                .ok_or_else(|| "usage: swarm-tool qa verify-attribution <test_attribution.toml> [--plan <dag.json>] [--require-live-contracts]".to_string())?;
             let valid = validate_path(repo_root, cwd, attr_arg, PathAccess::Read)
                 .map_err(|pv| format!("{}: {}", pv.code, pv.detail))?;
             let raw = fs::read_to_string(&valid.canonical_or_norm).map_err(|e| e.to_string())?;
@@ -806,7 +955,12 @@ fn run_qa(repo_root: &Path, cwd: &Path, args: &[String]) -> Result<(), String> {
             } else {
                 load_locked_plan(repo_root)?
             };
-            verify_attribution_against_plan(&rules, &plan)?;
+            let require_live = args.iter().any(|a| a == "--require-live-contracts");
+            if require_live {
+                verify_live_integration_contracts(repo_root, &rules, &plan)?;
+            } else {
+                verify_attribution_against_plan(&rules, &plan)?;
+            }
             println!(
                 "{}",
                 JsonValue::Object(vec![
@@ -817,6 +971,10 @@ fn run_qa(repo_root: &Path, cwd: &Path, args: &[String]) -> Result<(), String> {
                     (
                         "rule_count".to_string(),
                         JsonValue::Number(rules.len() as f64)
+                    ),
+                    (
+                        "live_contracts_verified".to_string(),
+                        JsonValue::Bool(require_live)
                     ),
                 ])
                 .to_json_string()
@@ -1394,6 +1552,7 @@ fn run_grunt(repo_root: &Path, cwd: &Path, args: &[String]) -> Result<(), String
     let sub = args.first().map(String::as_str).unwrap_or("--help");
 
     match sub {
+        "attach" => emit_attach_session_response(repo_root, &cap, args),
         "context" => {
             let out = JsonValue::Object(vec![
                 ("session_id".to_string(), JsonValue::Str(cap.session_id)),
@@ -1541,7 +1700,9 @@ fn run_grunt(repo_root: &Path, cwd: &Path, args: &[String]) -> Result<(), String
                 .ok_or_else(|| "missing --what \"<2 ASCII sentences>\"".to_string())?;
             let why = flag_val(args, "--why")
                 .ok_or_else(|| "missing --why \"<2 ASCII sentences>\"".to_string())?;
-            let entry = submit_work_ledger_entry(repo_root, &sid, &what, &why)?;
+            let reject_stubs = args.iter().any(|a| a == "--reject-stubs");
+            let entry =
+                submit_work_ledger_entry_with_opts(repo_root, &sid, &what, &why, reject_stubs)?;
             println!("{}", entry.to_json_value().to_json_string());
             Ok(())
         }
@@ -1565,7 +1726,7 @@ fn run_grunt(repo_root: &Path, cwd: &Path, args: &[String]) -> Result<(), String
             Ok(())
         }
         _ => Err(
-            "usage: swarm-tool grunt <context|record-edit|checkpoint-green|submit-ledger|report-blocker> ...".to_string(),
+            "usage: swarm-tool grunt <attach|context|record-edit|checkpoint-green|submit-ledger|report-blocker> ...".to_string(),
         ),
     }
 }
@@ -1649,6 +1810,16 @@ fn record_and_evaluate_reviewer_verdict(
             return Err(format!(
                 "STALE_WORK_LEDGER_TREE_OID: workspace tree '{current_oid}' drifted from green WORK_LEDGER.jsonl tree '{}' for task '{task_id}'",
                 matching_entry.git_tree_oid
+            ));
+        }
+        if let Some(stub_badge) = matching_entry
+            .smell_badges
+            .iter()
+            .find(|b| b.signal.starts_with("hollow_stub:"))
+        {
+            return Err(format!(
+                "REVIEWER_APPROVAL_BLOCKED_BY_HOLLOW_STUB: cannot approve task '{task_id}' attempt {attempt} while production stub smell '{}' is present",
+                stub_badge.signal
             ));
         }
     }
@@ -1783,6 +1954,7 @@ fn run_reviewer(repo_root: &Path, args: &[String]) -> Result<(), String> {
         resolve_worker_capability(repo_root, args, SwarmRole::AdversarialReviewer, "reviewer")?;
     let sub = args.first().map(String::as_str).unwrap_or("--help");
     match sub {
+        "attach" => emit_attach_session_response(repo_root, &cap, args),
         "inspect" => {
             let task_id =
                 flag_val(args, "--task").ok_or_else(|| "missing --task <task_id>".to_string())?;
@@ -1886,14 +2058,15 @@ fn run_reviewer(repo_root: &Path, args: &[String]) -> Result<(), String> {
             println!("{}", out.to_json_string());
             Ok(())
         }
-        _ => Err("usage: swarm-tool reviewer <inspect|lookup-doc|verdict> ...".to_string()),
+        _ => Err("usage: swarm-tool reviewer <attach|inspect|lookup-doc|verdict> ...".to_string()),
     }
 }
 
 fn run_coroner(repo_root: &Path, cwd: &Path, args: &[String]) -> Result<(), String> {
-    let _cap = resolve_worker_capability(repo_root, args, SwarmRole::ForensicCoroner, "coroner")?;
+    let cap = resolve_worker_capability(repo_root, args, SwarmRole::ForensicCoroner, "coroner")?;
     let sub = args.first().map(String::as_str).unwrap_or("--help");
     match sub {
+        "attach" => emit_attach_session_response(repo_root, &cap, args),
         "verify-trail" => {
             let raw_p = args.get(1).ok_or_else(|| {
                 "usage: swarm-tool coroner verify-trail <breadcrumbs.jsonl>".to_string()
@@ -1988,7 +2161,9 @@ fn run_coroner(repo_root: &Path, cwd: &Path, args: &[String]) -> Result<(), Stri
             );
             Ok(())
         }
-        _ => Err("usage: swarm-tool coroner <verify-trail|recover-spool|triage> ...".to_string()),
+        _ => Err(
+            "usage: swarm-tool coroner <attach|verify-trail|recover-spool|triage> ...".to_string(),
+        ),
     }
 }
 
@@ -2041,22 +2216,22 @@ fn quote_token_for_shell_ast(tok: &str) -> String {
 fn print_role_usage(role_ns: &str) {
     match role_ns {
         "master" => println!(
-            "swarm-tool master <lock-plan|mint-session|close-session|ingest-packet|status> [options]"
+            "swarm-tool master <attach|lock-plan|mint-session|close-session|ingest-packet|run-waves|status> [--phase discovery] [options]"
         ),
         "investigator" => {
-            println!("swarm-tool investigator <scout|emit-fact> [--session <sid>] [options]")
+            println!("swarm-tool investigator <attach|scout|emit-fact> [--session <sid>] [options]")
         }
         "qa" => println!(
-            "swarm-tool qa <coverage-targets|verify-attribution|triangulate> [--session <sid>] [options]"
+            "swarm-tool qa <attach|coverage-targets|verify-attribution|triangulate> [--session <sid>] [--require-live-contracts] [options]"
         ),
         "grunt" => println!(
-            "swarm-tool grunt <context|record-edit|checkpoint-green|submit-ledger|report-blocker> [--session <sid>] [options]"
+            "swarm-tool grunt <attach|context|record-edit|checkpoint-green|submit-ledger|report-blocker> [--session <sid>] [--reject-stubs] [options]"
         ),
-        "reviewer" => {
-            println!("swarm-tool reviewer <inspect|lookup-doc|verdict> [--session <sid>] [options]")
-        }
+        "reviewer" => println!(
+            "swarm-tool reviewer <attach|inspect|lookup-doc|verdict> [--session <sid>] [options]"
+        ),
         "coroner" => println!(
-            "swarm-tool coroner <verify-trail|recover-spool|triage> [--session <sid>] [options]"
+            "swarm-tool coroner <attach|verify-trail|recover-spool|triage> [--session <sid>] [options]"
         ),
         _ => print_usage(),
     }
@@ -2067,11 +2242,11 @@ fn print_usage() {
         "swarm-tool -- Role-specific deterministic Rust CLI tooling for dotagent Swarm v2\n\
          \n\
          Usage:\n\
-         \x20 swarm-tool master <lock-plan|mint-session|close-session|ingest-packet|status>\n\
-         \x20 swarm-tool investigator <scout|emit-fact>\n\
-         \x20 swarm-tool qa <coverage-targets|verify-attribution|triangulate>\n\
-         \x20 swarm-tool grunt <context|record-edit|checkpoint-green|submit-ledger|report-blocker>\n\
-         \x20 swarm-tool coroner <verify-trail|recover-spool|triage>\n\
-         \x20 swarm-tool reviewer <inspect|lookup-doc|verdict>"
+         \x20 swarm-tool master <attach|lock-plan|mint-session|close-session|ingest-packet|run-waves|status>\n\
+         \x20 swarm-tool investigator <attach|scout|emit-fact>\n\
+         \x20 swarm-tool qa <attach|coverage-targets|verify-attribution|triangulate>\n\
+         \x20 swarm-tool grunt <attach|context|record-edit|checkpoint-green|submit-ledger|report-blocker>\n\
+         \x20 swarm-tool coroner <attach|verify-trail|recover-spool|triage>\n\
+         \x20 swarm-tool reviewer <attach|inspect|lookup-doc|verdict>"
     );
 }

@@ -15,11 +15,11 @@ Attack `Grunt` task completions against the locked spec, security invariants, ed
 4. **Actionable Evidence Only**: Every rejection must cite exact `file:line` defects or invariant violations so `Master` can mint a clean-slate `attempt + 1` `Grunt`.
 
 ## Dedicated Rust Tooling (`swarm-tool reviewer`)
-1. **Inspect Task Ledger & Smell Badges**:
-   `swarm-tool reviewer inspect --task <TASK_ID>`
+1. **Attach Session & Inspect Task Ledger + Smell Badges**:
+   `swarm-tool reviewer attach --session <SESSION_ID>` / `swarm-tool reviewer inspect --task <TASK_ID>`
 2. **Offline Lockfile-Pinned Package Verification**:
    `swarm-tool reviewer lookup-doc --ecosystem <cargo|npm> --package <name> --version <ver> [--symbol <sym>]`
    Checks `Cargo.lock` / `package.json` inside Rust without exposing raw lockfiles or touching the network.
 3. **Record Round Verdict (`1` or `2`)**:
    `swarm-tool reviewer verdict --task <TASK_ID> --round <1|2> --decision <approve|reject> --attempt <N> --notes "<ASCII findings>"`
-   Returns `Approved`, `RetryCleanSlate`, or (on `round == 2` reject) `EscalateToMaster`.
+   Hard-blocks `--decision approve` if `hollow_stub:*` badges exist (`REVIEWER_APPROVAL_BLOCKED_BY_HOLLOW_STUB`); returns `Approved`, `RetryCleanSlate`, or `EscalateToMaster`.

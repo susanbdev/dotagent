@@ -446,7 +446,239 @@ pub fn classify_session_smells(
         });
     }
 
+    if !cap.allowed_write_paths.is_empty() {
+        badges.extend(scan_production_stub_smells(
+            repo_root,
+            &cap.allowed_write_paths,
+        ));
+    }
+
     Ok(badges)
+}
+
+/// Scans in-scope non-test production files for reward-hacking stubs:
+/// - `todo!(...)` / `unimplemented!(...)` macros outside `#[cfg(test)]`
+/// - Empty string-literal dispatch arms (`"fault-inject" => {}`)
+/// - HTTP `501` unimplemented shims (`501` + `"not implemented"` / `"attach compiled"` / `"before live dispatch"`)
+/// - Unbound secret-stream reads (`if let Err(...) = ...read_secret_stdin()` / `let _ = ...read_secret_from_fd()`)
+/// - No-op stack-copy `.to_bytes()` + `.zeroize()` inside `Drop::drop`
+pub fn scan_production_stub_smells(repo_root: &Path, write_patterns: &[String]) -> Vec<SmellBadge> {
+    let canon_repo = fs::canonicalize(repo_root).unwrap_or_else(|_| repo_root.to_path_buf());
+    let mut prod_files = BTreeMap::new();
+    collect_scoped_source_files(&canon_repo, &canon_repo, write_patterns, &mut prod_files);
+
+    let mut out = Vec::new();
+    for (rel, body) in prod_files {
+        if crate::role_sandbox::is_qa_writable_path(&rel) {
+            continue;
+        }
+        let effective = if rel.ends_with(".rs") {
+            strip_rust_cfg_test_tail(&body)
+        } else {
+            body.as_str()
+        };
+
+        let mut in_drop_fn = false;
+        let mut drop_brace_depth: i32 = 0;
+        let mut drop_copied_bytes_var: Option<String> = None;
+
+        for (idx, raw_line) in effective.lines().enumerate() {
+            let line_no = idx + 1;
+            let trimmed = raw_line.trim();
+            if trimmed.is_empty()
+                || trimmed.starts_with("//")
+                || trimmed.starts_with('#')
+                || trimmed.starts_with("/*")
+                || trimmed.starts_with('*')
+            {
+                continue;
+            }
+            let code_only = trimmed.split("//").next().unwrap_or(trimmed).trim();
+            let lower = code_only.to_ascii_lowercase();
+
+            if contains_macro_invocation(code_only, "todo!")
+                || contains_macro_invocation(code_only, "unimplemented!")
+            {
+                out.push(SmellBadge {
+                    bucket: SmellBucket::Risky,
+                    signal: format!("hollow_stub:todo_macro:{rel}:{line_no}"),
+                });
+            }
+
+            if is_empty_string_literal_match_arm(code_only) {
+                out.push(SmellBadge {
+                    bucket: SmellBucket::Risky,
+                    signal: format!("hollow_stub:empty_literal_arm:{rel}:{line_no}"),
+                });
+            }
+
+            if code_only.contains("501")
+                && (lower.contains("not implemented")
+                    || lower.contains("attach compiled")
+                    || lower.contains("before live dispatch"))
+            {
+                out.push(SmellBadge {
+                    bucket: SmellBucket::Risky,
+                    signal: format!("hollow_stub:http_501_placeholder:{rel}:{line_no}"),
+                });
+            }
+
+            if (code_only.starts_with("let _ =")
+                || code_only.starts_with("if let Err(")
+                || code_only.starts_with("let Err("))
+                && (code_only.contains("read_secret_stdin(")
+                    || code_only.contains("read_secret_from_fd("))
+            {
+                out.push(SmellBadge {
+                    bucket: SmellBucket::Malicious,
+                    signal: format!("hollow_stub:discarded_secret_read:{rel}:{line_no}"),
+                });
+            }
+
+            if rel.ends_with(".rs") {
+                if !in_drop_fn && code_only.starts_with("fn drop(&mut self)") {
+                    in_drop_fn = true;
+                    drop_brace_depth = 0;
+                    drop_copied_bytes_var = None;
+                }
+                if in_drop_fn {
+                    for ch in code_only.chars() {
+                        if ch == '{' {
+                            drop_brace_depth += 1;
+                        } else if ch == '}' {
+                            drop_brace_depth -= 1;
+                        }
+                    }
+                    if let Some(rest) = code_only.strip_prefix("let mut ")
+                        && let Some((var_name, rhs)) = rest.split_once('=')
+                        && rhs.contains(".to_bytes()")
+                    {
+                        drop_copied_bytes_var = Some(var_name.trim().to_string());
+                    } else if let Some(ref vname) = drop_copied_bytes_var
+                        && code_only.starts_with(&format!("{vname}.zeroize()"))
+                    {
+                        out.push(SmellBadge {
+                            bucket: SmellBucket::Risky,
+                            signal: format!("hollow_stub:noop_stack_copy_zeroize:{rel}:{line_no}"),
+                        });
+                        drop_copied_bytes_var = None;
+                    }
+                    if drop_brace_depth <= 0 {
+                        in_drop_fn = false;
+                        drop_copied_bytes_var = None;
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+fn collect_scoped_source_files(
+    canon_repo: &Path,
+    dir: &Path,
+    scope_patterns: &[String],
+    out: &mut BTreeMap<String, String>,
+) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+        if matches!(
+            name_str.as_ref(),
+            ".git" | "target" | ".state" | ".breadcrumbs.jsonl"
+        ) || name_str.ends_with(".breadcrumbs.jsonl.lock")
+        {
+            continue;
+        }
+        let full = entry.path();
+        let Ok(ft) = entry.file_type() else {
+            continue;
+        };
+        if ft.is_symlink() {
+            continue;
+        }
+        let rel = full
+            .strip_prefix(canon_repo)
+            .unwrap_or(&full)
+            .to_string_lossy()
+            .replace('\\', "/");
+        if ft.is_dir() {
+            if !scope_patterns.is_empty() && !dir_can_match_any_scope(&rel, scope_patterns) {
+                continue;
+            }
+            if validate_path_with_max_depth(
+                canon_repo,
+                canon_repo,
+                &rel,
+                PathAccess::ListSearch {
+                    requested_depth: Some(1),
+                },
+                usize::MAX,
+            )
+            .is_err()
+            {
+                continue;
+            }
+            collect_scoped_source_files(canon_repo, &full, scope_patterns, out);
+        } else if ft.is_file()
+            && (scope_patterns.is_empty() || path_matches_any_scope(&rel, scope_patterns))
+            && validate_path_with_max_depth(
+                canon_repo,
+                canon_repo,
+                &rel,
+                PathAccess::Read,
+                usize::MAX,
+            )
+            .is_ok()
+            && let Ok(text) = fs::read_to_string(&full)
+        {
+            out.insert(rel, text);
+        }
+    }
+}
+
+fn strip_rust_cfg_test_tail(src: &str) -> &str {
+    let mut byte_offset = 0usize;
+    for raw_line in src.lines() {
+        let trimmed = raw_line.trim();
+        if trimmed == "#[cfg(test)]" {
+            return &src[..byte_offset];
+        }
+        byte_offset = byte_offset
+            .saturating_add(raw_line.len() + 1)
+            .min(src.len());
+    }
+    src
+}
+
+fn contains_macro_invocation(line: &str, mac_prefix: &str) -> bool {
+    let mut rest = line;
+    while let Some(pos) = rest.find(mac_prefix) {
+        let before_ok = pos == 0
+            || !rest.as_bytes()[pos - 1].is_ascii_alphanumeric()
+                && rest.as_bytes()[pos - 1] != b'_';
+        let after = rest[pos + mac_prefix.len()..].trim_start();
+        if before_ok && (after.starts_with('(') || after.starts_with('[') || after.starts_with('{'))
+        {
+            return true;
+        }
+        rest = &rest[pos + mac_prefix.len()..];
+    }
+    false
+}
+
+fn is_empty_string_literal_match_arm(code_only: &str) -> bool {
+    if !code_only.starts_with('"') {
+        return false;
+    }
+    let Some((_, rhs)) = code_only.split_once("=>") else {
+        return false;
+    };
+    let rhs_clean = rhs.trim().trim_end_matches(',').trim();
+    rhs_clean == "{}" || rhs_clean == "()"
 }
 
 type TrailRecordsMap = BTreeMap<PathBuf, Vec<crate::breadcrumbs::SignedBreadcrumbRecord>>;
@@ -535,6 +767,16 @@ pub fn submit_work_ledger_entry(
     what_changed: &str,
     why_changed: &str,
 ) -> Result<WorkLedgerEntry, String> {
+    submit_work_ledger_entry_with_opts(repo_root, session_id, what_changed, why_changed, false)
+}
+
+pub fn submit_work_ledger_entry_with_opts(
+    repo_root: &Path,
+    session_id: &str,
+    what_changed: &str,
+    why_changed: &str,
+    reject_hollow_stubs: bool,
+) -> Result<WorkLedgerEntry, String> {
     validate_two_plus_two_sentences(what_changed, why_changed)?;
     let cap = load_session_capability(repo_root, session_id)?;
     if cap.role != SwarmRole::Grunt {
@@ -607,6 +849,16 @@ pub fn submit_work_ledger_entry(
     }
 
     let smell_badges = classify_session_smells(repo_root, &cap)?;
+    if reject_hollow_stubs
+        && let Some(stub_badge) = smell_badges
+            .iter()
+            .find(|b| b.signal.starts_with("hollow_stub:"))
+    {
+        return Err(format!(
+            "HOLLOW_STUB_IMPLEMENTATION_REJECTED: production stub detected ({}) in session '{}'; replace placeholders with real implementation before submitting WORK_LEDGER.jsonl",
+            stub_badge.signal, cap.session_id
+        ));
+    }
     let what_trimmed = what_changed.trim().to_string();
     let why_trimmed = why_changed.trim().to_string();
     let event_ids = verified.ids;

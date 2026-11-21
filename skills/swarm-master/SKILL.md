@@ -15,15 +15,15 @@ Coordinate multi-wave execution without polluting your context window with raw s
 4. **Four Mandatory Human-Escalation Triggers**: Halt and ask the human immediately on (a) ambiguous requirements, (b) conflicting constraints or `PlanAmendmentProposal`, (c) out-of-scope file boundaries (`WorkerHypothesis`), or (d) `AdversarialReviewer` round cap (`round == 2` rejection).
 
 ## Dedicated Rust Tooling (`swarm-tool master`)
-1. **Validate & Lock Wave DAG**:
+1. **Phase-1 Pre-Plan Discovery Scout (Before `lock-plan`)**:
+   `swarm-tool master mint-session --role investigator --task DISC-1 --phase discovery [--scope <csv>]`
+   Mints a read-only `Investigator` before `PLAN.lock.json` exists so you can map repo layout without touching source files.
+2. **Validate & Lock Wave DAG**:
    `swarm-tool master lock-plan docs/swarm_v2.dag.json`
-   *(Re-locking requires `--amend --human-approved`.)*
-2. **Mint Scoped Role Session**:
+   *(Preserves Phase-1 discovery provenance; re-locking an existing plan requires `--amend --human-approved`.)*
+3. **Mint Scoped Role Session**:
    `swarm-tool master mint-session --role <investigator|qa-engineer|grunt|adversarial-reviewer|forensic-coroner> --task <TASK_ID> --attempt 1`
-   Pass the returned `AGENT_GUARD_ROLE` and `AGENT_GUARD_SESSION_ID` when invoking the target subagent.
-3. **Validate Worker Output Packet**:
-   `swarm-tool master ingest-packet '<JSON_PACKET>'`
+   Pass the returned `session_id` to the subagent; in harnesses without custom `env`, instruct the subagent to run `swarm-tool <role> attach --session <SESSION_ID>` first.
+4. **Validate Worker Output Packet & Check Wave Status**:
+   `swarm-tool master ingest-packet '<JSON_PACKET>'` / `swarm-tool master status`
    If `requires_human_escalation: true`, stop delegation and surface `escalation_code` to the human.
-4. **Check Wave & Ledger Status**:
-   `swarm-tool master status`
-   *(If `smell_badges` appear on a receipt, mint `forensic-coroner` lazily.)*

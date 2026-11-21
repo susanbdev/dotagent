@@ -134,6 +134,90 @@ pub fn inspect_file_on_disk_hygiene(path: &Path) -> Result<String, BudgetViolati
     Ok(text)
 }
 
+pub const MAX_VETTED_WEBFONT_BYTES: u64 = 65_536; // 64 KiB cap for subset `.woff2`/`.woff` glyph atlases
+
+/// Validates bounded, magic-verified `.woff2` (`wOF2`) and `.woff` (`wOFF`) static webfont
+/// assets during `post-edit` so UI libraries (such as `vespoli-ui`'s `< 2 KB` glyph font)
+/// can persist valid font assets on disk while keeping binary context-ingestion hard-blocked.
+/// Returns `None` when `path` does not carry a `.woff2`/`.woff` extension.
+pub fn inspect_vetted_webfont_asset_on_disk(
+    path: &Path,
+) -> Option<Result<Vec<u8>, BudgetViolation>> {
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|s| s.to_ascii_lowercase())?;
+    let expected_magic: &[u8; 4] = match ext.as_str() {
+        "woff2" => b"wOF2",
+        "woff" => b"wOFF",
+        _ => return None,
+    };
+
+    let check = || -> Result<Vec<u8>, BudgetViolation> {
+        let meta = std::fs::symlink_metadata(path).map_err(|e| BudgetViolation {
+            code: "FILE_STAT_ERROR",
+            detail: format!("Cannot stat '{}': {e}", path.display()),
+        })?;
+        if meta.file_type().is_symlink() || !meta.file_type().is_file() {
+            return Err(BudgetViolation {
+                code: "NON_REGULAR_FILE",
+                detail: format!(
+                    "Refusing non-regular webfont file '{}' (FIFO/socket/device/symlink blocked)",
+                    path.display()
+                ),
+            });
+        }
+        if meta.len() > MAX_VETTED_WEBFONT_BYTES {
+            return Err(BudgetViolation {
+                code: "WEBFONT_SIZE_EXCEEDED",
+                detail: format!(
+                    "Webfont asset '{}' is {} bytes (> {MAX_VETTED_WEBFONT_BYTES} byte subset glyph ceiling).",
+                    path.display(),
+                    meta.len()
+                ),
+            });
+        }
+
+        let file = File::open(path).map_err(|e| BudgetViolation {
+            code: "FILE_OPEN_ERROR",
+            detail: format!("Cannot open '{}': {e}", path.display()),
+        })?;
+        let fd_meta = file.metadata().map_err(|e| BudgetViolation {
+            code: "FILE_STAT_ERROR",
+            detail: format!("Cannot fstat '{}': {e}", path.display()),
+        })?;
+        if !fd_meta.file_type().is_file() || fd_meta.len() > MAX_VETTED_WEBFONT_BYTES {
+            return Err(BudgetViolation {
+                code: "FILE_TOCTOU_REJECTED",
+                detail: format!(
+                    "Opened descriptor for '{}' failed regular-file or webfont size check.",
+                    path.display()
+                ),
+            });
+        }
+
+        let mut raw = Vec::new();
+        file.take(MAX_VETTED_WEBFONT_BYTES + 1)
+            .read_to_end(&mut raw)
+            .map_err(|e| BudgetViolation {
+                code: "FILE_READ_ERROR",
+                detail: format!("Cannot read '{}': {e}", path.display()),
+            })?;
+        if raw.len() < 44 || &raw[..4] != expected_magic {
+            return Err(BudgetViolation {
+                code: "INVALID_WEBFONT_MAGIC",
+                detail: format!(
+                    "File '{}' carries '.{ext}' extension without valid WOFF/WOFF2 header signature.",
+                    path.display()
+                ),
+            });
+        }
+        Ok(raw)
+    };
+
+    Some(check())
+}
+
 /// Safely reads up to `MAX_RAW_FILE_BYTES + 1` (or bounded slice) using `Read::take`
 /// so a multi-gigabyte file or special device can never OOM the guard itself.
 pub fn inspect_file_budget(

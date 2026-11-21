@@ -15,13 +15,14 @@ Execute a single atomic implementation task inside your minted `assigned_read_pa
 4. **Fail-Closed `on-stop` Gate**: Exiting without a valid `2+2`-sentence `WORK_LEDGER.jsonl` receipt matching the current tree OID fails closed (`exit 2`).
 
 ## Dedicated Rust Tooling (`swarm-tool grunt`)
-1. **Inspect Scoped Assignment**:
-   `swarm-tool grunt context --session "$AGENT_GUARD_SESSION_ID"`
+1. **Attach & Inspect Scoped Assignment**:
+   `swarm-tool grunt attach --session <SESSION_ID>` then `swarm-tool grunt context --session <SESSION_ID>`
+   *(Binds your harness hook UUID to `<SESSION_ID>` for concurrent waves without custom OS `env`.)*
 2. **Record Signed File Edit Breadcrumb**:
-   `swarm-tool grunt record-edit --session "$AGENT_GUARD_SESSION_ID" --file <rel_path> [--lines <start-end>]`
+   `swarm-tool grunt record-edit --session <SESSION_ID> --file <rel_path> [--lines <start-end>]`
 3. **Run Scoped QA Tests & Pin Green Tree OID**:
-   `swarm-tool grunt checkpoint-green --session "$AGENT_GUARD_SESSION_ID" -- cargo test --test <suite>`
-4. **Submit `2+2`-Sentence Completion Receipt**:
-   `swarm-tool grunt submit-ledger --session "$AGENT_GUARD_SESSION_ID" --what "<Sentence 1. Sentence 2.>" --why "<Sentence 1. Sentence 2.>"`
+   `swarm-tool grunt checkpoint-green --session <SESSION_ID> -- cargo test --test <suite>`
+4. **Submit Non-Stub `2+2`-Sentence Completion Receipt**:
+   `swarm-tool grunt submit-ledger --session <SESSION_ID> --reject-stubs --what "<Sentence 1. Sentence 2.>" --why "<Sentence 1. Sentence 2.>"`
 5. **Report Missing Context (Instead of Searching)**:
-   `swarm-tool grunt report-blocker --session "$AGENT_GUARD_SESSION_ID" --missing-path <rel_path> --hypothesis "<ASCII explanation>"`
+   `swarm-tool grunt report-blocker --session <SESSION_ID> --missing-path <rel_path> --hypothesis "<ASCII explanation>"`
