@@ -1106,3 +1106,91 @@ fn pr6_round2_all_twelve_security_and_concurrency_regressions() {
         "scout must stop reading beyond 256 KiB / 2,000 lines"
     );
 }
+
+#[test]
+fn investigator_blocks_raw_search_and_shell_wandering_while_allowing_scout_and_read_safe() {
+    let (repo, _) = isolated_sandbox("investigator_strict_rails");
+    fs::create_dir_all(repo.join("src")).unwrap();
+    fs::write(repo.join("src/a.rs"), "pub fn alpha() {}\n").unwrap();
+
+    for raw_search_tool in ["Grep", "Glob", "LS", "find_by_name", "list_dir"] {
+        let dec = enforce_role_pre_tool(
+            SwarmRole::Investigator,
+            None,
+            raw_search_tool,
+            &JsonValue::parse(r#"{"path":"src"}"#).unwrap(),
+            &repo,
+            &repo,
+        )
+        .expect("raw search tool must be denied for Investigator");
+        match dec {
+            agent_guard::Decision::Deny { code, .. } => {
+                assert_eq!(
+                    code, "INVESTIGATOR_RAW_SEARCH_FORBIDDEN",
+                    "tool={raw_search_tool}"
+                );
+            }
+            other => panic!("expected deny for {raw_search_tool}, got {other:?}"),
+        }
+    }
+
+    for blocked_cmd in [
+        "find . -maxdepth 5",
+        "rg alpha src",
+        "ls -la src",
+        "cat src/a.rs",
+        "swarm-tool investigator scout --dir src && ls",
+        "swarm-tool investigator scout --dir src | head -n 5",
+        "agent-guard user-prompt",
+    ] {
+        let dec = enforce_role_pre_tool(
+            SwarmRole::Investigator,
+            None,
+            "Bash",
+            &JsonValue::Object(vec![(
+                "command".to_string(),
+                JsonValue::Str(blocked_cmd.to_string()),
+            )]),
+            &repo,
+            &repo,
+        )
+        .unwrap_or_else(|| panic!("expected denial for Investigator shell `{blocked_cmd}`"));
+        assert!(!dec.is_allow(), "command `{blocked_cmd}` must be denied");
+    }
+
+    for allowed_cmd in [
+        "swarm-tool investigator scout --dir src --max-depth 20 --filter alpha",
+        "swarm-tool investigator emit-fact --session swm_1 --task T1 --claim ok --slice src/a.rs:1-1",
+        "agent-guard read-safe src/a.rs --offset 1 --limit 20",
+        "dotagent read-safe src/a.rs --offset 1 --limit 20",
+    ] {
+        let dec = enforce_role_pre_tool(
+            SwarmRole::Investigator,
+            None,
+            "Bash",
+            &JsonValue::Object(vec![(
+                "command".to_string(),
+                JsonValue::Str(allowed_cmd.to_string()),
+            )]),
+            &repo,
+            &repo,
+        );
+        assert!(
+            dec.is_none(),
+            "canonical Investigator command `{allowed_cmd}` must pass role gate, got {dec:?}"
+        );
+    }
+
+    let read_dec = enforce_role_pre_tool(
+        SwarmRole::Investigator,
+        None,
+        "Read",
+        &JsonValue::parse(r#"{"file_path":"src/a.rs"}"#).unwrap(),
+        &repo,
+        &repo,
+    );
+    assert!(
+        read_dec.is_none(),
+        "bounded Read tool must remain allowed for Investigator slice verification"
+    );
+}

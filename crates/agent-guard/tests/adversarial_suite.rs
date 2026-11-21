@@ -2339,3 +2339,330 @@ fn exec_sandbox_defrictioned_workflows_and_hardened_bypasses() {
         );
     }
 }
+
+#[test]
+fn antigravity_airlock_delegation_and_standard_coding_discovery_gate_with_escape_hatches() {
+    let repo = test_sandbox_root("airlock_discovery_and_escape_hatches");
+    fs::create_dir_all(repo.join("src")).expect("mkdir src");
+    fs::write(repo.join("src/lib.rs"), "pub fn demo() {}\n").expect("write src/lib.rs");
+    fs::create_dir_all(repo.join("node_modules/pkg")).expect("mkdir node_modules");
+    fs::write(
+        repo.join("node_modules/pkg/index.js"),
+        "module.exports={};\n",
+    )
+    .expect("write node_modules");
+
+    let sid = "s_airlock_gate";
+    let cwd_s = repo.to_string_lossy().into_owned();
+    let prompt_reset = JsonValue::Object(vec![
+        ("session_id".to_string(), JsonValue::Str(sid.to_string())),
+        ("cwd".to_string(), JsonValue::Str(cwd_s.clone())),
+        (
+            "prompt".to_string(),
+            JsonValue::Str("Investigate how demo works".to_string()),
+        ),
+    ])
+    .to_json_string();
+    assert!(handle_user_prompt_hook(&prompt_reset, &repo).is_allow());
+
+    // 1. Antigravity `define_subagent` (read-only `research-airlock`), `manage_subagents` (`list`),
+    //    and `invoke_subagent` (`TypeName: "research"`) are allowed, while write/self/kill variants are blocked!
+    let define_ok = JsonValue::Object(vec![
+        ("session_id".to_string(), JsonValue::Str(sid.to_string())),
+        ("cwd".to_string(), JsonValue::Str(cwd_s.clone())),
+        (
+            "tool_name".to_string(),
+            JsonValue::Str("define_subagent".to_string()),
+        ),
+        (
+            "tool_input".to_string(),
+            JsonValue::Object(vec![
+                (
+                    "name".to_string(),
+                    JsonValue::Str("research-airlock".to_string()),
+                ),
+                (
+                    "description".to_string(),
+                    JsonValue::Str("Read-only airlock".to_string()),
+                ),
+                (
+                    "system_prompt".to_string(),
+                    JsonValue::Str("Return <= 200 ASCII tokens.".to_string()),
+                ),
+                ("enable_write_tools".to_string(), JsonValue::Bool(false)),
+            ]),
+        ),
+    ])
+    .to_json_string();
+    assert!(handle_pre_tool_hook(&define_ok, &repo).is_allow());
+
+    let define_write_bad = JsonValue::Object(vec![
+        ("session_id".to_string(), JsonValue::Str(sid.to_string())),
+        ("cwd".to_string(), JsonValue::Str(cwd_s.clone())),
+        (
+            "tool_name".to_string(),
+            JsonValue::Str("define_subagent".to_string()),
+        ),
+        (
+            "tool_input".to_string(),
+            JsonValue::Object(vec![
+                (
+                    "name".to_string(),
+                    JsonValue::Str("research-airlock".to_string()),
+                ),
+                (
+                    "description".to_string(),
+                    JsonValue::Str("Write-enabled".to_string()),
+                ),
+                (
+                    "system_prompt".to_string(),
+                    JsonValue::Str("Mutate files.".to_string()),
+                ),
+                ("enable_write_tools".to_string(), JsonValue::Bool(true)),
+            ]),
+        ),
+    ])
+    .to_json_string();
+    match handle_pre_tool_hook(&define_write_bad, &repo) {
+        Decision::Deny { code, .. } => assert_eq!(code, "SUBAGENT_DELEGATION_BLOCKED"),
+        other => panic!("expected SUBAGENT_DELEGATION_BLOCKED, got {other:?}"),
+    }
+
+    let manage_list_ok = JsonValue::Object(vec![
+        ("session_id".to_string(), JsonValue::Str(sid.to_string())),
+        ("cwd".to_string(), JsonValue::Str(cwd_s.clone())),
+        (
+            "tool_name".to_string(),
+            JsonValue::Str("manage_subagents".to_string()),
+        ),
+        (
+            "tool_input".to_string(),
+            JsonValue::Object(vec![(
+                "Action".to_string(),
+                JsonValue::Str("list".to_string()),
+            )]),
+        ),
+    ])
+    .to_json_string();
+    assert!(handle_pre_tool_hook(&manage_list_ok, &repo).is_allow());
+
+    let manage_kill_bad = JsonValue::Object(vec![
+        ("session_id".to_string(), JsonValue::Str(sid.to_string())),
+        ("cwd".to_string(), JsonValue::Str(cwd_s.clone())),
+        (
+            "tool_name".to_string(),
+            JsonValue::Str("manage_subagents".to_string()),
+        ),
+        (
+            "tool_input".to_string(),
+            JsonValue::Object(vec![(
+                "Action".to_string(),
+                JsonValue::Str("kill_all".to_string()),
+            )]),
+        ),
+    ])
+    .to_json_string();
+    match handle_pre_tool_hook(&manage_kill_bad, &repo) {
+        Decision::Deny { code, .. } => assert_eq!(code, "SUBAGENT_DELEGATION_BLOCKED"),
+        other => panic!("expected SUBAGENT_DELEGATION_BLOCKED, got {other:?}"),
+    }
+
+    let invoke_self_bad = JsonValue::Object(vec![
+        ("session_id".to_string(), JsonValue::Str(sid.to_string())),
+        ("cwd".to_string(), JsonValue::Str(cwd_s.clone())),
+        (
+            "tool_name".to_string(),
+            JsonValue::Str("invoke_subagent".to_string()),
+        ),
+        (
+            "tool_input".to_string(),
+            JsonValue::Object(vec![(
+                "Subagents".to_string(),
+                JsonValue::Array(vec![JsonValue::Object(vec![
+                    ("TypeName".to_string(), JsonValue::Str("self".to_string())),
+                    ("Role".to_string(), JsonValue::Str("Worker".to_string())),
+                    ("Prompt".to_string(), JsonValue::Str("Edit src".to_string())),
+                ])]),
+            )]),
+        ),
+    ])
+    .to_json_string();
+    match handle_pre_tool_hook(&invoke_self_bad, &repo) {
+        Decision::Deny { code, .. } => assert_eq!(code, "SUBAGENT_DELEGATION_BLOCKED"),
+        other => panic!("expected SUBAGENT_DELEGATION_BLOCKED, got {other:?}"),
+    }
+
+    // 2. StandardCoding caps broad parent discovery at 4 calls, blocking the 5th with SUBAGENT_AIRLOCK_REQUIRED!
+    let make_grep_dir = |s: &str| {
+        JsonValue::Object(vec![
+            ("session_id".to_string(), JsonValue::Str(s.to_string())),
+            ("cwd".to_string(), JsonValue::Str(cwd_s.clone())),
+            ("tool_name".to_string(), JsonValue::Str("Grep".to_string())),
+            (
+                "tool_input".to_string(),
+                JsonValue::Object(vec![
+                    ("path".to_string(), JsonValue::Str("src".to_string())),
+                    ("pattern".to_string(), JsonValue::Str("demo".to_string())),
+                ]),
+            ),
+        ])
+        .to_json_string()
+    };
+    for i in 1..=4 {
+        assert!(
+            handle_pre_tool_hook(&make_grep_dir(sid), &repo).is_allow(),
+            "surgical discovery call #{i} must be allowed"
+        );
+    }
+    match handle_pre_tool_hook(&make_grep_dir(sid), &repo) {
+        Decision::Deny { code, reason, .. } => {
+            assert_eq!(code, "SUBAGENT_AIRLOCK_REQUIRED");
+            assert!(reason.contains("AGENT_GUARD_DIRECT_EXPLORE=1"));
+            assert!(reason.contains("/direct-explore"));
+        }
+        other => panic!("5th unscoped parent discovery call must require airlock, got {other:?}"),
+    }
+
+    // Delegating to Antigravity read-only `research` subagent unlocks the step!
+    let invoke_research_ok = JsonValue::Object(vec![
+        ("session_id".to_string(), JsonValue::Str(sid.to_string())),
+        ("cwd".to_string(), JsonValue::Str(cwd_s.clone())),
+        (
+            "tool_name".to_string(),
+            JsonValue::Str("invoke_subagent".to_string()),
+        ),
+        (
+            "tool_input".to_string(),
+            JsonValue::Object(vec![(
+                "Subagents".to_string(),
+                JsonValue::Array(vec![JsonValue::Object(vec![
+                    (
+                        "TypeName".to_string(),
+                        JsonValue::Str("research".to_string()),
+                    ),
+                    (
+                        "Role".to_string(),
+                        JsonValue::Str("Repo Airlock".to_string()),
+                    ),
+                    (
+                        "Prompt".to_string(),
+                        JsonValue::Str("Inspect src signatures".to_string()),
+                    ),
+                    (
+                        "Workspace".to_string(),
+                        JsonValue::Str("inherit".to_string()),
+                    ),
+                ])]),
+            )]),
+        ),
+    ])
+    .to_json_string();
+    assert!(handle_pre_tool_hook(&invoke_research_ok, &repo).is_allow());
+    assert!(
+        handle_pre_tool_hook(&make_grep_dir(sid), &repo).is_allow(),
+        "discovery must be unlocked once research subagent is delegated"
+    );
+
+    // 3. Escape Hatch A: `HookCallerContext.direct_explore = Some("1")` (`AGENT_GUARD_DIRECT_EXPLORE=1`)
+    assert!(handle_user_prompt_hook(&prompt_reset, &repo).is_allow());
+    let env_escape_ctx = agent_guard::HookCallerContext {
+        session_id: None,
+        profile_id: None,
+        role_id: None,
+        direct_explore: Some("1".to_string()),
+    };
+    for _ in 0..6 {
+        assert!(
+            agent_guard::handle_pre_tool_hook_with_context(
+                &make_grep_dir(sid),
+                &repo,
+                &env_escape_ctx,
+                None
+            )
+            .is_allow(),
+            "AGENT_GUARD_DIRECT_EXPLORE=1 escape hatch must lift parent discovery cap"
+        );
+    }
+    // Even with escape hatch enabled, forbidden `node_modules` stays hard-blocked!
+    let nm_grep = JsonValue::Object(vec![
+        ("session_id".to_string(), JsonValue::Str(sid.to_string())),
+        ("cwd".to_string(), JsonValue::Str(cwd_s.clone())),
+        ("tool_name".to_string(), JsonValue::Str("Grep".to_string())),
+        (
+            "tool_input".to_string(),
+            JsonValue::Object(vec![
+                (
+                    "path".to_string(),
+                    JsonValue::Str("node_modules".to_string()),
+                ),
+                ("pattern".to_string(), JsonValue::Str("exports".to_string())),
+            ]),
+        ),
+    ])
+    .to_json_string();
+    assert!(
+        !agent_guard::handle_pre_tool_hook_with_context(&nm_grep, &repo, &env_escape_ctx, None)
+            .is_allow(),
+        "escape hatch must NEVER relax forbidden directory protections"
+    );
+
+    // 4. Escape Hatch B: `/direct-explore` in user prompt enables sticky session override until `/airlock-only`!
+    let sid_prompt_escape = "s_prompt_escape";
+    let enable_escape_prompt = JsonValue::Object(vec![
+        (
+            "session_id".to_string(),
+            JsonValue::Str(sid_prompt_escape.to_string()),
+        ),
+        ("cwd".to_string(), JsonValue::Str(cwd_s.clone())),
+        (
+            "prompt".to_string(),
+            JsonValue::Str("/direct-explore trace how src modules connect".to_string()),
+        ),
+    ])
+    .to_json_string();
+    assert!(handle_user_prompt_hook(&enable_escape_prompt, &repo).is_allow());
+    for _ in 0..6 {
+        assert!(
+            handle_pre_tool_hook(&make_grep_dir(sid_prompt_escape), &repo).is_allow(),
+            "/direct-explore prompt escape hatch must allow >4 direct lookups"
+        );
+    }
+    // Follow-up prompt in same session preserves sticky `/direct-explore` override!
+    let followup_prompt = JsonValue::Object(vec![
+        (
+            "session_id".to_string(),
+            JsonValue::Str(sid_prompt_escape.to_string()),
+        ),
+        ("cwd".to_string(), JsonValue::Str(cwd_s.clone())),
+        (
+            "prompt".to_string(),
+            JsonValue::Str("Now check one more module".to_string()),
+        ),
+    ])
+    .to_json_string();
+    assert!(handle_user_prompt_hook(&followup_prompt, &repo).is_allow());
+    for _ in 0..6 {
+        assert!(handle_pre_tool_hook(&make_grep_dir(sid_prompt_escape), &repo).is_allow());
+    }
+    // `/airlock-only` re-arms strict subagent airlock enforcement!
+    let disable_escape_prompt = JsonValue::Object(vec![
+        (
+            "session_id".to_string(),
+            JsonValue::Str(sid_prompt_escape.to_string()),
+        ),
+        ("cwd".to_string(), JsonValue::Str(cwd_s.clone())),
+        (
+            "prompt".to_string(),
+            JsonValue::Str("/airlock-only lock back down".to_string()),
+        ),
+    ])
+    .to_json_string();
+    assert!(handle_user_prompt_hook(&disable_escape_prompt, &repo).is_allow());
+    for _ in 0..4 {
+        assert!(handle_pre_tool_hook(&make_grep_dir(sid_prompt_escape), &repo).is_allow());
+    }
+    match handle_pre_tool_hook(&make_grep_dir(sid_prompt_escape), &repo) {
+        Decision::Deny { code, .. } => assert_eq!(code, "SUBAGENT_AIRLOCK_REQUIRED"),
+        other => panic!("expected SUBAGENT_AIRLOCK_REQUIRED after /airlock-only, got {other:?}"),
+    }
+}

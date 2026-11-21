@@ -54,7 +54,8 @@ dotagent/
 |   |       +-- bin/agent-guard-sh.rs # Drop-in POSIX `$SHELL` wrapper entrypoint
 |   |       +-- lib.rs              # Multi-harness lifecycle coordinator & repository auditor
 |   |       +-- cli.rs              # Shared CLI router (`pre-tool`, `post-tool`, `on-stop`, `mcp-gateway`, `fleet`)
-|   |       +-- operator.rs         # `activate`, `deactivate`, `doctor`, & TTY-gated `session-reset`
+|   |       +-- operator.rs         # `activate`, `deactivate`, `doctor`, `elevate`, & TTY-gated `session-reset`
+|   |       +-- sudo_broker.rs      # Out-of-band human-TTY `sudo-request` / `approve` / `sudo-result` broker
 |   |       +-- fleet.rs            # Polyrepo `fleet <audit|doctor|sync|build-image>` & SLSA `self-verify`
 |   |       +-- telemetry.rs        # Human-TTY-only `telemetry <summary|top-denies|rotate|export-otlp>`
 |   |       +-- stop_receipt.rs     # Asymmetric Ed25519 `StopReceipt` attestation & `verify-receipt`

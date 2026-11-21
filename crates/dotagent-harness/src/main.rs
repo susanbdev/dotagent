@@ -3,6 +3,7 @@
 use std::path::PathBuf;
 use std::process::ExitCode;
 
+use dotagent_harness::airlock_eval::{render_airlock_eval_report, run_airlock_evaluation};
 use dotagent_harness::bench_suite::{render_bench_report, run_benchmarks};
 use dotagent_harness::{
     HarnessConfig, ReportFormat, SuiteSelection, discover_workspace_root, list_cases,
@@ -10,7 +11,7 @@ use dotagent_harness::{
 };
 
 const USAGE: &str = "\
-Usage: dotagent-harness [run|list|bench] [options]\n\
+Usage: dotagent-harness [run|list|bench|airlock-eval] [options]\n\
 \n\
 Options:\n\
   --suite <all|scenarios|swarm|compiler|bootstrap|corpus>  Select suite (default: all)\n\
@@ -31,6 +32,7 @@ fn main() -> ExitCode {
     let mut format = ReportFormat::Text;
     let mut list_only = false;
     let mut bench_mode = false;
+    let mut airlock_eval_mode = false;
     let mut quick_bench = false;
     let mut custom_scenario_path: Option<PathBuf> = None;
 
@@ -40,6 +42,10 @@ fn main() -> ExitCode {
             "run" => i += 1,
             "bench" | "benchmark" => {
                 bench_mode = true;
+                i += 1;
+            }
+            "airlock-eval" | "--airlock-eval" => {
+                airlock_eval_mode = true;
                 i += 1;
             }
             "--quick" => {
@@ -158,6 +164,24 @@ fn main() -> ExitCode {
             }
             Err(e) => {
                 eprintln!("[dotagent-harness ERROR] {e}");
+                return ExitCode::from(2);
+            }
+        }
+    }
+
+    if airlock_eval_mode {
+        match run_airlock_evaluation(&cfg) {
+            Ok(report) => {
+                let rendered = render_airlock_eval_report(&report, format);
+                if format == ReportFormat::Json {
+                    println!("{rendered}");
+                } else {
+                    print!("{rendered}");
+                }
+                return ExitCode::SUCCESS;
+            }
+            Err(e) => {
+                eprintln!("[dotagent-harness AIRLOCK-EVAL ERROR] {e}");
                 return ExitCode::from(2);
             }
         }
