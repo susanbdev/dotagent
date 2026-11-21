@@ -254,6 +254,48 @@ impl Drop for EphemeralTmpDir {
     }
 }
 
+fn checkpoint_session_id<'a>(
+    explicit: Option<&'a str>,
+    ambient: Option<&std::ffi::OsStr>,
+) -> Option<&'a str> {
+    let sid = explicit.filter(|sid| sid.starts_with("swm_"))?;
+    ambient
+        .is_none_or(|ambient| ambient == std::ffi::OsStr::new(sid))
+        .then_some(sid)
+}
+
+fn prepare_checkpoint_target(tmp: &Path, protected_roots: &[&Path]) -> std::io::Result<PathBuf> {
+    let root = fs::canonicalize(tmp)?;
+    if !fs::symlink_metadata(tmp)?.is_dir()
+        || !root
+            .to_str()
+            .is_some_and(|path| !path.chars().any(char::is_control))
+        || protected_roots
+            .iter()
+            .any(|path| root.starts_with(path) || path.starts_with(&root))
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "checkpoint scratch must be a separate regular directory",
+        ));
+    }
+    let target = root.join("cargo-target");
+    let mut builder = fs::DirBuilder::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    builder.create(&target)?;
+    if !fs::symlink_metadata(&target)?.is_dir() || fs::canonicalize(&target)? != target {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "checkpoint cargo target must be a regular directory beneath scratch",
+        ));
+    }
+    Ok(target)
+}
+
 /// Probes host OS kernel sandbox enforcement without mutating the current process.
 pub fn probe_host_sandbox_mode() -> KernelSandboxMode {
     #[cfg(target_os = "linux")]
@@ -536,25 +578,27 @@ pub fn run_exec_sandbox_cli(args: &[String], default_cwd: &Path) -> ExitCode {
     };
 
     let common_repo = crate::resolve_common_repo_root(&repo_root);
-    let env_session_id = env::var("AGENT_GUARD_SESSION_ID")
-        .ok()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty());
-    if checkpoint
-        && (env::var_os("AGENT_GUARD_SESSION_ID").is_some()
-            || !cli_session_id
-                .as_deref()
-                .is_some_and(|sid| sid.starts_with("swm_")))
-    {
-        eprintln!(
-            "[AGENT-GUARD HARD DENY :: CAPABILITY_WRITE_SCOPE] checkpoint requires an explicit Swarm session and no ambient session"
-        );
-        return ExitCode::from(2);
-    }
-    let requested_session_id = env_session_id
+    let ambient_session = env::var_os("AGENT_GUARD_SESSION_ID");
+    let env_session_id = ambient_session
         .as_deref()
-        .or(cli_session_id.as_deref())
-        .unwrap_or("default");
+        .and_then(std::ffi::OsStr::to_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let requested_session_id = if checkpoint {
+        let Some(sid) =
+            checkpoint_session_id(cli_session_id.as_deref(), ambient_session.as_deref())
+        else {
+            eprintln!(
+                "[AGENT-GUARD HARD DENY :: CAPABILITY_WRITE_SCOPE] checkpoint requires an explicit Swarm session matching any ambient session"
+            );
+            return ExitCode::from(2);
+        };
+        sid
+    } else {
+        env_session_id
+            .or(cli_session_id.as_deref())
+            .unwrap_or("default")
+    };
     let effective_session_id = if !requested_session_id.starts_with("swm_")
         && crate::breadcrumbs::swarm_state_dir_if_exists(&common_repo).is_some()
     {
@@ -702,12 +746,30 @@ pub fn run_exec_sandbox_cli(args: &[String], default_cwd: &Path) -> ExitCode {
 
     let ephemeral_tmp = EphemeralTmpDir::create();
     let tmp_dir_path = ephemeral_tmp.as_ref().map(|t| t.path.as_path());
-    if checkpoint && tmp_dir_path.is_none() {
-        eprintln!(
-            "[AGENT-GUARD HARD DENY :: CHECKPOINT_SCRATCH_UNAVAILABLE] cannot create isolated checkpoint scratch storage"
-        );
-        return ExitCode::from(2);
-    }
+    let checkpoint_target = if checkpoint {
+        let target = (|| -> std::io::Result<PathBuf> {
+            let tmp = tmp_dir_path
+                .ok_or_else(|| std::io::Error::other("cannot create isolated scratch storage"))?;
+            let checkout = fs::canonicalize(&repo_root)?;
+            let common = fs::canonicalize(&common_repo)?;
+            let state = crate::traversal_ledger::state_root_dir();
+            let state = fs::canonicalize(&state).unwrap_or(state);
+            prepare_checkpoint_target(tmp, &[&checkout, &common, &state])
+        })();
+        match target {
+            Ok(path) => Some(path),
+            Err(e) => {
+                eprintln!("[AGENT-GUARD HARD DENY :: CHECKPOINT_SCRATCH_UNAVAILABLE] {e}");
+                return ExitCode::from(2);
+            }
+        }
+    } else {
+        None
+    };
+    let tmp_dir_path = checkpoint_target
+        .as_deref()
+        .and_then(Path::parent)
+        .or(tmp_dir_path);
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     let capability_write_paths = if opts.writes_allowed || checkpoint {
@@ -772,17 +834,25 @@ pub fn run_exec_sandbox_cli(args: &[String], default_cwd: &Path) -> ExitCode {
             return ExitCode::from(2);
         }
     };
+    if !opts.invokes_swarm_tool
+        && !env_session_id.is_some_and(|sid| sid.starts_with("swm_"))
+        && !opts.invokes_feedback_submit
+    {
+        child_cmd.env_remove("AGENT_GUARD_COORDINATOR_SOCK");
+    }
     if !checkpoint
         && (effective_session_id != requested_session_id
             || (env_session_id.is_none() && cli_session_id.is_some()))
     {
         child_cmd.env("AGENT_GUARD_SESSION_ID", &effective_session_id);
     }
-    if checkpoint && let Some(tmp) = tmp_dir_path {
+    if let Some(target) = checkpoint_target {
         child_cmd
             .env("AGENT_GUARD_WORKER_LOCK", "1")
-            .env("CARGO_TARGET_DIR", tmp.join("cargo-target"))
+            .env("CARGO_TARGET_DIR", target)
             .env_remove("AGENT_GUARD_ROLE")
+            .env_remove("AGENT_GUARD_SESSION_ID")
+            .env_remove("AGENT_GUARD_COORDINATOR_SOCK")
             .env_remove("AGENT_GUARD_ROOT_SESSION_ID")
             .env_remove("AGENT_GUARD_PARENT_SESSION_ID")
             .env_remove("AGENT_GUARD_HOOK_SESSION_ID");
@@ -1338,11 +1408,6 @@ fn build_child_command(
     cmd.current_dir(cwd);
     for var in SCRUBBED_ENV_VARS {
         cmd.env_remove(var);
-    }
-    let has_swarm_session =
-        env::var("AGENT_GUARD_SESSION_ID").is_ok_and(|s| s.trim().starts_with("swm_"));
-    if !opts.invokes_swarm_tool && !has_swarm_session && !opts.invokes_feedback_submit {
-        cmd.env_remove("AGENT_GUARD_COORDINATOR_SOCK");
     }
     if let Ok(raw_ctd) = env::var("CARGO_TARGET_DIR") {
         let ctd_trim = raw_ctd.trim();
@@ -2194,8 +2259,7 @@ fn apply_linux_landlock(
 
     // 4b. Granular Swarm state access:
     //     `<swarm_state_dir>/vault` (`hmac.key`, `stop_receipt_ed25519.pub`) is UNCONDITIONALLY OMITTED (`EACCES`)!
-    let has_swarm_session = session_hint.trim().starts_with("swm_")
-        || env::var("AGENT_GUARD_SESSION_ID").is_ok_and(|s| s.trim().starts_with("swm_"));
+    let has_swarm_session = session_hint.starts_with("swm_");
     if opts.invokes_swarm_tool {
         if let Ok(sdir) = crate::breadcrumbs::swarm_state_dir(&canon_repo) {
             for allowed_sub in ["ipc", "sessions", "spools", "ledger"] {
@@ -2528,8 +2592,7 @@ fn render_macos_seatbelt_profile(
     let repo_writes_allowed = opts.writes_allowed && capability_write_paths.is_none();
     let repo_s = escape_sbpl_literal(&canon_repo.to_string_lossy());
     let home_s = escape_sbpl_literal(&env::var("HOME").unwrap_or_default());
-    let has_swarm_session = session_hint.trim().starts_with("swm_")
-        || env::var("AGENT_GUARD_SESSION_ID").is_ok_and(|s| s.trim().starts_with("swm_"));
+    let has_swarm_session = session_hint.starts_with("swm_");
     let mut p = String::from("(version 1)\n(allow default)\n");
 
     if opts.deny_net {
@@ -2786,6 +2849,53 @@ fn render_macos_seatbelt_profile(
 mod tests {
     use super::drain_stream_bounded;
     use std::io::Cursor;
+
+    #[test]
+    fn checkpoint_session_requires_explicit_identity_and_accepts_exact_ambient_match() {
+        use super::checkpoint_session_id;
+        use std::ffi::OsStr;
+
+        let sid = "swm_fixture";
+        assert_eq!(checkpoint_session_id(Some(sid), None), Some(sid));
+        assert_eq!(
+            checkpoint_session_id(Some(sid), Some(OsStr::new(sid))),
+            Some(sid)
+        );
+        assert_eq!(
+            checkpoint_session_id(Some(sid), Some(OsStr::new("swm_other"))),
+            None
+        );
+        assert_eq!(checkpoint_session_id(None, Some(OsStr::new(sid))), None);
+    }
+
+    #[test]
+    fn checkpoint_target_is_ready_under_separate_scratch() -> std::io::Result<()> {
+        use super::prepare_checkpoint_target;
+        use std::fs;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let nonce = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
+        let fixture = std::env::temp_dir().join(format!(
+            "dotagent-checkpoint-{}-{}",
+            std::process::id(),
+            nonce.as_nanos(),
+        ));
+        let checkout = fixture.join("checkout");
+        let scratch = fixture.join("scratch");
+        fs::create_dir_all(&checkout)?;
+        fs::create_dir(&scratch)?;
+        let checkout = fs::canonicalize(&checkout)?;
+        let target = prepare_checkpoint_target(&scratch, &[&checkout])?;
+        let ready =
+            target.is_dir() && target.parent() == Some(fs::canonicalize(&scratch)?.as_path());
+        fs::write(target.join("build-fixture"), "test output")?;
+        let checkout_refused = prepare_checkpoint_target(&checkout, &[&checkout]).is_err();
+        fs::remove_dir_all(&fixture)?;
+
+        assert!(ready);
+        assert!(checkout_refused);
+        Ok(())
+    }
 
     #[test]
     fn drain_stream_bounded_reads_full_eof_without_truncating_pipe() {
