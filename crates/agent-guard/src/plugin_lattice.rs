@@ -171,15 +171,11 @@ fn eval_toml_block(name: &str, lines: &[&str], snap: &HookSnapshot) -> Result<Ou
 
 fn try_eval_toml(name: &str, src: &str, snap: &HookSnapshot) -> Result<Vec<Outcome>, String> {
     let (mut blocks, mut cur) = (Vec::new(), Vec::new());
-    for line in src
-        .lines()
-        .map(|r| r.split('#').next().unwrap_or("").trim())
-    {
-        if line.is_empty() {
-            continue;
-        } else if matches!(line, "[rule]" | "[[rule]]") && !cur.is_empty() {
+    for raw in src.lines() {
+        let line = raw.split('#').next().unwrap_or("").trim();
+        if matches!(line, "[rule]" | "[[rule]]") && !cur.is_empty() {
             blocks.push(std::mem::take(&mut cur));
-        } else if !matches!(line, "[rule]" | "[[rule]]") {
+        } else if !line.is_empty() && !matches!(line, "[rule]" | "[[rule]]") {
             cur.push(line);
         }
     }
@@ -187,15 +183,14 @@ fn try_eval_toml(name: &str, src: &str, snap: &HookSnapshot) -> Result<Vec<Outco
         blocks.push(cur);
     }
     blocks
-        .into_iter()
-        .map(|b| eval_toml_block(name, &b, snap))
+        .iter()
+        .map(|b| eval_toml_block(name, b, snap))
         .collect()
 }
 
 fn try_eval_rego(name: &str, src: &str, snap_json: &str) -> Result<Outcome, String> {
-    let compact: String = src
-        .lines()
-        .map(|l| l.split('#').next().unwrap_or(""))
+    let no_cmt = src.lines().map(|l| l.split('#').next().unwrap_or(""));
+    let compact: String = no_cmt
         .flat_map(str::chars)
         .filter(|c| !c.is_ascii_whitespace())
         .collect();
