@@ -21,9 +21,14 @@ use std::path::{Component, Path, PathBuf};
 use std::process::ExitCode;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::breadcrumbs::ExclusiveFileLockGuard;
 use crate::json::JsonValue;
 use crate::path_policy::{PathAccess, check_forbidden_zones_lexical, validate_path};
+
+pub(crate) mod capture;
+pub(crate) mod controls;
+mod diagnostics;
+mod observations;
+pub(crate) mod store;
 
 pub(crate) const AGENT_SANDBOX_AND_HARNESS_MARKERS: &[&str] = &[
     "AGENT_GUARD_IN_SANDBOX",
@@ -202,6 +207,9 @@ pub fn analyze_audit_jsonl_reader<R: BufRead>(
         let Ok(val) = JsonValue::parse(trimmed) else {
             continue;
         };
+        if val.get("schema_version").is_some() {
+            continue;
+        }
         let repo = val.get("repo").and_then(JsonValue::as_str).unwrap_or("");
         if let Some(filter) = repo_filter
             && !repo.contains(filter)
@@ -372,90 +380,13 @@ pub fn render_otlp_export_json(summary: &AuditSummary, exported_at_ns: u64) -> J
     )])
 }
 
-/// Rotates `audit_path` (`audit.jsonl -> audit.jsonl.1 .. .keep`) when its size is `>= max_bytes`,
-/// holding `ExclusiveFileLockGuard` and verifying non-symlink regular file invariants at every slot.
+/// Rotates the protected audit log under the same lock as its writer.
 pub fn rotate_audit_log_at_path(
     audit_path: &Path,
     max_bytes: u64,
     keep_archives: usize,
 ) -> Result<bool, String> {
-    let keep = keep_archives.clamp(1, 20);
-    let _audit_lock = ExclusiveFileLockGuard::acquire(audit_path)?;
-    let meta = match fs::symlink_metadata(audit_path) {
-        Ok(m) => m,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(false),
-        Err(e) => return Err(format!("failed stat on '{}': {e}", audit_path.display())),
-    };
-    if meta.file_type().is_symlink() || !meta.file_type().is_file() {
-        return Err(format!(
-            "refusing to rotate non-regular/symlink audit file '{}'",
-            audit_path.display()
-        ));
-    }
-    if meta.len() < max_bytes {
-        return Ok(false);
-    }
-
-    let slot_path =
-        |idx: usize| -> PathBuf { PathBuf::from(format!("{}.{idx}", audit_path.display())) };
-
-    for idx in (1..=keep).rev() {
-        let dst = slot_path(idx);
-        if let Ok(dm) = fs::symlink_metadata(&dst)
-            && dm.file_type().is_symlink()
-        {
-            return Err(format!(
-                "refusing rotation: archive slot '{}' is a symlink",
-                dst.display()
-            ));
-        }
-        if idx == keep && dst.exists() {
-            let _ = fs::remove_file(&dst);
-        }
-        if idx > 1 {
-            let prev = slot_path(idx - 1);
-            if let Ok(pm) = fs::symlink_metadata(&prev) {
-                if pm.file_type().is_symlink() {
-                    return Err(format!(
-                        "refusing rotation: archive slot '{}' is a symlink",
-                        prev.display()
-                    ));
-                }
-                if pm.file_type().is_file() {
-                    fs::rename(&prev, &dst).map_err(|e| {
-                        format!(
-                            "failed rotating '{}' -> '{}': {e}",
-                            prev.display(),
-                            dst.display()
-                        )
-                    })?;
-                }
-            }
-        }
-    }
-
-    let first_archive = slot_path(1);
-    fs::rename(audit_path, &first_archive).map_err(|e| {
-        format!(
-            "failed rotating '{}' -> '{}': {e}",
-            audit_path.display(),
-            first_archive.display()
-        )
-    })?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        let _ = fs::OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .mode(0o600)
-            .open(audit_path);
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = fs::File::create(audit_path);
-    }
-    Ok(true)
+    store::rotate_at(audit_path, max_bytes, keep_archives).map_err(|error| error.to_string())
 }
 
 fn validate_telemetry_export_target(target: &str) -> Result<(), String> {
@@ -511,7 +442,36 @@ fn validate_telemetry_export_target(target: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// CLI entrypoint: `dotagent telemetry <summary|top-denies|rotate|export-otlp> ...`
+fn run_trace_cli(path: &Path, args: &[String]) -> ExitCode {
+    let trace_id = match args {
+        [] => None,
+        [flag, id] if flag == "--trace-id" && capture::valid_id(id) => Some(id.as_str()),
+        _ => {
+            eprintln!("usage: dotagent telemetry trace [--trace-id ID]");
+            return ExitCode::from(2);
+        }
+    };
+    let report = match store::open_audit_read(path) {
+        Ok(Some(file)) => diagnostics::analyze(&mut BufReader::new(file), trace_id),
+        Ok(None) => {
+            eprintln!("[DOTAGENT CAPTURE] No active audit file. Capture coverage is unavailable.");
+            return ExitCode::from(2);
+        }
+        Err(_) => Err(io::Error::other("audit log unavailable")),
+    };
+    match report {
+        Ok(report) => {
+            println!("{}", report.to_json_string());
+            ExitCode::SUCCESS
+        }
+        Err(_) => {
+            eprintln!("[DOTAGENT CAPTURE] Protected audit log is unavailable.");
+            ExitCode::from(2)
+        }
+    }
+}
+
+/// CLI entrypoint: `dotagent telemetry <summary|top-denies|baseline|trace|rotate|export-otlp> ...`
 pub fn run_telemetry_cli(args: &[String]) -> ExitCode {
     if let Err((code, msg)) = verify_human_tty_telemetry_gate() {
         eprintln!("[AGENT-GUARD HARD DENY :: {code}] {msg}");
@@ -550,6 +510,8 @@ pub fn run_telemetry_cli(args: &[String]) -> ExitCode {
     let audit_path = crate::traversal_ledger::audit_log_path();
 
     match sub {
+        "baseline" => observations::run_baseline_cli(&args[1..], &repo_root),
+        "trace" => run_trace_cli(&audit_path, &args[1..]),
         "rotate" => {
             let mut max_bytes: u64 = 10 * 1024 * 1024; // 10 MiB default
             let mut keep: usize = 5;

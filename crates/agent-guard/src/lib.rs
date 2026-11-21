@@ -60,9 +60,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use budget_guard::{
-    MAX_SLICED_FILE_BYTES, MAX_TOOL_OUTPUT_BYTES, MAX_UNSLICED_LINES, RuntimeProfile,
-    STEP_SOFT_COMPACT_TOKENS, analyze_text_budget, estimate_bpe_tokens,
-    inspect_file_budget_with_limits, inspect_file_on_disk_hygiene, load_active_profile,
+    MAX_SLICED_FILE_BYTES, MAX_TOOL_OUTPUT_BYTES, MAX_UNSLICED_LINES, ReadObservation,
+    RuntimeProfile, STEP_SOFT_COMPACT_TOKENS, analyze_text_budget, estimate_bpe_tokens,
+    inspect_file_budget_with_observation, inspect_file_on_disk_hygiene, load_active_profile,
 };
 use cmd_policy::evaluate_shell_command;
 use injection_scan::scan_untrusted_content;
@@ -73,7 +73,11 @@ use path_policy::{
 };
 use sanitizer::{
     DEFAULT_COMPACT_STREAM_MAX_BYTES, DEFAULT_COMPACT_STREAM_MAX_LINES, neuter_to_clean_ascii,
-    sanitize_and_compact_bytes, wrap_spotlight_envelope,
+    sanitize_and_compact_bytes_observed, wrap_spotlight_envelope,
+};
+use telemetry::capture::{self, Context as CaptureContext};
+use telemetry::controls::{
+    self, Boundary, Control, ControlAction, LimitSource, OutputMeasurement, ReadMeasurement,
 };
 use traversal_ledger::{SessionLedger, append_audit_jsonl};
 use unicode_guard::{ScanMode, scan_unicode};
@@ -300,6 +304,11 @@ pub fn handle_pre_compact_hook(raw_json: &str, fallback_cwd: &Path) -> Decision 
         ledger.halted,
     );
 
+    capture::record_guard(
+        &capture::guard_context(&repo_root, &ledger, None),
+        controls::compaction_callback(ledger.compaction_epoch),
+    );
+
     Decision::allow_with_advisory(format!(
         "TINY-CONTEXT STEP COMPACTION (epoch={}, new_nonce={}): Retain ONLY (1) active user goal, (2) verified file paths/symbols changed in the completed step, and (3) immediate next step (<= 250 strict 7-bit ASCII tokens). Purge ALL raw file contents, command logs, comments, and untrusted text.",
         ledger.compaction_epoch, ledger.turn_nonce
@@ -345,6 +354,7 @@ pub fn handle_pre_tool_hook_with_context(
     caller_ctx: &HookCallerContext,
     hot_cache: Option<&traversal_ledger::HotLedgerCache>,
 ) -> Decision {
+    let capture_started = std::time::Instant::now();
     let parsed = match JsonValue::parse(raw_json) {
         Ok(v) => v,
         Err(e) => {
@@ -378,6 +388,8 @@ pub fn handle_pre_tool_hook_with_context(
     let mut ledger = SessionLedger::load_or_create_with_cache(&repo_root, &session_id, hot_cache);
     ledger.apply_root_session_override(caller_ctx.root_session_id.as_deref());
 
+    let mut observation = capture::guard_context(&repo_root, &ledger, Some(&profile.profile_id));
+
     if let Err(msg) = ledger.record_tool_call_with_limit(profile.max_turn_tool_calls) {
         let _ = ledger.save_locked_with_cache(&repo_root, hot_cache);
         append_audit_jsonl(
@@ -387,6 +399,20 @@ pub fn handle_pre_tool_hook_with_context(
             "SESSION_HALTED_OR_EXHAUSTED",
             &msg,
             true,
+        );
+        observation
+            .intervention_id
+            .clone_from(&observation.trace_id);
+        observation.duration_ns = u64::try_from(capture_started.elapsed().as_nanos()).ok();
+        capture::record_guard(
+            &observation,
+            capture::hook_decision(
+                "pre_tool_hook",
+                "deny",
+                "SESSION_HALTED_OR_EXHAUSTED",
+                "denied",
+                Some((profile.max_turn_tool_calls as u64, "calls")),
+            ),
         );
         return Decision::deny("SESSION_HALTED_OR_EXHAUSTED", msg, true);
     }
@@ -448,6 +474,7 @@ pub fn handle_pre_tool_hook_with_context(
             &profile,
             &mut ledger,
             &session_id,
+            &observation,
             (
                 role,
                 cap_opt.as_ref(),
@@ -548,6 +575,24 @@ pub fn handle_pre_tool_hook_with_context(
         }
     }
     let _ = ledger.save_locked_with_cache(&repo_root, hot_cache);
+    let (action, code, disposition) = match &decision {
+        Decision::Deny { code, .. } => ("deny", *code, "denied"),
+        Decision::Allow {
+            updated_input_json: Some(_),
+            ..
+        } => ("rewrite", "GUARD_REWRITE", "allowed"),
+        Decision::Allow { .. } => ("allow", "GUARD_ALLOW", "allowed"),
+    };
+    if !decision.is_allow() {
+        observation
+            .intervention_id
+            .clone_from(&observation.trace_id);
+    }
+    observation.duration_ns = u64::try_from(capture_started.elapsed().as_nanos()).ok();
+    capture::record_guard(
+        &observation,
+        capture::hook_decision("pre_tool_hook", action, code, disposition, None),
+    );
     decision
 }
 
@@ -707,6 +752,7 @@ fn evaluate_tool_invocation(
     profile: &RuntimeProfile,
     ledger: &mut SessionLedger,
     raw_session_id: &str,
+    observation: &CaptureContext,
     (role, cap, direct_explore_env, payload_is_airlock_subagent): (
         swarm_contracts::SwarmRole,
         Option<&swarm_contracts::SessionCapability>,
@@ -869,6 +915,7 @@ fn evaluate_tool_invocation(
                     ledger,
                     false,
                     cap_preapproved,
+                    observation,
                 ) {
                     return dec;
                 }
@@ -1049,6 +1096,7 @@ fn evaluate_tool_invocation(
             ledger,
             true,
             cap_preapproved,
+            observation,
         ) {
             Ok(_) => {
                 return Decision::allow_with_advisory(format!(
@@ -1078,10 +1126,19 @@ fn evaluate_tool_invocation(
                 }
 
                 let clamped_offset = offset_line.unwrap_or(1).max(1);
-                for candidate_limit in [
+                let retry_context = capture::intervention(observation);
+                for (attempt, candidate_limit) in [
                     profile.max_slice_lines,
                     (profile.max_slice_lines / 2).max(25),
-                ] {
+                ]
+                .into_iter()
+                .enumerate()
+                {
+                    let retry_number = (attempt + 1) as u64;
+                    capture::record_guard(
+                        &retry_context,
+                        capture::pagination_recovery(retry_number, false),
+                    );
                     match pre_inspect_file_for_ingestion_with_profile(
                         &valid.canonical_or_norm,
                         &valid.repo_rel,
@@ -1093,8 +1150,13 @@ fn evaluate_tool_invocation(
                         ledger,
                         true,
                         cap_preapproved,
+                        &retry_context,
                     ) {
                         Ok(_) => {
+                            capture::record_guard(
+                                &retry_context,
+                                capture::pagination_recovery(retry_number, true),
+                            );
                             let end_line = clamped_offset
                                 .saturating_add(candidate_limit)
                                 .saturating_sub(1);
@@ -1741,6 +1803,7 @@ pub fn pre_inspect_file_for_ingestion(
 ) -> Result<String, Decision> {
     let profile =
         load_active_profile(repo_root).map_err(|bv| Decision::deny(bv.code, bv.detail, false))?;
+    let observation = capture::guard_context(repo_root, ledger, Some(&profile.profile_id));
     pre_inspect_file_for_ingestion_with_profile(
         abs_path,
         repo_rel,
@@ -1752,6 +1815,7 @@ pub fn pre_inspect_file_for_ingestion(
         ledger,
         deliver_sanitized_on_non_ascii,
         false,
+        &observation,
     )
 }
 
@@ -1767,6 +1831,7 @@ fn pre_inspect_file_for_ingestion_with_profile(
     ledger: &mut SessionLedger,
     deliver_sanitized_on_non_ascii: bool,
     capability_preapproved: bool,
+    observation: &CaptureContext,
 ) -> Result<String, Decision> {
     // 1. Check transitive hop depth FIRST (`A -> B -> C` denied before even opening `C`!)
     let max_ref_level = if operator::has_active_elevated_lease(repo_root) {
@@ -1791,16 +1856,56 @@ fn pre_inspect_file_for_ingestion_with_profile(
     // 2. File size, line count, single-line bomb, & BPE splitter bomb check
     let effective_limit = limit_lines.map(|l| l.min(profile.max_slice_lines));
     let max_unsliced = MAX_UNSLICED_LINES.max(profile.max_slice_lines);
-    let (content, mut metrics) = inspect_file_budget_with_limits(
+    let mut measured_read = ReadObservation::default();
+    let (content, mut metrics) = inspect_file_budget_with_observation(
         abs_path,
         offset_line,
         effective_limit,
         profile.max_slice_lines,
         profile.max_raw_file_bytes,
         max_unsliced,
+        &mut measured_read,
     )
-    .map_err(|bv| Decision::deny(bv.code, bv.detail, false))?;
+    .map_err(|bv| {
+        let intervention = capture::intervention(observation);
+        capture::record_guard(
+            &intervention,
+            ReadMeasurement {
+                observation: &measured_read,
+                requested_offset_line: offset_line,
+                requested_lines: limit_lines,
+                granted_lines: effective_limit,
+                emitted: None,
+                estimated_tokens: None,
+                sanitized: None,
+            }
+            .payload(),
+        );
+        if let Some(event) = controls::read_budget_decision(bv.code, profile) {
+            capture::record_guard(&intervention, event);
+        }
+        Decision::deny(bv.code, bv.detail, false)
+    })?;
+    if limit_lines
+        .zip(effective_limit)
+        .is_some_and(|(requested, effective)| requested > effective)
+    {
+        capture::record_guard(
+            &capture::intervention(observation),
+            controls::control_decision(
+                Boundary::FileRead,
+                Control::FileSliceLines,
+                profile.max_slice_lines as u64,
+                LimitSource::EffectiveProfile,
+                ControlAction::Truncate,
+                "FILE_SLICE_LIMIT_APPLIED",
+            ),
+        );
+    }
     if (metrics.byte_len as u64) > profile.max_raw_file_bytes {
+        if let Some(event) = controls::read_budget_decision("FILE_BYTE_CAP_EXCEEDED", profile) {
+            capture::record_guard(&capture::intervention(observation), event);
+        }
         return Err(Decision::deny(
             "FILE_BYTE_CAP_EXCEEDED",
             format!(
@@ -1811,6 +1916,9 @@ fn pre_inspect_file_for_ingestion_with_profile(
         ));
     }
     if metrics.line_count > profile.max_slice_lines && offset_line.is_some() {
+        if let Some(event) = controls::read_budget_decision("SLICE_LINE_CAP_EXCEEDED", profile) {
+            capture::record_guard(&capture::intervention(observation), event);
+        }
         return Err(Decision::deny(
             "SLICE_LINE_CAP_EXCEEDED",
             format!(
@@ -1824,6 +1932,11 @@ fn pre_inspect_file_for_ingestion_with_profile(
     // 3. Unicode smuggling & Trojan Source scan (hard-halts on Bidi, Tags, Variation Selectors, ESC, homoglyphs)
     let uni_violations = scan_unicode(&content, ScanMode::UntrustedContent);
     if let Some(first) = uni_violations.first() {
+        capture::record_alert(
+            observation,
+            controls::unicode_alert(Boundary::FileRead, first, content.len(), true),
+            controls::enforcement_decision(Boundary::FileRead, first.code),
+        );
         return Err(Decision::deny(
             first.code,
             format!(
@@ -1838,6 +1951,11 @@ fn pre_inspect_file_for_ingestion_with_profile(
     let source_dir = abs_path.parent().unwrap_or(repo_root);
     let scan_report = scan_untrusted_content(&content, repo_root, source_dir, is_root_authority);
     if let Some(halt_finding) = scan_report.first_halt() {
+        capture::record_alert(
+            observation,
+            controls::injection_alert(Boundary::FileRead, halt_finding, content.len(), true),
+            controls::enforcement_decision(Boundary::FileRead, halt_finding.code),
+        );
         return Err(Decision::deny(
             halt_finding.code,
             format!(
@@ -1847,16 +1965,36 @@ fn pre_inspect_file_for_ingestion_with_profile(
             true,
         ));
     }
-    if !scan_report.findings.is_empty() {
+    if let Some(finding) = scan_report.findings.first() {
+        capture::record_guard(
+            observation,
+            controls::injection_alert(Boundary::FileRead, finding, content.len(), true),
+        );
         ledger.mark_tainted(format!("suspicious content in {repo_rel}"));
     }
 
+    let record_read = |estimated_tokens, sanitized| {
+        capture::record_guard(
+            observation,
+            ReadMeasurement {
+                observation: &measured_read,
+                requested_offset_line: offset_line,
+                requested_lines: limit_lines,
+                granted_lines: effective_limit,
+                emitted: None,
+                estimated_tokens: Some(estimated_tokens),
+                sanitized,
+            }
+            .payload(),
+        );
+    };
     // 5. Authorize read in cumulative step budget & register outgoing pointers (`A -> B` or `B -> C`)
     if !is_root_authority {
         let san = neuter_to_clean_ascii(&content);
         if san.was_modified {
             metrics.estimated_tokens = estimate_bpe_tokens(&san.clean_ascii);
         }
+        record_read(metrics.estimated_tokens, Some(&san));
         ledger
             .authorize_and_record_read_with_scope(
                 repo_rel,
@@ -1865,7 +2003,12 @@ fn pre_inspect_file_for_ingestion_with_profile(
                 profile.max_turn_tokens,
                 capability_preapproved,
             )
-            .map_err(|(code, msg)| Decision::deny(code, msg, false))?;
+            .map_err(|(code, msg)| {
+                if let Some(event) = controls::read_budget_decision(code, profile) {
+                    capture::record_guard(&capture::intervention(observation), event);
+                }
+                Decision::deny(code, msg, false)
+            })?;
 
         ledger.register_outgoing_pointers(repo_rel, &scan_report.valid_repo_pointers);
 
@@ -1884,6 +2027,7 @@ fn pre_inspect_file_for_ingestion_with_profile(
         return Ok(san.clean_ascii);
     }
 
+    record_read(metrics.estimated_tokens, None);
     Ok(content)
 }
 
@@ -1914,6 +2058,7 @@ pub fn handle_post_tool_hook_with_context(
     caller_ctx: &HookCallerContext,
     hot_cache: Option<&traversal_ledger::HotLedgerCache>,
 ) -> Decision {
+    let capture_started = std::time::Instant::now();
     let parsed = match JsonValue::parse(raw_json) {
         Ok(v) => v,
         Err(e) => {
@@ -1952,6 +2097,8 @@ pub fn handle_post_tool_hook_with_context(
     let mut ledger = SessionLedger::load_or_create_with_cache(&repo_root, &session_id, hot_cache);
     ledger.apply_root_session_override(caller_ctx.root_session_id.as_deref());
 
+    let observation = capture::guard_context(&repo_root, &ledger, Some(&profile.profile_id));
+    let intervention = capture::intervention(&observation);
     let raw_tool_name = extract_tool_name(&parsed);
     let tool_label = if raw_tool_name.is_empty() {
         "PostToolUse"
@@ -1968,9 +2115,20 @@ pub fn handle_post_tool_hook_with_context(
             scan_end -= 1;
         }
         let inspect_slice = &output_text[..scan_end];
+        let whole_output_scanned = scan_end == output_text.len();
 
         let uni = scan_unicode(inspect_slice, ScanMode::UntrustedContent);
         if let Some(first) = uni.first() {
+            capture::record_alert(
+                &observation,
+                controls::unicode_alert(
+                    Boundary::ToolOutput,
+                    first,
+                    scan_end,
+                    whole_output_scanned,
+                ),
+                controls::enforcement_decision(Boundary::ToolOutput, first.code),
+            );
             ledger.trip_circuit_breaker(format!("{}: {}", first.code, first.detail));
             let _ = ledger.save_locked_with_cache(&repo_root, hot_cache);
             append_audit_jsonl(
@@ -1993,6 +2151,16 @@ pub fn handle_post_tool_hook_with_context(
 
         let scan = scan_untrusted_content(inspect_slice, &repo_root, &cwd, false);
         if let Some(halt) = scan.first_halt() {
+            capture::record_alert(
+                &observation,
+                controls::injection_alert(
+                    Boundary::ToolOutput,
+                    halt,
+                    scan_end,
+                    whole_output_scanned,
+                ),
+                controls::enforcement_decision(Boundary::ToolOutput, halt.code),
+            );
             ledger.trip_circuit_breaker(format!("{}: {}", halt.code, halt.detail));
             let _ = ledger.save_locked_with_cache(&repo_root, hot_cache);
             append_audit_jsonl(
@@ -2006,8 +2174,19 @@ pub fn handle_post_tool_hook_with_context(
             return Decision::deny(halt.code, halt.detail.clone(), true);
         }
 
+        if let Some(finding) = scan.findings.first() {
+            capture::record_guard(
+                &observation,
+                controls::injection_alert(
+                    Boundary::ToolOutput,
+                    finding,
+                    scan_end,
+                    whole_output_scanned,
+                ),
+            );
+        }
         ledger.register_dynamic_tool_pointers(tool_label, &scan.valid_repo_pointers);
-        let compacted = sanitize_and_compact_bytes(
+        let (compacted, compaction) = sanitize_and_compact_bytes_observed(
             inspect_slice.as_bytes(),
             DEFAULT_COMPACT_STREAM_MAX_LINES,
             DEFAULT_COMPACT_STREAM_MAX_BYTES,
@@ -2041,10 +2220,40 @@ pub fn handle_post_tool_hook_with_context(
             &audit_detail,
             false,
         );
+        capture::record_guard(
+            &intervention,
+            controls::control_decision(
+                Boundary::ToolOutput,
+                Control::ToolOutputBytes,
+                MAX_TOOL_OUTPUT_BYTES as u64,
+                LimitSource::GuardConstant,
+                ControlAction::Truncate,
+                "TOOL_OUTPUT_FLOOD_BLOCKED",
+            ),
+        );
+        let mut measured = intervention.clone();
+        measured.duration_ns = u64::try_from(capture_started.elapsed().as_nanos()).ok();
+        capture::record_guard(
+            &measured,
+            OutputMeasurement {
+                boundary: Boundary::ToolOutput,
+                requested_bytes: output_text.len(),
+                scanned_bytes: scan_end,
+                sanitized: &compacted,
+                compaction: Some(&compaction),
+                estimated_tokens: Some(compacted_tokens),
+                emitted: Some((wrapped.len(), wrapped.lines().count())),
+                continuation_available: Some(false),
+            }
+            .payload(),
+        );
         return Decision::deny("TOOL_OUTPUT_FLOOD_BLOCKED", wrapped, false);
     }
 
     if let Err(bv) = analyze_text_budget(&output_text, false) {
+        if let Some(event) = controls::output_budget_decision(bv.code) {
+            capture::record_guard(&intervention, event);
+        }
         let ts_now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
@@ -2069,6 +2278,11 @@ pub fn handle_post_tool_hook_with_context(
     // 2. Unicode smuggling in dynamic output
     let uni = scan_unicode(&output_text, ScanMode::UntrustedContent);
     if let Some(first) = uni.first() {
+        capture::record_alert(
+            &observation,
+            controls::unicode_alert(Boundary::ToolOutput, first, output_text.len(), true),
+            controls::enforcement_decision(Boundary::ToolOutput, first.code),
+        );
         ledger.trip_circuit_breaker(format!("{}: {}", first.code, first.detail));
         let _ = ledger.save_locked_with_cache(&repo_root, hot_cache);
         append_audit_jsonl(
@@ -2092,6 +2306,11 @@ pub fn handle_post_tool_hook_with_context(
     // 3. Prompt injection & poisoned pointer check on dynamic output
     let scan = scan_untrusted_content(&output_text, &repo_root, &cwd, false);
     if let Some(halt) = scan.first_halt() {
+        capture::record_alert(
+            &observation,
+            controls::injection_alert(Boundary::ToolOutput, halt, output_text.len(), true),
+            controls::enforcement_decision(Boundary::ToolOutput, halt.code),
+        );
         ledger.trip_circuit_breaker(format!("{}: {}", halt.code, halt.detail));
         let _ = ledger.save_locked_with_cache(&repo_root, hot_cache);
         append_audit_jsonl(
@@ -2105,6 +2324,12 @@ pub fn handle_post_tool_hook_with_context(
         return Decision::deny(halt.code, halt.detail.clone(), true);
     }
 
+    if let Some(finding) = scan.findings.first() {
+        capture::record_guard(
+            &observation,
+            controls::injection_alert(Boundary::ToolOutput, finding, output_text.len(), true),
+        );
+    }
     // 4. Register outgoing repository pointers discovered in dynamic tool output (`A -> B -> C`)
     ledger.register_dynamic_tool_pointers(tool_label, &scan.valid_repo_pointers);
 
@@ -2116,13 +2341,53 @@ pub fn handle_post_tool_hook_with_context(
     let effective_subagent_cap = profile
         .max_return_summary_ascii_tokens
         .or(if swarm_allowed { None } else { Some(200) });
+    let is_subagent_return = matches!(
+        raw_tool_name.to_ascii_lowercase().as_str(),
+        "task" | "agent" | "invoke_subagent" | "subagent"
+    );
+    let output_boundary = if is_subagent_return {
+        Boundary::SubagentReturn
+    } else {
+        Boundary::ToolOutput
+    };
+    let record_output = |context: &CaptureContext, emitted| {
+        let mut measured = context.clone();
+        measured.duration_ns = u64::try_from(capture_started.elapsed().as_nanos()).ok();
+        capture::record_guard(
+            &measured,
+            OutputMeasurement {
+                boundary: output_boundary,
+                requested_bytes: output_text.len(),
+                scanned_bytes: output_text.len(),
+                sanitized: &sanitized,
+                compaction: None,
+                estimated_tokens: Some(out_tokens),
+                emitted,
+                continuation_available: None,
+            }
+            .payload(),
+        );
+    };
     if let Some(summary_cap) = effective_subagent_cap
-        && matches!(
-            raw_tool_name.to_ascii_lowercase().as_str(),
-            "task" | "agent" | "invoke_subagent" | "subagent"
-        )
+        && is_subagent_return
         && out_tokens > summary_cap
     {
+        record_output(&intervention, Some((0, 0)));
+        capture::record_guard(
+            &intervention,
+            controls::control_decision(
+                Boundary::SubagentReturn,
+                Control::SubagentReturnTokens,
+                summary_cap as u64,
+                if profile.max_return_summary_ascii_tokens.is_some() {
+                    LimitSource::EffectiveProfile
+                } else {
+                    LimitSource::GuardConstant
+                },
+                ControlAction::Deny,
+                "SUBAGENT_RETURN_BUDGET_EXCEEDED",
+            ),
+        );
         let _ = ledger.save_locked_with_cache(&repo_root, hot_cache);
         let detail = format!(
             "Subagent return summary ({out_tokens} est. tokens) exceeds airlock cap ({summary_cap} ASCII tokens for profile '{}').",
@@ -2141,6 +2406,18 @@ pub fn handle_post_tool_hook_with_context(
     let next_total = ledger.cumulative_tokens.saturating_add(out_tokens);
     ledger.cumulative_tokens = next_total;
     if next_total > profile.max_turn_tokens {
+        record_output(&intervention, Some((0, 0)));
+        capture::record_guard(
+            &intervention,
+            controls::control_decision(
+                Boundary::ToolOutput,
+                Control::TurnTokens,
+                profile.max_turn_tokens as u64,
+                LimitSource::EffectiveProfile,
+                ControlAction::Deny,
+                "TURN_TOKEN_BUDGET_EXCEEDED",
+            ),
+        );
         let _ = ledger.save_locked_with_cache(&repo_root, hot_cache);
         let detail = format!(
             "Dynamic tool output (+{out_tokens} est. tokens) pushed step context to {next_total} tokens (> {} hard step ceiling for profile '{}'). Compact step context immediately before continuing.",
@@ -2172,6 +2449,20 @@ pub fn handle_post_tool_hook_with_context(
             ),
             false,
         );
+        record_output(
+            &intervention,
+            Some((wrapped.len(), wrapped.lines().count())),
+        );
+        capture::record_guard(
+            &intervention,
+            capture::hook_decision(
+                "post_tool_hook",
+                "sanitize",
+                "NON_ASCII_SANITIZED_PREBUFFER",
+                "quarantined",
+                None,
+            ),
+        );
         return Decision::deny("NON_ASCII_SANITIZED_PREBUFFER", wrapped, false);
     }
 
@@ -2192,6 +2483,7 @@ pub fn handle_post_tool_hook_with_context(
         }
     }
 
+    record_output(&observation, None);
     Decision::allow_with_advisory(advisory)
 }
 

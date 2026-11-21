@@ -1,0 +1,33 @@
+{
+  "schema_version": 1,
+  "event_id": "fixture-envctl-1",
+  "event_type": "USAGE_AND_DISPOSITION",
+  "producer": {
+    "component": "envctl.fixture",
+    "instance_id": "fixture",
+    "sequence": 1
+  },
+  "timing": {
+    "clock": "fixture"
+  },
+  "correlation": {},
+  "work": {},
+  "configuration": {},
+  "trust": {
+    "origin": "fixture",
+    "authentication": "none",
+    "evidence": "synthetic",
+    "verification": "fixture_only"
+  },
+  "result": {
+    "action": "observe",
+    "reason_code": "FIXTURE",
+    "disposition": "observed",
+    "completeness": "complete"
+  },
+  "payload": {
+    "namespace": "envctl",
+    "operation": "validate_profile",
+    "setting_count": 4
+  }
+}

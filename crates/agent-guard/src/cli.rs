@@ -281,7 +281,7 @@ pub fn run_cli_entrypoint() -> ExitCode {
                  \x20 fleet <audit|doctor|sync|build-image|configure-github>  Polyrepo sync, image builder, & GitHub Org rulesets\n\
                  \x20 feedback <submit|status|sync-github|run-loop>  Agent friction ballots, AgentPI stream, & autonomous loop\n\
                  \x20 verify-ring0-ratchet [--base origin/main] Verify Ring-0 immutability & monotonic bypass corpus\n\
-                 \x20 telemetry <summary|top-denies|rotate|export-otlp>  Human-TTY-only security analytics\n\
+                 \x20 telemetry <summary|top-denies|baseline|trace|rotate|export-otlp>  Human-TTY-only security analytics\n\
                  \x20 verify-receipt [receipt.json] [--pubkey]  Verify asymmetric Ed25519 StopReceipt attestation\n\
                  \x20 self-verify --sums <SHA256SUMS>           Verify binary SHA-256 & SLSA v1.0 provenance\n\
                  \x20 doctor [--json] [path]                    Run 7-point live security & sandbox health report\n\

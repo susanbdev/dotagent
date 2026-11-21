@@ -204,15 +204,57 @@ pub fn sanitize_and_compact_bytes(
     max_lines: usize,
     max_bytes: usize,
 ) -> SanitizedOutput {
-    let mut san = match std::str::from_utf8(raw) {
-        Ok(valid_utf8) => neuter_to_clean_ascii(valid_utf8),
+    sanitize_and_compact_bytes_inner(raw, max_lines, max_bytes).0
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct CompactionObservation {
+    pub input_lines: Option<usize>,
+    pub line_limit: usize,
+    pub byte_limit: usize,
+    pub sanitized_bytes: usize,
+    pub line_cap_dropped_bytes: usize,
+    pub byte_cap_dropped_bytes: usize,
+    pub byte_cap_applied: bool,
+    pub replaced_invalid_utf8: bool,
+    pub duration_ns: Option<u64>,
+}
+
+pub(crate) fn sanitize_and_compact_bytes_observed(
+    raw: &[u8],
+    max_lines: usize,
+    max_bytes: usize,
+) -> (SanitizedOutput, CompactionObservation) {
+    let started = std::time::Instant::now();
+    let (sanitized, mut observation) = sanitize_and_compact_bytes_inner(raw, max_lines, max_bytes);
+    let newlines = raw.iter().filter(|&&byte| byte == b'\n').count();
+    observation.input_lines = Some(newlines + usize::from(raw.last().is_some_and(|&b| b != b'\n')));
+    observation.duration_ns = u64::try_from(started.elapsed().as_nanos()).ok();
+    (sanitized, observation)
+}
+
+fn sanitize_and_compact_bytes_inner(
+    raw: &[u8],
+    max_lines: usize,
+    max_bytes: usize,
+) -> (SanitizedOutput, CompactionObservation) {
+    let (mut san, replaced_invalid_utf8) = match std::str::from_utf8(raw) {
+        Ok(valid_utf8) => (neuter_to_clean_ascii(valid_utf8), false),
         Err(_) => {
             let lossy = String::from_utf8_lossy(raw);
             let mut res = neuter_to_clean_ascii(&lossy);
             res.was_modified = true;
-            res
+            (res, true)
         }
     };
+    let mut observation = CompactionObservation {
+        line_limit: max_lines,
+        byte_limit: max_bytes,
+        sanitized_bytes: san.clean_ascii.len(),
+        replaced_invalid_utf8,
+        ..CompactionObservation::default()
+    };
+    let mut line_marker = 0..0;
 
     // Enforce tight line & byte compaction via zero-allocation byte offsets (`clean_ascii` has zero `\r`)!
     if max_lines >= 10 && !san.clean_ascii.is_empty() {
@@ -256,11 +298,15 @@ pub fn sanitize_and_compact_bytes(
             let tail_slice = &trimmed[tail_start..];
             let mut compacted = String::with_capacity(head_slice.len() + tail_slice.len() + 96);
             compacted.push_str(head_slice);
+            let marker_start = compacted.len();
             let _ = writeln!(
                 &mut compacted,
                 "... [COMPACTED {omitted} LINES BY AGENT-GUARD TO KEEP CONTEXT WINDOW TINY] ..."
             );
+            line_marker = marker_start..compacted.len();
             compacted.push_str(tail_slice);
+            observation.line_cap_dropped_bytes =
+                san.clean_ascii.len() - (head_slice.len() + tail_slice.len());
             san.clean_ascii = compacted;
             san.truncated_lines = omitted;
             san.was_modified = true;
@@ -269,17 +315,20 @@ pub fn sanitize_and_compact_bytes(
 
     const TRUNC_MARKER: &str = "\n... [TRUNCATED AT TIGHT STEP BYTE CAP BY AGENT-GUARD] ...";
     if san.clean_ascii.len() > max_bytes {
+        let keep = max_bytes.saturating_sub(TRUNC_MARKER.len());
+        let dropped_marker_bytes = line_marker.end.saturating_sub(line_marker.start.max(keep));
+        observation.byte_cap_dropped_bytes = san.clean_ascii.len() - keep - dropped_marker_bytes;
+        observation.byte_cap_applied = true;
         if max_bytes <= TRUNC_MARKER.len() {
             san.clean_ascii = TRUNC_MARKER[..max_bytes].to_string();
         } else {
-            let keep = max_bytes - TRUNC_MARKER.len();
             san.clean_ascii.truncate(keep);
             san.clean_ascii.push_str(TRUNC_MARKER);
         }
         san.was_modified = true;
     }
 
-    san
+    (san, observation)
 }
 
 /// Wraps already-sanitized 7-bit ASCII data inside an unpredictable per-turn
