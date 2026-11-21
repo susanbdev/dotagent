@@ -26,7 +26,10 @@ pub mod coordinator;
 pub mod crypto;
 pub mod diagnostics;
 pub mod exec_sandbox;
+pub mod feedback;
+pub mod feedback_loop;
 pub mod fleet;
+pub mod github_governance;
 pub mod injection_scan;
 pub mod json;
 pub mod kani_proofs;
@@ -36,6 +39,7 @@ pub mod operator;
 pub mod path_policy;
 pub mod qa_suspects;
 pub mod repo_audit;
+pub mod ring0_ratchet;
 pub mod role_sandbox;
 pub mod sanitizer;
 pub mod shell_wrapper;
@@ -76,7 +80,7 @@ pub const ALLOWED_MCP_SERVER_PREFIX: &str = "mcp__susanbdev__";
 
 /// Canonical SHA-256 of `dist/gemini/GEMINI.md` emitted by `dotagent-compiler`.
 pub const CANONICAL_DIST_GEMINI_SHA256: &str =
-    "475c75a35206d39b62c4d620c0679636beca80ccea5172466e842c5abb130aca";
+    "14758b427c7c71289cb3694af2792d40baf410a8ffad833f818323971ef6b8ef";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Decision {
@@ -305,6 +309,7 @@ pub fn handle_pre_compact_hook(raw_json: &str, fallback_cwd: &Path) -> Decision 
 #[derive(Debug, Clone, Default)]
 pub struct HookCallerContext {
     pub session_id: Option<String>,
+    pub root_session_id: Option<String>,
     pub profile_id: Option<String>,
     pub role_id: Option<String>,
     pub direct_explore: Option<String>,
@@ -316,6 +321,14 @@ pub struct HookCallerContext {
 pub fn handle_pre_tool_hook(raw_json: &str, fallback_cwd: &Path) -> Decision {
     let ctx = HookCallerContext {
         session_id: std::env::var("AGENT_GUARD_SESSION_ID").ok(),
+        root_session_id: std::env::var("AGENT_GUARD_ROOT_SESSION_ID")
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+            .or_else(|| {
+                std::env::var("AGENT_GUARD_PARENT_SESSION_ID")
+                    .ok()
+                    .filter(|s| !s.trim().is_empty())
+            }),
         profile_id: std::env::var("AGENT_GUARD_PROFILE").ok(),
         role_id: std::env::var("AGENT_GUARD_ROLE").ok(),
         direct_explore: std::env::var("AGENT_GUARD_DIRECT_EXPLORE").ok(),
@@ -360,6 +373,7 @@ pub fn handle_pre_tool_hook_with_context(
     let session_id = extract_session_id_with_override(&parsed, caller_ctx.session_id.as_deref());
     let _session_lock = SessionLedger::acquire_lock(&repo_root, &session_id);
     let mut ledger = SessionLedger::load_or_create_with_cache(&repo_root, &session_id, hot_cache);
+    ledger.apply_root_session_override(caller_ctx.root_session_id.as_deref());
 
     if let Err(msg) = ledger.record_tool_call_with_limit(profile.max_turn_tool_calls) {
         let _ = ledger.save_locked_with_cache(&repo_root, hot_cache);
@@ -397,7 +411,7 @@ pub fn handle_pre_tool_hook_with_context(
         }
     };
 
-    let decision = if let Some(role_denial) = role_sandbox::enforce_role_pre_tool(
+    let mut decision = if let Some(role_denial) = role_sandbox::enforce_role_pre_tool(
         role,
         cap_opt.as_ref(),
         &tool_name,
@@ -414,6 +428,7 @@ pub fn handle_pre_tool_hook_with_context(
             &cwd,
             &profile,
             &mut ledger,
+            &session_id,
             (
                 role,
                 cap_opt.as_ref(),
@@ -422,36 +437,108 @@ pub fn handle_pre_tool_hook_with_context(
             ),
         )
     };
-    if let Decision::Deny {
-        code,
-        ref reason,
-        halt_session,
-    } = decision
-    {
-        if halt_session {
-            ledger.trip_circuit_breaker(format!("{code}: {reason}"));
-            if let Some(mut c) = cap_opt {
-                c.malicious_flags = c.malicious_flags.saturating_add(1);
-                let _ = role_sandbox::save_session_capability(&repo_root, &c);
-            }
-        }
-        append_audit_jsonl(
-            &repo_root,
-            &session_id,
-            if tool_name.is_empty() {
-                "PreToolUse"
-            } else {
-                &tool_name
-            },
+    match &mut decision {
+        Decision::Deny {
             code,
             reason,
             halt_session,
-        );
+        } => {
+            let ts_now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            let denied_shape = extract_first_str(
+                tool_input,
+                &[
+                    "command",
+                    "CommandLine",
+                    "cmd",
+                    "script",
+                    "file_path",
+                    "AbsolutePath",
+                    "TargetFile",
+                    "path",
+                    "target_file",
+                    "notebook_path",
+                    "SearchPath",
+                    "DirectoryPath",
+                    "dir",
+                    "directory",
+                    "pattern",
+                    "Pattern",
+                    "Query",
+                ],
+            )
+            .unwrap_or(&tool_name);
+            let denial_id = ledger.record_denial(code, &tool_name, denied_shape, ts_now);
+            if !denial_id.is_empty() && !reason.contains("[denial_id:") {
+                reason.push_str(&format!(" [denial_id: {denial_id}]"));
+            }
+            if *halt_session {
+                ledger.trip_circuit_breaker(format!("{code}: {reason}"));
+                if let Some(mut c) = cap_opt {
+                    c.malicious_flags = c.malicious_flags.saturating_add(1);
+                    let _ = role_sandbox::save_session_capability(&repo_root, &c);
+                }
+            }
+            append_audit_jsonl(
+                &repo_root,
+                &session_id,
+                if tool_name.is_empty() {
+                    "PreToolUse"
+                } else {
+                    &tool_name
+                },
+                code,
+                reason,
+                *halt_session,
+            );
+        }
+        Decision::Allow { advisory, .. } => {
+            let is_feedback_submit_call = tool_name
+                .to_ascii_lowercase()
+                .contains("dotagent_submit_friction")
+                || extract_first_str(tool_input, &["command", "CommandLine", "cmd", "script"])
+                    .is_some_and(exec_sandbox::is_atomic_feedback_submit_command);
+            if !is_feedback_submit_call {
+                let trc_id = ledger.record_allowed_tool_trace(&tool_name);
+                if let Some(adv) = advisory
+                    && adv.starts_with("[AGENT-GUARD AUTO-PAGINATED]")
+                    && !adv.contains("[trace_id:")
+                {
+                    if let Some(idx) = adv.find(" <<<SPOTLIGHT_BOUNDARY_") {
+                        adv.insert_str(idx, &format!(" [trace_id: {trc_id}]"));
+                    } else {
+                        adv.push_str(&format!(" [trace_id: {trc_id}]"));
+                    }
+                }
+            }
+        }
     }
     let _ = ledger.save_locked_with_cache(&repo_root, hot_cache);
     decision
 }
 
+fn is_vetted_local_gateway_mcp_tool(norm_tool: &str) -> Option<&str> {
+    let sub = norm_tool
+        .strip_prefix("mcp__dotagent__")
+        .or_else(|| norm_tool.strip_prefix("mcp__dotagent_mcp_gateway__"))?;
+    if matches!(
+        sub,
+        "dotagent_read_file"
+            | "dotagent_edit_file"
+            | "dotagent_search"
+            | "dotagent_exec"
+            | "dotagent_status"
+            | "dotagent_submit_friction"
+    ) {
+        Some(sub)
+    } else {
+        None
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn evaluate_tool_invocation(
     tool_name: &str,
     input: &JsonValue,
@@ -459,6 +546,7 @@ fn evaluate_tool_invocation(
     cwd: &Path,
     profile: &RuntimeProfile,
     ledger: &mut SessionLedger,
+    raw_session_id: &str,
     (role, cap, direct_explore_env, payload_is_airlock_subagent): (
         swarm_contracts::SwarmRole,
         Option<&swarm_contracts::SessionCapability>,
@@ -505,12 +593,15 @@ fn evaluate_tool_invocation(
         );
     }
 
-    // 2. Enforce Zero-Trust MCP server allowlist (`mcp__susanbdev__*` only, with exact delimiter)
-    if norm_tool.starts_with("mcp__") && !norm_tool.starts_with(ALLOWED_MCP_SERVER_PREFIX) {
+    // 2. Enforce Zero-Trust MCP server allowlist (`mcp__susanbdev__*` + vetted local `dotagent` gateway tools only)
+    if norm_tool.starts_with("mcp__")
+        && !norm_tool.starts_with(ALLOWED_MCP_SERVER_PREFIX)
+        && is_vetted_local_gateway_mcp_tool(&norm_tool).is_none()
+    {
         return Decision::deny(
             "UNVETTED_MCP_SERVER_BLOCKED",
             format!(
-                "MCP tool '{tool_name}' is not from the locked canonical 'susanbdev/mcp' server (`{ALLOWED_MCP_SERVER_PREFIX}*`)."
+                "MCP tool '{tool_name}' is not from the locked canonical 'susanbdev/mcp' server (`{ALLOWED_MCP_SERVER_PREFIX}*`) or local `dotagent` MCP gateway."
             ),
             true,
         );
@@ -658,7 +749,16 @@ fn evaluate_tool_invocation(
             .map(|v| v != "0")
             .unwrap_or(true);
         if wrap_ascii && !exec_sandbox::is_canonical_exec_sandbox_wrapper(effective_cmd) {
-            let wrapped = exec_sandbox::wrap_bash_with_exec_sandbox(effective_cmd, true);
+            let sid_for_wrap = if exec_sandbox::is_atomic_feedback_submit_command(effective_cmd) {
+                Some(raw_session_id)
+            } else {
+                None
+            };
+            let wrapped = exec_sandbox::wrap_bash_with_exec_sandbox_session(
+                effective_cmd,
+                true,
+                sid_for_wrap,
+            );
             let updated_json = build_updated_shell_input_json(input, cmd_key, &wrapped);
             return Decision::Allow {
                 advisory: None,
@@ -1164,8 +1264,14 @@ fn evaluate_tool_invocation(
 
     // 7. Approved canonical MCP tools (`mcp__susanbdev__*`) and safe non-FS harness meta tools:
     //    Validate all string arguments for Unicode/injection smuggling and validate any path fields!
-    let is_approved_mcp = norm_tool.starts_with(ALLOWED_MCP_SERVER_PREFIX)
-        && norm_tool.len() > ALLOWED_MCP_SERVER_PREFIX.len();
+    let local_gateway_sub = is_vetted_local_gateway_mcp_tool(&norm_tool);
+    let is_approved_mcp = (norm_tool.starts_with(ALLOWED_MCP_SERVER_PREFIX)
+        && norm_tool.len() > ALLOWED_MCP_SERVER_PREFIX.len())
+        || local_gateway_sub.is_some();
+    let is_bare_feedback_or_status = matches!(
+        norm_tool.as_str(),
+        "dotagent_submit_friction" | "dotagent_status"
+    );
     let is_safe_harness_meta = matches!(
         norm_tool.as_str(),
         "todowrite"
@@ -1180,7 +1286,8 @@ fn evaluate_tool_invocation(
             | "list_skills"
             | "enterplanmode"
             | "exitplanmode"
-    ) || (is_subagent_tool && (swarm_allowed || is_research_airlock));
+    ) || is_bare_feedback_or_status
+        || (is_subagent_tool && (swarm_allowed || is_research_airlock));
     if is_approved_mcp || is_safe_harness_meta {
         if let Some(first) = find_first_unicode_violation_in_json(input) {
             return Decision::deny(
@@ -1233,8 +1340,14 @@ fn evaluate_tool_invocation(
                 "[AGENT-GUARD RESEARCH-AIRLOCK] Read-only `research-airlock` subagent authorized. Subagent return summary MUST stay <= 200 pure 7-bit ASCII tokens (file paths, line ranges, symbol signatures only).",
             );
         }
-        if is_approved_mcp {
-            let sub_action = &norm_tool[ALLOWED_MCP_SERVER_PREFIX.len()..];
+        if is_approved_mcp || is_bare_feedback_or_status {
+            let sub_action = if let Some(local_sub) = local_gateway_sub {
+                local_sub
+            } else if is_bare_feedback_or_status {
+                norm_tool.as_str()
+            } else {
+                &norm_tool[ALLOWED_MCP_SERVER_PREFIX.len()..]
+            };
             if let Err((code, reason, halt)) = mcp_policy::authorize_mcp_rpc_invocation(
                 tool_name,
                 sub_action,
@@ -1606,6 +1719,14 @@ fn pre_inspect_file_for_ingestion_with_profile(
 pub fn handle_post_tool_hook(raw_json: &str, fallback_cwd: &Path) -> Decision {
     let ctx = HookCallerContext {
         session_id: std::env::var("AGENT_GUARD_SESSION_ID").ok(),
+        root_session_id: std::env::var("AGENT_GUARD_ROOT_SESSION_ID")
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+            .or_else(|| {
+                std::env::var("AGENT_GUARD_PARENT_SESSION_ID")
+                    .ok()
+                    .filter(|s| !s.trim().is_empty())
+            }),
         profile_id: std::env::var("AGENT_GUARD_PROFILE").ok(),
         role_id: std::env::var("AGENT_GUARD_ROLE").ok(),
         direct_explore: std::env::var("AGENT_GUARD_DIRECT_EXPLORE").ok(),
@@ -1655,6 +1776,7 @@ pub fn handle_post_tool_hook_with_context(
     let session_id = extract_session_id_with_override(&parsed, caller_ctx.session_id.as_deref());
     let _session_lock = SessionLedger::acquire_lock(&repo_root, &session_id);
     let mut ledger = SessionLedger::load_or_create_with_cache(&repo_root, &session_id, hot_cache);
+    ledger.apply_root_session_override(caller_ctx.root_session_id.as_deref());
 
     let raw_tool_name = extract_tool_name(&parsed);
     let tool_label = if raw_tool_name.is_empty() {
@@ -1718,10 +1840,19 @@ pub fn handle_post_tool_hook_with_context(
         );
         let compacted_tokens = estimate_bpe_tokens(&compacted.clean_ascii);
         ledger.cumulative_tokens = ledger.cumulative_tokens.saturating_add(compacted_tokens);
+        let ts_now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let denial_id =
+            ledger.record_denial("TOOL_OUTPUT_FLOOD_BLOCKED", tool_label, tool_label, ts_now);
         let _ = ledger.save_locked_with_cache(&repo_root, hot_cache);
 
-        let wrapped =
+        let mut wrapped =
             wrap_spotlight_envelope(&compacted.clean_ascii, &ledger.turn_nonce, tool_label);
+        if !denial_id.is_empty() {
+            wrapped.push_str(&format!("\n[denial_id: {denial_id}]"));
+        }
         let audit_detail = format!(
             "Tool output {} bytes (> {MAX_TOOL_OUTPUT_BYTES} byte step ceiling for profile '{}') auto-compacted to {} bytes.",
             output_text.len(),
@@ -1740,6 +1871,11 @@ pub fn handle_post_tool_hook_with_context(
     }
 
     if let Err(bv) = analyze_text_budget(&output_text, false) {
+        let ts_now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let denial_id = ledger.record_denial(bv.code, tool_label, tool_label, ts_now);
         let _ = ledger.save_locked_with_cache(&repo_root, hot_cache);
         append_audit_jsonl(
             &repo_root,
@@ -1749,7 +1885,11 @@ pub fn handle_post_tool_hook_with_context(
             &bv.detail,
             false,
         );
-        return Decision::deny(bv.code, bv.detail, false);
+        let mut msg = bv.detail;
+        if !denial_id.is_empty() {
+            msg.push_str(&format!(" [denial_id: {denial_id}]"));
+        }
+        return Decision::deny(bv.code, msg, false);
     }
 
     // 2. Unicode smuggling in dynamic output
@@ -1873,6 +2013,9 @@ pub fn handle_post_tool_hook_with_context(
             " [COMPACT_STEP_NOW: Step context reached {}/{} tokens ({} tool calls). Finish this atomic step and compact context immediately rather than accumulating multi-feature history.]",
             ledger.cumulative_tokens, profile.max_turn_tokens, ledger.tool_calls
         ));
+        if let Some(tid) = ledger.last_tool_trace_id.as_deref() {
+            advisory.push_str(&format!(" [trace_id: {tid}]"));
+        }
     }
 
     Decision::allow_with_advisory(advisory)

@@ -605,6 +605,8 @@ fn dispatch_mediated_tool_call(tool_name: &str, args: &JsonValue, cwd: &Path) ->
     // 1. Per-RPC capability classification & taint/profile gate
     let sub_method = tool_name
         .strip_prefix("mcp__susanbdev__")
+        .or_else(|| tool_name.strip_prefix("mcp__dotagent__"))
+        .or_else(|| tool_name.strip_prefix("mcp__dotagent_mcp_gateway__"))
         .unwrap_or(tool_name);
     if let Err((code, detail, halt)) = authorize_mcp_rpc_invocation(
         tool_name,
@@ -613,13 +615,34 @@ fn dispatch_mediated_tool_call(tool_name: &str, args: &JsonValue, cwd: &Path) ->
         ledger_snapshot.tainted,
         &profile.profile_id,
     ) {
-        if halt {
+        let denial_id = {
             let _lock = SessionLedger::acquire_lock(&repo_root, &sid);
             let mut l = SessionLedger::load_or_create(&repo_root, &sid);
-            l.trip_circuit_breaker(format!("{code}: {detail}"));
+            let ts = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            let did = l.record_denial(code, tool_name, sub_method, ts);
+            if halt {
+                l.trip_circuit_breaker(format!("{code}: {detail}"));
+            }
             let _ = l.save_locked(&repo_root);
-        }
-        return mcp_tool_error(code, &detail);
+            did
+        };
+        let full_detail = if denial_id.is_empty() {
+            detail
+        } else {
+            format!("{detail} [denial_id: {denial_id}]")
+        };
+        crate::traversal_ledger::append_audit_jsonl(
+            &repo_root,
+            &sid,
+            tool_name,
+            code,
+            &full_detail,
+            halt,
+        );
+        return mcp_tool_error(code, &full_detail);
     }
 
     // 2. Dispatch mediated zero-trust workspace & upstream tools
@@ -918,6 +941,88 @@ fn dispatch_mediated_tool_call(tool_name: &str, args: &JsonValue, cwd: &Path) ->
                 Err(e) => mcp_tool_error("EXEC_SPAWN_FAILED", &format!("{e}")),
             }
         }
+        "dotagent_submit_friction" => {
+            let hook_req = JsonValue::Object(vec![
+                (
+                    "tool_name".to_string(),
+                    JsonValue::Str("dotagent_submit_friction".to_string()),
+                ),
+                ("tool_input".to_string(), args.clone()),
+            ])
+            .to_json_string();
+            if let Decision::Deny { code, reason, .. } = handle_pre_tool_hook(&hook_req, cwd) {
+                return mcp_tool_error(code, &reason);
+            }
+            if !profile.enable_write_tools {
+                let _lock = SessionLedger::acquire_lock(&repo_root, &sid);
+                let mut l = SessionLedger::load_or_create(&repo_root, &sid);
+                if l.mcp_readonly_feedback_calls >= 5 {
+                    return mcp_tool_error(
+                        "FEEDBACK_RATE_LIMIT_EXCEEDED",
+                        "research-readonly profile caps dotagent_submit_friction at 5 calls per session",
+                    );
+                }
+                l.mcp_readonly_feedback_calls = l.mcp_readonly_feedback_calls.saturating_add(1);
+                let _ = l.save_locked(&repo_root);
+            }
+            let Some(cat_str) = args.get("category").and_then(JsonValue::as_str) else {
+                return mcp_tool_error(
+                    "INVALID_FEEDBACK_BALLOT",
+                    "dotagent_submit_friction requires 'category'",
+                );
+            };
+            let Some(category) = crate::feedback::FeedbackCategory::parse(cat_str) else {
+                return mcp_tool_error(
+                    "INVALID_FEEDBACK_BALLOT",
+                    &format!(
+                        "unrecognized category '{cat_str}' (expected false_positive_block | missing_safe_flag | pagination_or_budget_friction | unclear_remediation | adapter_or_workflow_bug)"
+                    ),
+                );
+            };
+            let denial_id = args
+                .get("denial_id")
+                .and_then(JsonValue::as_str)
+                .map(String::from);
+            let reason_code = args
+                .get("reason_code")
+                .and_then(JsonValue::as_str)
+                .map(String::from);
+            if args.get("note_ascii").is_some() && args.get("summary").is_some() {
+                return mcp_tool_error(
+                    "AMBIGUOUS_TOOL_PARAM_ALIAS",
+                    "dotagent_submit_friction cannot specify both 'note_ascii' and 'summary'",
+                );
+            }
+            let note_ascii = args
+                .get("note_ascii")
+                .or_else(|| args.get("summary"))
+                .and_then(JsonValue::as_str)
+                .map(String::from);
+            let root_session_id = std::env::var("AGENT_GUARD_ROOT_SESSION_ID")
+                .ok()
+                .or_else(|| std::env::var("AGENT_GUARD_PARENT_SESSION_ID").ok());
+            let role =
+                std::env::var("AGENT_GUARD_ROLE").unwrap_or_else(|_| "coding-agent".to_string());
+            let task_id = std::env::var("DOTAGENT_TASK_ID").ok();
+            let req = crate::feedback::BallotRequest {
+                denial_id,
+                category,
+                reason_code,
+                note_ascii,
+                session_id: sid,
+                root_session_id,
+                role,
+                task_id,
+            };
+            match crate::feedback::submit_friction_ballot_with_sink(
+                &repo_root,
+                &req,
+                crate::feedback::EmitSink::HookOrMcpStderr,
+            ) {
+                Ok(agentpi_ev) => mcp_tool_success(&agentpi_ev.to_json_string()),
+                Err(err) => mcp_tool_error(err.guard_code().as_str(), err.message()),
+            }
+        }
         _ => {
             // Upstream `mcp__susanbdev__*` call: run full PreToolUse validation + mint CSPRNG DPoP proof
             let prefixed = if tool_name.starts_with("mcp__susanbdev__") {
@@ -1105,6 +1210,65 @@ fn gateway_tools_manifest() -> Vec<JsonValue> {
             "Read-only status of active zero-trust profile, session ledger, and pinned MCP endpoint",
             &[],
         ),
+        JsonValue::Object(vec![
+            (
+                "name".to_string(),
+                JsonValue::Str("dotagent_submit_friction".to_string()),
+            ),
+            (
+                "description".to_string(),
+                JsonValue::Str(
+                    "Submit kernel-grounded guardrail false-positive or workflow friction ballot (AgentPI emitted on stderr only)"
+                        .to_string(),
+                ),
+            ),
+            (
+                "inputSchema".to_string(),
+                JsonValue::Object(vec![
+                    ("type".to_string(), JsonValue::Str("object".to_string())),
+                    (
+                        "properties".to_string(),
+                        JsonValue::Object(vec![
+                            (
+                                "denial_id".to_string(),
+                                JsonValue::Object(vec![(
+                                    "type".to_string(),
+                                    JsonValue::Str("string".to_string()),
+                                )]),
+                            ),
+                            (
+                                "category".to_string(),
+                                JsonValue::Object(vec![(
+                                    "type".to_string(),
+                                    JsonValue::Str("string".to_string()),
+                                )]),
+                            ),
+                            (
+                                "reason_code".to_string(),
+                                JsonValue::Object(vec![(
+                                    "type".to_string(),
+                                    JsonValue::Str("string".to_string()),
+                                )]),
+                            ),
+                            (
+                                "note_ascii".to_string(),
+                                JsonValue::Object(vec![(
+                                    "type".to_string(),
+                                    JsonValue::Str("string".to_string()),
+                                )]),
+                            ),
+                        ]),
+                    ),
+                    (
+                        "required".to_string(),
+                        JsonValue::Array(vec![
+                            JsonValue::Str("denial_id".to_string()),
+                            JsonValue::Str("category".to_string()),
+                        ]),
+                    ),
+                ]),
+            ),
+        ]),
     ]
 }
 

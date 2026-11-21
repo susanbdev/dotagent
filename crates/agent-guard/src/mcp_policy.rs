@@ -16,6 +16,7 @@
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum McpRpcClass {
     ReadOnly,
+    FeedbackTelemetry,
     WorkspaceWrite,
     ExternalMutation,
 }
@@ -24,6 +25,7 @@ impl McpRpcClass {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::ReadOnly => "read_only",
+            Self::FeedbackTelemetry => "feedback_telemetry",
             Self::WorkspaceWrite => "workspace_write",
             Self::ExternalMutation => "external_mutation",
         }
@@ -42,12 +44,17 @@ pub const MCP_CAPABILITY_MANIFEST: &[McpManifestRule] = &[
     McpManifestRule {
         pattern: "ping|health|status|version|dotagent_status",
         class: McpRpcClass::ReadOnly,
-        description: "Liveness and read-only health metadata",
+        description: "Liveness and pure read-only health metadata",
     },
     McpManifestRule {
         pattern: "get_*|list_*|read_*|search|search_*|query|query_*|inspect_*|describe_*|explain_*|verify_*|diff|diff_*|check_*|audit_*|lookup_*|dotagent_read_file|dotagent_search",
         class: McpRpcClass::ReadOnly,
         description: "Pure read-only lookup, search, and verification RPCs",
+    },
+    McpManifestRule {
+        pattern: "dotagent_submit_friction",
+        class: McpRpcClass::FeedbackTelemetry,
+        description: "Kernel-grounded friction ballot telemetry spooling (taint-quarantined, rate-limited, zero workspace file mutation)",
     },
     McpManifestRule {
         pattern: "dotagent_edit_file",
@@ -81,6 +88,8 @@ const READONLY_EXACT_METHODS: &[&str] = &[
     "dotagent_search",
     "dotagent_status",
 ];
+
+const FEEDBACK_TELEMETRY_EXACT: &[&str] = &["dotagent_submit_friction"];
 
 const READONLY_PREFIXES: &[&str] = &[
     "get_",
@@ -138,6 +147,9 @@ pub fn classify_mcp_sub_method(sub_method: &str) -> McpRpcClass {
     if WORKSPACE_WRITE_EXACT.contains(&lower.as_str()) {
         return McpRpcClass::WorkspaceWrite;
     }
+    if FEEDBACK_TELEMETRY_EXACT.contains(&lower.as_str()) {
+        return McpRpcClass::FeedbackTelemetry;
+    }
 
     // Compound & camelCase smuggling guard: if ANY subtoken in the method identifier is a mutating
     // verb (e.g., `get_and_delete_repo`, `get_and_deleteAll`, `read_deleteFile`), fail closed!
@@ -171,6 +183,9 @@ pub fn authorize_mcp_rpc_invocation(
     let class = classify_mcp_sub_method(sub_method);
     match class {
         McpRpcClass::ReadOnly => Ok(McpRpcClass::ReadOnly),
+        // Dedicated telemetry capability: permitted across coding and research profiles (bounded at
+        // <= 5 calls/session under read-only profiles and quarantined to 0 votes if tainted).
+        McpRpcClass::FeedbackTelemetry => Ok(McpRpcClass::FeedbackTelemetry),
         McpRpcClass::WorkspaceWrite => {
             if writes_disabled {
                 return Err((

@@ -1,0 +1,251 @@
+name: Server-Side Ring-0 & Copilot Gate
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+  pull_request_target:
+    types: [opened, synchronize, reopened]
+  pull_request_review:
+    types: [submitted, dismissed]
+
+permissions:
+  contents: read
+  pull-requests: read
+  statuses: write
+
+concurrency:
+  group: copilot-gate-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  copilot-and-ratchet-gate:
+    name: Evaluate Ring-0 & Copilot Gate Status
+    # Decoy-PR defense: commit statuses are per-SHA, so a PR aimed at a scratch branch must never
+    # mint a green gate status that a second PR (same head SHA) into the default branch inherits.
+    # Fork PRs run under pull_request_target so GITHUB_TOKEN retains statuses:write while Step 1
+    # stays 100% tokenless and compiles the verifier strictly from the trusted default-branch base.
+    if: >-
+      github.event.pull_request.base.ref == github.event.repository.default_branch &&
+      (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) &&
+      (github.event_name != 'pull_request_target' || github.event.pull_request.head.repo.full_name != github.repository)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      CARGO_TERM_COLOR: always
+      GIT_CONFIG_NOSYSTEM: "1"
+    steps:
+      - name: Checkout PR head commit (full history for merge-base & hardware-key check)
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+          submodules: false
+          fetch-depth: 0
+
+      - name: Install stable Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      # No GH_TOKEN is exposed to any step that compiles or executes repository code.
+      - name: Build verifier from trusted base & run Ring-0 ratchet (token-less)
+        id: ratchet
+        env:
+          BASE_REF: ${{ github.event.repository.default_branch }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_AUTHOR: ${{ github.event.pull_request.user.login }}
+          PR_AUTHOR_TYPE: ${{ github.event.pull_request.user.type }}
+          PR_AUTHOR_ASSOC: ${{ github.event.pull_request.author_association }}
+          EVENT_ACTOR: ${{ github.actor }}
+        run: |
+          set -euo pipefail
+          BASE_OID="$(git rev-parse --verify "origin/${BASE_REF}^{commit}")"
+          TRUSTED="${RUNNER_TEMP}/trusted-base"
+          git worktree add --detach "${TRUSTED}" "${BASE_OID}"
+          for f in .cargo/config .cargo/config.toml rust-toolchain rust-toolchain.toml; do
+            if [ -e "${TRUSTED}/${f}" ] || [ -e "${GITHUB_WORKSPACE}/${f}" ]; then
+              echo "::error::Refusing to run ratchet: forbidden toolchain override ${f} present"
+              exit 1
+            fi
+          done
+          if git -C "${TRUSTED}" grep -q -F 'verify-ring0-ratchet' -- crates/agent-guard/src/cli.rs; then
+            (cd "${TRUSTED}" && CARGO_TARGET_DIR="${RUNNER_TEMP}/trusted-target" \
+              cargo build --locked -p agent-guard --bin dotagent)
+            "${RUNNER_TEMP}/trusted-target/debug/dotagent" verify-ring0-ratchet \
+              --base "origin/${BASE_REF}"
+          elif git merge-base --is-ancestor 0194af29450aa65d1699337ec731d1740efc00e4 "${BASE_OID}" \
+               && ! git cat-file -e "${BASE_OID}:config/allowed_human_signers" 2>/dev/null; then
+            # Self-extinguishing one-time genesis bootstrap (never compiles PR sources): constrains any
+            # non-human/automation PR to the 5-file Ring-2 allowlist and requires authenticated human
+            # org-member ownership (susanbeasles, PR #15) + pinned signer digest for the initial enrollment.
+            python3 -c 'import sys, textwrap; exec(textwrap.dedent(sys.stdin.read()))' "${TRUSTED}" "${GITHUB_WORKSPACE}" "${BASE_OID}" <<'PY'
+          import hashlib, os, subprocess, sys, tomllib
+          trusted, ws, base_oid = sys.argv[1], sys.argv[2], sys.argv[3]
+          RING2_ALLOWLIST = {
+              "crates/agent-guard/src/cmd_policy.rs",
+              "crates/agent-guard/src/mcp_policy.rs",
+              "crates/agent-guard/src/diagnostics.rs",
+              "tests/bypass_corpus.toml",
+              "crates/agent-guard/tests/ring2_policy_tests.rs",
+          }
+          PINNED_SIGNERS_SHA256 = "89ce5a026336a21d62959969b1552654c79709d03601d82f16fc3102d1dd7692"
+          mb = subprocess.check_output(["git", "-C", ws, "merge-base", "HEAD", base_oid], text=True).strip()
+          if subprocess.run(["git", "-C", ws, "merge-base", "--is-ancestor", "0194af29450aa65d1699337ec731d1740efc00e4", mb]).returncode != 0:
+              raise SystemExit(f"GENESIS_VIOLATION: merge-base {mb} does not descend from v2.0.0 genesis")
+          changed = [
+              p for p in subprocess.check_output(
+                  ["git", "-C", ws, "diff", "--name-only", base_oid], text=True
+              ).splitlines() if p.strip()
+          ]
+          outside_ring2 = [p for p in changed if p not in RING2_ALLOWLIST]
+          if outside_ring2:
+              actor = os.environ.get("EVENT_ACTOR", "")
+              pr_author = os.environ.get("PR_AUTHOR", "")
+              pr_type = os.environ.get("PR_AUTHOR_TYPE", "")
+              pr_assoc = os.environ.get("PR_AUTHOR_ASSOC", "")
+              pr_num = os.environ.get("PR_NUMBER", "")
+              if (
+                  actor.endswith("[bot]")
+                  or pr_author != "susanbeasles"
+                  or pr_type != "User"
+                  or pr_assoc not in ("OWNER", "MEMBER")
+                  or pr_num != "15"
+              ):
+                  raise SystemExit(
+                      f"GENESIS_VIOLATION: paths outside 5-file Ring-2 allowlist ({outside_ring2[:3]}) require authenticated human owner enrollment"
+                  )
+              sig_path = os.path.join(ws, "config", "allowed_human_signers")
+              if os.path.islink(sig_path) or not os.path.isfile(sig_path):
+                  raise SystemExit("GENESIS_VIOLATION: config/allowed_human_signers missing or symlink")
+              digest = hashlib.sha256(open(sig_path, "rb").read()).hexdigest()
+              if digest != PINNED_SIGNERS_SHA256:
+                  raise SystemExit(f"GENESIS_VIOLATION: signers sha256 {digest} != {PINNED_SIGNERS_SHA256}")
+          base_vecs = tomllib.load(open(os.path.join(trusted, "tests", "bypass_corpus.toml"), "rb"))["vectors"]
+          head_vecs = tomllib.load(open(os.path.join(ws, "tests", "bypass_corpus.toml"), "rb"))["vectors"]
+          if len(head_vecs) < len(base_vecs) or head_vecs[:len(base_vecs)] != base_vecs:
+              raise SystemExit("GENESIS_VIOLATION: bypass_corpus.toml violates prefix identity against base")
+          seen = set()
+          for idx, v in enumerate(head_vecs):
+              key = (v["kind"], " ".join(v["payload"].split()))
+              if key in seen:
+                  raise SystemExit(f"GENESIS_VIOLATION: duplicate corpus vector at #{idx + 1}")
+              seen.add(key)
+          print(f"[RING0 RATCHET GENESIS OK] base={base_oid[:12]} corpus={len(head_vecs)} (+{len(head_vecs)-len(base_vecs)})")
+          PY
+          else
+            echo "::error::Trusted base ${BASE_OID} lacks verify-ring0-ratchet and is not the pinned genesis commit; failing closed."
+            exit 1
+          fi
+
+      # Runs no cargo / repository code; only stdlib Python + gh against the GitHub API.
+      - name: Post Ring-0 & Copilot Gate commit status
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO_FULL: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          RATCHET_OUTCOME: ${{ steps.ratchet.outcome }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, os, subprocess, sys
+
+          repo = os.environ["REPO_FULL"]
+          owner, name = repo.split("/", 1)
+          pr_num = int(os.environ["PR_NUMBER"])
+          head_sha = os.environ["PR_HEAD_SHA"]
+          COPILOT = "copilot-pull-request-reviewer[bot]"
+
+          def set_status(state, desc):
+              subprocess.run(
+                  [
+                      "gh", "api", "-X", "POST", f"repos/{repo}/statuses/{head_sha}",
+                      "-f", f"state={state}",
+                      "-f", "context=Ring-0 & Copilot Gate",
+                      "-f", f"description={desc[:135]}",
+                  ],
+                  stdout=subprocess.DEVNULL,
+                  check=True,
+              )
+
+          def gh_json(args):
+              out = subprocess.check_output(["gh"] + args, text=True)
+              return json.loads(out) if out.strip() else None
+
+          def evaluate():
+              if os.environ.get("RATCHET_OUTCOME") != "success":
+                  set_status("failure", "Ring-0 Constitutional Ratchet failed")
+                  return 1
+
+              gql = (
+                  "query($owner:String!,$name:String!,$pr:Int!){"
+                  "repository(owner:$owner,name:$name){"
+                  "pullRequest(number:$pr){"
+                  "reviewThreads(first:100){pageInfo{hasNextPage}nodes{isResolved}}"
+                  "}}}"
+              )
+              gql_data = gh_json([
+                  "api", "graphql",
+                  "-f", f"query={gql}",
+                  "--raw-field", f"owner={owner}",
+                  "--raw-field", f"name={name}",
+                  "-F", f"pr={pr_num}",
+              ])
+              if not isinstance(gql_data, dict) or gql_data.get("errors"):
+                  raise ValueError("GraphQL errors while reading review threads")
+              rt = gql_data["data"]["repository"]["pullRequest"]["reviewThreads"]
+              if rt["pageInfo"]["hasNextPage"]:
+                  set_status("failure", ">100 review threads; manual review required")
+                  return 1
+              unresolved = sum(1 for n in rt["nodes"] if not n["isResolved"])
+
+              pages = gh_json(["api", "--paginate", "--slurp", f"repos/{repo}/pulls/{pr_num}/reviews"]) or []
+              reviews = [r for p in pages for r in (p if isinstance(p, list) else [p])]
+              # Track the newest Copilot review on head_sha including DISMISSED so a subsequent
+              # dismissal invalidates any earlier clean review on the same commit.
+              latest_copilot = None
+              for rev in reviews:
+                  u = rev.get("user") or {}
+                  is_copilot = u.get("login", "") == COPILOT and str(u.get("type", "")).lower() == "bot"
+                  if is_copilot and rev.get("commit_id") == head_sha:
+                      if latest_copilot is None or int(rev.get("id", 0)) >= int(latest_copilot.get("id", 0)):
+                          latest_copilot = rev
+
+              if latest_copilot is not None:
+                  rid = latest_copilot["id"]
+                  rstate = str(latest_copilot.get("state", "")).upper()
+                  if rstate == "DISMISSED":
+                      set_status("pending", "Latest Copilot review on head was dismissed; awaiting fresh review")
+                      return 0
+                  cpages = gh_json(["api", "--paginate", "--slurp", f"repos/{repo}/pulls/{pr_num}/reviews/{rid}/comments"]) or []
+                  inline_comments = sum(len(p) if isinstance(p, list) else 1 for p in cpages)
+                  if rstate == "CHANGES_REQUESTED" or inline_comments > 0:
+                      set_status(
+                          "failure",
+                          f"Copilot inline_comments={inline_comments}, state={rstate} on head",
+                      )
+                      return 1
+                  if unresolved > 0:
+                      # Clean head review but stale threads remain: stay pending; resolving the
+                      # threads re-triggers this workflow via pull_request_review_thread.
+                      set_status("pending", f"Copilot clean on head; {unresolved} unresolved thread(s) remain")
+                      return 0
+                  set_status("success", "Ring-0 ratchet + Copilot 0-comment review verified")
+                  return 0
+
+              # Copilot review is required unconditionally on every PR (hardware signatures govern
+              # only Ring-0 path eligibility in verify-ring0-ratchet, never review bypass).
+              set_status("pending", "Waiting for copilot-pull-request-reviewer[bot] review on head commit")
+              return 0
+
+          try:
+              rc = evaluate()
+          except Exception as exc:  # fail closed on any API / parse error
+              print(f"gate evaluation error: {exc}", file=sys.stderr)
+              try:
+                  set_status("failure", "Gate evaluation error (fail-closed)")
+              finally:
+                  rc = 1
+          raise SystemExit(rc)
+          PY

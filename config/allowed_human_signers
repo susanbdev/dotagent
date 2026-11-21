@@ -1,0 +1,6 @@
+# Ring-0 Constitutional Hardware Signers (`susanbdev/dotagent`)
+# Commits modifying any path outside the 5-file Ring-2 allowlist must pass cryptographic
+# FIDO2/SSH commit signature verification (`ssh-keygen -Y verify -n git` / `git verify-commit`)
+# against the version of this file committed at `<merge_base>`.
+215839550+susanbeasles@users.noreply.github.com namespaces="git" sk-ssh-ed25519@openssh.com AAAAGnNrLXNzaC1lZDI1NTE5QG9wZW5zc2guY29tAAAAIONErNAQxLFUrTlkW6aphr1CYrio2kjFDCAGaZAW15GeAAAAE3NzaDpnaXRodWItcGVyc29uYWw=
+215839550+susanbeasles@users.noreply.github.com namespaces="git" sk-ssh-ed25519@openssh.com AAAAGnNrLXNzaC1lZDI1NTE5QG9wZW5zc2guY29tAAAAIH9fcLqvKjJTzXml+HMYS1xlRFjbz/A1i0F/59mSGg6cAAAAF3NzaDpzdXNhbmJlYXNsZXMtZ2l0aHVi

@@ -522,6 +522,44 @@ pub fn rpc_verify_domain_hmac(
     }
 }
 
+pub fn load_or_init_feedback_vault_key(repo_root: &Path) -> Result<ZeroizingKey, String> {
+    let raw = load_or_init_vault_hmac_key(repo_root)?;
+    Ok(ZeroizingKey::new(raw))
+}
+
+pub fn compute_domain_tag_for_feedback(
+    key: &[u8; 32],
+    domain: &[u8],
+    payload: &[u8],
+) -> Result<[u8; 32], String> {
+    compute_domain_tag_raw(key, domain, payload)
+}
+
+pub fn rpc_submit_friction_ballot(
+    repo_root: &Path,
+    ballot_req: &JsonValue,
+) -> Result<JsonValue, String> {
+    #[cfg(unix)]
+    {
+        let sock_path = coordinator_socket_path(repo_root)?;
+        let worker_token = std::env::var("AGENT_GUARD_IPC_WORKER_TOKEN").unwrap_or_default();
+        let req = JsonValue::Object(vec![
+            (
+                "op".to_string(),
+                JsonValue::Str("submit_friction_ballot".to_string()),
+            ),
+            ("worker_token".to_string(), JsonValue::Str(worker_token)),
+            ("ballot_req".to_string(), ballot_req.clone()),
+        ]);
+        send_rpc_request(&sock_path, &req)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (repo_root, ballot_req);
+        Err("Unix domain sockets unsupported on this platform".to_string())
+    }
+}
+
 pub fn rpc_compute_raw_hmac_bytes(
     repo_root: &Path,
     canonical_bytes: &[u8],
@@ -830,6 +868,8 @@ pub fn ensure_hook_daemon() -> Result<PathBuf, String> {
         "AGENT_GUARD_PROFILE",
         "AGENT_GUARD_ROLE",
         "AGENT_GUARD_SESSION_ID",
+        "AGENT_GUARD_ROOT_SESSION_ID",
+        "AGENT_GUARD_PARENT_SESSION_ID",
         "AGENT_GUARD_REPO_ROOT",
     ] {
         daemon_cmd.env_remove(scrub_key);
@@ -881,6 +921,14 @@ pub fn rpc_eval_hook(
     {
         let sock_path = hook_daemon_socket_path()?;
         let caller_sid = std::env::var("AGENT_GUARD_SESSION_ID").ok();
+        let caller_root_sid = std::env::var("AGENT_GUARD_ROOT_SESSION_ID")
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+            .or_else(|| {
+                std::env::var("AGENT_GUARD_PARENT_SESSION_ID")
+                    .ok()
+                    .filter(|s| !s.trim().is_empty())
+            });
         let caller_profile = std::env::var("AGENT_GUARD_PROFILE").ok();
         let caller_role = std::env::var("AGENT_GUARD_ROLE").ok();
         let caller_direct_explore = std::env::var("AGENT_GUARD_DIRECT_EXPLORE").ok();
@@ -902,6 +950,10 @@ pub fn rpc_eval_hook(
             (
                 "caller_session_id".to_string(),
                 caller_sid.map_or(JsonValue::Null, JsonValue::Str),
+            ),
+            (
+                "caller_root_session_id".to_string(),
+                caller_root_sid.map_or(JsonValue::Null, JsonValue::Str),
             ),
             (
                 "caller_profile".to_string(),
@@ -971,6 +1023,9 @@ pub fn rpc_eval_hook(
 }
 
 fn intern_known_guard_code(code: &str) -> &'static str {
+    if let Some(gc) = crate::diagnostics::GuardCode::from_code_str(code) {
+        return gc.as_str();
+    }
     const KNOWN_GUARD_CODES: &[&str] = &[
         "ADVERSARIAL_ROUND_CAP_EXCEEDED",
         "AMBIGUOUS_REQUIREMENT",
@@ -1408,6 +1463,10 @@ fn process_hook_daemon_line(
             let caller_ctx = crate::HookCallerContext {
                 session_id: req
                     .get("caller_session_id")
+                    .and_then(JsonValue::as_str)
+                    .map(String::from),
+                root_session_id: req
+                    .get("caller_root_session_id")
                     .and_then(JsonValue::as_str)
                     .map(String::from),
                 profile_id: req
@@ -2192,6 +2251,46 @@ pub(crate) fn process_rpc_line(
             Ok(JsonValue::Object(vec![
                 ("ok".to_string(), JsonValue::Bool(true)),
                 ("epoch_id".to_string(), JsonValue::Uint(ep)),
+            ]))
+        }
+        "submit_friction_ballot" => {
+            let worker_tok = req
+                .get("worker_token")
+                .and_then(JsonValue::as_str)
+                .ok_or_else(|| "UNAUTHENTICATED_IPC_BALLOT: missing worker_token".to_string())?;
+            let (verified_sid, verified_root_sid, verified_role) =
+                crate::feedback::verify_ipc_worker_token(
+                    key,
+                    canon_repo,
+                    worker_tok,
+                    now_epoch_secs(),
+                )?;
+            let ballot_req_val = req
+                .get("ballot_req")
+                .ok_or_else(|| "missing ballot_req in submit_friction_ballot".to_string())?;
+            let mut ballot_req = crate::feedback::BallotRequest::from_json_value(ballot_req_val)?;
+            if !ballot_req.session_id.is_empty()
+                && ballot_req.session_id != "default"
+                && ballot_req.session_id != verified_sid
+            {
+                return Err(format!(
+                    "FORGED_IPC_SESSION_DENIED: caller asserted session_id '{}' but worker token is bound to '{verified_sid}'",
+                    ballot_req.session_id
+                ));
+            }
+            ballot_req.session_id = verified_sid;
+            ballot_req.root_session_id = Some(verified_root_sid);
+            ballot_req.role = verified_role;
+            let agentpi_ev = crate::feedback::commit_ballot_on_host_redacted(
+                canon_repo,
+                &ballot_req,
+                true,
+                crate::feedback::EmitSink::Silent,
+            )
+            .map_err(|e| format!("{}: {}", e.guard_code().as_str(), e.message()))?;
+            Ok(JsonValue::Object(vec![
+                ("ok".to_string(), JsonValue::Bool(true)),
+                ("agentpi_event".to_string(), agentpi_ev),
             ]))
         }
         "eval_hook" => Err(

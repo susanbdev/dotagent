@@ -110,8 +110,8 @@ fn blocks_entire_250_plus_bypass_corpus_at_100_percent() {
     let vectors = load_bypass_corpus();
     assert_eq!(
         vectors.len(),
-        315,
-        "Expected exact 315 adversarial bypass vectors, got {}",
+        327,
+        "Expected exact 327 adversarial bypass vectors, got {}",
         vectors.len()
     );
 
@@ -153,6 +153,7 @@ fn blocks_entire_250_plus_bypass_corpus_at_100_percent() {
                     .is_some();
                 uni_bad || inj_bad
             }
+            "mcp" => agent_guard::ring0_ratchet::mcp_corpus_vector_blocked(&vec_item.payload),
             other => panic!("unknown corpus kind '{other}'"),
         };
 
@@ -2567,6 +2568,7 @@ fn antigravity_airlock_delegation_and_standard_coding_discovery_gate_with_escape
     assert!(handle_user_prompt_hook(&prompt_reset, &repo).is_allow());
     let env_escape_ctx = agent_guard::HookCallerContext {
         session_id: None,
+        root_session_id: None,
         profile_id: None,
         role_id: None,
         direct_explore: Some("1".to_string()),

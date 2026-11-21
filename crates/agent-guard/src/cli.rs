@@ -73,6 +73,10 @@ pub fn run_cli_entrypoint() -> ExitCode {
         "activate" => crate::operator::run_activate_cli(&args[1..], &cwd),
         "deactivate" => crate::operator::run_deactivate_cli(&args[1..], &cwd),
         "fleet" => crate::fleet::run_fleet_cli(&args[1..], &cwd),
+        "feedback" => crate::feedback::run_feedback_cli(&args[1..], &cwd),
+        "verify-ring0-ratchet" => {
+            crate::ring0_ratchet::run_verify_ring0_ratchet_cli(&args[1..], &cwd)
+        }
         "telemetry" => crate::telemetry::run_telemetry_cli(&args[1..]),
         "self-verify" => crate::fleet::run_self_verify_cli(&args[1..]),
         "verify-receipt" => crate::stop_receipt::run_verify_receipt_cli(&args[1..], &cwd),
@@ -268,7 +272,9 @@ pub fn run_cli_entrypoint() -> ExitCode {
                  Operator & Onboarding Commands:\n\
                  \x20 activate [--workspace <dir>] [--dry-run]  Non-destructive multi-harness activation & backups\n\
                  \x20 deactivate [--workspace <dir>]            Restore .dotagent.bak files & remove deployed plane\n\
-                 \x20 fleet <audit|doctor|sync|build-image>     Polyrepo org sync, drift audit, & /opt/dotagent builder\n\
+                 \x20 fleet <audit|doctor|sync|build-image|configure-github>  Polyrepo sync, image builder, & GitHub Org rulesets\n\
+                 \x20 feedback <submit|status|sync-github|run-loop>  Agent friction ballots, AgentPI stream, & autonomous loop\n\
+                 \x20 verify-ring0-ratchet [--base origin/main] Verify Ring-0 immutability & monotonic bypass corpus\n\
                  \x20 telemetry <summary|top-denies|rotate|export-otlp>  Human-TTY-only security analytics\n\
                  \x20 verify-receipt [receipt.json] [--pubkey]  Verify asymmetric Ed25519 StopReceipt attestation\n\
                  \x20 self-verify --sums <SHA256SUMS>           Verify binary SHA-256 & SLSA v1.0 provenance\n\
@@ -310,11 +316,19 @@ pub fn run_cli_entrypoint() -> ExitCode {
 }
 
 fn exec_sibling_tool(bin_name: &str, forward_args: &[String]) -> ExitCode {
-    let resolved = std::env::current_exe()
+    let Some(resolved) = std::env::current_exe()
         .ok()
         .and_then(|exe| exe.parent().map(|dir| dir.join(bin_name)))
-        .filter(|p| p.is_file())
-        .unwrap_or_else(|| PathBuf::from(bin_name));
+        .filter(|p| {
+            std::fs::symlink_metadata(p)
+                .is_ok_and(|m| !m.file_type().is_symlink() && m.file_type().is_file())
+        })
+    else {
+        eprintln!(
+            "[dotagent] HARD DENY: trusted sibling binary '{bin_name}' not found beside current executable"
+        );
+        return ExitCode::from(2);
+    };
 
     match std::process::Command::new(&resolved)
         .args(forward_args)
@@ -486,9 +500,17 @@ fn emit_hook_decision(decision: Decision, phase: HookPhase) -> ExitCode {
                     "hookEventName".to_string(),
                     JsonValue::Str(phase.event_name().to_string()),
                 )];
-                if let Some(raw_obj) = updated_input_json
-                    && let Ok(parsed_obj) = JsonValue::parse(&raw_obj)
-                {
+                if let Some(raw_obj) = updated_input_json {
+                    let Ok(parsed_obj) = JsonValue::parse(&raw_obj) else {
+                        return emit_hook_decision(
+                            Decision::deny(
+                                "INTERNAL_HOOK_JSON_ERROR",
+                                "Failed serializing updatedInput JSON object".to_string(),
+                                false,
+                            ),
+                            phase,
+                        );
+                    };
                     fields.push((
                         "permissionDecision".to_string(),
                         JsonValue::Str("allow".to_string()),
