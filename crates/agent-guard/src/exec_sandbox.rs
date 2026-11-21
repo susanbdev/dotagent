@@ -536,23 +536,25 @@ pub fn run_exec_sandbox_cli(args: &[String], default_cwd: &Path) -> ExitCode {
         .ok()
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty());
-    let resolved_cli_swarm_sid = if let Some(ref cli_sid) = cli_session_id {
-        if cli_sid.starts_with("swm_") {
-            Some(cli_sid.clone())
-        } else {
-            crate::role_sandbox::lookup_bound_hook_capability(&common_repo, cli_sid)
-                .ok()
-                .flatten()
-                .map(|c| c.session_id)
+    let requested_session_id = env_session_id
+        .as_deref()
+        .or(cli_session_id.as_deref())
+        .unwrap_or("default");
+    let effective_session_id = if !requested_session_id.starts_with("swm_")
+        && crate::breadcrumbs::swarm_state_dir_if_exists(&common_repo).is_some()
+    {
+        match crate::role_sandbox::lookup_bound_hook_capability(&common_repo, requested_session_id)
+        {
+            Ok(Some(cap)) => cap.session_id,
+            Ok(None) => requested_session_id.to_string(),
+            Err(e) => {
+                eprintln!("[AGENT-GUARD HARD DENY :: CAPABILITY_WRITE_SCOPE] {e}");
+                return ExitCode::from(2);
+            }
         }
     } else {
-        None
+        requested_session_id.to_string()
     };
-    let effective_session_id = env_session_id
-        .clone()
-        .or_else(|| resolved_cli_swarm_sid.clone())
-        .or_else(|| cli_session_id.clone())
-        .unwrap_or_else(|| "default".to_string());
     let has_swarm_session = effective_session_id.starts_with("swm_");
 
     // Snapshot `.git/config` bytes (<= 256 KiB) and SHA-256 digest prior to execution so any
@@ -703,9 +705,7 @@ pub fn run_exec_sandbox_cli(args: &[String], default_cwd: &Path) -> ExitCode {
         &effective_session_id,
         capability_write_paths.as_deref(),
     );
-    if (require_kernel || (cfg!(target_os = "linux") && capability_write_paths.is_some()))
-        && !mode.is_kernel_enforced()
-    {
+    if (require_kernel || capability_write_paths.is_some()) && !mode.is_kernel_enforced() {
         eprintln!(
             "[AGENT-GUARD HARD DENY :: KERNEL_SANDBOX_UNAVAILABLE] Host kernel does not enforce Landlock/Seatbelt VFS containment (mode={}).",
             mode.as_str()
@@ -721,7 +721,7 @@ pub fn run_exec_sandbox_cli(args: &[String], default_cwd: &Path) -> ExitCode {
         return ExitCode::from(2);
     }
 
-    let mut child_cmd = build_child_command(
+    let mut child_cmd = match build_child_command(
         &shell_script,
         &repo_root,
         &cwd,
@@ -729,13 +729,18 @@ pub fn run_exec_sandbox_cli(args: &[String], default_cwd: &Path) -> ExitCode {
         opts,
         mode,
         &effective_session_id,
-    );
-    if env_session_id.is_none() {
-        if let Some(ref swm_sid) = resolved_cli_swarm_sid {
-            child_cmd.env("AGENT_GUARD_SESSION_ID", swm_sid);
-        } else if let Some(ref sid_override) = cli_session_id {
-            child_cmd.env("AGENT_GUARD_SESSION_ID", sid_override);
+        capability_write_paths.as_deref(),
+    ) {
+        Ok(cmd) => cmd,
+        Err(e) => {
+            eprintln!("[AGENT-GUARD HARD DENY :: CAPABILITY_WRITE_SCOPE] {e}");
+            return ExitCode::from(2);
         }
+    };
+    if effective_session_id != requested_session_id
+        || (env_session_id.is_none() && cli_session_id.is_some())
+    {
+        child_cmd.env("AGENT_GUARD_SESSION_ID", &effective_session_id);
     }
     if let Some(tok) = minted_ipc_worker_token {
         child_cmd.env("AGENT_GUARD_IPC_WORKER_TOKEN", tok);
@@ -1199,13 +1204,19 @@ fn build_child_command(
     opts: SandboxPolicyOpts,
     mode: KernelSandboxMode,
     session_hint: &str,
-) -> Command {
+    capability_write_paths: Option<&[PathBuf]>,
+) -> Result<Command, String> {
     #[cfg(target_os = "macos")]
     let mut cmd = {
         let _ = mode;
         if Path::new("/usr/bin/sandbox-exec").is_file() {
-            let profile =
-                render_macos_seatbelt_profile(repo_root, ephemeral_tmp, opts, session_hint);
+            let profile = render_macos_seatbelt_profile(
+                repo_root,
+                ephemeral_tmp,
+                opts,
+                session_hint,
+                capability_write_paths,
+            )?;
             let mut c = Command::new("/usr/bin/sandbox-exec");
             c.arg("-p")
                 .arg(profile)
@@ -1231,7 +1242,7 @@ fn build_child_command(
 
     #[cfg(target_os = "linux")]
     let mut cmd = {
-        let _ = (repo_root, session_hint);
+        let _ = (repo_root, session_hint, capability_write_paths);
         // Only wrap with `/usr/bin/unshare --user --net` when Landlock VFS restriction did NOT
         // restrict `/proc/self/uid_map` / `/proc/self/setgroups` (under Landlock, seccomp-bpf
         // already blocks all non-AF_UNIX/non-AF_NETLINK socket creation in-kernel).
@@ -1265,7 +1276,7 @@ fn build_child_command(
 
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     let mut cmd = {
-        let _ = (repo_root, mode, session_hint);
+        let _ = (repo_root, mode, session_hint, capability_write_paths);
         let mut c = Command::new("bash");
         c.arg("--norc")
             .arg("--noprofile")
@@ -1377,7 +1388,7 @@ fn build_child_command(
         cmd.env(format!("GIT_CONFIG_VALUE_{idx}"), v);
     }
 
-    cmd
+    Ok(cmd)
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -1839,7 +1850,15 @@ fn prepare_capability_write_paths(
     use std::collections::BTreeSet;
     use std::os::unix::fs::MetadataExt;
 
-    let (role, capability) = crate::role_sandbox::resolve_active_role(canon_repo, session_hint)?;
+    // Standalone ledger IDs can appear in AGENT_GUARD_SESSION_ID. The selected
+    // session hint already contains the verified binding or the original ID.
+    let role_override = env::var("AGENT_GUARD_ROLE").ok();
+    let (role, capability) = crate::role_sandbox::resolve_active_role_with_overrides(
+        canon_repo,
+        session_hint,
+        role_override.as_deref(),
+        None,
+    )?;
     let qa_only = role == SwarmRole::QaEngineer;
     if role != SwarmRole::Grunt && !qa_only {
         return Ok(None);
@@ -2421,8 +2440,34 @@ fn render_macos_seatbelt_profile(
     ephemeral_tmp: Option<&Path>,
     opts: SandboxPolicyOpts,
     session_hint: &str,
-) -> String {
-    let canon_repo = fs::canonicalize(repo_root).unwrap_or_else(|_| repo_root.to_path_buf());
+    capability_write_paths: Option<&[PathBuf]>,
+) -> Result<String, String> {
+    use std::os::unix::fs::MetadataExt;
+
+    let canon_repo = match fs::canonicalize(repo_root) {
+        Ok(path) => path,
+        Err(_) if capability_write_paths.is_none() => repo_root.to_path_buf(),
+        Err(_) => {
+            return Err("cannot resolve the checkout for the Seatbelt write scope".to_string());
+        }
+    };
+    let representable = |path: &Path| {
+        path.is_absolute()
+            && path
+                .to_str()
+                .is_some_and(|raw| !raw.chars().any(char::is_control))
+    };
+    if capability_write_paths.is_some() && !representable(&canon_repo) {
+        return Err("checkout path cannot be represented in the Seatbelt write scope".to_string());
+    }
+    let allow_write_tree = |path: &Path| {
+        capability_write_paths.is_none()
+            || (representable(path)
+                && fs::canonicalize(path).ok().as_deref() == Some(path)
+                && !path.starts_with(&canon_repo)
+                && !canon_repo.starts_with(path))
+    };
+    let repo_writes_allowed = opts.writes_allowed && capability_write_paths.is_none();
     let repo_s = escape_sbpl_literal(&canon_repo.to_string_lossy());
     let home_s = escape_sbpl_literal(&env::var("HOME").unwrap_or_default());
     let has_swarm_session = session_hint.trim().starts_with("swm_")
@@ -2436,16 +2481,36 @@ fn render_macos_seatbelt_profile(
     // Default-deny arbitrary filesystem writes outside `repo_root` and `ephemeral_tmp`
     p.push_str("(deny file-write*)\n");
     p.push_str("(allow file-write* (literal \"/dev/null\") (literal \"/dev/zero\") (literal \"/dev/urandom\") (literal \"/dev/random\"))\n");
-    if opts.writes_allowed {
+    if repo_writes_allowed {
         p.push_str(&format!("(allow file-write* (subpath \"{repo_s}\"))\n"));
+    }
+    if let Some(paths) = capability_write_paths {
+        for path in paths {
+            if !representable(path)
+                || !path.starts_with(&canon_repo)
+                || fs::canonicalize(path).ok().as_deref() != Some(path.as_path())
+                || !fs::symlink_metadata(path).is_ok_and(|meta| meta.is_file() && meta.nlink() == 1)
+            {
+                return Err(
+                    "a capability file cannot be represented safely in Seatbelt".to_string()
+                );
+            }
+            let literal = escape_sbpl_literal(&path.to_string_lossy());
+            p.push_str(&format!(
+                "(allow file-write-data (literal \"{literal}\"))\n"
+            ));
+        }
     }
 
     if let Some(tmp) = ephemeral_tmp {
         let canon_tmp = fs::canonicalize(tmp).unwrap_or_else(|_| tmp.to_path_buf());
         let tmp_s = escape_sbpl_literal(&canon_tmp.to_string_lossy());
-        p.push_str(&format!(
-            "(deny file-read* file-write* (subpath \"/tmp\") (subpath \"/private/tmp\") (subpath \"/var/tmp\") (subpath \"/private/var/tmp\"))\n(allow file-read* file-write* (subpath \"{tmp_s}\"))\n"
-        ));
+        p.push_str("(deny file-read* file-write* (subpath \"/tmp\") (subpath \"/private/tmp\") (subpath \"/var/tmp\") (subpath \"/private/var/tmp\"))\n");
+        if allow_write_tree(&canon_tmp) {
+            p.push_str(&format!(
+                "(allow file-read* file-write* (subpath \"{tmp_s}\"))\n"
+            ));
+        }
     }
     if !home_s.is_empty() {
         p.push_str(&format!(
@@ -2479,6 +2544,9 @@ fn render_macos_seatbelt_profile(
             for sub in ["ipc", "sessions", "spools", "ledger"] {
                 let sub_path = sdir.join(sub);
                 let canon_sub = fs::canonicalize(&sub_path).unwrap_or(sub_path);
+                if !allow_write_tree(&canon_sub) {
+                    continue;
+                }
                 let sp = escape_sbpl_literal(&canon_sub.to_string_lossy());
                 p.push_str(&format!(
                     "(allow file-read* file-write* (subpath \"{sp}\"))\n"
@@ -2498,10 +2566,12 @@ fn render_macos_seatbelt_profile(
         }
         if let Ok(raw_locks) = crate::breadcrumbs::swarm_locks_dir() {
             let locks_dir = fs::canonicalize(&raw_locks).unwrap_or(raw_locks);
-            let lp = escape_sbpl_literal(&locks_dir.to_string_lossy());
-            p.push_str(&format!(
-                "(allow file-read* file-write* (subpath \"{lp}\"))\n"
-            ));
+            if allow_write_tree(&locks_dir) {
+                let lp = escape_sbpl_literal(&locks_dir.to_string_lossy());
+                p.push_str(&format!(
+                    "(allow file-read* file-write* (subpath \"{lp}\"))\n"
+                ));
+            }
         }
     } else if has_swarm_session {
         if !sb_s.is_empty() {
@@ -2514,6 +2584,9 @@ fn render_macos_seatbelt_profile(
             for rw_sub in ["ipc", "spools", "ledger"] {
                 let sub_path = sdir.join(rw_sub);
                 let canon_sub = fs::canonicalize(&sub_path).unwrap_or(sub_path);
+                if !allow_write_tree(&canon_sub) {
+                    continue;
+                }
                 let sp = escape_sbpl_literal(&canon_sub.to_string_lossy());
                 p.push_str(&format!(
                     "(allow file-read* file-write* (subpath \"{sp}\"))\n"
@@ -2537,10 +2610,12 @@ fn render_macos_seatbelt_profile(
         }
         if let Ok(raw_locks) = crate::breadcrumbs::swarm_locks_dir() {
             let locks_dir = fs::canonicalize(&raw_locks).unwrap_or(raw_locks);
-            let lp = escape_sbpl_literal(&locks_dir.to_string_lossy());
-            p.push_str(&format!(
-                "(allow file-read* file-write* (subpath \"{lp}\"))\n"
-            ));
+            if allow_write_tree(&locks_dir) {
+                let lp = escape_sbpl_literal(&locks_dir.to_string_lossy());
+                p.push_str(&format!(
+                    "(allow file-read* file-write* (subpath \"{lp}\"))\n"
+                ));
+            }
         }
         p.push_str(&format!(
             "(deny file-write* (literal \"{repo_s}/PLAN.lock.json\"))\n"
@@ -2555,14 +2630,16 @@ fn render_macos_seatbelt_profile(
             let sdir = fs::canonicalize(&raw_sdir).unwrap_or(raw_sdir);
             let ipc_path = sdir.join("ipc");
             let canon_ipc = fs::canonicalize(&ipc_path).unwrap_or(ipc_path);
-            let sp = escape_sbpl_literal(&canon_ipc.to_string_lossy());
-            p.push_str(&format!(
-                "(allow file-read* file-write* (subpath \"{sp}\"))\n"
-            ));
-            if opts.deny_net {
+            if allow_write_tree(&canon_ipc) {
+                let sp = escape_sbpl_literal(&canon_ipc.to_string_lossy());
                 p.push_str(&format!(
-                    "(allow network-outbound (remote unix-socket (subpath \"{sp}\")))\n"
+                    "(allow file-read* file-write* (subpath \"{sp}\"))\n"
                 ));
+                if opts.deny_net {
+                    p.push_str(&format!(
+                        "(allow network-outbound (remote unix-socket (subpath \"{sp}\")))\n"
+                    ));
+                }
             }
             let vault_dir = sdir.join("vault");
             let canon_vault = fs::canonicalize(&vault_dir).unwrap_or(vault_dir);
@@ -2575,27 +2652,6 @@ fn render_macos_seatbelt_profile(
             "(deny file-write* (literal \"{repo_s}/PLAN.lock.json\") (literal \"{repo_s}/WORK_LEDGER.jsonl\") (literal \"{repo_s}/.breadcrumbs.jsonl\"))\n"
         ));
     } else {
-        if opts.invokes_feedback_submit
-            && let Ok(raw_sdir) = crate::breadcrumbs::swarm_state_dir(&canon_repo)
-        {
-            if !sb_s.is_empty() {
-                p.push_str(&format!(
-                    "(allow file-read-metadata (subpath \"{sb_s}\"))\n"
-                ));
-            }
-            let sdir = fs::canonicalize(&raw_sdir).unwrap_or(raw_sdir);
-            let ipc_path = sdir.join("ipc");
-            let canon_ipc = fs::canonicalize(&ipc_path).unwrap_or(ipc_path);
-            let ip = escape_sbpl_literal(&canon_ipc.to_string_lossy());
-            p.push_str(&format!(
-                "(allow file-read* file-write* (subpath \"{ip}\"))\n"
-            ));
-            if opts.deny_net {
-                p.push_str(&format!(
-                    "(allow network-outbound (remote unix-socket (subpath \"{ip}\")))\n"
-                ));
-            }
-        }
         p.push_str(&format!(
             "(deny file-write* (literal \"{repo_s}/PLAN.lock.json\") (literal \"{repo_s}/WORK_LEDGER.jsonl\") (literal \"{repo_s}/.breadcrumbs.jsonl\"))\n"
         ));
@@ -2608,14 +2664,18 @@ fn render_macos_seatbelt_profile(
         p.push_str(&format!(
                 "(deny file-read* file-write* (subpath \"{cg_s}/hooks\"))\n(deny file-write* (literal \"{cg_s}/config\"))\n"
             ));
-        if opts.invokes_git && opts.writes_allowed {
+        if opts.invokes_git && repo_writes_allowed {
             p.push_str(&format!(
                 "(allow file-write* (subpath \"{wt_s}\") (subpath \"{cg_s}/objects\"))\n"
             ));
         }
         if opts.invokes_swarm_tool || has_swarm_session {
-            p.push_str(&format!("(allow file-write* (subpath \"{cg_s}/info\"))\n"));
-            if let Some(common_repo) = common_git_dir.parent() {
+            if allow_write_tree(&common_git_dir.join("info")) {
+                p.push_str(&format!("(allow file-write* (subpath \"{cg_s}/info\"))\n"));
+            }
+            if let Some(common_repo) = common_git_dir.parent()
+                && allow_write_tree(common_repo)
+            {
                 let cr_s = escape_sbpl_literal(&common_repo.to_string_lossy());
                 if opts.invokes_swarm_tool {
                     p.push_str(&format!(
@@ -2632,7 +2692,7 @@ fn render_macos_seatbelt_profile(
     } else {
         false
     };
-    if !opts.invokes_git {
+    if !opts.invokes_git || capability_write_paths.is_some() {
         p.push_str(&format!(
             "(deny file-write* (subpath \"{repo_s}/.git\") (literal \"{repo_s}/.git\"))\n"
         ));
@@ -2646,7 +2706,7 @@ fn render_macos_seatbelt_profile(
     p.push_str(&format!(
         "(deny file-write* (literal \"{repo_s}/AGENTS.md\") (literal \"{repo_s}/.dotagent-smoke.toml\") (literal \"{repo_s}/.git/config\") (subpath \"{repo_s}/profiles\") (subpath \"{repo_s}/.guard\") (subpath \"{repo_s}/.claude\") (subpath \"{repo_s}/.codex\") (subpath \"{repo_s}/.cursor\") (subpath \"{repo_s}/.github\") (subpath \"{repo_s}/.cargo\") (literal \"{repo_s}/.gitattributes\") (literal \"{repo_s}/.npmrc\"))\n"
     ));
-    p
+    Ok(p)
 }
 
 #[cfg(test)]

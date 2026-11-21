@@ -4,9 +4,11 @@
 //! `CONFUSED`, `RISKY`), `2+2` pure-ASCII sentence `WORK_LEDGER.jsonl` receipt
 //! engine, and fail-closed `Grunt` `on-stop` tree-OID verifier (`F18`, `F32`, `F33`).
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::Write;
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -478,17 +480,9 @@ pub fn scan_production_stub_smells(repo_root: &Path, write_patterns: &[String]) 
         } else {
             Vec::new()
         };
-        let test_tail_offset = rust_tokens
-            .windows(7)
-            .find(|tokens| {
-                tokens
-                    .iter()
-                    .zip(["#", "[", "cfg", "(", "test", ")", "]"])
-                    .all(|(token, expected)| token.is(expected))
-            })
-            .map_or(body.len(), |tokens| tokens[0].offset);
-        let effective = &body[..test_tail_offset];
-        let macro_lines = rust_stub_macro_lines(&rust_tokens, test_tail_offset);
+        let test_ranges = rust_cfg_test_item_ranges(&rust_tokens);
+        let effective = mask_rust_test_items(&body, &test_ranges);
+        let macro_lines = rust_stub_macro_lines(&rust_tokens, &test_ranges);
 
         let mut in_drop_fn = false;
         let mut drop_brace_depth: i32 = 0;
@@ -649,10 +643,150 @@ fn collect_scoped_source_files(
     }
 }
 
-fn rust_stub_macro_lines(tokens: &[SourceToken<'_>], end_offset: usize) -> BTreeSet<usize> {
+fn rust_cfg_test_item_ranges(tokens: &[SourceToken<'_>]) -> Vec<Range<usize>> {
+    const CFG_TEST: [&str; 7] = ["#", "[", "cfg", "(", "test", ")", "]"];
+    let mut ranges = Vec::new();
+    let mut index = 0;
+    while let Some(attribute) = tokens.get(index..index + CFG_TEST.len()) {
+        if attribute
+            .iter()
+            .zip(CFG_TEST)
+            .all(|(token, expected)| token.is(expected))
+            && let Some(end) = rust_attributed_item_end(tokens, index + CFG_TEST.len())
+        {
+            ranges.push(attribute[0].offset..tokens[end].offset + tokens[end].text.len());
+            index = end + 1;
+        } else {
+            index += 1;
+        }
+    }
+    ranges
+}
+
+fn rust_attributed_item_end(tokens: &[SourceToken<'_>], start: usize) -> Option<usize> {
+    let mut groups = Vec::new();
+    let mut item_kind_found = false;
+    let mut braced_item = false;
+    let mut type_parameters = 0usize;
+    for (index, token) in tokens.iter().enumerate().skip(start) {
+        if groups.is_empty() {
+            if token.is("}") {
+                return None;
+            }
+            if token.is(";") {
+                return item_kind_found.then_some(index);
+            }
+            if !item_kind_found {
+                braced_item = [
+                    "fn",
+                    "mod",
+                    "struct",
+                    "enum",
+                    "union",
+                    "trait",
+                    "impl",
+                    "extern",
+                    "macro_rules",
+                    "{",
+                ]
+                .iter()
+                .any(|name| token.is(name))
+                    || rust_macro_item_starts_at(tokens, index);
+                let const_fn = token.is("const")
+                    && tokens.get(index + 1).is_some_and(|next| {
+                        ["fn", "async", "unsafe", "extern"]
+                            .iter()
+                            .any(|qualifier| next.is(qualifier))
+                    });
+                item_kind_found = braced_item
+                    || !const_fn
+                        && ["type", "const", "static", "use", "let"]
+                            .iter()
+                            .any(|name| token.is(name));
+                if !item_kind_found
+                    && !const_fn
+                    && !["#", "[", "pub", "(", "async", "unsafe", "default", "auto"]
+                        .iter()
+                        .any(|qualifier| token.is(qualifier))
+                {
+                    return None;
+                }
+            }
+            if braced_item {
+                if token.is("<") {
+                    type_parameters += 1;
+                } else if token.is(">")
+                    && !tokens
+                        .get(index.wrapping_sub(1))
+                        .is_some_and(|previous| previous.is("-"))
+                {
+                    type_parameters = type_parameters.saturating_sub(1);
+                }
+            }
+        }
+        if let Some(close) = [("(", ")"), ("[", "]"), ("{", "}")]
+            .into_iter()
+            .find_map(|(open, close)| token.is(open).then_some(close))
+        {
+            groups.push(close);
+        } else if groups.last().is_some_and(|close| token.is(close)) {
+            groups.pop();
+            if groups.is_empty() && token.is("}") && braced_item && type_parameters == 0 {
+                return Some(index);
+            }
+        }
+    }
+    None
+}
+
+fn rust_macro_item_starts_at(tokens: &[SourceToken<'_>], mut index: usize) -> bool {
+    while let Some(token) = tokens.get(index).filter(|token| {
+        token.is(token.text)
+            && token
+                .text
+                .starts_with(|first: char| first.is_alphabetic() || first == '_')
+    }) {
+        if token.is("_") {
+            return false;
+        }
+        if tokens.get(index + 1).is_some_and(|next| next.is("!")) {
+            return tokens
+                .get(index + 2)
+                .is_some_and(|opener| ["(", "[", "{"].iter().any(|text| opener.is(text)));
+        }
+        if !tokens
+            .get(index + 1..index + 3)
+            .is_some_and(|pair| pair.iter().all(|colon| colon.is(":")))
+        {
+            return false;
+        }
+        index += 3;
+    }
+    false
+}
+
+fn mask_rust_test_items<'a>(source: &'a str, test_ranges: &[Range<usize>]) -> Cow<'a, str> {
+    if test_ranges.is_empty() {
+        return Cow::Borrowed(source);
+    }
+    let mut code = String::with_capacity(source.len());
+    let mut copied = 0;
+    for range in test_ranges {
+        code.push_str(&source[copied..range.start]);
+        code.push(' ');
+        code.extend(source[range.clone()].chars().filter(|&c| c == '\n'));
+        copied = range.end;
+    }
+    code.push_str(&source[copied..]);
+    Cow::Owned(code)
+}
+
+fn rust_stub_macro_lines(
+    tokens: &[SourceToken<'_>],
+    test_ranges: &[Range<usize>],
+) -> BTreeSet<usize> {
     tokens
         .windows(3)
-        .take_while(|t| t[0].offset < end_offset)
         .filter(|t| {
             (t[0].is("todo")
                 || t[0].is("unimplemented")
@@ -660,6 +794,9 @@ fn rust_stub_macro_lines(tokens: &[SourceToken<'_>], end_offset: usize) -> BTree
                 || t[0].is("r#unimplemented"))
                 && t[1].is("!")
                 && (t[2].is("(") || t[2].is("[") || t[2].is("{"))
+                && !test_ranges
+                    .get(test_ranges.partition_point(|range| range.end <= t[0].offset))
+                    .is_some_and(|range| range.start <= t[2].offset)
         })
         .map(|t| t[0].line)
         .collect()
@@ -1202,7 +1339,9 @@ pub fn verify_on_stop_swarm_gates(repo_root: &Path) -> Result<(), String> {
 
 #[cfg(test)]
 mod stub_macro_tests {
-    use super::{rust_source_tokens, rust_stub_macro_lines};
+    use super::{
+        mask_rust_test_items, rust_cfg_test_item_ranges, rust_source_tokens, rust_stub_macro_lines,
+    };
     use std::collections::BTreeSet;
 
     #[test]
@@ -1214,8 +1353,38 @@ mod stub_macro_tests {
             fn draft() { todo ! ("pending implementation"); }
         "##;
         assert_eq!(
-            rust_stub_macro_lines(&rust_source_tokens(source), source.len()),
+            rust_stub_macro_lines(&rust_source_tokens(source), &[]),
             BTreeSet::from([5]),
+        );
+    }
+
+    #[test]
+    fn scans_production_items_on_both_sides_of_test_items() {
+        let source = "\
+fn before() { todo!(); }\n\
+#[cfg(test)]\n\
+#[allow(dead_code)]\n\
+mod tests {\n\
+    fn test_helper() { todo!(); }\n\
+}\n\
+#[cfg(test)] fn test_only() { todo!(); } fn after() { todo!(); }\n\
+#[cfg(test)] mod other_tests;\n\
+#[cfg(test)] fixtures::register! { todo!(); }\n\
+fn last() { todo!(); }\n";
+        let tokens = rust_source_tokens(source);
+        let ranges = rust_cfg_test_item_ranges(&tokens);
+        assert_eq!(ranges.len(), 4);
+        assert_eq!(
+            rust_stub_macro_lines(&tokens, &ranges),
+            BTreeSet::from([1, 7, 10])
+        );
+        let masked = mask_rust_test_items(source, &ranges);
+        assert_eq!(masked.lines().count(), source.lines().count());
+        assert!(
+            masked
+                .lines()
+                .nth(6)
+                .is_some_and(|line| line.trim_start() == "fn after() { todo!(); }")
         );
     }
 }

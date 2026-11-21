@@ -1361,6 +1361,43 @@ mod tests {
     };
     use std::path::Path;
 
+    #[cfg(any(
+        target_os = "macos",
+        all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        )
+    ))]
+    #[test]
+    fn vetted_webfont_reads_regular_file_and_refuses_symlink() -> std::io::Result<()> {
+        use std::os::unix::fs::symlink;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let nonce = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
+        let fixture = std::env::temp_dir().join(format!(
+            "dotagent-webfont-{}-{}",
+            std::process::id(),
+            nonce.as_nanos()
+        ));
+        std::fs::create_dir(&fixture)?;
+        let font = fixture.join("regular.woff2");
+        let link = fixture.join("linked.woff2");
+        let mut bytes = [0; 48];
+        bytes[..4].copy_from_slice(b"wOF2");
+        std::fs::write(&font, bytes)?;
+        symlink(&font, &link)?;
+
+        let regular = super::inspect_vetted_webfont_asset_on_disk(&font);
+        let linked = super::inspect_vetted_webfont_asset_on_disk(&link);
+        let open_link = super::open_vetted_webfont_nofollow(&link);
+        std::fs::remove_dir_all(&fixture)?;
+
+        assert_eq!(regular.unwrap().unwrap(), bytes);
+        assert_eq!(linked.unwrap().unwrap_err().code, "NON_REGULAR_FILE");
+        assert!(open_link.is_err(), "no-follow open must refuse a symlink");
+        Ok(())
+    }
+
     #[test]
     fn blocks_minified_single_line_and_splitter_bombs() {
         let minified = "a".repeat(2500);
