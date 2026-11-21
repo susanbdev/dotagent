@@ -514,7 +514,6 @@ pub fn run_exec_sandbox_cli(args: &[String], default_cwd: &Path) -> ExitCode {
         return ExitCode::from(2);
     }
     if opts.deny_net
-        && (require_kernel || mode.is_kernel_enforced())
         && let Err(seccomp_err) = net_filter_res
     {
         eprintln!(
@@ -1584,7 +1583,7 @@ fn render_macos_seatbelt_profile(
     }
     if !home_s.is_empty() {
         p.push_str(&format!(
-            "(deny file-read* file-write* (subpath \"{home_s}/.ssh\") (subpath \"{home_s}/.aws\") (subpath \"{home_s}/.gnupg\") (subpath \"{home_s}/.config/gh\") (subpath \"{home_s}/Library/Keychains\"))\n(deny file-read-data file-write* (subpath \"{home_s}/.local/state/agent-guard\"))\n"
+            "(deny file-read* file-write* (subpath \"{home_s}/.ssh\") (subpath \"{home_s}/.aws\") (subpath \"{home_s}/.gnupg\") (subpath \"{home_s}/.config/gh\") (subpath \"{home_s}/Library/Keychains\") (subpath \"{home_s}/.local/state/agent-guard\"))\n"
         ));
     }
     let active_state_base = crate::traversal_ledger::state_base_dir();
@@ -1592,10 +1591,15 @@ fn render_macos_seatbelt_profile(
     let sb_s = escape_sbpl_literal(&canon_state_base.to_string_lossy());
     if !sb_s.is_empty() {
         p.push_str(&format!(
-            "(deny file-read-data file-write* (subpath \"{sb_s}\"))\n"
+            "(deny file-read* file-write* (subpath \"{sb_s}\"))\n"
         ));
     }
     if opts.invokes_swarm_tool {
+        if !sb_s.is_empty() {
+            p.push_str(&format!(
+                "(allow file-read-metadata (subpath \"{sb_s}\"))\n"
+            ));
+        }
         if let Ok(raw_sdir) = crate::breadcrumbs::swarm_state_dir(&canon_repo) {
             let sdir = fs::canonicalize(&raw_sdir).unwrap_or(raw_sdir);
             for sub in ["ipc", "sessions", "spools", "ledger"] {
@@ -1615,7 +1619,7 @@ fn render_macos_seatbelt_profile(
             let canon_vault = fs::canonicalize(&vault_dir).unwrap_or(vault_dir);
             let vp = escape_sbpl_literal(&canon_vault.to_string_lossy());
             p.push_str(&format!(
-                "(deny file-read* file-write* (subpath \"{vp}\"))\n"
+                "(deny file-read* file-read-metadata file-write* (subpath \"{vp}\"))\n"
             ));
         }
         if let Ok(raw_locks) = crate::breadcrumbs::swarm_locks_dir() {
@@ -1626,6 +1630,11 @@ fn render_macos_seatbelt_profile(
             ));
         }
     } else if has_swarm_session {
+        if !sb_s.is_empty() {
+            p.push_str(&format!(
+                "(allow file-read-metadata (subpath \"{sb_s}\"))\n"
+            ));
+        }
         if let Ok(raw_sdir) = crate::breadcrumbs::swarm_state_dir(&canon_repo) {
             let sdir = fs::canonicalize(&raw_sdir).unwrap_or(raw_sdir);
             for rw_sub in ["ipc", "spools", "ledger"] {
@@ -1649,7 +1658,7 @@ fn render_macos_seatbelt_profile(
             let canon_vault = fs::canonicalize(&vault_dir).unwrap_or(vault_dir);
             let vp = escape_sbpl_literal(&canon_vault.to_string_lossy());
             p.push_str(&format!(
-                "(deny file-read* file-write* (subpath \"{vp}\"))\n"
+                "(deny file-read* file-read-metadata file-write* (subpath \"{vp}\"))\n"
             ));
         }
         if let Ok(raw_locks) = crate::breadcrumbs::swarm_locks_dir() {

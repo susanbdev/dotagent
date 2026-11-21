@@ -744,12 +744,31 @@ fn dispatch_mediated_tool_call(tool_name: &str, args: &JsonValue, cwd: &Path) ->
                     }
                     let clean_slice =
                         crate::sanitizer::neuter_to_clean_ascii(&raw_slice).clean_ascii;
+                    let read_post_req = JsonValue::Object(vec![
+                        ("tool_name".to_string(), JsonValue::Str("Read".to_string())),
+                        (
+                            "tool_response".to_string(),
+                            JsonValue::Str(clean_slice.clone()),
+                        ),
+                    ])
+                    .to_json_string();
+                    let effective_body = match handle_post_tool_hook(&read_post_req, cwd) {
+                        Decision::Allow { .. } => clean_slice,
+                        Decision::Deny {
+                            code: "NON_ASCII_SANITIZED_PREBUFFER" | "TOOL_OUTPUT_FLOOD_BLOCKED",
+                            reason,
+                            ..
+                        } => reason,
+                        Decision::Deny { code, reason, .. } => {
+                            return mcp_tool_error(code, &reason);
+                        }
+                    };
                     let turn_nonce = {
                         let _lock = SessionLedger::acquire_lock(&repo_root, &sid);
                         SessionLedger::load_or_create(&repo_root, &sid).turn_nonce
                     };
                     let spotlighted =
-                        wrap_spotlight_envelope(&clean_slice, &turn_nonce, &valid.repo_rel);
+                        wrap_spotlight_envelope(&effective_body, &turn_nonce, &valid.repo_rel);
                     mcp_tool_success(&spotlighted)
                 }
             }
@@ -868,10 +887,19 @@ fn dispatch_mediated_tool_call(tool_name: &str, args: &JsonValue, cwd: &Path) ->
             if let Decision::Deny { code, reason, .. } = handle_pre_tool_hook(&hook_req, cwd) {
                 return mcp_tool_error(code, &reason);
             }
+            let tainted = SessionLedger::load_or_create(&repo_root, &sid).tainted;
+            let effective_cmd = match crate::cmd_policy::evaluate_shell_command(
+                cmd_str, &repo_root, cwd, tainted,
+            ) {
+                Ok(plan) => plan
+                    .rewritten_command
+                    .unwrap_or_else(|| cmd_str.to_string()),
+                Err(cv) => return mcp_tool_error(cv.code, &cv.detail),
+            };
             let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("agent-guard"));
             match Command::new(exe)
                 .current_dir(cwd)
-                .args(["exec-sandbox", "--sanitize-stream", "--", cmd_str])
+                .args(["exec-sandbox", "--sanitize-stream", "--", &effective_cmd])
                 .output()
             {
                 Ok(out) => {

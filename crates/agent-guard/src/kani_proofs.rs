@@ -86,7 +86,7 @@ mod proofs {
     }
 
     #[kani::proof]
-    #[kani::unwind(4)]
+    #[kani::unwind(16)]
     fn proof_json_duplicate_key_rejection() {
         let k1: [u8; 2] = kani::any();
         let k2: [u8; 2] = kani::any();
@@ -99,7 +99,7 @@ mod proofs {
     }
 
     #[kani::proof]
-    #[kani::unwind(8)]
+    #[kani::unwind(40)]
     fn proof_shell_lexer_forward_progress_and_brace_block() {
         let raw: [u8; 6] = kani::any();
         let _ = scan_shell_brace_and_quote_bytes(&raw);

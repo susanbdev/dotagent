@@ -474,6 +474,18 @@ pub fn rpc_compute_domain_hmac_hex(
     }
 }
 
+/// Sends `ACTIVE_SLOT_HMAC_DOMAIN` candidate payload to the coordinator daemon (`op = "domain_hmac"`),
+/// where `commit_ipc_active_slot_update` acquires `ExclusiveFileLockGuard(&slot_file)`, verifies
+/// `candidate_rev == existing_rev + 1` CAS and non-escalation subset rules, signs the new record,
+/// and atomically persists `<swarm_state_dir>/sessions/active_sessions.json` on the host side.
+pub fn rpc_commit_active_sessions_cas(
+    repo_root: &Path,
+    domain: &[u8],
+    payload: &[u8],
+) -> Result<String, String> {
+    rpc_compute_domain_hmac_hex(repo_root, domain, payload)
+}
+
 pub fn rpc_verify_domain_hmac(
     repo_root: &Path,
     domain: &[u8],

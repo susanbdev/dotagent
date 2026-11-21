@@ -61,12 +61,17 @@ jobs:
           cargo build --release --locked --workspace
           ./target/release/dotagent-compiler verify .
           ./target/release/dotagent audit-repo .
-          DOTAGENT_RECEIPT_SEED_HEX="9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60" \
+          openssl genpkey -algorithm ED25519 -out "${RUNNER_TEMP}/ci_receipt_ed25519.pem"
+          SEED_HEX="$(openssl pkey -in "${RUNNER_TEMP}/ci_receipt_ed25519.pem" -outform DER | tail -c 32 | od -An -tx1 | tr -d ' \n')"
+          PUBKEY_HEX="$(openssl pkey -in "${RUNNER_TEMP}/ci_receipt_ed25519.pem" -pubout -outform DER | tail -c 32 | od -An -tx1 | tr -d ' \n')"
+          rm -f "${RUNNER_TEMP}/ci_receipt_ed25519.pem"
+          DOTAGENT_RECEIPT_SEED_HEX="${SEED_HEX}" \
             ./target/release/dotagent on-stop --receipt-out target/ci.receipt.json
           ./target/release/dotagent verify-receipt target/ci.receipt.json --repo . \
-            --pubkey "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a"
+            --pubkey "${PUBKEY_HEX}"
           ./target/release/dotagent-harness bench --quick
-          rm -rf target/test-workspaces target/tbench-* target/ci.receipt.json
+          chmod -R u+w target/test-workspaces 2>/dev/null || true
+          rm -rf target/test-workspaces target/tbench-* target/ci.receipt.json || true
 
   supply-chain-deny:
     name: Supply-Chain Advisory & License Gate (cargo-deny)

@@ -314,7 +314,7 @@ fn commit_registry_with_lock(
     // verify `candidate_revision == existing_revision + 1` CAS + subset rules, and atomically
     // persist `active_sessions.json` under the held registry lock.
     drop(guard);
-    let _mac = crate::coordinator::rpc_compute_domain_hmac_hex(
+    let _mac = crate::coordinator::rpc_commit_active_sessions_cas(
         repo_root,
         ACTIVE_SLOT_HMAC_DOMAIN,
         &payload,
