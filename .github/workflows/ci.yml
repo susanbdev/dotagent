@@ -78,15 +78,31 @@ jobs:
           persist-credentials: false
           submodules: false
 
-      - name: Audit advisories, licenses, bans, and registry sources
-        uses: EmbarkStudios/cargo-deny-action@17aeb3c839e42274e2b8adf721c8c65edfdc74dd # v2
-        with:
-          command: check advisories licenses bans sources
+      - name: Install SHA-256-pinned cargo-deny 0.22.0 & audit advisories, licenses, bans, and sources
+        shell: bash
+        run: |
+          set -euo pipefail
+          ARCHIVE="${RUNNER_TEMP}/cargo-deny-0.22.0-x86_64-unknown-linux-musl.tar.gz"
+          python3 - "${ARCHIVE}" <<'PY'
+          import hashlib, sys, urllib.request
+          url = "https://github.com/EmbarkStudios/cargo-deny/releases/download/0.22.0/cargo-deny-0.22.0-x86_64-unknown-linux-musl.tar.gz"
+          expected = "98c56e6a408bfa5c3c60744b6015aaa6aa08f743fdeb88386d06fca035bb1786"
+          data = urllib.request.urlopen(url, timeout=60).read()
+          actual = hashlib.sha256(data).hexdigest()
+          if actual != expected:
+              raise SystemExit(f"cargo-deny SHA-256 mismatch: expected {expected}, got {actual}")
+          with open(sys.argv[1], "wb") as fh:
+              fh.write(data)
+          PY
+          tar -xzf "${ARCHIVE}" -C "${RUNNER_TEMP}"
+          "${RUNNER_TEMP}/cargo-deny-0.22.0-x86_64-unknown-linux-musl/cargo-deny" check advisories licenses bans sources
 
   kani-formal-proofs:
     name: Kani Bounded Model Checking Proofs
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    env:
+      CARGO_TERM_COLOR: always
     steps:
       - name: Checkout repository (zero persisted credentials)
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -94,11 +110,44 @@ jobs:
           persist-credentials: false
           submodules: false
 
-      - name: Run Kani proofs on agent-guard security kernel
-        uses: model-checking/kani-github-action@f838096619a707b0f6b2118cf435eaccfa33e51f # v1.1
+      - name: Install stable Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      - name: Cache Kani 0.68.0 verifier & CBMC bundle
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
-          kani-version: 0.68.0
-          args: -p agent-guard
+          path: |
+            ~/.cargo/bin/kani
+            ~/.cargo/bin/cargo-kani
+            ~/.kani
+          key: ${{ runner.os }}-kani-0.68.0-v1
+
+      - name: Install SHA-256-pinned Kani 0.68.0 bundle & verify proofs on agent-guard
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! command -v cargo-kani >/dev/null 2>&1 || [ ! -d "${HOME}/.kani/kani-0.68.0" ]; then
+            cargo +stable install --locked --version 0.68.0 kani-verifier
+            BUNDLE="${RUNNER_TEMP}/kani-0.68.0-x86_64-unknown-linux-gnu.tar.gz"
+            python3 - "${BUNDLE}" <<'PY'
+          import hashlib, sys, urllib.request
+          url = "https://github.com/model-checking/kani/releases/download/kani-0.68.0/kani-0.68.0-x86_64-unknown-linux-gnu.tar.gz"
+          expected = "32e2b484d73ede0bbf64a2cf0879c4259422497d8aec4ee67d448de9ae7843d3"
+          data = urllib.request.urlopen(url, timeout=120).read()
+          actual = hashlib.sha256(data).hexdigest()
+          if actual != expected:
+              raise SystemExit(f"kani bundle SHA-256 mismatch: expected {expected}, got {actual}")
+          with open(sys.argv[1], "wb") as fh:
+              fh.write(data)
+          PY
+            cargo-kani setup --use-local-bundle "${BUNDLE}"
+            rm -f "${BUNDLE}"
+          else
+            rustup toolchain install "$(cat "${HOME}/.kani/kani-0.68.0/rust-toolchain-version")" --profile minimal || cargo-kani setup
+          fi
+          cargo kani -p agent-guard
 
   msrv-1-88:
     name: MSRV 1.88.0 Compatibility Gate
