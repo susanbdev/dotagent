@@ -34,6 +34,11 @@ jobs:
       - name: Apply hardened global Git configuration
         run: cp dist/gitconfig.hardened ~/.gitconfig
 
+      - name: Prefer trusted system Git on macOS
+        if: runner.os == 'macOS'
+        shell: bash
+        run: echo "/usr/bin" >> "${GITHUB_PATH}"
+
       - name: Install stable Rust toolchain
         run: |
           rustup toolchain install stable --profile minimal --component rustfmt,clippy
