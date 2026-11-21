@@ -53,7 +53,7 @@ pub fn check_cmd_policy_no_panic(cmd: &str) -> bool {
 
 #[cfg(kani)]
 mod proofs {
-    use crate::cmd_policy::scan_shell_brace_and_quote_bytes;
+    use crate::cmd_policy::{ShellScanError, scan_shell_brace_and_quote_bytes};
     use crate::crypto::{constant_time_eq_bytes, zeroize_slice};
     use crate::json::is_unique_str_key;
     use crate::sanitizer::is_clean_7bit_ascii_byte;
@@ -86,7 +86,7 @@ mod proofs {
     }
 
     #[kani::proof]
-    #[kani::unwind(16)]
+    #[kani::unwind(4)]
     fn proof_json_duplicate_key_rejection() {
         let k1: [u8; 2] = kani::any();
         let k2: [u8; 2] = kani::any();
@@ -99,17 +99,17 @@ mod proofs {
     }
 
     #[kani::proof]
-    #[kani::unwind(40)]
+    #[kani::unwind(8)]
     fn proof_shell_lexer_forward_progress_and_brace_block() {
         let raw: [u8; 6] = kani::any();
         let _ = scan_shell_brace_and_quote_bytes(&raw);
         assert_eq!(
             scan_shell_brace_and_quote_bytes(b"{a,b}"),
-            Err("SHELL_BRACE_EXPANSION_BLOCKED")
+            Err(ShellScanError::BraceExpansionBlocked)
         );
         assert_eq!(
             scan_shell_brace_and_quote_bytes(b"{1..3}"),
-            Err("SHELL_BRACE_EXPANSION_BLOCKED")
+            Err(ShellScanError::BraceExpansionBlocked)
         );
         assert!(scan_shell_brace_and_quote_bytes(b"${a}").is_ok());
     }

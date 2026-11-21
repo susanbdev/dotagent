@@ -1052,13 +1052,13 @@ pub fn apply_linux_seccomp_net_filter() -> Result<(), String> {
         rules_map.insert(X32_BIT | 53, build_non_local_deny_rule()?);
     }
 
-    let filter = SeccompFilter::new(
-        rules_map,
-        SeccompAction::Allow,
-        SeccompAction::Errno(1), // EPERM = 1 across Linux ABIs whenever domain != AF_UNIX && domain != AF_NETLINK
-        arch,
-    )
-    .map_err(|e| format!("seccomp filter init error: {e}"))?;
+    // `seccompiler::SeccompFilter::new(rules, mismatch_action, match_action, target_arch)`:
+    // - `mismatch_action = Allow`: permits syscalls not in `rules_map` and `AF_UNIX`/`AF_NETLINK` sockets.
+    // - `match_action = Errno(1)` (`EPERM`): denies any `socket`/`socketpair` call matching `domain != AF_UNIX && domain != AF_NETLINK`.
+    let mismatch_action = SeccompAction::Allow;
+    let match_action = SeccompAction::Errno(1);
+    let filter = SeccompFilter::new(rules_map, mismatch_action, match_action, arch)
+        .map_err(|e| format!("seccomp filter init error: {e}"))?;
 
     let bpf: BpfProgram = filter
         .try_into()
@@ -1586,8 +1586,16 @@ fn render_macos_seatbelt_profile(
             "(deny file-read* file-write* (subpath \"{home_s}/.ssh\") (subpath \"{home_s}/.aws\") (subpath \"{home_s}/.gnupg\") (subpath \"{home_s}/.config/gh\") (subpath \"{home_s}/Library/Keychains\") (subpath \"{home_s}/.local/state/agent-guard\"))\n"
         ));
     }
-    let active_state_base = crate::traversal_ledger::state_base_dir();
-    let canon_state_base = fs::canonicalize(&active_state_base).unwrap_or(active_state_base);
+    let raw_state_base = crate::traversal_ledger::state_base_dir();
+    let active_state_root = if raw_state_base.file_name().is_some_and(|n| n == "sessions") {
+        raw_state_base
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or(raw_state_base)
+    } else {
+        raw_state_base
+    };
+    let canon_state_base = fs::canonicalize(&active_state_root).unwrap_or(active_state_root);
     let sb_s = escape_sbpl_literal(&canon_state_base.to_string_lossy());
     if !sb_s.is_empty() {
         p.push_str(&format!(

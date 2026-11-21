@@ -909,9 +909,13 @@ fn run_qa(repo_root: &Path, cwd: &Path, args: &[String]) -> Result<(), String> {
             };
             if let Some(cov_map) = cov_summary_opt {
                 if let Some(min_raw) = flag_val(args, "--min-coverage-pct") {
-                    let min_pct = min_raw.parse::<u8>().map_err(|_| {
-                        format!("invalid --min-coverage-pct '{min_raw}' (expected 0..=100)")
-                    })?;
+                    let min_pct = min_raw
+                        .parse::<u8>()
+                        .ok()
+                        .filter(|&v| v <= 100)
+                        .ok_or_else(|| {
+                            format!("invalid --min-coverage-pct '{min_raw}' (expected 0..=100)")
+                        })?;
                     let explicit_files = split_csv(&flag_val(args, "--files").unwrap_or_default());
                     let targets: Vec<String> = if explicit_files.is_empty() {
                         cov_map.keys().cloned().collect()

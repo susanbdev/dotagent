@@ -208,9 +208,21 @@ pub fn build_immutable_dotagent_image(
                 stage_dir.display()
             ));
         }
-        if meta.file_type().is_dir() {
-            set_mode(stage_dir, 0o755);
+        if !meta.file_type().is_dir() {
+            return Err(format!(
+                "stage output '{}' exists and is not a directory",
+                stage_dir.display()
+            ));
         }
+        let mut entries = fs::read_dir(stage_dir)
+            .map_err(|e| format!("failed reading stage output '{}': {e}", stage_dir.display()))?;
+        if entries.next().is_some() {
+            return Err(format!(
+                "STAGE_DIR_NOT_EMPTY: stage output '{}' must not exist or must be an empty directory so stale files cannot escape IMAGE_MANIFEST.sha256",
+                stage_dir.display()
+            ));
+        }
+        set_mode(stage_dir, 0o755);
     }
     let stage_bin = stage_dir.join("bin");
     if let Ok(meta) = fs::symlink_metadata(&stage_bin) {

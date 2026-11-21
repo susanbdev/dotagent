@@ -802,16 +802,19 @@ fn run_on_stop(args: &[String], cwd: &Path) -> ExitCode {
     let repo_root = resolve_repo_root(cwd);
 
     let sid = std::env::var("AGENT_GUARD_SESSION_ID").unwrap_or_else(|_| "default".to_string());
-    let ledger = SessionLedger::load_or_create(&repo_root, &sid);
-    if ledger.halted {
-        let reason = ledger
-            .halt_reason
-            .as_deref()
-            .unwrap_or("circuit breaker tripped");
-        eprintln!(
-            "[AGENT-GUARD ON-STOP FAIL] SESSION_CIRCUIT_BREAKER_HALTED: session '{sid}' is halted ({reason})."
-        );
-        return ExitCode::from(2);
+    {
+        let _ledger_lock = SessionLedger::acquire_lock(&repo_root, &sid);
+        let ledger = SessionLedger::load_or_create(&repo_root, &sid);
+        if ledger.halted {
+            let reason = ledger
+                .halt_reason
+                .as_deref()
+                .unwrap_or("circuit breaker tripped");
+            eprintln!(
+                "[AGENT-GUARD ON-STOP FAIL] SESSION_CIRCUIT_BREAKER_HALTED: session '{sid}' is halted ({reason})."
+            );
+            return ExitCode::from(2);
+        }
     }
 
     if let Err(err) = verify_global_git_hardening() {

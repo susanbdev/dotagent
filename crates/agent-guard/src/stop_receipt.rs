@@ -640,6 +640,7 @@ pub fn issue_verified_stop_receipt(
     }
 
     let sid = std::env::var("AGENT_GUARD_SESSION_ID").unwrap_or_else(|_| "default".to_string());
+    let _session_lock = SessionLedger::acquire_lock(&canon, &sid);
     let ledger = SessionLedger::load_or_create(&canon, &sid);
     if ledger.halted {
         return Err(format!(

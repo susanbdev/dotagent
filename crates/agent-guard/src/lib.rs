@@ -1850,13 +1850,14 @@ fn extract_session_id(v: &JsonValue) -> String {
 }
 
 fn extract_session_id_with_override(v: &JsonValue, env_sid_override: Option<&str>) -> String {
+    if let Some(env_sid) = env_sid_override {
+        let trimmed = env_sid.trim();
+        if !trimmed.is_empty() {
+            return trimmed.to_string();
+        }
+    }
     if let Some(s) = extract_first_str(v, &["session_id", "conversation_id", "transcript_path"]) {
         return s.to_string();
-    }
-    if let Some(env_sid) = env_sid_override {
-        if !env_sid.trim().is_empty() {
-            return env_sid.to_string();
-        }
     }
     "default".to_string()
 }

@@ -5064,9 +5064,21 @@ pub fn tokenize_shell_script_pure(script: &str) -> Result<usize, &'static str> {
         .map_err(|v| v.code)
 }
 
+/// Compact `u8`-discriminant error code for `scan_shell_brace_and_quote_bytes` so CBMC/Kani
+/// verifies exact error variants in `O(1)` without string `memcmp` loop unrolling.
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShellScanError {
+    UnterminatedEscape = 1,
+    UnterminatedSingleQuote = 2,
+    UnterminatedDoubleQuote = 3,
+    NestingExceeded = 4,
+    BraceExpansionBlocked = 5,
+}
+
 /// Zero-heap-allocation byte-level shell quote, escape, and unquoted brace-expansion verifier
 /// (`{a,b}` / `{a..b}` vs `${VAR}`) with a fixed stack depth of 8 for fast CBMC/Kani model checking.
-pub const fn scan_shell_brace_and_quote_bytes(bytes: &[u8]) -> Result<usize, &'static str> {
+pub const fn scan_shell_brace_and_quote_bytes(bytes: &[u8]) -> Result<usize, ShellScanError> {
     let mut i = 0usize;
     let mut stack_is_param = [false; 8];
     let mut stack_saw_exp = [false; 8];
@@ -5079,7 +5091,7 @@ pub const fn scan_shell_brace_and_quote_bytes(bytes: &[u8]) -> Result<usize, &'s
         let b = bytes[i];
         if b == b'\\' {
             if i + 1 >= bytes.len() {
-                return Err("UNTERMINATED_SHELL_ESCAPE");
+                return Err(ShellScanError::UnterminatedEscape);
             }
             prev_unquoted_dollar = false;
             prev_unquoted_dot = false;
@@ -5094,7 +5106,7 @@ pub const fn scan_shell_brace_and_quote_bytes(bytes: &[u8]) -> Result<usize, &'s
                 i += 1;
             }
             if i >= bytes.len() {
-                return Err("UNTERMINATED_SINGLE_QUOTE");
+                return Err(ShellScanError::UnterminatedSingleQuote);
             }
             tokens += 1;
             i += 1;
@@ -5107,7 +5119,7 @@ pub const fn scan_shell_brace_and_quote_bytes(bytes: &[u8]) -> Result<usize, &'s
             while i < bytes.len() && bytes[i] != b'"' {
                 if bytes[i] == b'\\' {
                     if i + 1 >= bytes.len() {
-                        return Err("UNTERMINATED_DOUBLE_QUOTE");
+                        return Err(ShellScanError::UnterminatedDoubleQuote);
                     }
                     i += 2;
                 } else {
@@ -5115,7 +5127,7 @@ pub const fn scan_shell_brace_and_quote_bytes(bytes: &[u8]) -> Result<usize, &'s
                 }
             }
             if i >= bytes.len() {
-                return Err("UNTERMINATED_DOUBLE_QUOTE");
+                return Err(ShellScanError::UnterminatedDoubleQuote);
             }
             tokens += 1;
             i += 1;
@@ -5124,7 +5136,7 @@ pub const fn scan_shell_brace_and_quote_bytes(bytes: &[u8]) -> Result<usize, &'s
         match b {
             b'{' => {
                 if sp >= 8 {
-                    return Err("SHELL_NESTING_EXCEEDED");
+                    return Err(ShellScanError::NestingExceeded);
                 }
                 stack_is_param[sp] = prev_unquoted_dollar;
                 stack_saw_exp[sp] = false;
@@ -5150,7 +5162,7 @@ pub const fn scan_shell_brace_and_quote_bytes(bytes: &[u8]) -> Result<usize, &'s
                 if sp > 0 {
                     sp -= 1;
                     if !stack_is_param[sp] && stack_saw_exp[sp] {
-                        return Err("SHELL_BRACE_EXPANSION_BLOCKED");
+                        return Err(ShellScanError::BraceExpansionBlocked);
                     }
                 }
                 prev_unquoted_dollar = false;
