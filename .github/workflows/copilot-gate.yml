@@ -50,6 +50,7 @@ jobs:
           PR_AUTHOR: ${{ github.event.pull_request.user.login }}
           PR_AUTHOR_TYPE: ${{ github.event.pull_request.user.type }}
           PR_AUTHOR_ASSOC: ${{ github.event.pull_request.author_association }}
+          PR_HEAD_REF: ${{ github.event.pull_request.head.ref }}
           EVENT_ACTOR: ${{ github.actor }}
         run: |
           set -euo pipefail

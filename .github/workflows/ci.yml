@@ -235,10 +235,13 @@ jobs:
           rustup toolchain install stable --profile minimal
           rustup default stable
 
-      - name: Enforce unconditional Ring-0 allowlist ratchet & hardware-signer verification
+      - name: Enforce Ring-0 corpus ratchet & autonomous-bot allowlist confinement
         env:
           BASE_REF: ${{ github.event.repository.default_branch || 'main' }}
           EVENT_ACTOR: ${{ github.actor }}
+          PR_AUTHOR: ${{ github.event.pull_request.user.login || '' }}
+          PR_AUTHOR_TYPE: ${{ github.event.pull_request.user.type || '' }}
+          PR_HEAD_REF: ${{ github.head_ref || github.ref_name }}
         run: |
           set -euo pipefail
           BASE_OID="$(git rev-parse --verify "origin/${BASE_REF}^{commit}")"

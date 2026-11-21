@@ -688,7 +688,8 @@ fn resolve_merge_base(repo_root: &Path, base_ref: &str) -> Result<String, String
 struct WorkingDiffSummary {
     changed_files: Vec<String>,
     has_uncommitted_or_untracked: bool,
-    forbidden_mode_mutation: Option<String>,
+    always_forbidden_mode: Option<String>,
+    autonomous_only_mode: Option<String>,
 }
 
 fn collect_working_and_commit_diff(
@@ -696,7 +697,8 @@ fn collect_working_and_commit_diff(
     merge_base: &str,
 ) -> Result<WorkingDiffSummary, String> {
     let mut all_paths = BTreeSet::new();
-    let mut forbidden_mode: Option<String> = None;
+    let mut always_forbidden_mode: Option<String> = None;
+    let mut autonomous_only_mode: Option<String> = None;
 
     // 1. `git diff --raw -z <merge_base>` diffs `merge_base` against the LIVE working tree + index + HEAD!
     let raw_out = git_cmd(repo_root)
@@ -747,15 +749,19 @@ fn collect_working_and_commit_diff(
         let p1_norm = normalize_repo_rel_path(p1_str)?;
         all_paths.insert(p1_norm.clone());
 
-        // Autonomous PRs may only produce regular non-executable files: deletions (`D` /
-        // `000000`), symlinks (`120000`), gitlinks (`160000`) and exec-bit flips all fail closed.
-        if status_tok.starts_with('D')
-            || new_mode != "100644"
-            || old_mode == "120000"
+        // Symlinks (`120000`) and gitlinks/submodules (`160000`) are forbidden on ALL PRs.
+        if old_mode == "120000"
+            || new_mode == "120000"
             || old_mode == "160000"
+            || new_mode == "160000"
         {
-            forbidden_mode = Some(format!(
-                "RING0_RATCHET_VIOLATION: forbidden file mode/symlink change ({old_mode} -> {new_mode}) on '{p1_norm}'"
+            always_forbidden_mode = Some(format!(
+                "RING0_RATCHET_VIOLATION: forbidden symlink/submodule mode ({old_mode} -> {new_mode}) on '{p1_norm}'"
+            ));
+        } else if status_tok.starts_with('D') || new_mode != "100644" {
+            // Deletions (`D` / `000000`) and exec-bit flips (`100755`) are blocked in autonomous Ring-2 mode.
+            autonomous_only_mode = Some(format!(
+                "RING0_RATCHET_VIOLATION: forbidden file deletion/mode change ({old_mode} -> {new_mode}) on '{p1_norm}' in autonomous Ring-2 mode"
             ));
         }
 
@@ -790,12 +796,12 @@ fn collect_working_and_commit_diff(
         }
         let s = std::str::from_utf8(raw_u).map_err(|_| "non-UTF-8 untracked path".to_string())?;
         let u_norm = normalize_repo_rel_path(s)?;
-        if forbidden_mode.is_none() {
+        if always_forbidden_mode.is_none() {
             let full_u = repo_root.join(&u_norm);
             match fs::symlink_metadata(&full_u) {
                 Ok(meta) => {
                     if meta.file_type().is_symlink() || !meta.file_type().is_file() {
-                        forbidden_mode = Some(format!(
+                        always_forbidden_mode = Some(format!(
                             "RING0_RATCHET_VIOLATION: untracked path '{u_norm}' is a symlink or non-regular file"
                         ));
                     } else {
@@ -803,8 +809,8 @@ fn collect_working_and_commit_diff(
                         {
                             use std::os::unix::fs::PermissionsExt;
                             let mode = meta.permissions().mode();
-                            if (mode & 0o111) != 0 {
-                                forbidden_mode = Some(format!(
+                            if (mode & 0o111) != 0 && autonomous_only_mode.is_none() {
+                                autonomous_only_mode = Some(format!(
                                     "RING0_RATCHET_VIOLATION: untracked file '{u_norm}' has executable mode {:o} (autonomous Ring-2 edits only permit regular 100644 files)",
                                     mode & 0o777
                                 ));
@@ -813,7 +819,7 @@ fn collect_working_and_commit_diff(
                     }
                 }
                 Err(e) => {
-                    forbidden_mode = Some(format!(
+                    always_forbidden_mode = Some(format!(
                         "RING0_RATCHET_VIOLATION: cannot stat untracked path '{u_norm}': {e}"
                     ));
                 }
@@ -835,7 +841,8 @@ fn collect_working_and_commit_diff(
     Ok(WorkingDiffSummary {
         changed_files: all_paths.into_iter().collect(),
         has_uncommitted_or_untracked,
-        forbidden_mode_mutation: forbidden_mode,
+        always_forbidden_mode,
+        autonomous_only_mode,
     })
 }
 
@@ -843,9 +850,58 @@ fn is_bot_github_actor() -> bool {
     if std::env::var("DOTAGENT_AUTONOMOUS_LOOP").as_deref() == Ok("1") {
         return true;
     }
-    if let Ok(actor) = std::env::var("GITHUB_ACTOR") {
-        let lower = actor.trim().to_ascii_lowercase();
-        if lower.ends_with("[bot]") || lower == "dotagent-loop" || lower == "github-actions" {
+    for var in ["GITHUB_ACTOR", "EVENT_ACTOR", "PR_AUTHOR"] {
+        if let Ok(actor) = std::env::var(var) {
+            let lower = actor.trim().to_ascii_lowercase();
+            if lower.ends_with("[bot]") || lower == "dotagent-loop" || lower == "github-actions" {
+                return true;
+            }
+        }
+    }
+    if let Ok(ptype) = std::env::var("PR_AUTHOR_TYPE")
+        && ptype.trim().eq_ignore_ascii_case("bot")
+    {
+        return true;
+    }
+    false
+}
+
+fn is_autonomous_bot_or_loop_context(repo_root: &Path, merge_base: &str) -> bool {
+    if is_bot_github_actor() {
+        return true;
+    }
+    for ref_var in ["PR_HEAD_REF", "GITHUB_HEAD_REF"] {
+        if let Ok(r) = std::env::var(ref_var) {
+            let trimmed = r.trim().trim_start_matches("refs/heads/");
+            if trimmed.starts_with("auto/") {
+                return true;
+            }
+        }
+    }
+    if let Ok(sym_out) = git_cmd(repo_root)
+        .args(["symbolic-ref", "--quiet", "--short", "HEAD"])
+        .output()
+        && sym_out.status.success()
+    {
+        let branch = String::from_utf8_lossy(&sym_out.stdout);
+        if branch.trim().starts_with("auto/") {
+            return true;
+        }
+    }
+    if let Ok(log_out) = git_cmd(repo_root)
+        .args([
+            "log",
+            "-n",
+            "50",
+            "--format=%an%x09%ae%x09%cn%x09%ce",
+            "--end-of-options",
+            &format!("{merge_base}..HEAD"),
+        ])
+        .output()
+        && log_out.status.success()
+    {
+        let lower = String::from_utf8_lossy(&log_out.stdout).to_ascii_lowercase();
+        if lower.contains("[bot]") || lower.contains("dotagent-loop") {
             return true;
         }
     }
@@ -1431,7 +1487,8 @@ pub fn verify_ring0_ratchet(
     let merge_base = resolve_merge_base(repo_root, base_ref)?;
     let diff_summary = collect_working_and_commit_diff(repo_root, &merge_base)?;
 
-    let human_hardware_signed = if force_ratchet {
+    let autonomous_context = is_autonomous_bot_or_loop_context(repo_root, &merge_base);
+    let human_hardware_signed = if force_ratchet || autonomous_context {
         false
     } else {
         check_all_commits_human_hardware_signed(
@@ -1441,17 +1498,34 @@ pub fn verify_ring0_ratchet(
             diff_summary.has_uncommitted_or_untracked,
         )?
     };
-    let enforce_ring0_paths = force_ratchet || !human_hardware_signed;
 
-    if let Some(mode_err) = diff_summary.forbidden_mode_mutation {
+    // Per-commit hardware signatures are NOT required for human/browser-agent PRs; strict 5-file
+    // Ring-2 confinement applies strictly to autonomous loop / `[bot]` / `auto/*` / `--require-ratchet` runs.
+    let enforce_ring0_paths = force_ratchet || autonomous_context;
+
+    if let Some(mode_err) = diff_summary.always_forbidden_mode {
         return Err(mode_err);
+    }
+    if enforce_ring0_paths && let Some(auto_mode_err) = diff_summary.autonomous_only_mode {
+        return Err(auto_mode_err);
     }
 
     for path in &diff_summary.changed_files {
         verify_no_symlink_along_repo_rel(repo_root, path)?;
+        // Protect enrolled release-tag FIDO2 trust anchors even on non-bot PRs so an agent VM
+        // cannot silently replace or wipe `config/allowed_human_signers`.
+        if matches!(
+            path.as_str(),
+            "config/allowed_human_signers" | "scripts/allowed_hardware_signers"
+        ) && !human_hardware_signed
+        {
+            return Err(format!(
+                "RING0_RATCHET_VIOLATION: UNAUTHENTICATED_SIGNER_KEYRING_MUTATION: modifying trust-anchor '{path}' requires a verified hardware signature from an enrolled signer"
+            ));
+        }
         if enforce_ring0_paths && !is_ring2_allowed_path(path) {
             return Err(format!(
-                "RING0_RATCHET_VIOLATION: path '{path}' is outside the strict 5-file Ring-2 allowlist (commits lack verified hardware signature in config/allowed_human_signers)"
+                "RING0_RATCHET_VIOLATION: path '{path}' is outside the strict 5-file Ring-2 allowlist for autonomous/bot changes"
             ));
         }
     }
@@ -1581,6 +1655,234 @@ pub fn verify_ring0_ratchet(
     })
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReleaseTagVerifyReport {
+    pub tag: String,
+    pub target_commit: String,
+    pub signer_principal: String,
+    pub hardware_fido2_signer: bool,
+}
+
+impl ReleaseTagVerifyReport {
+    pub fn to_json_value(&self) -> JsonValue {
+        JsonValue::Object(vec![
+            ("ok".to_string(), JsonValue::Bool(true)),
+            ("tag".to_string(), JsonValue::Str(self.tag.clone())),
+            (
+                "target_commit".to_string(),
+                JsonValue::Str(self.target_commit.clone()),
+            ),
+            (
+                "signer_principal".to_string(),
+                JsonValue::Str(self.signer_principal.clone()),
+            ),
+            (
+                "hardware_fido2_signer".to_string(),
+                JsonValue::Bool(self.hardware_fido2_signer),
+            ),
+        ])
+    }
+}
+
+/// Extracts `(unsigned_tag_payload_bytes, ssh_signature_pem)` from an annotated Git tag object.
+pub fn extract_tag_ssh_signature(raw_tag: &[u8]) -> Option<(Vec<u8>, String)> {
+    const MARKER: &[u8] = b"-----BEGIN SSH SIGNATURE-----";
+    let pos = raw_tag.windows(MARKER.len()).rposition(|w| w == MARKER)?;
+    let unsigned_payload = raw_tag[..pos].to_vec();
+    let sig_pem = std::str::from_utf8(&raw_tag[pos..]).ok()?.to_string();
+    if !sig_pem.contains("-----END SSH SIGNATURE-----") {
+        return None;
+    }
+    Some((unsigned_payload, sig_pem))
+}
+
+/// Cryptographically verifies an annotated `v*` release tag against `<base_ref>:config/allowed_human_signers`
+/// (`ssh-keygen -Y verify -n git`). When `require_fido2_sk_key` is `true`, non-`sk-*` software SSH keys
+/// in the signer file are rejected so production release tags require a hardware FIDO2 authenticator.
+pub fn verify_release_tag_signature(
+    repo_root: &Path,
+    tag_name: &str,
+    base_ref: &str,
+    require_fido2_sk_key: bool,
+) -> Result<ReleaseTagVerifyReport, String> {
+    static TAG_VERIFY_SEQ: AtomicU64 = AtomicU64::new(0);
+
+    let clean_tag = tag_name.trim().trim_start_matches("refs/tags/");
+    validate_git_ref_arg(clean_tag)?;
+    if !clean_tag.starts_with('v') {
+        return Err(format!(
+            "INVALID_RELEASE_TAG: release tag '{clean_tag}' must start with 'v'"
+        ));
+    }
+    validate_git_ref_arg(base_ref)?;
+
+    let tag_ref_spec = format!("refs/tags/{clean_tag}");
+    let target_commit = resolve_git_commit_oid(repo_root, &tag_ref_spec)?;
+    let base_commit = resolve_git_commit_oid(repo_root, base_ref)?;
+    let is_anc = git_cmd(repo_root)
+        .args([
+            "merge-base",
+            "--is-ancestor",
+            "--end-of-options",
+            &target_commit,
+            &base_commit,
+        ])
+        .status()
+        .is_ok_and(|s| s.success());
+    if !is_anc {
+        return Err(format!(
+            "UNMERGED_RELEASE_TAG_FORBIDDEN: tagged commit '{target_commit}' is not an ancestor of '{base_ref}' ({base_commit})"
+        ));
+    }
+    let cat_type = git_cmd(repo_root)
+        .args(["cat-file", "-t", "--end-of-options", &tag_ref_spec])
+        .output()
+        .map_err(|e| format!("git cat-file -t '{tag_ref_spec}' failed: {e}"))?;
+    if !cat_type.status.success() || String::from_utf8_lossy(&cat_type.stdout).trim() != "tag" {
+        return Err(format!(
+            "LIGHTWEIGHT_RELEASE_TAG_FORBIDDEN: '{clean_tag}' is not an annotated signed Git tag object"
+        ));
+    }
+
+    let cat_tag = git_cmd(repo_root)
+        .args(["cat-file", "tag", "--end-of-options", &tag_ref_spec])
+        .output()
+        .map_err(|e| format!("git cat-file tag '{tag_ref_spec}' failed: {e}"))?;
+    if !cat_tag.status.success() {
+        return Err(format!(
+            "RELEASE_TAG_READ_FAILED: unable to read annotated tag object '{clean_tag}'"
+        ));
+    }
+    let Some((unsigned_payload, sig_pem)) = extract_tag_ssh_signature(&cat_tag.stdout) else {
+        return Err(format!(
+            "UNSIGNED_RELEASE_TAG_FORBIDDEN: annotated tag '{clean_tag}' lacks an embedded OpenSSH signature"
+        ));
+    };
+
+    let signers_spec = format!("{base_commit}:config/allowed_human_signers");
+    let signers_out = git_cmd(repo_root)
+        .args(["show", "--end-of-options", &signers_spec])
+        .output()
+        .map_err(|e| format!("git show '{signers_spec}' failed: {e}"))?;
+    if !signers_out.status.success() {
+        return Err(format!(
+            "MISSING_RELEASE_SIGNERS: '{signers_spec}' not found on base branch"
+        ));
+    }
+    let raw_signers = String::from_utf8_lossy(&signers_out.stdout);
+    let mut filtered_lines = Vec::new();
+    let mut any_fido2 = false;
+    for line in raw_signers.lines() {
+        let t = line.trim();
+        if t.is_empty() || t.starts_with('#') {
+            continue;
+        }
+        let is_sk = t.contains("sk-ssh-ed25519@openssh.com")
+            || t.contains("sk-ecdsa-sha2-nistp256@openssh.com");
+        if require_fido2_sk_key && !is_sk {
+            continue;
+        }
+        if is_sk {
+            any_fido2 = true;
+        }
+        filtered_lines.push(format!("{t}\n"));
+    }
+    if filtered_lines.is_empty() {
+        return Err(
+            "MISSING_HARDWARE_RELEASE_SIGNERS: no eligible FIDO2 sk-* signers enrolled in config/allowed_human_signers"
+                .to_string(),
+        );
+    }
+    let signers_content = filtered_lines.concat();
+
+    let scratch = crate::traversal_ledger::state_root_dir().join("ratchet-verify");
+    ensure_nonsymlink_state_dir(&scratch)?;
+    let seq = TAG_VERIFY_SEQ.fetch_add(1, Ordering::Relaxed);
+    let pid = std::process::id();
+    let signers_path = scratch.join(format!("tag_signers.{pid}.{seq}"));
+    let sig_path = scratch.join(format!("tag.{pid}.{seq}.sig"));
+    let _ = fs::remove_file(&signers_path);
+    let _ = fs::remove_file(&sig_path);
+
+    let write_private = |p: &Path, data: &[u8]| -> Result<(), String> {
+        let mut opts = OpenOptions::new();
+        opts.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        let mut f = opts
+            .open(p)
+            .map_err(|e| format!("failed creating '{}': {e}", p.display()))?;
+        f.write_all(data)
+            .map_err(|e| format!("failed writing '{}': {e}", p.display()))
+    };
+
+    let verify_res = (|| -> Result<String, String> {
+        write_private(&signers_path, signers_content.as_bytes())?;
+        write_private(&sig_path, sig_pem.as_bytes())?;
+
+        let find_out = Command::new("ssh-keygen")
+            .args(["-Y", "find-principals", "-f"])
+            .arg(&signers_path)
+            .arg("-s")
+            .arg(&sig_path)
+            .output()
+            .map_err(|e| format!("ssh-keygen -Y find-principals failed: {e}"))?;
+        if !find_out.status.success() {
+            return Err(format!(
+                "UNTRUSTED_RELEASE_TAG_SIGNER: tag '{clean_tag}' signature does not match any enrolled signer in config/allowed_human_signers"
+            ));
+        }
+        let principal = String::from_utf8_lossy(&find_out.stdout)
+            .lines()
+            .next()
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        if principal.is_empty() {
+            return Err(format!(
+                "UNTRUSTED_RELEASE_TAG_SIGNER: empty principal for tag '{clean_tag}'"
+            ));
+        }
+
+        let mut verify_child = Command::new("ssh-keygen")
+            .args(["-Y", "verify", "-f"])
+            .arg(&signers_path)
+            .args(["-I", &principal, "-n", "git", "-s"])
+            .arg(&sig_path)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|e| format!("ssh-keygen -Y verify spawn failed: {e}"))?;
+        if let Some(mut stdin) = verify_child.stdin.take() {
+            let _ = stdin.write_all(&unsigned_payload);
+        }
+        let status = verify_child
+            .wait()
+            .map_err(|e| format!("ssh-keygen -Y verify wait failed: {e}"))?;
+        if !status.success() {
+            return Err(format!(
+                "INVALID_RELEASE_TAG_SIGNATURE: ssh-keygen -Y verify rejected signature on tag '{clean_tag}'"
+            ));
+        }
+        Ok(principal)
+    })();
+
+    let _ = fs::remove_file(&signers_path);
+    let _ = fs::remove_file(&sig_path);
+
+    let signer_principal = verify_res?;
+    Ok(ReleaseTagVerifyReport {
+        tag: clean_tag.to_string(),
+        target_commit,
+        signer_principal,
+        hardware_fido2_signer: any_fido2,
+    })
+}
+
 pub fn verify_corpus_monotonic_only(
     repo_root: &Path,
     base_ref: &str,
@@ -1629,6 +1931,8 @@ pub fn run_verify_ring0_ratchet_cli(args: &[String], cwd: &Path) -> ExitCode {
     let mut corpus_only = false;
     let mut json_mode = false;
     let mut repo_override: Option<String> = None;
+    let mut release_tag: Option<String> = None;
+    let mut allow_software_ssh_for_test = false;
 
     let mut i = 0usize;
     while i < args.len() {
@@ -1640,6 +1944,14 @@ pub fn run_verify_ring0_ratchet_cli(args: &[String], cwd: &Path) -> ExitCode {
             "--repo" if i + 1 < args.len() => {
                 repo_override = Some(args[i + 1].clone());
                 i += 2;
+            }
+            "--verify-release-tag" if i + 1 < args.len() => {
+                release_tag = Some(args[i + 1].clone());
+                i += 2;
+            }
+            "--allow-software-ssh-for-test" => {
+                allow_software_ssh_for_test = true;
+                i += 1;
             }
             "--require-ratchet" | "--enforce-ring0" => {
                 force_ratchet = true;
@@ -1655,7 +1967,7 @@ pub fn run_verify_ring0_ratchet_cli(args: &[String], cwd: &Path) -> ExitCode {
             }
             other => {
                 eprintln!(
-                    "[dotagent verify-ring0-ratchet] unrecognized argument '{other}' (expected --base <ref> [--require-ratchet] [--repo <dir>] [--json])"
+                    "[dotagent verify-ring0-ratchet] unrecognized argument '{other}' (expected --base <ref> [--require-ratchet] [--verify-release-tag <vX.Y.Z>] [--repo <dir>] [--json])"
                 );
                 return ExitCode::from(2);
             }
@@ -1667,6 +1979,34 @@ pub fn run_verify_ring0_ratchet_cli(args: &[String], cwd: &Path) -> ExitCode {
         .map(Path::new)
         .map(Path::to_path_buf)
         .unwrap_or_else(|| resolve_repo_root(cwd));
+
+    if let Some(tag) = release_tag {
+        match verify_release_tag_signature(
+            &target_dir,
+            &tag,
+            &base_ref,
+            !allow_software_ssh_for_test,
+        ) {
+            Ok(rep) => {
+                if json_mode {
+                    println!("{}", rep.to_json_value().to_json_string());
+                } else {
+                    println!(
+                        "[RELEASE TAG VERIFIED] tag='{}' commit='{}' signer='{}' fido2_sk={}",
+                        rep.tag,
+                        &rep.target_commit[..rep.target_commit.len().min(12)],
+                        rep.signer_principal,
+                        rep.hardware_fido2_signer
+                    );
+                }
+                return ExitCode::SUCCESS;
+            }
+            Err(e) => {
+                eprintln!("[RELEASE TAG VERIFY FAIL] {e}");
+                return ExitCode::from(2);
+            }
+        }
+    }
 
     let res = if corpus_only {
         verify_corpus_monotonic_only(&target_dir, &base_ref)

@@ -6,6 +6,7 @@ on:
       - "main"
     tags:
       - "v*"
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -18,6 +19,7 @@ jobs:
   auto-tag-release:
     name: auto-tag-release
     if: github.ref == 'refs/heads/main'
+    environment: release
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
@@ -172,7 +174,7 @@ jobs:
           tar -xzf "${ARCHIVE}" -C "${RUNNER_TEMP}"
           "${RUNNER_TEMP}/cargo-deny-0.22.0-x86_64-unknown-linux-musl/cargo-deny" check advisories licenses bans sources
 
-      - name: Run fmt, strict clippy, MSRV 1.88 check, full test & fuzz suite, compiler verify, and repo audit
+      - name: Run fmt, strict clippy, MSRV 1.88 check, full test & fuzz suite, compiler verify, repo audit, & FIDO2 tag check
         run: |
           cargo fmt --all -- --check
           cargo +1.88.0 check --workspace --all-targets --locked
@@ -180,6 +182,10 @@ jobs:
           cargo test --workspace --locked
           cargo run --release --locked -p dotagent-compiler -- verify .
           cargo run --release --locked -p agent-guard --bin dotagent -- audit-repo .
+          if git cat-file tag "refs/tags/${GITHUB_REF_NAME}" 2>/dev/null | grep -q -F "-----BEGIN SSH SIGNATURE-----"; then
+            cargo run --release --locked -p agent-guard --bin dotagent -- verify-ring0-ratchet \
+              --verify-release-tag "${GITHUB_REF_NAME}" --base refs/remotes/origin/main
+          fi
 
       - name: Run packaging tests (installer, repackager, ceremony script)
         run: |
