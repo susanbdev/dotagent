@@ -665,26 +665,6 @@ fn rust_stub_macro_lines(tokens: &[SourceToken<'_>], end_offset: usize) -> BTree
         .collect()
 }
 
-#[cfg(test)]
-mod stub_macro_tests {
-    use super::{rust_source_tokens, rust_stub_macro_lines};
-    use std::collections::BTreeSet;
-
-    #[test]
-    fn recognizes_invocations_and_preserves_source_lines() {
-        let source = r##"
-            const HELP: &str = "Use todo!() during development.";
-            /* Guide: compile out unimplemented!() before release. */
-            const RAW: &str = r#"Both todo!() and unimplemented!() require review."#;
-            fn draft() { todo ! ("pending implementation"); }
-        "##;
-        assert_eq!(
-            rust_stub_macro_lines(&rust_source_tokens(source), source.len()),
-            BTreeSet::from([5]),
-        );
-    }
-}
-
 fn is_empty_string_literal_match_arm(code_only: &str) -> bool {
     if !code_only.starts_with('"') {
         return false;
@@ -1218,4 +1198,24 @@ pub fn verify_on_stop_swarm_gates(repo_root: &Path) -> Result<(), String> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod stub_macro_tests {
+    use super::{rust_source_tokens, rust_stub_macro_lines};
+    use std::collections::BTreeSet;
+
+    #[test]
+    fn recognizes_invocations_and_preserves_source_lines() {
+        let source = r##"
+            const HELP: &str = "Use todo!() during development.";
+            /* Guide: compile out unimplemented!() before release. */
+            const RAW: &str = r#"Both todo!() and unimplemented!() require review."#;
+            fn draft() { todo ! ("pending implementation"); }
+        "##;
+        assert_eq!(
+            rust_stub_macro_lines(&rust_source_tokens(source), source.len()),
+            BTreeSet::from([5]),
+        );
+    }
 }

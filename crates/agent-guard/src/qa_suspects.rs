@@ -1232,61 +1232,6 @@ fn javascript_test_body(tokens: &[SourceToken<'_>]) -> bool {
         })
 }
 
-#[cfg(test)]
-mod source_declaration_tests {
-    use super::{TestSourceLanguage, test_declarations};
-
-    #[test]
-    fn rust_requires_an_attributed_function_body() {
-        let source = r##"
-            //! Unit tests in this module.
-            const DESCRIPTION: &str = r#"Documentation for example_test"#;
-            fn helper() { assert_eq!(2 + 2, 4); }
-            #[test]
-            fn example_test() { helper(); }
-            #[test]
-            #[ignore = "needs hardware"]
-            fn hardware_test() { helper(); }
-        "##;
-        assert_eq!(
-            test_declarations(source, TestSourceLanguage::Rust),
-            vec![("example_test", false), ("hardware_test", true)],
-        );
-    }
-
-    #[test]
-    fn python_recognizes_functions_and_testcase_methods() {
-        let source = r#"
-"""Integration checks for arithmetic."""
-
-def test_arithmetic():
-    assert 2 + 2 == 4
-
-@unittest.skip("needs hardware")
-class HardwareCases(unittest.TestCase):
-    def test_hardware(self):
-        self.assertTrue(connected())
-"#;
-        assert_eq!(
-            test_declarations(source, TestSourceLanguage::Python),
-            vec![("test_arithmetic", false), ("test_hardware", true)],
-        );
-    }
-
-    #[test]
-    fn javascript_matches_the_registration_name() {
-        let source = r#"
-            const help = "Example math test";
-            test("arithmetic", () => { expect(2 + 2).toBe(4); });
-            it.skip("hardware", () => { expect(connected()).toBe(true); });
-        "#;
-        assert_eq!(
-            test_declarations(source, TestSourceLanguage::JavaScript),
-            vec![("arithmetic", false), ("hardware", true)],
-        );
-    }
-}
-
 fn collect_integration_test_sources(dir: &Path, depth: usize, out: &mut Vec<(String, String)>) {
     if depth > 4 {
         return;
@@ -1459,4 +1404,59 @@ fn parse_toml_str_array(raw: &str) -> Result<Vec<String>, String> {
         }
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod source_declaration_tests {
+    use super::{TestSourceLanguage, test_declarations};
+
+    #[test]
+    fn rust_requires_an_attributed_function_body() {
+        let source = r##"
+            //! Unit tests in this module.
+            const DESCRIPTION: &str = r#"Documentation for example_test"#;
+            fn helper() { assert_eq!(2 + 2, 4); }
+            #[test]
+            fn example_test() { helper(); }
+            #[test]
+            #[ignore = "needs hardware"]
+            fn hardware_test() { helper(); }
+        "##;
+        assert_eq!(
+            test_declarations(source, TestSourceLanguage::Rust),
+            vec![("example_test", false), ("hardware_test", true)],
+        );
+    }
+
+    #[test]
+    fn python_recognizes_functions_and_testcase_methods() {
+        let source = r#"
+"""Integration checks for arithmetic."""
+
+def test_arithmetic():
+    assert 2 + 2 == 4
+
+@unittest.skip("needs hardware")
+class HardwareCases(unittest.TestCase):
+    def test_hardware(self):
+        self.assertTrue(connected())
+"#;
+        assert_eq!(
+            test_declarations(source, TestSourceLanguage::Python),
+            vec![("test_arithmetic", false), ("test_hardware", true)],
+        );
+    }
+
+    #[test]
+    fn javascript_matches_the_registration_name() {
+        let source = r#"
+            const help = "Example math test";
+            test("arithmetic", () => { expect(2 + 2).toBe(4); });
+            it.skip("hardware", () => { expect(connected()).toBe(true); });
+        "#;
+        assert_eq!(
+            test_declarations(source, TestSourceLanguage::JavaScript),
+            vec![("arithmetic", false), ("hardware", true)],
+        );
+    }
 }
