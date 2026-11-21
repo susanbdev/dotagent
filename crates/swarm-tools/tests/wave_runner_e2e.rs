@@ -5,7 +5,7 @@
 //! - Concurrent `(plan_id, task_id, attempt)` capability slots
 //! - `recommended_model_tier` worker command routing (`frontier` vs `local_7b_or_mid`)
 //! - 2-round adversarial retry recovery (`attempt 1` rejected -> `attempt 2` clean-slate approved)
-//! - Mechanical out-of-scope write rejection (`OBSERVED_WRITE_OUTSIDE_SCOPE`)
+//! - Kernel or supervisor rejection of out-of-scope writes
 //! - Auto-computed & verified `doc_sha256` on `investigator emit-fact`
 
 use std::fs;
@@ -73,6 +73,13 @@ fn ensure_agent_guard_built(workspace_root: &Path) {
             assert!(st.success(), "cargo build -p agent-guard failed");
         }
     });
+}
+
+fn kernel_denied_path(error: &str, path: &str) -> bool {
+    error.lines().any(|line| {
+        line.contains(path)
+            && (line.contains("Permission denied") || line.contains("Operation not permitted"))
+    })
 }
 
 #[test]
@@ -179,7 +186,11 @@ fn parallel_multi_worktree_wave_reconciles_disjoint_writes_and_retries_round_1_r
     };
     let err = run_swarm_dag_supervisor(&repo, dag_json, &bad_cfg)
         .expect_err("out-of-scope write must fail");
-    assert!(err.contains("OBSERVED_WRITE_OUTSIDE_SCOPE"), "got: {err}");
+    assert!(
+        err.contains("OBSERVED_WRITE_OUTSIDE_SCOPE")
+            || kernel_denied_path(&err, "src/unauthorized.rs"),
+        "got: {err}"
+    );
     assert!(!repo.join("src/unauthorized.rs").exists());
 
     // Verify symlink creation inside allowed_write_paths is immediately hard-blocked!
@@ -194,8 +205,18 @@ fn parallel_multi_worktree_wave_reconciles_disjoint_writes_and_retries_round_1_r
             .expect_err("symlink write must fail");
         assert!(
             sym_err.contains("OBSERVED_SYMLINK_FORBIDDEN")
-                || sym_err.contains("OBSERVED_WRITE_FORBIDDEN_PATH"),
+                || sym_err.contains("OBSERVED_WRITE_FORBIDDEN_PATH")
+                || kernel_denied_path(&sym_err, "src/setup.rs"),
             "got: {sym_err}"
+        );
+        assert!(
+            fs::symlink_metadata(repo.join("src/setup.rs"))
+                .expect("setup file remains")
+                .is_file()
+        );
+        assert_eq!(
+            fs::read_to_string(repo.join("src/setup.rs")).expect("setup content remains"),
+            setup_body
         );
     }
 

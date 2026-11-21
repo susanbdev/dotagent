@@ -2714,9 +2714,28 @@ fn render_macos_seatbelt_profile(
             "(deny file-write* (literal \"{repo_s}/PLAN.lock.json\") (literal \"{repo_s}/WORK_LEDGER.jsonl\") (literal \"{repo_s}/.breadcrumbs.jsonl\"))\n"
         ));
     }
-    let is_linked_worktree = if let Some((wt_gitdir, common_git_dir)) =
-        resolve_linked_worktree_git_dirs(&canon_repo)
-    {
+    let linked_worktree = resolve_linked_worktree_git_dirs(&canon_repo);
+    if opts.invokes_swarm_tool {
+        let common_repo = linked_worktree
+            .as_ref()
+            .and_then(|(_, common_git_dir)| common_git_dir.parent());
+        for root in std::iter::once(canon_repo.as_path()).chain(common_repo) {
+            for name in ["PLAN.lock.json", "WORK_LEDGER.jsonl", ".breadcrumbs.jsonl"] {
+                let artifact = root.join(name);
+                if representable(&artifact)
+                    && fs::canonicalize(&artifact).ok().as_deref() == Some(artifact.as_path())
+                    && fs::symlink_metadata(&artifact)
+                        .is_ok_and(|meta| meta.is_file() && meta.nlink() == 1)
+                {
+                    let literal = escape_sbpl_literal(&artifact.to_string_lossy());
+                    p.push_str(&format!(
+                        "(allow file-write-data (literal \"{literal}\"))\n"
+                    ));
+                }
+            }
+        }
+    }
+    let is_linked_worktree = if let Some((wt_gitdir, common_git_dir)) = linked_worktree {
         let cg_s = escape_sbpl_literal(&common_git_dir.to_string_lossy());
         let wt_s = escape_sbpl_literal(&wt_gitdir.to_string_lossy());
         p.push_str(&format!(
@@ -2731,19 +2750,15 @@ fn render_macos_seatbelt_profile(
             if allow_write_tree(&common_git_dir.join("info")) {
                 p.push_str(&format!("(allow file-write* (subpath \"{cg_s}/info\"))\n"));
             }
-            if let Some(common_repo) = common_git_dir.parent()
+            if !opts.invokes_swarm_tool
+                && capability_write_paths.is_none()
+                && let Some(common_repo) = common_git_dir.parent()
                 && allow_write_tree(common_repo)
             {
                 let cr_s = escape_sbpl_literal(&common_repo.to_string_lossy());
-                if opts.invokes_swarm_tool {
-                    p.push_str(&format!(
-                            "(allow file-write* (literal \"{cr_s}/PLAN.lock.json\") (literal \"{cr_s}/WORK_LEDGER.jsonl\") (literal \"{cr_s}/.breadcrumbs.jsonl\"))\n"
-                        ));
-                } else {
-                    p.push_str(&format!(
-                            "(allow file-write* (literal \"{cr_s}/WORK_LEDGER.jsonl\") (literal \"{cr_s}/.breadcrumbs.jsonl\"))\n"
-                        ));
-                }
+                p.push_str(&format!(
+                    "(allow file-write* (literal \"{cr_s}/WORK_LEDGER.jsonl\") (literal \"{cr_s}/.breadcrumbs.jsonl\"))\n"
+                ));
             }
         }
         true
