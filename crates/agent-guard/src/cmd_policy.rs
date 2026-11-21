@@ -948,6 +948,8 @@ fn check_single_command(
                     | "hook-daemon"
                     | "activate"
                     | "deactivate"
+                    | "elevate"
+                    | "approve"
                     | "telemetry"
                     | "fleet"
                     | "self-verify"
@@ -959,7 +961,7 @@ fn check_single_command(
                 return Err(CommandViolation {
                     code: "SELF_TAMPERING_BLOCKED",
                     detail:
-                        "Agents may not reset agent-guard session/compaction state, spoof lifecycle hooks, mutate activation/fleet, read human telemetry, or invoke internal daemons/gateways."
+                        "Agents may not reset agent-guard session/compaction state, spoof lifecycle hooks, self-elevate/approve sudo tickets, mutate activation/fleet, read human telemetry, or invoke internal daemons/gateways."
                             .to_string(),
                     halt_session: true,
                 });
@@ -1147,6 +1149,41 @@ fn check_single_command(
                 return Ok(());
             }
             if matches!(sub, "sanitize-stream" | "sandbox-status") {
+                return Ok(());
+            }
+            if sub == "sudo-request" {
+                if session_tainted {
+                    return Err(CommandViolation {
+                        code: "TAINTED_EXTERNAL_MUTATION_BLOCKED",
+                        detail:
+                            "Session is tainted by untrusted content; staging `sudo-request` tickets is blocked."
+                                .to_string(),
+                        halt_session: false,
+                    });
+                }
+                crate::sudo_broker::parse_and_validate_sudo_request(&sub_args[1..], repo_root, cwd)
+                    .map_err(|(code, detail, halt_session)| CommandViolation {
+                        code,
+                        detail,
+                        halt_session,
+                    })?;
+                return Ok(());
+            }
+            if sub == "sudo-result" {
+                if sub_args.len() != 2 {
+                    return Err(CommandViolation {
+                        code: "INVALID_SUDO_REQUEST_ID",
+                        detail: "Usage: `dotagent sudo-result <req_id>`.".to_string(),
+                        halt_session: false,
+                    });
+                }
+                crate::sudo_broker::validate_request_id(&sub_args[1]).map_err(
+                    |(code, detail)| CommandViolation {
+                        code,
+                        detail,
+                        halt_session: false,
+                    },
+                )?;
                 return Ok(());
             }
             if sub == "exec-sandbox" {
@@ -2721,7 +2758,8 @@ fn check_interpreter_command(
 
     let allow_interpreter = std::env::var("AGENT_GUARD_ALLOW_INTERPRETER")
         .map(|v| v == "1")
-        .unwrap_or(false);
+        .unwrap_or(false)
+        || crate::operator::has_active_elevated_lease(repo_root);
     if session_tainted || !allow_interpreter {
         return Err(CommandViolation {
             code: "UNAPPROVED_INTERPRETER_BLOCKED",

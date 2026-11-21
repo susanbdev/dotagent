@@ -931,6 +931,7 @@ pub fn rpc_eval_hook(
             });
         let caller_profile = std::env::var("AGENT_GUARD_PROFILE").ok();
         let caller_role = std::env::var("AGENT_GUARD_ROLE").ok();
+        let caller_direct_explore = std::env::var("AGENT_GUARD_DIRECT_EXPLORE").ok();
         let req = JsonValue::Object(vec![
             ("op".to_string(), JsonValue::Str("eval_hook".to_string())),
             ("phase".to_string(), JsonValue::Str(phase.to_string())),
@@ -961,6 +962,10 @@ pub fn rpc_eval_hook(
             (
                 "caller_role".to_string(),
                 caller_role.map_or(JsonValue::Null, JsonValue::Str),
+            ),
+            (
+                "caller_direct_explore".to_string(),
+                caller_direct_explore.map_or(JsonValue::Null, JsonValue::Str),
             ),
         ]);
         let resp = match send_rpc_request(&sock_path, &req) {
@@ -1116,8 +1121,11 @@ fn intern_known_guard_code(code: &str) -> &'static str {
         "INVALID_BUILD_CONFIG_UTF8",
         "INVALID_CAPABILITY_SESSION_ID",
         "INVALID_HOOK_JSON",
+        "INVALID_SUDO_REQUEST_ID",
         "INVALID_SWARM_ROLE",
         "INVALID_UTF8_BLOCKED",
+        "INVESTIGATOR_RAW_SEARCH_FORBIDDEN",
+        "INVESTIGATOR_SHELL_RESTRICTED",
         "INVESTIGATOR_WEB_FORBIDDEN",
         "INVESTIGATOR_WRITE_FORBIDDEN",
         "INVISIBLE_UNICODE_SMUGGLING",
@@ -1214,8 +1222,14 @@ fn intern_known_guard_code(code: &str) -> &'static str {
         "SORT_COMPRESS_EXEC_BLOCKED",
         "STATE_WRITE_ERROR",
         "STDIN_SCRIPT_EXECUTION_BLOCKED",
+        "SUBAGENT_AIRLOCK_REQUIRED",
         "SUBAGENT_DELEGATION_BLOCKED",
         "SUBAGENT_RETURN_BUDGET_EXCEEDED",
+        "SUDO_INVALID_REASON",
+        "SUDO_NON_ASCII_ARG_BLOCKED",
+        "SUDO_RESULT_READ_ERROR",
+        "SUDO_SENSITIVE_TARGET_FORBIDDEN",
+        "SUDO_SHELL_OR_EVAL_FORBIDDEN",
         "SYMLINKED_BUILD_CONFIG_BLOCKED",
         "SYMLINKED_GIT_DIR_BLOCKED",
         "SYMLINKED_GIT_HOOKS_BLOCKED",
@@ -1246,6 +1260,7 @@ fn intern_known_guard_code(code: &str) -> &'static str {
         "UNKNOWN_PROFILE_KEY",
         "UNKNOWN_RUNTIME_PROFILE",
         "UNKNOWN_SUBCOMMAND",
+        "UNKNOWN_SUDO_TICKET",
         "UNMINTED_CAPABILITY_DENIED",
         "UNREADABLE_PROFILE_BLOCKED",
         "UNRECOGNIZED_HMAC_DOMAIN_DENIED",
@@ -1460,6 +1475,10 @@ fn process_hook_daemon_line(
                     .map(String::from),
                 role_id: req
                     .get("caller_role")
+                    .and_then(JsonValue::as_str)
+                    .map(String::from),
+                direct_explore: req
+                    .get("caller_direct_explore")
                     .and_then(JsonValue::as_str)
                     .map(String::from),
             };

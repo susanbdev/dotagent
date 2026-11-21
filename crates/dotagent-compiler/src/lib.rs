@@ -39,6 +39,7 @@ pub struct ProfileIr {
     pub auto_compact_pct_override: u64,
     pub disable_auto_memory: bool,
     pub subagent_airlock_max_tokens: u64,
+    pub max_direct_discovery_calls: u64,
     pub mcp_allowed_endpoint: String,
     pub ban_stdio_npx_servers: bool,
 }
@@ -146,6 +147,10 @@ impl ProfileIr {
                     (
                         "subagent_airlock_max_tokens".to_string(),
                         JsonValue::Uint(self.subagent_airlock_max_tokens),
+                    ),
+                    (
+                        "max_direct_discovery_calls".to_string(),
+                        JsonValue::Uint(self.max_direct_discovery_calls),
                     ),
                 ]),
             ),
@@ -756,6 +761,16 @@ pub fn parse_profile_toml_to_ir(file_name: &str, raw_toml: &str) -> Result<Profi
         .and_then(|i| i.get("subagent_airlock_max_tokens"))
         .and_then(JsonValue::as_u64)
         .unwrap_or(200);
+    let default_direct_discovery = if enable_write_tools {
+        4
+    } else {
+        max_turn_tool_calls
+    };
+    let max_direct_discovery_calls = isolation
+        .and_then(|i| i.get("max_direct_discovery_calls"))
+        .or_else(|| budgets.and_then(|b| b.get("max_direct_discovery_calls")))
+        .and_then(JsonValue::as_u64)
+        .unwrap_or(default_direct_discovery);
 
     let mcp = ast.get("mcp");
     let mcp_allowed_endpoint = mcp
@@ -789,6 +804,7 @@ pub fn parse_profile_toml_to_ir(file_name: &str, raw_toml: &str) -> Result<Profi
         auto_compact_pct_override,
         disable_auto_memory,
         subagent_airlock_max_tokens,
+        max_direct_discovery_calls,
         mcp_allowed_endpoint,
         ban_stdio_npx_servers,
     })
@@ -1279,7 +1295,38 @@ pub fn render_antigravity_harness_json_from_ir(coding: &ProfileIr) -> String {
                     "subagentAirlockMaxTokens".to_string(),
                     JsonValue::Uint(coding.subagent_airlock_max_tokens),
                 ),
+                (
+                    "maxDirectDiscoveryCalls".to_string(),
+                    JsonValue::Uint(coding.max_direct_discovery_calls),
+                ),
             ]),
+        ),
+        (
+            "subagents".to_string(),
+            JsonValue::Object(vec![(
+                "research-airlock".to_string(),
+                JsonValue::Object(vec![
+                    (
+                        "baseType".to_string(),
+                        JsonValue::Str("research".to_string()),
+                    ),
+                    ("enableWriteTools".to_string(), JsonValue::Bool(false)),
+                    ("enableSubagentTools".to_string(), JsonValue::Bool(false)),
+                    ("enableMcpTools".to_string(), JsonValue::Bool(false)),
+                    (
+                        "workspace".to_string(),
+                        JsonValue::Str("inherit".to_string()),
+                    ),
+                    (
+                        "maxWalkDepth".to_string(),
+                        JsonValue::Uint(coding.max_directory_walk_depth),
+                    ),
+                    (
+                        "maxReturnTokens".to_string(),
+                        JsonValue::Uint(coding.subagent_airlock_max_tokens),
+                    ),
+                ]),
+            )]),
         ),
         (
             "mcpServers".to_string(),
@@ -1296,7 +1343,7 @@ pub fn render_antigravity_harness_json_from_ir(coding: &ProfileIr) -> String {
 }
 
 /// Lowers an agent markdown specification from Claude frontmatter + body into target-native
-/// harness frontmatter (`claude`, `cursor`, `codex`, `gemini`) driven by the matching `ProfileIr`.
+/// harness frontmatter (`antigravity`, `claude`, `cursor`, `codex`, `gemini`) driven by the matching `ProfileIr`.
 pub fn lower_agent_markdown_for_harness(
     harness: &str,
     agent_file_name: &str,
@@ -1317,6 +1364,9 @@ pub fn lower_agent_markdown_for_harness(
     let max_depth = profile.map_or(2, |p| p.max_directory_walk_depth);
 
     match harness {
+        "antigravity" => format!(
+            "---\nname: {name}\ndescription: {description}\nenable_write_tools: {enable_writes}\nenable_subagent_tools: false\nenable_mcp_tools: false\nworkspace: inherit\nmax_turn_tokens: {max_tokens}\nmax_walk_depth: {max_depth}\n---\n{body}"
+        ),
         "cursor" => format!(
             "---\nname: {name}\ndescription: {description}\nreadonly: {}\nmax_turn_tokens: {max_tokens}\nmax_walk_depth: {max_depth}\n---\n{body}",
             !enable_writes

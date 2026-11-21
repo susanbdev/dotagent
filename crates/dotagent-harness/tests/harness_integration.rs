@@ -122,3 +122,73 @@ fn cli_binary_supports_list_and_structured_json_reports() {
         Some(5)
     );
 }
+
+#[test]
+fn airlock_pareto_eval_proves_token_savings_zero_hop_pollution_and_cap_knee() {
+    let ws = discover_workspace_root();
+    let cfg = HarnessConfig::for_workspace(ws.clone());
+    let report = dotagent_harness::airlock_eval::run_airlock_evaluation(&cfg)
+        .expect("run airlock evaluation");
+
+    assert!(
+        report.baseline.rust_files_sampled >= 40,
+        "expected >= 40 real Rust modules sampled, got {}",
+        report.baseline.rust_files_sampled
+    );
+    assert_eq!(
+        report.recommended_cap, 4,
+        "expected zero-surgical-friction Pareto knee at cap=4"
+    );
+
+    let cap0 = report
+        .rows
+        .iter()
+        .find(|r| r.max_direct_discovery_calls == 0)
+        .expect("cap 0 row");
+    let cap4 = report
+        .rows
+        .iter()
+        .find(|r| r.max_direct_discovery_calls == 4)
+        .expect("cap 4 row");
+    let cap28 = report
+        .rows
+        .iter()
+        .find(|r| r.max_direct_discovery_calls == 28)
+        .expect("cap 28 row");
+
+    // Cap 0 forces subagent overhead on surgical 1..4-lookup edits (why Swarm Master != standalone coding-agent)
+    assert!(cap0.surgical_forced_subagent_pct >= 75.0);
+
+    // Cap 4 achieves 0% surgical false-positives AND 100% multi-module investigation containment!
+    assert_eq!(cap4.surgical_forced_subagent_pct, 0.0);
+    assert_eq!(cap4.investigation_caught_pct, 100.0);
+    assert_eq!(cap4.parent_exploratory_files_exposed, 0);
+    assert_eq!(cap4.downstream_hop_blocks, 0);
+    assert_eq!(cap4.step_budget_failures, 0);
+    assert!(
+        cap4.investigation_token_savings_pct >= 60.0,
+        "expected >= 60% parent investigation token savings at cap=4, got {:.1}%",
+        cap4.investigation_token_savings_pct
+    );
+
+    // Unbounded parent exploration (cap=28) leaks untrusted files, pollutes A->B->C hops, and OOMs 16k window!
+    assert!(cap28.parent_exploratory_files_exposed >= 20);
+    assert!(cap28.downstream_hop_blocks >= 2);
+    assert!(cap28.step_budget_failures >= 1);
+    assert!(cap28.pareto_effective_cost > (cap4.pareto_effective_cost * 3) / 2);
+
+    // CLI JSON output contract check
+    let bin = env!("CARGO_BIN_EXE_dotagent-harness");
+    let cli_out = Command::new(bin)
+        .args(["airlock-eval", "--json", "--workspace"])
+        .arg(&ws)
+        .output()
+        .expect("run airlock-eval --json");
+    assert!(cli_out.status.success());
+    let parsed =
+        JsonValue::parse(&String::from_utf8_lossy(&cli_out.stdout)).expect("valid airlock JSON");
+    assert_eq!(
+        parsed.get("recommended_cap").and_then(JsonValue::as_u64),
+        Some(4)
+    );
+}

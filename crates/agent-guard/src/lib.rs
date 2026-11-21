@@ -44,6 +44,7 @@ pub mod role_sandbox;
 pub mod sanitizer;
 pub mod shell_wrapper;
 pub mod stop_receipt;
+pub mod sudo_broker;
 pub mod swarm_contracts;
 pub mod telemetry;
 pub mod traversal_ledger;
@@ -56,9 +57,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use budget_guard::{
-    MAX_SLICED_FILE_BYTES, MAX_TOOL_OUTPUT_BYTES, RuntimeProfile, STEP_SOFT_COMPACT_TOKENS,
-    analyze_text_budget, estimate_bpe_tokens, inspect_file_budget, inspect_file_on_disk_hygiene,
-    load_active_profile,
+    MAX_SLICED_FILE_BYTES, MAX_TOOL_OUTPUT_BYTES, MAX_UNSLICED_LINES, RuntimeProfile,
+    STEP_SOFT_COMPACT_TOKENS, analyze_text_budget, estimate_bpe_tokens,
+    inspect_file_budget_with_limits, inspect_file_on_disk_hygiene, load_active_profile,
 };
 use cmd_policy::evaluate_shell_command;
 use injection_scan::scan_untrusted_content;
@@ -79,7 +80,7 @@ pub const ALLOWED_MCP_SERVER_PREFIX: &str = "mcp__susanbdev__";
 
 /// Canonical SHA-256 of `dist/gemini/GEMINI.md` emitted by `dotagent-compiler`.
 pub const CANONICAL_DIST_GEMINI_SHA256: &str =
-    "dbbf04daa59b265d5a793927a32b9aa3de24c1fe26a1b180a42f6c712d27d51f";
+    "14758b427c7c71289cb3694af2792d40baf410a8ffad833f818323971ef6b8ef";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Decision {
@@ -234,12 +235,26 @@ pub fn handle_user_prompt_hook(raw_json: &str, fallback_cwd: &Path) -> Decision 
         Err(bv) => return Decision::deny(bv.code, bv.detail, false),
     };
     let session_id = extract_session_id(&parsed);
+    let direct_explore_toggle = extract_user_prompt_direct_explore_toggle(&parsed);
 
-    match SessionLedger::reset_for_new_user_prompt(&repo_root, &session_id) {
-        Ok(ledger) => Decision::allow_with_advisory(format!(
-            "ZERO-TRUST MICRO-WINDOW ACTIVE (profile={}, spotlight_nonce={}, step_ceiling={} tokens). Compact immediately after completing each discrete step; never carry multi-feature context.",
-            profile.profile_id, ledger.turn_nonce, profile.max_turn_tokens
-        )),
+    match SessionLedger::reset_for_new_user_prompt_with_direct_explore(
+        &repo_root,
+        &session_id,
+        direct_explore_toggle,
+    ) {
+        Ok(ledger) => {
+            let explore_mode = if ledger.direct_explore_override
+                || env_flag_enabled("AGENT_GUARD_DIRECT_EXPLORE")
+            {
+                "direct-explore-escape-hatch"
+            } else {
+                "research-airlock-subagent"
+            };
+            Decision::allow_with_advisory(format!(
+                "ZERO-TRUST MICRO-WINDOW ACTIVE (profile={}, spotlight_nonce={}, step_ceiling={} tokens, exploration={explore_mode}). Compact immediately after completing each discrete step; never carry multi-feature context.",
+                profile.profile_id, ledger.turn_nonce, profile.max_turn_tokens
+            ))
+        }
         Err(e) => Decision::deny("STATE_WRITE_ERROR", e, false),
     }
 }
@@ -297,6 +312,7 @@ pub struct HookCallerContext {
     pub root_session_id: Option<String>,
     pub profile_id: Option<String>,
     pub role_id: Option<String>,
+    pub direct_explore: Option<String>,
 }
 
 /// Evaluates `PreToolUse` across Claude Code, Gemini/Antigravity, Cursor, and Codex payloads.
@@ -315,6 +331,7 @@ pub fn handle_pre_tool_hook(raw_json: &str, fallback_cwd: &Path) -> Decision {
             }),
         profile_id: std::env::var("AGENT_GUARD_PROFILE").ok(),
         role_id: std::env::var("AGENT_GUARD_ROLE").ok(),
+        direct_explore: std::env::var("AGENT_GUARD_DIRECT_EXPLORE").ok(),
     };
     handle_pre_tool_hook_with_context(raw_json, fallback_cwd, &ctx, None)
 }
@@ -373,6 +390,14 @@ pub fn handle_pre_tool_hook_with_context(
 
     let tool_name = extract_tool_name(&parsed);
     let tool_input = parsed.get("tool_input").unwrap_or(&parsed);
+    let direct_explore_env = caller_ctx
+        .direct_explore
+        .as_deref()
+        .map(is_truthy_env_val)
+        .unwrap_or_else(|| env_flag_enabled("AGENT_GUARD_DIRECT_EXPLORE"));
+    let payload_is_airlock_subagent =
+        extract_first_str(&parsed, &["agent_type", "subagent_type", "agent_name"])
+            .is_some_and(is_allowed_airlock_subagent_name);
 
     let (role, cap_opt) = match role_sandbox::resolve_active_role_with_overrides(
         &repo_root,
@@ -404,7 +429,12 @@ pub fn handle_pre_tool_hook_with_context(
             &profile,
             &mut ledger,
             &session_id,
-            (role, cap_opt.as_ref()),
+            (
+                role,
+                cap_opt.as_ref(),
+                direct_explore_env,
+                payload_is_airlock_subagent,
+            ),
         )
     };
     match &mut decision {
@@ -517,13 +547,29 @@ fn evaluate_tool_invocation(
     profile: &RuntimeProfile,
     ledger: &mut SessionLedger,
     raw_session_id: &str,
-    (role, cap): (
+    (role, cap, direct_explore_env, payload_is_airlock_subagent): (
         swarm_contracts::SwarmRole,
         Option<&swarm_contracts::SessionCapability>,
+        bool,
+        bool,
     ),
 ) -> Decision {
     let norm_tool = tool_name.to_ascii_lowercase();
     let writes_disabled = !profile.enable_write_tools || profile.write_scope_none;
+    let elevated_active = role == swarm_contracts::SwarmRole::StandardCoding
+        && operator::has_active_elevated_lease(repo_root);
+    let swarm_allowed = (std::env::var("AGENT_GUARD_ALLOW_SWARM").ok().as_deref() == Some("1")
+        || role == swarm_contracts::SwarmRole::Master
+        || elevated_active)
+        && !ledger.tainted;
+    let parent_discovery_gated = role == swarm_contracts::SwarmRole::StandardCoding
+        && !writes_disabled
+        && !elevated_active
+        && !payload_is_airlock_subagent
+        && !swarm_allowed
+        && !direct_explore_env
+        && !ledger.direct_explore_override
+        && !ledger.airlock_delegated;
 
     // 1. Hard-block unvetted external web fetch / browse tools unconditionally (`spec.md` Law 6)
     if matches!(
@@ -670,6 +716,29 @@ fn evaluate_tool_invocation(
             if let Err((code, msg)) = ledger.check_search_target(rel) {
                 return Decision::deny(code, msg, false);
             }
+        }
+
+        let is_single_file_grep = plan.search_files.len() == 1 && plan.read_files.is_empty();
+        if !is_single_file_grep && role_sandbox::shell_leads_with_discovery_binary(cmd_str) {
+            if parent_discovery_gated
+                && ledger.discovery_calls >= profile.max_direct_discovery_calls
+            {
+                return subagent_airlock_required_denial(profile.max_direct_discovery_calls);
+            }
+            ledger.discovery_calls = ledger.discovery_calls.saturating_add(1);
+        }
+
+        if let Some(broker_dec) = try_broker_sudo_subcommand_in_pre_tool(
+            cmd_str,
+            input,
+            cmd_key,
+            repo_root,
+            &cmd_cwd,
+            writes_disabled,
+            &profile.profile_id,
+            ledger.tainted,
+        ) {
+            return broker_dec;
         }
 
         let effective_cmd = plan.rewritten_command.as_deref().unwrap_or(cmd_str);
@@ -1057,16 +1126,13 @@ fn evaluate_tool_invocation(
             | "delegate"
             | "delegate_task"
     );
-    let swarm_allowed = (std::env::var("AGENT_GUARD_ALLOW_SWARM").ok().as_deref() == Some("1")
-        || role == swarm_contracts::SwarmRole::Master)
-        && !ledger.tainted;
     let is_research_airlock =
         is_research_airlock_delegation(norm_tool.as_str(), input, ledger.tainted);
     if is_subagent_tool && !swarm_allowed && !is_research_airlock {
         return Decision::deny(
             "SUBAGENT_DELEGATION_BLOCKED",
             format!(
-                "Subagent/delegation tool '{tool_name}' is blocked unless explicitly targeting read-only `subagent_type: \"research-airlock\"` (or set AGENT_GUARD_ALLOW_SWARM=1 outside the shell when authorized)."
+                "Subagent/delegation tool '{tool_name}' is blocked unless explicitly targeting read-only `research-airlock` (`research` on Antigravity, read-only `define_subagent`, or `manage_subagents` `list`; set AGENT_GUARD_ALLOW_SWARM=1 outside the shell when authorized)."
             ),
             false,
         );
@@ -1137,7 +1203,9 @@ fn evaluate_tool_invocation(
             cwd.join(raw_path)
         };
 
-        let role_max_depth = if cap.is_some() {
+        let role_max_depth = if elevated_active {
+            swarm_contracts::INVESTIGATOR_MAX_WALK_DEPTH
+        } else if cap.is_some() {
             role_sandbox::max_walk_depth_for_role(role)
         } else {
             crate::path_policy::MAX_DIRECTORY_WALK_DEPTH
@@ -1181,6 +1249,15 @@ fn evaluate_tool_invocation(
             ) {
                 return Decision::deny(pv.code, pv.detail, pv.is_poisoned_zone);
             }
+        }
+
+        if !candidate.is_file() {
+            if parent_discovery_gated
+                && ledger.discovery_calls >= profile.max_direct_discovery_calls
+            {
+                return subagent_airlock_required_denial(profile.max_direct_discovery_calls);
+            }
+            ledger.discovery_calls = ledger.discovery_calls.saturating_add(1);
         }
         return Decision::allow();
     }
@@ -1253,6 +1330,12 @@ fn evaluate_tool_invocation(
                     return Decision::deny(halt.code, halt.detail.clone(), true);
                 }
             }
+            if matches!(
+                norm_tool.as_str(),
+                "task" | "agent" | "subagent" | "invoke_subagent"
+            ) {
+                ledger.airlock_delegated = true;
+            }
             return Decision::allow_with_advisory(
                 "[AGENT-GUARD RESEARCH-AIRLOCK] Read-only `research-airlock` subagent authorized. Subagent return summary MUST stay <= 200 pure 7-bit ASCII tokens (file paths, line ranges, symbol signatures only).",
             );
@@ -1293,10 +1376,58 @@ fn evaluate_tool_invocation(
     )
 }
 
+fn is_truthy_env_val(raw: &str) -> bool {
+    matches!(
+        raw.trim().to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes"
+    )
+}
+
+fn env_flag_enabled(name: &str) -> bool {
+    std::env::var(name)
+        .ok()
+        .as_deref()
+        .is_some_and(is_truthy_env_val)
+}
+
+fn extract_user_prompt_direct_explore_toggle(v: &JsonValue) -> Option<bool> {
+    let raw = extract_first_str(v, &["prompt", "user_prompt", "content", "message"])?;
+    let lower = raw.to_ascii_lowercase();
+    if lower.contains("/no-direct-explore") || lower.contains("/airlock-only") {
+        Some(false)
+    } else if lower.contains("/direct-explore") || lower.contains("[direct-explore]") {
+        Some(true)
+    } else {
+        None
+    }
+}
+
+fn subagent_airlock_required_denial(limit: usize) -> Decision {
+    Decision::deny(
+        "SUBAGENT_AIRLOCK_REQUIRED",
+        format!(
+            "Broad repository exploration in `coding-agent` exceeded the direct surgical lookup cap ({limit} discovery calls). Delegate multi-file exploration to the read-only `research-airlock` subagent (`research` on Antigravity) returning <= 200 ASCII tokens, or enable the operator escape hatch via `AGENT_GUARD_DIRECT_EXPLORE=1` or `/direct-explore` in your prompt."
+        ),
+        false,
+    )
+}
+
+fn is_allowed_airlock_subagent_name(name: &str) -> bool {
+    let trimmed = name.trim();
+    trimmed.eq_ignore_ascii_case("research-airlock") || trimmed.eq_ignore_ascii_case("research")
+}
+
 fn json_contains_write_enable(val: &JsonValue) -> bool {
     match val {
         JsonValue::Object(entries) => entries.iter().any(|(k, v)| {
-            (k.eq_ignore_ascii_case("enable_write_tools") && v.as_bool() == Some(true))
+            ((k.eq_ignore_ascii_case("enable_write_tools")
+                || k.eq_ignore_ascii_case("enable_subagent_tools")
+                || k.eq_ignore_ascii_case("enable_mcp_tools"))
+                && v.as_bool() == Some(true))
+                || (k.eq_ignore_ascii_case("workspace")
+                    && v.as_str().is_some_and(|s| {
+                        !s.trim().is_empty() && !s.eq_ignore_ascii_case("inherit")
+                    }))
                 || (k.eq_ignore_ascii_case("mode")
                     && v.as_str().is_some_and(|s| {
                         !s.eq_ignore_ascii_case("readonly")
@@ -1315,29 +1446,44 @@ fn is_research_airlock_delegation(
     input: &JsonValue,
     session_tainted: bool,
 ) -> bool {
-    if session_tainted {
+    if session_tainted || json_contains_write_enable(input) {
         return false;
     }
-    if !matches!(norm_tool, "task" | "agent" | "subagent" | "invoke_subagent") {
-        return false;
-    }
-    if json_contains_write_enable(input) {
-        return false;
-    }
-    if let Some(JsonValue::Array(subagents)) = input.get("Subagents") {
-        if subagents.is_empty() {
-            return false;
+    match norm_tool {
+        "task" | "agent" | "subagent" | "invoke_subagent" => {
+            if let Some(JsonValue::Array(subagents)) = input.get("Subagents") {
+                if subagents.is_empty() {
+                    return false;
+                }
+                return subagents.iter().all(|entry| {
+                    extract_first_str(entry, &["TypeName", "subagent_type", "agent_type"])
+                        .is_some_and(is_allowed_airlock_subagent_name)
+                });
+            }
+            extract_first_str(
+                input,
+                &["subagent_type", "agent_type", "TypeName", "subagent"],
+            )
+            .is_some_and(is_allowed_airlock_subagent_name)
         }
-        return subagents.iter().all(|entry| {
-            extract_first_str(entry, &["TypeName", "subagent_type", "agent_type"])
-                .is_some_and(|t| t.eq_ignore_ascii_case("research-airlock"))
-        });
+        "define_subagent" => {
+            let explicit_write_disabled = input
+                .get("enable_write_tools")
+                .or_else(|| input.get("enableWriteTools"))
+                .and_then(JsonValue::as_bool)
+                == Some(false);
+            explicit_write_disabled
+                && extract_first_str(input, &["name", "Name"])
+                    .is_some_and(|n| n.trim().eq_ignore_ascii_case("research-airlock"))
+                && extract_first_str(input, &["description", "Description"])
+                    .is_some_and(|d| !d.trim().is_empty())
+                && extract_first_str(input, &["system_prompt", "SystemPrompt"])
+                    .is_some_and(|p| !p.trim().is_empty())
+        }
+        "manage_subagents" => extract_first_str(input, &["Action", "action"])
+            .is_some_and(|a| a.trim().eq_ignore_ascii_case("list")),
+        _ => false,
     }
-    extract_first_str(
-        input,
-        &["subagent_type", "agent_type", "TypeName", "subagent"],
-    )
-    .is_some_and(|t| t.eq_ignore_ascii_case("research-airlock"))
 }
 
 fn collect_all_json_strings<'a>(val: &'a JsonValue, out: &mut Vec<&'a str>) {
@@ -1451,12 +1597,17 @@ fn pre_inspect_file_for_ingestion_with_profile(
     deliver_sanitized_on_non_ascii: bool,
 ) -> Result<String, Decision> {
     // 1. Check transitive hop depth FIRST (`A -> B -> C` denied before even opening `C`!)
+    let max_ref_level = if operator::has_active_elevated_lease(repo_root) {
+        10u8
+    } else {
+        traversal_ledger::MAX_REFERENCE_LEVEL
+    };
     if let Some(existing) = ledger.nodes.get(repo_rel) {
-        if existing.level > traversal_ledger::MAX_REFERENCE_LEVEL {
+        if existing.level > max_ref_level {
             return Err(Decision::deny(
                 "TRANSITIVE_DEPTH_EXCEEDED",
                 format!(
-                    "Pointer traversal chain '{} -> {repo_rel}' exceeds max depth of 2 levels (A -> B allowed; B -> C forbidden). Stop immediately and ask the user.",
+                    "Pointer traversal chain '{} -> {repo_rel}' exceeds max depth of {max_ref_level} levels (A -> B allowed; B -> C forbidden). Stop immediately and ask the user.",
                     existing.chain
                 ),
                 false,
@@ -1466,8 +1617,16 @@ fn pre_inspect_file_for_ingestion_with_profile(
 
     // 2. File size, line count, single-line bomb, & BPE splitter bomb check
     let effective_limit = limit_lines.map(|l| l.min(profile.max_slice_lines));
-    let (content, mut metrics) = inspect_file_budget(abs_path, offset_line, effective_limit)
-        .map_err(|bv| Decision::deny(bv.code, bv.detail, false))?;
+    let max_unsliced = MAX_UNSLICED_LINES.max(profile.max_slice_lines);
+    let (content, mut metrics) = inspect_file_budget_with_limits(
+        abs_path,
+        offset_line,
+        effective_limit,
+        profile.max_slice_lines,
+        profile.max_raw_file_bytes,
+        max_unsliced,
+    )
+    .map_err(|bv| Decision::deny(bv.code, bv.detail, false))?;
     if (metrics.byte_len as u64) > profile.max_raw_file_bytes {
         return Err(Decision::deny(
             "FILE_BYTE_CAP_EXCEEDED",
@@ -1570,6 +1729,7 @@ pub fn handle_post_tool_hook(raw_json: &str, fallback_cwd: &Path) -> Decision {
             }),
         profile_id: std::env::var("AGENT_GUARD_PROFILE").ok(),
         role_id: std::env::var("AGENT_GUARD_ROLE").ok(),
+        direct_explore: std::env::var("AGENT_GUARD_DIRECT_EXPLORE").ok(),
     };
     handle_post_tool_hook_with_context(raw_json, fallback_cwd, &ctx, None)
 }
@@ -1914,7 +2074,98 @@ pub fn handle_post_edit(file_path: &str, cwd: &Path) -> Decision {
     Decision::allow()
 }
 
-fn scan_accidental_secret_literal(text: &str) -> Option<&'static str> {
+#[allow(clippy::too_many_arguments)]
+fn try_broker_sudo_subcommand_in_pre_tool(
+    cmd_str: &str,
+    input: &JsonValue,
+    cmd_key: &str,
+    repo_root: &Path,
+    cmd_cwd: &Path,
+    writes_disabled: bool,
+    profile_id: &str,
+    session_tainted: bool,
+) -> Option<Decision> {
+    let words = role_sandbox::tokenize_unchained_shell_words(cmd_str.trim())?;
+    let bin = words
+        .first()?
+        .rsplit('/')
+        .next()
+        .unwrap_or(words[0].as_str());
+    if !matches!(bin, "dotagent" | "agent-guard") {
+        return None;
+    }
+    let sub_args: &[String] = if words.get(1).map(String::as_str) == Some("guard") {
+        &words[2..]
+    } else {
+        &words[1..]
+    };
+    let sub = sub_args.first()?.as_str();
+    let banner = match sub {
+        "sudo-request" => {
+            if writes_disabled {
+                return Some(Decision::deny(
+                    "PROFILE_WRITE_TOOLS_DISABLED",
+                    format!(
+                        "Read-only profile '{profile_id}' may not stage privileged `sudo-request` tickets."
+                    ),
+                    false,
+                ));
+            }
+            if session_tainted {
+                return Some(Decision::deny(
+                    "TAINTED_EXTERNAL_MUTATION_BLOCKED",
+                    "Session is tainted by untrusted content; staging `sudo-request` tickets is blocked.",
+                    false,
+                ));
+            }
+            let validated = match sudo_broker::parse_and_validate_sudo_request(
+                &sub_args[1..],
+                repo_root,
+                cmd_cwd,
+            ) {
+                Ok(v) => v,
+                Err((code, detail, halt)) => return Some(Decision::deny(code, detail, halt)),
+            };
+            match sudo_broker::stage_sudo_request(&validated, repo_root, cmd_cwd) {
+                Ok(ticket) => sudo_broker::format_queued_banner(&ticket),
+                Err(e) => return Some(Decision::deny("STATE_WRITE_ERROR", e, false)),
+            }
+        }
+        "sudo-result" => {
+            let Some(req_id) = sub_args.get(1) else {
+                return Some(Decision::deny(
+                    "INVALID_SUDO_REQUEST_ID",
+                    "Usage: `dotagent sudo-result <req_id>`.",
+                    false,
+                ));
+            };
+            match sudo_broker::read_sudo_result_banner(req_id) {
+                Ok(b) => b,
+                Err((code, detail)) => return Some(Decision::deny(code, detail, false)),
+            }
+        }
+        _ => return None,
+    };
+
+    let single_quoted = format!("'{}'", banner.replace('\'', "'\\''"));
+    let printf_cmd = format!("printf '%s\\n' {single_quoted}");
+    let wrap_ascii = std::env::var("AGENT_GUARD_WRAP_BASH_ASCII")
+        .map(|v| v != "0")
+        .unwrap_or(true);
+    let final_cmd = if wrap_ascii {
+        exec_sandbox::wrap_bash_with_exec_sandbox(&printf_cmd, true)
+    } else {
+        printf_cmd
+    };
+    let updated_json = build_updated_shell_input_json(input, cmd_key, &final_cmd);
+    Some(Decision::Allow {
+        advisory: None,
+        updated_bash_cmd: Some(final_cmd),
+        updated_input_json: updated_json,
+    })
+}
+
+pub(crate) fn scan_accidental_secret_literal(text: &str) -> Option<&'static str> {
     const SECRET_PREFIXES: &[(&str, &str)] = &[
         ("-----BEGIN OPENSSH PRIVATE KEY-----", "OpenSSH private key"),
         ("-----BEGIN RSA PRIVATE KEY-----", "RSA private key"),

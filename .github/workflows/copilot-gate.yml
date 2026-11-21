@@ -68,13 +68,13 @@ jobs:
               cargo build --locked -p agent-guard --bin dotagent)
             "${RUNNER_TEMP}/trusted-target/debug/dotagent" verify-ring0-ratchet \
               --base "origin/${BASE_REF}"
-          elif [ "${BASE_OID}" = "0194af29450aa65d1699337ec731d1740efc00e4" ]; then
+          elif git merge-base --is-ancestor 0194af29450aa65d1699337ec731d1740efc00e4 "${BASE_OID}" \
+               && ! git cat-file -e "${BASE_OID}:config/allowed_human_signers" 2>/dev/null; then
             # Self-extinguishing one-time genesis bootstrap (never compiles PR sources): constrains any
             # non-human/automation PR to the 5-file Ring-2 allowlist and requires authenticated human
             # org-member ownership (susanbeasles, PR #15) + pinned signer digest for the initial enrollment.
-            python3 - "${TRUSTED}" "${GITHUB_WORKSPACE}" "${BASE_OID}" <<'PY'
+            python3 -c 'import sys, textwrap; exec(textwrap.dedent(sys.stdin.read()))' "${TRUSTED}" "${GITHUB_WORKSPACE}" "${BASE_OID}" <<'PY'
           import hashlib, os, subprocess, sys, tomllib
-
           trusted, ws, base_oid = sys.argv[1], sys.argv[2], sys.argv[3]
           RING2_ALLOWLIST = {
               "crates/agent-guard/src/cmd_policy.rs",
@@ -85,8 +85,8 @@ jobs:
           }
           PINNED_SIGNERS_SHA256 = "89ce5a026336a21d62959969b1552654c79709d03601d82f16fc3102d1dd7692"
           mb = subprocess.check_output(["git", "-C", ws, "merge-base", "HEAD", base_oid], text=True).strip()
-          if mb != base_oid:
-              raise SystemExit(f"GENESIS_VIOLATION: merge-base {mb} != {base_oid}")
+          if subprocess.run(["git", "-C", ws, "merge-base", "--is-ancestor", "0194af29450aa65d1699337ec731d1740efc00e4", mb]).returncode != 0:
+              raise SystemExit(f"GENESIS_VIOLATION: merge-base {mb} does not descend from v2.0.0 genesis")
           changed = [
               p for p in subprocess.check_output(
                   ["git", "-C", ws, "diff", "--name-only", base_oid], text=True

@@ -10,9 +10,10 @@ Scout deep repository structure, module boundaries, and exact symbol signatures 
 
 ## Hard Sandbox Rules (`agent-guard` Enforced)
 1. **Strictly Zero Writes (`0` Mutations)**: Any `Write`, `Edit`, `MultiEdit`, or mutating shell command is hard-blocked (`INVESTIGATOR_WRITE_FORBIDDEN`, `exit 2`).
-2. **Controlled Depth-20 Lift Inside Safe Repo Only**: Your directory traversal cap is lifted from `2` to `20` (`--max-depth 20`), **strictly** inside `realpath`-verified repository directories.
-3. **Forbidden Zones Stay Hard-Blocked (`exit 2`)**: Accessing `/tmp`, `/var/tmp`, `.cache/`, `node_modules/`, `vendor/`, `.venv/`, `.env*`, symlinks escaping `repo_root`, or guard state trips an immediate session halt.
-4. **200-Token Pure-ASCII Airlock Output**: Never dump raw file bodies back to `Master`. Emit only `ObservedFact` JSON packets (`<= 200` tokens: concise claim + `path:start-end` slices).
+2. **No Raw Search or Shell Wandering**: Raw `Grep`, `Glob`, `LS` (`INVESTIGATOR_RAW_SEARCH_FORBIDDEN`) and arbitrary `find`/`rg`/`ls`/`cat` shell commands (`INVESTIGATOR_SHELL_RESTRICTED`) are hard-blocked (`exit 2`). Scout exclusively via `swarm-tool investigator scout` and read slices via `Read` or `agent-guard read-safe`.
+3. **Controlled Depth-20 Lift Inside Safe Repo Only**: `swarm-tool investigator scout` walks up to `20` levels (`--max-depth 20`), **strictly** inside `realpath`-verified repository directories.
+4. **Forbidden Zones Stay Hard-Blocked (`exit 2`)**: Accessing `/tmp`, `/var/tmp`, `.cache/`, `node_modules/`, `vendor/`, `.venv/`, `.env*`, symlinks escaping `repo_root`, or guard state trips an immediate session halt.
+5. **200-Token Pure-ASCII Airlock Output**: Never dump raw file bodies back to `Master`. Emit only `ObservedFact` JSON packets (`<= 200` tokens: concise claim + `path:start-end` slices).
 
 ## Dedicated Rust Tooling (`swarm-tool investigator`)
 1. **Deep Safe Signature Scout**:

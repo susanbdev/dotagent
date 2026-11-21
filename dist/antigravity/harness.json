@@ -20,7 +20,19 @@
     "maxSliceLines": 150,
     "maxRawFileBytes": 24576,
     "maxTurnTokens": 16000,
-    "subagentAirlockMaxTokens": 200
+    "subagentAirlockMaxTokens": 200,
+    "maxDirectDiscoveryCalls": 4
+  },
+  "subagents": {
+    "research-airlock": {
+      "baseType": "research",
+      "enableWriteTools": false,
+      "enableSubagentTools": false,
+      "enableMcpTools": false,
+      "workspace": "inherit",
+      "maxWalkDepth": 2,
+      "maxReturnTokens": 200
+    }
   },
   "mcpServers": {
     "susanbdev": {

@@ -996,12 +996,30 @@ fn check_all_commits_human_hardware_signed(
         .map_err(|e| format!("git show '{signers_spec}' failed: {e}"))?;
 
     if !signers_out.status.success() {
-        // One-time self-extinguishing genesis enrollment: the merge-base AND base ref must both
-        // resolve exactly to the v2.0.0 genesis SHA, and `HEAD:config/allowed_human_signers` must
-        // match the pinned SHA-256 digest byte-for-byte (no arbitrary key injection possible).
+        // One-time self-extinguishing genesis enrollment: `merge_base` must descend from the
+        // v2.0.0 genesis SHA, `base_ref` must still lack `config/allowed_human_signers`, and
+        // `HEAD:config/allowed_human_signers` must match the pinned SHA-256 digest byte-for-byte.
         let base_oid = resolve_git_commit_oid(repo_root, base_ref)?;
         let mb_oid = resolve_git_commit_oid(repo_root, merge_base)?;
-        if base_oid == RING0_SIGNERS_GENESIS_BASE_SHA && mb_oid == RING0_SIGNERS_GENESIS_BASE_SHA {
+        let descends_from_v2_genesis = git_cmd(repo_root)
+            .args([
+                "merge-base",
+                "--is-ancestor",
+                "--end-of-options",
+                RING0_SIGNERS_GENESIS_BASE_SHA,
+                &mb_oid,
+            ])
+            .status()
+            .is_ok_and(|s| s.success());
+        let base_lacks_signers = !git_cmd(repo_root)
+            .args([
+                "cat-file",
+                "-e",
+                &format!("{base_oid}:config/allowed_human_signers"),
+            ])
+            .status()
+            .is_ok_and(|s| s.success());
+        if descends_from_v2_genesis && base_lacks_signers {
             let head_signers = git_cmd(repo_root)
                 .args([
                     "show",
@@ -1014,7 +1032,7 @@ fn check_all_commits_human_hardware_signed(
                 && crate::crypto::sha256_hex(&head_signers.stdout) == RING0_GENESIS_SIGNERS_SHA256
             {
                 eprintln!(
-                    "[ring0-ratchet] GENESIS_SIGNER_ENROLLMENT: base {RING0_SIGNERS_GENESIS_BASE_SHA} has no signer keyring; accepting pinned-digest enrollment once (self-extinguishes when main advances)."
+                    "[ring0-ratchet] GENESIS_SIGNER_ENROLLMENT: base {base_oid} has no signer keyring; accepting pinned-digest enrollment once (self-extinguishes when main has config/allowed_human_signers)."
                 );
                 return Ok(true);
             }

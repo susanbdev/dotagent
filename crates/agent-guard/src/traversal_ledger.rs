@@ -85,6 +85,9 @@ pub struct SessionLedger {
     pub cumulative_tokens: usize,
     pub file_reads: usize,
     pub tool_calls: usize,
+    pub discovery_calls: usize,
+    pub airlock_delegated: bool,
+    pub direct_explore_override: bool,
     pub nodes: BTreeMap<String, TraversalNode>,
     pub last_tool_trace_id: Option<String>,
     pub recent_traces: VecDeque<(String, String)>,
@@ -158,6 +161,9 @@ impl SessionLedger {
             cumulative_tokens: 0,
             file_reads: 0,
             tool_calls: 0,
+            discovery_calls: 0,
+            airlock_delegated: false,
+            direct_explore_override: false,
             nodes: BTreeMap::new(),
             last_tool_trace_id: None,
             recent_traces: VecDeque::new(),
@@ -332,22 +338,34 @@ impl SessionLedger {
     }
 
     pub fn reset_for_new_user_prompt(repo_root: &Path, session_id: &str) -> Result<Self, String> {
+        Self::reset_for_new_user_prompt_with_direct_explore(repo_root, session_id, None)
+    }
+
+    pub fn reset_for_new_user_prompt_with_direct_explore(
+        repo_root: &Path,
+        session_id: &str,
+        direct_explore_toggle: Option<bool>,
+    ) -> Result<Self, String> {
         let _lock = Self::acquire_lock(repo_root, session_id);
         let mut fresh = Self::new(repo_root, session_id);
         let path = ledger_file_path_for_hash(&fresh.session_key_hash);
+        let mut inherited_direct_explore = false;
         if let Ok(Some(raw)) = read_nonsymlink_state_file(&path)
             && let Some(prev) = Self::from_json(&raw)
             && (prev.session_key_hash.is_empty() || prev.session_key_hash == fresh.session_key_hash)
         {
+            inherited_direct_explore = prev.direct_explore_override;
             if !prev.root_session_id.is_empty() {
                 fresh.root_session_id = prev.root_session_id;
             }
             fresh.last_tool_trace_id = prev.last_tool_trace_id;
+            fresh.recent_traces = prev.recent_traces;
             fresh.recent_denials = prev.recent_denials;
             fresh.ballot_submissions = prev.ballot_submissions;
             fresh.ballot_counts_by_cluster = prev.ballot_counts_by_cluster;
             fresh.mcp_readonly_feedback_calls = prev.mcp_readonly_feedback_calls;
         }
+        fresh.direct_explore_override = direct_explore_toggle.unwrap_or(inherited_direct_explore);
         let serialized = fresh.to_json();
         atomic_write_nonsymlink_state_file(&path, serialized.as_bytes())?;
         Ok(fresh)
@@ -361,6 +379,8 @@ impl SessionLedger {
         self.cumulative_tokens = 0;
         self.file_reads = 0;
         self.tool_calls = 0;
+        self.discovery_calls = 0;
+        self.airlock_delegated = false;
         self.turn_nonce =
             generate_turn_nonce(repo_root, &self.session_key_hash, self.compaction_epoch);
         for node in self.nodes.values_mut() {
@@ -436,12 +456,18 @@ impl SessionLedger {
             return Err(("SESSION_CIRCUIT_BREAKER_HALTED", msg));
         }
 
+        let max_ref_level =
+            if crate::operator::has_active_elevated_lease(Path::new(&self.repo_root)) {
+                10u8
+            } else {
+                MAX_REFERENCE_LEVEL
+            };
         if let Some(existing) = self.nodes.get(rel_path) {
-            if existing.level > MAX_REFERENCE_LEVEL {
+            if existing.level > max_ref_level {
                 return Err((
                     "TRANSITIVE_DEPTH_EXCEEDED",
                     format!(
-                        "Transitive reference chain '{} -> {rel_path}' reaches level {} (> max {MAX_REFERENCE_LEVEL} levels: A -> B allowed, B -> C forbidden). Stop immediately and ask the user.",
+                        "Transitive reference chain '{} -> {rel_path}' reaches level {} (> max {max_ref_level} levels: A -> B allowed, B -> C forbidden). Stop immediately and ask the user.",
                         existing.chain, existing.level
                     ),
                 ));
@@ -534,12 +560,18 @@ impl SessionLedger {
         if let Err(msg) = self.check_not_halted() {
             return Err(("SESSION_CIRCUIT_BREAKER_HALTED", msg));
         }
+        let max_ref_level =
+            if crate::operator::has_active_elevated_lease(Path::new(&self.repo_root)) {
+                10u8
+            } else {
+                MAX_REFERENCE_LEVEL
+            };
         if let Some(existing) = self.nodes.get(rel_path) {
-            if existing.level > MAX_REFERENCE_LEVEL {
+            if existing.level > max_ref_level {
                 return Err((
                     "TRANSITIVE_DEPTH_EXCEEDED",
                     format!(
-                        "Transitive reference chain '{} -> {rel_path}' reaches level {} (> max {MAX_REFERENCE_LEVEL} levels: A -> B allowed, B -> C forbidden). Stop immediately and ask the user.",
+                        "Transitive reference chain '{} -> {rel_path}' reaches level {} (> max {max_ref_level} levels: A -> B allowed, B -> C forbidden). Stop immediately and ask the user.",
                         existing.chain, existing.level
                     ),
                 ));
@@ -825,6 +857,18 @@ impl SessionLedger {
                 "tool_calls".to_string(),
                 JsonValue::Number(self.tool_calls as f64),
             ),
+            (
+                "discovery_calls".to_string(),
+                JsonValue::Number(self.discovery_calls as f64),
+            ),
+            (
+                "airlock_delegated".to_string(),
+                JsonValue::Bool(self.airlock_delegated),
+            ),
+            (
+                "direct_explore_override".to_string(),
+                JsonValue::Bool(self.direct_explore_override),
+            ),
             ("nodes".to_string(), JsonValue::Object(nodes_entries)),
             (
                 "last_tool_trace_id".to_string(),
@@ -892,6 +936,18 @@ impl SessionLedger {
         let cumulative_tokens = v.get("cumulative_tokens")?.as_u64()? as usize;
         let file_reads = v.get("file_reads")?.as_u64()? as usize;
         let tool_calls = v.get("tool_calls")?.as_u64()? as usize;
+        let discovery_calls = v
+            .get("discovery_calls")
+            .and_then(JsonValue::as_u64)
+            .unwrap_or(0) as usize;
+        let airlock_delegated = v
+            .get("airlock_delegated")
+            .and_then(JsonValue::as_bool)
+            .unwrap_or(false);
+        let direct_explore_override = v
+            .get("direct_explore_override")
+            .and_then(JsonValue::as_bool)
+            .unwrap_or(false);
 
         let mut nodes = BTreeMap::new();
         if let Some(entries) = v.get("nodes").and_then(JsonValue::as_object) {
@@ -994,6 +1050,9 @@ impl SessionLedger {
             cumulative_tokens,
             file_reads,
             tool_calls,
+            discovery_calls,
+            airlock_delegated,
+            direct_explore_override,
             nodes,
             last_tool_trace_id,
             recent_traces,

@@ -55,6 +55,7 @@ per_repo_state_namespace = true
 block_cross_repo_reads = true
 taint_gates_privileged_clis = true
 subagent_airlock_max_tokens = 200
+max_direct_discovery_calls = 4
 
 [mcp]
 allowed_endpoint = "https://mcp.zt.susanb.dev/mcp"
