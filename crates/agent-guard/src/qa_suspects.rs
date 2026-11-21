@@ -397,41 +397,42 @@ pub fn save_locked_plan(
     plan: &LockedPlan,
     allow_amend_with_human_approval: bool,
 ) -> Result<PathBuf, String> {
-    save_locked_plan_after_validation(repo_root, plan, allow_amend_with_human_approval, || Ok(()))
+    save_locked_plan_inner(
+        repo_root,
+        plan,
+        allow_amend_with_human_approval,
+        PlanWriteEpoch::Current,
+    )
 }
 
-/// Validates the existing plan before changing the signing epoch and writes the new lock under
-/// the same file lock. The callback must not attempt to acquire the plan lock.
-pub fn save_locked_plan_after_validation(
+/// Re-signs the plan, active Master, and session registry before installing the replacement key.
+pub fn save_locked_plan_with_epoch_rotation(
     repo_root: &Path,
     plan: &LockedPlan,
     allow_amend_with_human_approval: bool,
-    prepare: impl FnOnce() -> Result<(), String>,
+    master_session_id: Option<&str>,
+) -> Result<PathBuf, String> {
+    save_locked_plan_inner(
+        repo_root,
+        plan,
+        allow_amend_with_human_approval,
+        PlanWriteEpoch::Rotate(master_session_id),
+    )
+}
+
+enum PlanWriteEpoch<'a> {
+    Current,
+    Rotate(Option<&'a str>),
+}
+
+fn save_locked_plan_inner(
+    repo_root: &Path,
+    plan: &LockedPlan,
+    allow_amend_with_human_approval: bool,
+    epoch: PlanWriteEpoch<'_>,
 ) -> Result<PathBuf, String> {
     let lock_path = plan_lock_state_path(repo_root)?;
     let _guard = ExclusiveFileLockGuard::acquire(&lock_path)?;
-
-    let existing_len = match fs::symlink_metadata(&lock_path) {
-        Ok(meta) if meta.file_type().is_symlink() => {
-            return Err(format!(
-                "SYMLINK_REJECTED: PLAN.lock.json path '{}' is a symlink",
-                lock_path.display()
-            ));
-        }
-        Ok(meta) if meta.is_file() => meta.len(),
-        Ok(_) => return Err("PLAN_LOCK_TAMPERED: PLAN.lock.json must be a regular file".into()),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => 0,
-        Err(err) => return Err(format!("failed inspecting PLAN.lock.json: {err}")),
-    };
-    if existing_len > 0 && !allow_amend_with_human_approval {
-        let existing = load_locked_plan_unlocked(repo_root, &lock_path)?;
-        if existing.plan_sha256 != plan.plan_sha256 {
-            return Err(format!(
-                "PLAN_LOCK_IMMUTABLE: PLAN.lock.json already pinned at {}; pass --amend --human-approved to re-lock",
-                &existing.plan_sha256[..16]
-            ));
-        }
-    }
 
     let canonical = serialize_locked_tasks_canonical(&plan.plan_id, &plan.tasks);
     let recomputed_sha = hex_encode(&sha256_digest(canonical.as_bytes()));
@@ -442,27 +443,73 @@ pub fn save_locked_plan_after_validation(
         ));
     }
     let parsed_tasks = JsonValue::parse(&canonical).map_err(|e| e.to_string())?;
-    prepare()?;
-    let record_mac =
-        compute_arbitrary_hmac_hex(repo_root, PLAN_LOCK_HMAC_DOMAIN, canonical.as_bytes())?;
-    let wrapper = JsonValue::Object(vec![
-        ("plan_id".to_string(), JsonValue::Str(plan.plan_id.clone())),
-        (
-            "plan_sha256".to_string(),
-            JsonValue::Str(plan.plan_sha256.clone()),
-        ),
-        (
-            "tasks".to_string(),
-            parsed_tasks
-                .get("tasks")
-                .cloned()
-                .unwrap_or(JsonValue::Array(Vec::new())),
-        ),
-        ("record_mac".to_string(), JsonValue::Str(record_mac)),
-    ]);
-    let encoded = format!("{}\n", wrapper.to_json_string());
-    crate::traversal_ledger::atomic_write_nonsymlink_state_file(&lock_path, encoded.as_bytes())
-        .map_err(|e| format!("failed writing PLAN.lock.json: {e}"))?;
+    let encode = |record_mac| {
+        let wrapper = JsonValue::Object(vec![
+            ("plan_id".to_string(), JsonValue::Str(plan.plan_id.clone())),
+            (
+                "plan_sha256".to_string(),
+                JsonValue::Str(plan.plan_sha256.clone()),
+            ),
+            (
+                "tasks".to_string(),
+                parsed_tasks
+                    .get("tasks")
+                    .cloned()
+                    .unwrap_or(JsonValue::Array(Vec::new())),
+            ),
+            ("record_mac".to_string(), JsonValue::Str(record_mac)),
+        ]);
+        format!("{}\n", wrapper.to_json_string()).into_bytes()
+    };
+    let validate_existing = || {
+        let existing_len = match fs::symlink_metadata(&lock_path) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                return Err(format!(
+                    "SYMLINK_REJECTED: PLAN.lock.json path '{}' is a symlink",
+                    lock_path.display()
+                ));
+            }
+            Ok(meta) if meta.is_file() => meta.len(),
+            Ok(_) => return Err("PLAN_LOCK_TAMPERED: PLAN.lock.json must be a regular file".into()),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => 0,
+            Err(err) => return Err(format!("failed inspecting PLAN.lock.json: {err}")),
+        };
+        if existing_len > 0 && !allow_amend_with_human_approval {
+            let existing = load_locked_plan_unlocked(repo_root, &lock_path)?;
+            if existing.plan_sha256 != plan.plan_sha256 {
+                return Err(format!(
+                    "PLAN_LOCK_IMMUTABLE: PLAN.lock.json already pinned at {}; pass --amend --human-approved to re-lock",
+                    &existing.plan_sha256[..16]
+                ));
+            }
+        }
+        Ok(())
+    };
+    match epoch {
+        PlanWriteEpoch::Current => {
+            validate_existing()?;
+            let mac =
+                compute_arbitrary_hmac_hex(repo_root, PLAN_LOCK_HMAC_DOMAIN, canonical.as_bytes())?;
+            crate::traversal_ledger::atomic_write_nonsymlink_state_file(&lock_path, &encode(mac))
+                .map_err(|e| format!("failed writing PLAN.lock.json: {e}"))?;
+        }
+        PlanWriteEpoch::Rotate(master_session_id) => {
+            crate::role_sandbox::rotate_closed_session_epoch(
+                repo_root,
+                master_session_id,
+                &lock_path,
+                |key| {
+                    validate_existing()?;
+                    let mac = crate::coordinator::compute_domain_tag_raw(
+                        key,
+                        PLAN_LOCK_HMAC_DOMAIN,
+                        canonical.as_bytes(),
+                    )?;
+                    Ok(encode(hex_encode(&mac)))
+                },
+            )?;
+        }
+    }
     Ok(lock_path)
 }
 

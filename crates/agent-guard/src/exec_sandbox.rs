@@ -415,13 +415,14 @@ fn drain_stream_bounded<R: Read>(mut reader: R) -> Vec<u8> {
     head
 }
 
-/// CLI entrypoint for `agent-guard exec-sandbox [--sanitize-stream] [--require-kernel] [--deny-net] [--read-only] [--session-id <sid>] [--cwd <dir>] -- <cmd>`
+/// CLI entrypoint for `agent-guard exec-sandbox` with optional session or checkpoint scope.
 pub fn run_exec_sandbox_cli(args: &[String], default_cwd: &Path) -> ExitCode {
     let mut sanitize_stream = false;
     let mut require_kernel = false;
     let mut explicit_deny_net = false;
     let mut explicit_read_only = false;
     let mut cli_session_id: Option<String> = None;
+    let mut checkpoint = false;
     let mut custom_cwd: Option<PathBuf> = None;
     let mut cmd_parts: Vec<String> = Vec::new();
     let mut after_sep = false;
@@ -454,20 +455,23 @@ pub fn run_exec_sandbox_cli(args: &[String], default_cwd: &Path) -> ExitCode {
                 explicit_read_only = true;
                 i += 1;
             }
-            "--session-id" => {
+            "--session-id" | "--checkpoint-session" => {
+                let flag = args[i].as_str();
                 if let Some(sid_arg) = args.get(i + 1) {
                     let trimmed = sid_arg.trim();
-                    if trimmed.is_empty()
+                    if cli_session_id.is_some()
+                        || trimmed.is_empty()
                         || trimmed.len() > 128
                         || !trimmed.bytes().all(|b| (0x21..=0x7e).contains(&b))
                     {
-                        eprintln!("[AGENT-GUARD] exec-sandbox: invalid --session-id value");
+                        eprintln!("[AGENT-GUARD] exec-sandbox: invalid or repeated {flag} value");
                         return ExitCode::from(2);
                     }
+                    checkpoint = flag == "--checkpoint-session";
                     cli_session_id = Some(trimmed.to_string());
                     i += 2;
                 } else {
-                    eprintln!("[AGENT-GUARD] exec-sandbox: missing value after --session-id");
+                    eprintln!("[AGENT-GUARD] exec-sandbox: missing value after {flag}");
                     return ExitCode::from(2);
                 }
             }
@@ -520,12 +524,12 @@ pub fn run_exec_sandbox_cli(args: &[String], default_cwd: &Path) -> ExitCode {
     };
     let writes_allowed = !explicit_read_only && active_prof.enable_write_tools;
     let profile_denies_net = active_prof.network_access_none;
-    let invokes_git = is_atomic_leading_command(&shell_script, "git");
-    let invokes_swarm_tool = is_atomic_leading_command(&shell_script, "swarm-tool");
-    let invokes_feedback_submit = is_atomic_feedback_submit_command(&shell_script);
+    let invokes_git = !checkpoint && is_atomic_leading_command(&shell_script, "git");
+    let invokes_swarm_tool = !checkpoint && is_atomic_leading_command(&shell_script, "swarm-tool");
+    let invokes_feedback_submit = !checkpoint && is_atomic_feedback_submit_command(&shell_script);
     let opts = SandboxPolicyOpts {
         writes_allowed,
-        deny_net: explicit_deny_net || profile_denies_net,
+        deny_net: checkpoint || explicit_deny_net || profile_denies_net,
         invokes_git,
         invokes_swarm_tool,
         invokes_feedback_submit,
@@ -536,6 +540,17 @@ pub fn run_exec_sandbox_cli(args: &[String], default_cwd: &Path) -> ExitCode {
         .ok()
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty());
+    if checkpoint
+        && (env::var_os("AGENT_GUARD_SESSION_ID").is_some()
+            || !cli_session_id
+                .as_deref()
+                .is_some_and(|sid| sid.starts_with("swm_")))
+    {
+        eprintln!(
+            "[AGENT-GUARD HARD DENY :: CAPABILITY_WRITE_SCOPE] checkpoint requires an explicit Swarm session and no ambient session"
+        );
+        return ExitCode::from(2);
+    }
     let requested_session_id = env_session_id
         .as_deref()
         .or(cli_session_id.as_deref())
@@ -555,7 +570,14 @@ pub fn run_exec_sandbox_cli(args: &[String], default_cwd: &Path) -> ExitCode {
     } else {
         requested_session_id.to_string()
     };
-    let has_swarm_session = effective_session_id.starts_with("swm_");
+    // Checkpoint identity scopes the host launcher only. The test process gets
+    // no session privileges, coordinator access or Swarm state directories.
+    let runtime_session_id = if checkpoint {
+        ""
+    } else {
+        &effective_session_id
+    };
+    let has_swarm_session = runtime_session_id.starts_with("swm_");
 
     // Snapshot `.git/config` bytes (<= 256 KiB) and SHA-256 digest prior to execution so any
     // `.git` lockfile access (or non-Landlock fallback execution) can never tamper with `.git/config`.
@@ -680,11 +702,22 @@ pub fn run_exec_sandbox_cli(args: &[String], default_cwd: &Path) -> ExitCode {
 
     let ephemeral_tmp = EphemeralTmpDir::create();
     let tmp_dir_path = ephemeral_tmp.as_ref().map(|t| t.path.as_path());
+    if checkpoint && tmp_dir_path.is_none() {
+        eprintln!(
+            "[AGENT-GUARD HARD DENY :: CHECKPOINT_SCRATCH_UNAVAILABLE] cannot create isolated checkpoint scratch storage"
+        );
+        return ExitCode::from(2);
+    }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
-    let capability_write_paths = if opts.writes_allowed {
+    let capability_write_paths = if opts.writes_allowed || checkpoint {
         let canon_repo = fs::canonicalize(&repo_root).unwrap_or_else(|_| repo_root.clone());
-        match prepare_capability_write_paths(&canon_repo, &effective_session_id) {
+        match prepare_capability_write_paths(
+            &canon_repo,
+            &effective_session_id,
+            checkpoint,
+            opts.writes_allowed,
+        ) {
             Ok(paths) => paths,
             Err(e) => {
                 eprintln!("[AGENT-GUARD HARD DENY :: CAPABILITY_WRITE_SCOPE] {e}");
@@ -702,10 +735,12 @@ pub fn run_exec_sandbox_cli(args: &[String], default_cwd: &Path) -> ExitCode {
         &repo_root,
         tmp_dir_path,
         opts,
-        &effective_session_id,
+        runtime_session_id,
         capability_write_paths.as_deref(),
     );
-    if (require_kernel || capability_write_paths.is_some()) && !mode.is_kernel_enforced() {
+    if (checkpoint || require_kernel || capability_write_paths.is_some())
+        && !mode.is_kernel_enforced()
+    {
         eprintln!(
             "[AGENT-GUARD HARD DENY :: KERNEL_SANDBOX_UNAVAILABLE] Host kernel does not enforce Landlock/Seatbelt VFS containment (mode={}).",
             mode.as_str()
@@ -728,7 +763,7 @@ pub fn run_exec_sandbox_cli(args: &[String], default_cwd: &Path) -> ExitCode {
         tmp_dir_path,
         opts,
         mode,
-        &effective_session_id,
+        runtime_session_id,
         capability_write_paths.as_deref(),
     ) {
         Ok(cmd) => cmd,
@@ -737,10 +772,20 @@ pub fn run_exec_sandbox_cli(args: &[String], default_cwd: &Path) -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    if effective_session_id != requested_session_id
-        || (env_session_id.is_none() && cli_session_id.is_some())
+    if !checkpoint
+        && (effective_session_id != requested_session_id
+            || (env_session_id.is_none() && cli_session_id.is_some()))
     {
         child_cmd.env("AGENT_GUARD_SESSION_ID", &effective_session_id);
+    }
+    if checkpoint && let Some(tmp) = tmp_dir_path {
+        child_cmd
+            .env("AGENT_GUARD_WORKER_LOCK", "1")
+            .env("CARGO_TARGET_DIR", tmp.join("cargo-target"))
+            .env_remove("AGENT_GUARD_ROLE")
+            .env_remove("AGENT_GUARD_ROOT_SESSION_ID")
+            .env_remove("AGENT_GUARD_PARENT_SESSION_ID")
+            .env_remove("AGENT_GUARD_HOOK_SESSION_ID");
     }
     if let Some(tok) = minted_ipc_worker_token {
         child_cmd.env("AGENT_GUARD_IPC_WORKER_TOKEN", tok);
@@ -1844,21 +1889,34 @@ fn is_capability_write_component(name: &str) -> bool {
 fn prepare_capability_write_paths(
     canon_repo: &Path,
     session_hint: &str,
+    checkpoint: bool,
+    writes_allowed: bool,
 ) -> Result<Option<Vec<PathBuf>>, String> {
-    use crate::role_sandbox::is_qa_writable_path;
+    use crate::role_sandbox::{is_qa_writable_path, load_open_session_capabilities};
     use crate::swarm_contracts::SwarmRole;
     use std::collections::BTreeSet;
     use std::os::unix::fs::MetadataExt;
 
     // Standalone ledger IDs can appear in AGENT_GUARD_SESSION_ID. The selected
     // session hint already contains the verified binding or the original ID.
-    let role_override = env::var("AGENT_GUARD_ROLE").ok();
-    let (role, capability) = crate::role_sandbox::resolve_active_role_with_overrides(
-        canon_repo,
-        session_hint,
-        role_override.as_deref(),
-        None,
-    )?;
+    let (role, capability) = if checkpoint {
+        let cap = load_open_session_capabilities(canon_repo)?
+            .into_iter()
+            .find(|cap| cap.role == SwarmRole::Grunt && cap.session_id == session_hint)
+            .ok_or_else(|| "checkpoint requires an open, verified Grunt capability".to_string())?;
+        (cap.role, Some(cap))
+    } else {
+        let role_override = env::var("AGENT_GUARD_ROLE").ok();
+        crate::role_sandbox::resolve_active_role_with_overrides(
+            canon_repo,
+            session_hint,
+            role_override.as_deref(),
+            None,
+        )?
+    };
+    if !writes_allowed {
+        return Ok(Some(Vec::new()));
+    }
     let qa_only = role == SwarmRole::QaEngineer;
     if role != SwarmRole::Grunt && !qa_only {
         return Ok(None);

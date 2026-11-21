@@ -21,8 +21,9 @@ use agent_guard::json::JsonValue;
 use agent_guard::path_policy::{PathAccess, validate_path};
 use agent_guard::qa_suspects::{
     compute_task_coverage_targets, load_locked_plan, parse_and_validate_dag_json,
-    parse_attribution_toml, plan_lock_state_path, save_locked_plan_after_validation,
-    triangulate_faults, verify_attribution_against_plan, verify_live_integration_contracts,
+    parse_attribution_toml, plan_lock_state_path, save_locked_plan,
+    save_locked_plan_with_epoch_rotation, triangulate_faults, verify_attribution_against_plan,
+    verify_live_integration_contracts,
 };
 use agent_guard::resolve_repo_root;
 use agent_guard::role_sandbox::{
@@ -31,7 +32,7 @@ use agent_guard::role_sandbox::{
     list_session_capabilities, load_active_session_slot, load_open_session_capabilities,
     load_session_capability, lookup_pinned_package_doc, mint_discovery_investigator_capability,
     mint_session_capability, parse_and_validate_worker_packet, path_matches_any_scope,
-    rotate_closed_session_epoch, scout_repo_signatures,
+    scout_repo_signatures,
 };
 use agent_guard::swarm_contracts::{
     EventOp, ReviewVerdictOutcome, SessionCapability, SuspectVerdict, SwarmRole, WorkerPacket,
@@ -543,12 +544,11 @@ fn run_master(
                 && load_locked_plan(repo_root).is_err()
                 && load_open_session_capabilities(repo_root)?.is_empty()
                 && list_session_capabilities(repo_root)?.is_empty();
-            let saved_path = save_locked_plan_after_validation(repo_root, &plan, allow_amend, || {
-                if explicit_rotate || rotate_fresh {
-                    rotate_closed_session_epoch(repo_root, master_session_id)?;
-                }
-                Ok(())
-            })?;
+            let saved_path = if explicit_rotate || rotate_fresh {
+                save_locked_plan_with_epoch_rotation(repo_root, &plan, allow_amend, master_session_id)?
+            } else {
+                save_locked_plan(repo_root, &plan, allow_amend)?
+            };
             let out = JsonValue::Object(vec![
                 (
                     "status".to_string(),
@@ -1660,6 +1660,8 @@ fn run_grunt(repo_root: &Path, cwd: &Path, args: &[String]) -> Result<(), String
             sbx_cmd
                 .arg("exec-sandbox")
                 .arg("--deny-net")
+                .arg("--checkpoint-session")
+                .arg(&sid)
                 .arg("--cwd")
                 .arg(repo_root)
                 .arg("--")

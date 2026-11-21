@@ -662,6 +662,30 @@ pub fn current_hmac_epoch_id(repo_root: &Path) -> Result<u64, String> {
 static ATOMIC_TMP_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 pub(crate) fn write_atomic_private_0600(path: &Path, body: &[u8]) -> Result<(), String> {
+    let staged = stage_atomic_private_0600(path, body)?;
+    if let Err(e) = fs::rename(&staged, path) {
+        let _ = fs::remove_file(&staged);
+        return Err(format!(
+            "failed renaming atomic temp onto '{}': {e}",
+            path.display()
+        ));
+    }
+    Ok(())
+}
+
+fn atomic_private_sibling(path: &Path, suffix: &str) -> Result<PathBuf, String> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| format!("missing parent directory for '{}'", path.display()))?;
+    let seq = ATOMIC_TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let name = path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("atomic.dat");
+    Ok(parent.join(format!(".{name}.{suffix}.{}.{seq}", std::process::id())))
+}
+
+fn stage_atomic_private_0600(path: &Path, body: &[u8]) -> Result<PathBuf, String> {
     if let Ok(meta) = fs::symlink_metadata(path)
         && meta.file_type().is_symlink()
     {
@@ -670,43 +694,133 @@ pub(crate) fn write_atomic_private_0600(path: &Path, body: &[u8]) -> Result<(), 
             path.display()
         ));
     }
-    let parent = path
-        .parent()
-        .ok_or_else(|| format!("missing parent directory for '{}'", path.display()))?;
-    let seq = ATOMIC_TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let fname = path
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or("atomic.dat");
-    let tmp_path = parent.join(format!(".{fname}.tmp.{}.{seq}", std::process::id()));
+    let tmp_path = atomic_private_sibling(path, "tmp")?;
+    let mut options = fs::OpenOptions::new();
+    options.create_new(true).write(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        let mut f = fs::OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .mode(0o600)
-            .open(&tmp_path)
-            .map_err(|e| format!("failed creating atomic temp '{}': {e}", tmp_path.display()))?;
-        if let Err(e) = f.write_all(body).and_then(|()| f.sync_all()) {
-            let _ = fs::remove_file(&tmp_path);
-            return Err(format!(
-                "failed syncing atomic temp '{}': {e}",
-                tmp_path.display()
-            ));
-        }
+        options.mode(0o600);
     }
-    #[cfg(not(unix))]
-    {
-        fs::write(&tmp_path, body)
-            .map_err(|e| format!("failed writing atomic temp '{}': {e}", tmp_path.display()))?;
-    }
-    if let Err(e) = fs::rename(&tmp_path, path) {
+    let mut file = options
+        .open(&tmp_path)
+        .map_err(|e| format!("failed creating atomic temp '{}': {e}", tmp_path.display()))?;
+    if let Err(e) = file.write_all(body).and_then(|()| file.sync_all()) {
+        drop(file);
         let _ = fs::remove_file(&tmp_path);
         return Err(format!(
-            "failed renaming atomic temp onto '{}': {e}",
-            path.display()
+            "failed syncing atomic temp '{}': {e}",
+            tmp_path.display()
         ));
+    }
+    Ok(tmp_path)
+}
+
+pub(crate) enum EpochFileUpdate {
+    Replace(PathBuf, Vec<u8>),
+    Retire(PathBuf),
+}
+
+struct StagedEpochFile {
+    path: PathBuf,
+    replacement: Option<PathBuf>,
+    backup: Option<PathBuf>,
+}
+
+impl StagedEpochFile {
+    fn stage(update: EpochFileUpdate) -> Result<Self, String> {
+        let (path, body) = match update {
+            EpochFileUpdate::Replace(path, body) => (path, Some(body)),
+            EpochFileUpdate::Retire(path) => (path, None),
+        };
+        let parent = path.parent().ok_or("epoch state file has no parent")?;
+        crate::traversal_ledger::ensure_nonsymlink_state_dir(parent)?;
+        let mut staged = Self {
+            path,
+            replacement: None,
+            backup: None,
+        };
+        match fs::symlink_metadata(&staged.path) {
+            Ok(meta) if meta.is_file() => {
+                let backup = atomic_private_sibling(&staged.path, "epoch-backup")?;
+                fs::hard_link(&staged.path, &backup).map_err(|e| {
+                    format!(
+                        "failed preserving epoch state '{}': {e}",
+                        staged.path.display()
+                    )
+                })?;
+                staged.backup = Some(backup);
+            }
+            Ok(_) => {
+                return Err(format!(
+                    "epoch state '{}' must be a regular file",
+                    staged.path.display()
+                ));
+            }
+            Err(e) if e.kind() == ErrorKind::NotFound && body.is_some() => {}
+            Err(e) => {
+                return Err(format!(
+                    "failed inspecting epoch state '{}': {e}",
+                    staged.path.display()
+                ));
+            }
+        }
+        if let Some(body) = body {
+            staged.replacement = Some(stage_atomic_private_0600(&staged.path, &body)?);
+        }
+        Ok(staged)
+    }
+
+    fn publish(&self) -> std::io::Result<()> {
+        match &self.replacement {
+            Some(replacement) => fs::rename(replacement, &self.path),
+            None => fs::remove_file(&self.path),
+        }
+    }
+
+    fn restore(&mut self) -> Result<(), String> {
+        if let Some(backup) = self.backup.take() {
+            fs::rename(&backup, &self.path).map_err(|e| {
+                format!(
+                    "failed restoring '{}' from '{}': {e}",
+                    self.path.display(),
+                    backup.display()
+                )
+            })
+        } else {
+            fs::remove_file(&self.path).map_err(|e| {
+                format!(
+                    "failed removing new epoch state '{}': {e}",
+                    self.path.display()
+                )
+            })
+        }
+    }
+}
+
+impl Drop for StagedEpochFile {
+    fn drop(&mut self) {
+        for path in self.replacement.iter().chain(self.backup.iter()) {
+            let _ = fs::remove_file(path);
+        }
+    }
+}
+
+fn publish_staged_epoch(mut staged: Vec<StagedEpochFile>) -> Result<(), String> {
+    for index in 0..staged.len() {
+        if let Err(e) = staged[index].publish() {
+            let mut failure = format!(
+                "failed publishing epoch state '{}': {e}",
+                staged[index].path.display()
+            );
+            for file in staged[..index].iter_mut().rev() {
+                if let Err(restore_error) = file.restore() {
+                    failure.push_str("\nEPOCH_ROTATION_RECOVERY_REQUIRED: ");
+                    failure.push_str(&restore_error);
+                }
+            }
+            return Err(failure);
+        }
     }
     Ok(())
 }
@@ -731,6 +845,15 @@ fn unlink_if_same_inode(path: &Path, expected_id: Option<(u64, u64)>) {
 /// increments `vault/hmac_epoch.json`, and retires any active `coord.sock` bound to the old epoch.
 /// Strictly host-only: hard-denied inside `exec-sandbox` or worker locks.
 pub fn rotate_vault_hmac_epoch(repo_root: &Path) -> Result<u64, String> {
+    rotate_vault_hmac_epoch_with_files(repo_root, |_| Ok(Vec::new()))
+}
+
+/// Prepares dependent records under the epoch lock and replaces the active key only after all
+/// other writes succeed. Callers hold the locks protecting their own dependent records.
+pub(crate) fn rotate_vault_hmac_epoch_with_files(
+    repo_root: &Path,
+    prepare: impl FnOnce(&[u8; 32]) -> Result<Vec<EpochFileUpdate>, String>,
+) -> Result<u64, String> {
     if std::env::var("AGENT_GUARD_IN_SANDBOX").as_deref() == Ok("1")
         || std::env::var("AGENT_GUARD_WORKER_LOCK").as_deref() == Ok("1")
     {
@@ -743,10 +866,8 @@ pub fn rotate_vault_hmac_epoch(repo_root: &Path) -> Result<u64, String> {
     let _guard = ExclusiveFileLockGuard::acquire(&lock_path)?;
 
     let canon_repo = fs::canonicalize(repo_root).unwrap_or_else(|_| repo_root.to_path_buf());
-    let _ = load_or_init_vault_hmac_key(&canon_repo)?;
-    let vault_dir = swarm_state_dir(&canon_repo)?.join("vault");
-    let key_file = vault_dir.join("hmac.key");
-    let epoch_file = vault_dir.join("hmac_epoch.json");
+    let key_file = crate::breadcrumbs::vault_hmac_key_path(&canon_repo)?;
+    let epoch_file = key_file.with_file_name("hmac_epoch.json");
 
     if let Ok(meta) = fs::symlink_metadata(&key_file)
         && meta.file_type().is_symlink()
@@ -758,6 +879,8 @@ pub fn rotate_vault_hmac_epoch(repo_root: &Path) -> Result<u64, String> {
     {
         return Err("VAULT_SYMLINK_TAMPER: vault/hmac_epoch.json is a symlink".to_string());
     }
+    // Preserve the bootstrap and legacy migration behavior when a caller rotates before jobs run.
+    drop(ZeroizingKey::new(load_or_init_vault_hmac_key(&canon_repo)?));
 
     let next_epoch = current_hmac_epoch_id(&canon_repo)?.saturating_add(1);
     let mut fresh_key = [0u8; 32];
@@ -780,10 +903,6 @@ pub fn rotate_vault_hmac_epoch(repo_root: &Path) -> Result<u64, String> {
 
     let fresh_zk = ZeroizingKey::new(fresh_key);
     zeroize_raw_arr(&mut fresh_key);
-    let hex_body = format!("{}\n", hex_encode(fresh_zk.as_bytes()));
-    write_atomic_private_0600(&key_file, hex_body.as_bytes())
-        .map_err(|e| format!("failed rotating vault/hmac.key: {e}"))?;
-
     let meta_json = JsonValue::Object(vec![
         ("epoch_id".to_string(), JsonValue::Uint(next_epoch)),
         (
@@ -792,9 +911,25 @@ pub fn rotate_vault_hmac_epoch(repo_root: &Path) -> Result<u64, String> {
         ),
     ])
     .to_json_string();
-    let epoch_body = format!("{meta_json}\n");
-    write_atomic_private_0600(&epoch_file, epoch_body.as_bytes())
-        .map_err(|e| format!("failed writing vault/hmac_epoch.json: {e}"))?;
+    let mut updates = prepare(fresh_zk.as_bytes())?;
+    updates.push(EpochFileUpdate::Replace(
+        epoch_file,
+        format!("{meta_json}\n").into_bytes(),
+    ));
+    let mut staged = updates
+        .into_iter()
+        .map(StagedEpochFile::stage)
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut key_body = format!("{}\n", hex_encode(fresh_zk.as_bytes())).into_bytes();
+    let key_update = stage_atomic_private_0600(&key_file, &key_body);
+    crate::crypto::zeroize_slice(&mut key_body);
+    // The final rename commits the new epoch. Until it succeeds the original key is untouched.
+    staged.push(StagedEpochFile {
+        path: key_file,
+        replacement: Some(key_update?),
+        backup: None,
+    });
+    publish_staged_epoch(staged)?;
 
     // Unlink existing socket path so the next coordinator call binds with the rotated key
     if let Ok(sock) = coordinator_socket_path(&canon_repo) {
@@ -2313,5 +2448,47 @@ pub(crate) fn process_rpc_line(
                 .to_string(),
         ),
         other => Err(format!("unknown coordinator op '{other}'")),
+    }
+}
+
+#[cfg(test)]
+mod epoch_file_tests {
+    use super::*;
+
+    #[test]
+    fn epoch_publication_restores_existing_state_on_failed_final_rename() {
+        let sequence = ATOMIC_TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let fixture = std::env::temp_dir().join(format!(
+            "dotagent-epoch-file-test-{}-{sequence}",
+            std::process::id()
+        ));
+        fs::create_dir(&fixture).unwrap();
+        let existing = fixture.join("existing.json");
+        let retired = fixture.join("retired.json");
+        let added = fixture.join("added.json");
+        let final_file = fixture.join("final.txt");
+        fs::write(&existing, b"previous").unwrap();
+        fs::write(&retired, b"retained on failure").unwrap();
+        fs::write(&final_file, b"previous").unwrap();
+
+        let files = vec![
+            StagedEpochFile::stage(EpochFileUpdate::Replace(existing.clone(), b"next".to_vec()))
+                .unwrap(),
+            StagedEpochFile::stage(EpochFileUpdate::Retire(retired.clone())).unwrap(),
+            StagedEpochFile::stage(EpochFileUpdate::Replace(added.clone(), b"next".to_vec()))
+                .unwrap(),
+            StagedEpochFile {
+                path: final_file.clone(),
+                replacement: Some(fixture.join("missing-stage-file")),
+                backup: None,
+            },
+        ];
+
+        assert!(publish_staged_epoch(files).is_err());
+        assert_eq!(fs::read(existing).unwrap(), b"previous");
+        assert_eq!(fs::read(retired).unwrap(), b"retained on failure");
+        assert_eq!(fs::read(final_file).unwrap(), b"previous");
+        assert!(!added.exists());
+        fs::remove_dir_all(fixture).unwrap();
     }
 }
