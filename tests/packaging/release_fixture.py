@@ -52,7 +52,13 @@ def host_target():
 
 
 def stub_script(name):
-    return ("#!/bin/sh\nprintf '%%s %%s\\n' '%s' \"$*\" >> \"${HOME}/.stub.log\"\nexit 0\n" % name).encode("ascii")
+    body = (
+        "#!/bin/sh\n"
+        "printf '%%s %%s\\n' '%s' \"$*\" >> \"${HOME}/.stub.log\"\n"
+        "if [ \"$1\" = self-verify ] && [ -n \"${STUB_FAIL_SELFVERIFY:-}\" ]; then exit 1; fi\n"
+        "exit 0\n"
+    ) % name
+    return body.encode("ascii")
 
 
 def add_member(tar, name, data, mode, kind=tarfile.REGTYPE, linkname=""):
@@ -68,9 +74,9 @@ def add_member(tar, name, data, mode, kind=tarfile.REGTYPE, linkname=""):
         tar.addfile(info)
 
 
-def write_archive(path, prefix, files, extra=()):
+def write_archive(path, prefix, files, extra=(), fmt=tarfile.GNU_FORMAT):
     """files: {rel: (bytes, mode)}; extra: [(name, data, mode, kind, linkname)] appended verbatim."""
-    with tarfile.open(path, "w:gz", format=tarfile.GNU_FORMAT) as tar:
+    with tarfile.open(path, "w:gz", format=fmt) as tar:
         add_member(tar, prefix, b"", 0o555, tarfile.DIRTYPE)
         for rel, (data, mode) in sorted(files.items()):
             add_member(tar, prefix + "/" + rel, data, mode)
@@ -87,12 +93,12 @@ def default_files(shared_marker="one"):
     return files
 
 
-def build_archives(dest, tag=TAG, shared_marker="one", skew_target=None):
+def build_archives(dest, tag=TAG, shared_marker="one", skew_target=None, fmt=tarfile.GNU_FORMAT):
     os.makedirs(dest, exist_ok=True)
     for target in TARGETS:
         marker = "two" if target == skew_target else shared_marker
         prefix = "dotagent-%s-%s" % (tag, target)
-        write_archive(os.path.join(dest, prefix + ".tar.gz"), prefix, default_files(marker))
+        write_archive(os.path.join(dest, prefix + ".tar.gz"), prefix, default_files(marker), fmt=fmt)
 
 
 def make_key(directory, name="key"):
@@ -136,13 +142,15 @@ def sign_file(path, key):
     os.replace(path + ".sig", path + ".sshsig")
 
 
-def build_release(scratch, key=None):
-    """Return dict(dir, out, installer, key) with a fully signed, flat release directory."""
+def build_release(scratch, key=None, signer_pub=None, sign=True, fmt=tarfile.GNU_FORMAT):
+    """Return dict(dir, out, installer, key) with a flat release directory (signed unless sign=False)."""
     archives = os.path.join(scratch, "archives")
-    build_archives(archives)
-    key = key or make_key(scratch)
+    build_archives(archives, fmt=fmt)
+    if signer_pub is None:
+        key = key or make_key(scratch)
+        signer_pub = key + ".pub"
     out = os.path.join(scratch, "out")
-    result = run_repackage(archives, key + ".pub", out)
+    result = run_repackage(archives, signer_pub, out)
     if result.returncode != 0:
         raise RuntimeError(result.stderr)
     release = os.path.join(scratch, "release")
@@ -151,15 +159,21 @@ def build_release(scratch, key=None):
         shutil.copy(os.path.join(archives, name), release)
     shutil.copy(os.path.join(out, "SHA256SUMS"), release)
     installer = os.path.join(out, "web", "install.sh")
-    shutil.copy(installer, release)
-    sign_file(os.path.join(release, "SHA256SUMS"), key)
+    for sub in sorted(os.listdir(out)):
+        sub_dir = os.path.join(out, sub)
+        if os.path.isdir(sub_dir):
+            for name in sorted(os.listdir(sub_dir)):
+                if os.path.isfile(os.path.join(sub_dir, name)):
+                    shutil.copy(os.path.join(sub_dir, name), release)
+    if sign:
+        sign_file(os.path.join(release, "SHA256SUMS"), key)
     return {"dir": release, "out": out, "installer": installer, "key": key, "archives": archives}
 
 
 def strip_gate(installer, dest):
     with open(installer, "r", encoding="ascii") as handle:
         lines = handle.read().splitlines(keepends=True)
-    assert lines[-1] == 'dotagent_install_main "$@"\n'
+    assert lines[-1] == 'dotagent_bootstrap "$@" --eof-v1\n'
     with open(dest, "w", encoding="ascii") as handle:
         handle.writelines(lines[:-1])
     return dest
@@ -167,8 +181,8 @@ def strip_gate(installer, dest):
 
 WRAPPER = (
     'source "${INSTALLER_NOGATE}"\n'
-    'dotagent_fetch() { cp "${RELEASE_DIR}/${1##*/}" "$2"; }\n'
-    'dotagent_install_main "$@"\n'
+    'dotagent_fetch() { printf "%s\\n" "$1" >> "${RELEASE_DIR}/.fetch.log"; cp "${RELEASE_DIR}/${1##*/}" "$2"; }\n'
+    'dotagent_bootstrap "$@" --eof-v1\n'
 )
 
 

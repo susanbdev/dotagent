@@ -90,7 +90,11 @@ Every channel repackages the same four attested release archives (`x86_64`/`aarc
 | macOS | `dotagent-<tag>-universal-apple-darwin.pkg` (Developer ID signed, notarized) | Apple + SSHSIG (`SHA256SUMS.macos`) |
 | OCI | `docker pull ghcr.io/susanbdev/dotagent:<version>` | GitHub attestation |
 
-Installer flags (pass after `bash -s --`): `--activate --workspace DIR`, `--bin-dir DIR`, `--system` (existing root shell only), `--require-attestation`. The installer refuses to run inside a guarded agent session. Verify any asset by hand with `gh attestation verify <file> --owner susanbdev`. Release maintainers: `packaging/` holds the repackager, installer template and nfpm/OCI definitions; `scripts/sign-release-yk.sh <tag>` is the YubiKey ceremony (see its header for the required environment).
+Installer flags (pass after `bash -s --`): `--activate --workspace DIR`, `--bin-dir DIR` (absolute), `--system` (existing root shell with a root-owned `$HOME` only), `--require-attestation` (needs `gh`; pins repo, signer workflow and `refs/tags/<tag>`). The installer refuses to run inside a guarded agent session, refuses a truncated stream (final `--eof-v1` sentinel), purges every non-installer shell function before doing any work, and rejects hardlinks/links/devices in the archive. It cannot defend against a hostile `BASH_ENV`/`SHELLOPTS`/`PS4` exported into the invoking shell; run it from a clean shell. Verify any asset by hand with `gh attestation verify <file> --owner susanbdev`.
+
+The `.deb`/`.rpm`/`.apk` packages are not individually signed; authenticate them through the YubiKey-signed `SHA256SUMS` or the GitHub attestation before installing (`apk` needs `--allow-untrusted` for that reason). `scripts/activate-local.sh --from-prebuilt DIR` requires `--prebuilt-sums FILE`, a `SHA256SUMS`-style list (`<hex>  bin/<name>`) that the caller must itself have obtained from a verified source.
+
+Release maintainers: `packaging/` holds the repackager, installer template and nfpm/OCI definitions; `scripts/sign-release-yk.sh <tag>` is the YubiKey ceremony (see its header for the required environment). The `release` job gate requires the tag commit to be on `main` and the annotated tag to be GitHub-verified; publishing jobs run in the protected environments `release`, `release-pypi`, `release-npm` and `release-homebrew`.
 
 ## Unified `dotagent` Operator CLI
 

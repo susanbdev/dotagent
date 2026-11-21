@@ -12,6 +12,12 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and [Sem
 - **`scripts/activate-local.sh --from-prebuilt <dir>`** installs verified release binaries without invoking Cargo; `cargo binstall` metadata added to every binary crate.
 - `tests/packaging/`: installer, repackager, ceremony and workflow-hygiene tests (truncated stream, tampered archive, forged/namespace-confused SSHSIG, tar traversal/link/device rejection, running-binary atomic replace, byte-identical repackaging).
 
+### Security
+- **Installer**: `--eof-v1` end-of-stream sentinel (every truncated prefix executes nothing), purge of shadowing shell functions, hardlink rejection, bounded download size (`ulimit -f`), array-safe binary lists, `--require-attestation` pinned to repo, signer workflow and tag ref, `--system` requires a root-owned `$HOME`.
+- **`activate-local.sh --from-prebuilt`** requires `--prebuilt-sums` and verifies every binary digest (and rejects symlinks) before installing anything.
+- **Release workflow**: tag must be on `main` and GitHub-verified; `release` environment on the release/ghcr jobs; every downstream registry job re-verifies build provenance of each downloaded asset; idempotent PyPI/npm publishing; npm license `UNLICENSED` for non-SPDX licenses.
+- **Ceremony**: fetches tags, runs from the repo root, pins attestation `--source-digest`, cross-checks the baked installer against the tag and `SHA256SUMS`, aborts on any failed `.pkg` step, and never downgrades the latest `install.sh`.
+
 ## [2.0.0] - 2026-11-20
 
 ### Added

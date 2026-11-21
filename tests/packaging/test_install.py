@@ -181,14 +181,14 @@ class InstallerTests(unittest.TestCase):
                 self.assertNotEqual(result.returncode, 0, label)
                 self.assertIn("refusing", result.stderr)
 
-    def test_truncated_stream_executes_nothing(self):
+    def test_every_truncated_prefix_executes_nothing(self):
         script = slurp(self.release["installer"], "rb")
-        gate = script.rindex(b'dotagent_install_main "$@"')
-        offsets = set(range(0, gate + len(b"dotagent_install_main"), 89))
-        offsets.update(i + 1 for i, byte in enumerate(script[:gate]) if byte == 10)
-        offsets.add(gate + len(b"dotagent_install_main") - 1)
+        # The only prefix that is a complete command is the whole script minus its final newline.
+        offsets = set(range(0, len(script) - 1, 61))
+        offsets.update(i + 1 for i, byte in enumerate(script[:-1]) if byte == 10)
+        offsets.update(range(len(script) - 40, len(script) - 1))
         for offset in sorted(offsets):
-            if offset > gate + len(b"dotagent_install_main") - 1:
+            if offset >= len(script) - 1:
                 continue
             home = os.path.join(self.scratch, "trunc-home")
             shutil.rmtree(home, ignore_errors=True)
@@ -200,6 +200,120 @@ class InstallerTests(unittest.TestCase):
                 env={"HOME": home, "PATH": fx.CLEAN_PATH},
             )
             self.assertEqual(os.listdir(home), [], "truncation at byte %d had side effects" % offset)
+
+    def test_missing_sentinel_refuses_before_any_work(self):
+        script = 'source "${INSTALLER_NOGATE}"\ndotagent_bootstrap --activate\n'
+        result = subprocess.run(
+            ["bash", "-c", script],
+            capture_output=True,
+            text=True,
+            env={"HOME": self.home, "PATH": fx.CLEAN_PATH, "INSTALLER_NOGATE": self.nogate},
+        )
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("truncated", result.stderr)
+        self.assertEqual(os.listdir(self.home), [])
+
+    def test_fetch_urls_are_tag_pinned_github_https(self):
+        self.assertEqual(self.install().returncode, 0)
+        urls = slurp(os.path.join(self.release["dir"], ".fetch.log")).split()
+        base = "https://github.com/susanbdev/dotagent/releases/download/%s/" % fx.TAG
+        self.assertEqual(
+            urls,
+            [base + PREFIX + ".tar.gz", base + "SHA256SUMS", base + "SHA256SUMS.sshsig"],
+        )
+
+    def test_fetch_uses_strict_curl_flags(self):
+        stubs = os.path.join(self.scratch, "stubs")
+        os.makedirs(stubs)
+        log = os.path.join(self.scratch, "curl.args")
+        curl = os.path.join(stubs, "curl")
+        with open(curl, "w", encoding="ascii") as handle:
+            handle.write('#!/bin/sh\nprintf "%s\\n" "$@" > "' + log + '"\n')
+        os.chmod(curl, 0o755)
+        script = 'source "${INSTALLER_NOGATE}"\ndotagent_fetch https://example.invalid/x out.bin 1000\n'
+        subprocess.run(
+            ["bash", "-c", script],
+            check=True,
+            cwd=self.scratch,
+            env={"HOME": self.home, "PATH": stubs + ":" + fx.CLEAN_PATH, "INSTALLER_NOGATE": self.nogate},
+        )
+        args = slurp(log).split("\n")
+        for flag in ("-q", "--tlsv1.2", "--fail", "--max-filesize", "--proto-redir", "--connect-timeout"):
+            self.assertIn(flag, args)
+        self.assertEqual(args[args.index("--proto") + 1], "=https")
+        self.assertEqual(args[args.index("--proto-redir") + 1], "=https")
+        self.assertEqual(args[-3:-1], ["--", "https://example.invalid/x"])
+
+    def test_sums_file_with_wrong_hash_is_rejected_even_when_validly_signed(self):
+        sums = os.path.join(self.release["dir"], "SHA256SUMS")
+        lines = slurp(sums).splitlines()
+        forged = []
+        for line in lines:
+            if line.endswith(PREFIX + ".tar.gz"):
+                line = ("0" * 64) + line[64:]
+            forged.append(line)
+        with open(sums, "w", encoding="ascii") as handle:
+            handle.write("\n".join(forged) + "\n")
+        fx.sign_file(sums, self.release["key"])
+        result = self.install()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("does not match SHA256SUMS", result.stderr)
+        self.assert_untouched()
+
+    def test_self_verify_failure_aborts_before_install(self):
+        result = self.install(extra_env={"STUB_FAIL_SELFVERIFY": "1"})
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("self-verify failed", result.stderr)
+        self.assert_untouched()
+        self.assert_no_stage_left()
+
+    def test_bin_dir_flag_is_honoured(self):
+        target = os.path.join(self.scratch, "custom-bin")
+        result = self.install("--bin-dir", target)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(fx.mode_of(os.path.join(target, "dotagent")), 0o555)
+        self.assertFalse(os.path.exists(self.bin))
+
+    def test_relative_bin_dir_is_rejected(self):
+        result = self.install("--bin-dir", "relative")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("absolute", result.stderr)
+
+    def test_inherited_shell_functions_cannot_shadow_verification_tools(self):
+        digest = fx.sha256_file(os.path.join(self.release["dir"], PREFIX + ".tar.gz"))
+        with open(os.path.join(self.release["dir"], PREFIX + ".tar.gz"), "ab") as handle:
+            handle.write(b"tampered")
+        script = (
+            "sha256sum() { echo '%s  fake'; }\n"
+            "shasum() { echo '%s  fake'; }\n"
+            "export -f sha256sum shasum\n"
+            'bash -c \'source "${INSTALLER_NOGATE}"; '
+            'dotagent_fetch() { cp "${RELEASE_DIR}/${1##*/}" "$2"; }; '
+            'dotagent_bootstrap --eof-v1\''
+        ) % (digest, digest)
+        result = subprocess.run(
+            ["bash", "-c", script],
+            capture_output=True,
+            text=True,
+            env={
+                "HOME": self.home,
+                "PATH": fx.CLEAN_PATH,
+                "RELEASE_DIR": self.release["dir"],
+                "INSTALLER_NOGATE": self.nogate,
+            },
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("does not match digest baked", result.stderr)
+        self.assert_untouched()
+
+    def test_require_attestation_fails_closed_without_gh(self):
+        for candidate in ("/opt/homebrew/bin/gh", "/usr/local/bin/gh", "/usr/bin/gh"):
+            if os.path.exists(candidate):
+                self.skipTest("gh is installed on this host")
+        result = self.install("--require-attestation")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("gh was not found", result.stderr)
+        self.assert_untouched()
 
     def test_full_script_via_stdin_pipe_refuses_inside_agent_session(self):
         script = slurp(self.release["installer"], "rb")
@@ -222,6 +336,21 @@ class InstallerTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("unrendered", result.stderr)
         self.assertFalse(os.path.exists(self.bin))
+
+
+@unittest.skipIf(HOST is None, "unsupported host platform")
+class PaxArchiveTests(unittest.TestCase):
+    """CI builds PAX archives; make sure the whole chain accepts that format."""
+
+    def test_pax_release_round_trips_through_repackager_and_installer(self):
+        scratch = fx.make_scratch()
+        self.addCleanup(fx.drop_scratch, scratch)
+        release = fx.build_release(scratch, fmt=tarfile.PAX_FORMAT)
+        nogate = fx.strip_gate(release["installer"], os.path.join(scratch, "nogate.sh"))
+        home = os.path.join(scratch, "home")
+        os.makedirs(home)
+        result = fx.run_install(release, nogate, home)
+        self.assertEqual(result.returncode, 0, result.stderr)
 
 
 if __name__ == "__main__":

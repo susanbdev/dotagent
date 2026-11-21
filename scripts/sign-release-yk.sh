@@ -60,6 +60,8 @@ hash_file() {
 
 verify_tag() {
     local tag="$1"
+    # Plain fetch (no --force): a remote tag that differs from the local one aborts here.
+    git fetch --tags origin >/dev/null 2>&1 || die "could not fetch tags from origin (local tag differs from remote?)"
     git tag -v "${tag}" >/dev/null 2>&1 || die "git tag ${tag} is missing or its signature does not verify"
 }
 
@@ -71,7 +73,7 @@ download_assets() {
 }
 
 verify_attestations() {
-    local tag="$1" dir="$2" asset
+    local tag="$1" dir="$2" digest="$3" asset
     for asset in "${dir}"/*; do
         case "${asset##*/}" in
             *.sshsig|SHA256SUMS.macos) continue ;;
@@ -80,6 +82,7 @@ verify_attestations() {
         gh attestation verify "${asset}" --repo "${REPO}" \
             --signer-workflow "${WORKFLOW}" \
             --source-ref "refs/tags/${tag}" \
+            --source-digest "${digest}" \
             --cert-oidc-issuer "${OIDC_ISSUER}" >/dev/null \
             || die "attestation FAILED for ${asset##*/}; refusing to sign"
     done
@@ -96,13 +99,19 @@ verify_sums() {
     done < "${dir}/SHA256SUMS"
 }
 
-build_pkg() {
-    local tag="$1" dir="$2" version="${1#v}" work="$2/pkg" t bin arm intel
+# Decides whether the .pkg is built at all. Kept separate from build_pkg: a command that runs
+# as an `if` condition has `set -e` disabled, which would let a failed codesign/notarize slide.
+pkg_wanted() {
     [[ "$(uname -s)" == "Darwin" ]] || { note "not macOS: skipping .pkg"; return 1; }
     if [[ -z "${DOTAGENT_APP_IDENTITY:-}" || -z "${DOTAGENT_INSTALLER_IDENTITY:-}" || -z "${DOTAGENT_NOTARY_PROFILE:-}" ]]; then
         note "macOS signing identities not configured: skipping .pkg"
         return 1
     fi
+    return 0
+}
+
+build_pkg() {
+    local tag="$1" dir="$2" version="${1#v}" work="$2/pkg" t bin arm intel
     for t in lipo codesign pkgbuild productbuild xcrun; do require_tool "${t}"; done
     arm="${work}/arm"
     intel="${work}/intel"
@@ -128,14 +137,32 @@ build_pkg() {
     xcrun notarytool submit "${dir}/dotagent-${tag}-universal-apple-darwin.pkg" \
         --keychain-profile "${DOTAGENT_NOTARY_PROFILE}" --wait
     xcrun stapler staple "${dir}/dotagent-${tag}-universal-apple-darwin.pkg"
-    return 0
+}
+
+# The installer is attested by CI but its bake must still agree with what we are about to sign.
+verify_installer() {
+    local tag="$1" dir="$2" baked var target want have
+    baked="$(grep '^DOTAGENT_RELEASE_TAG=' "${dir}/install.sh" | head -n 1 | cut -d'"' -f2)"
+    [[ "${baked}" == "${tag}" ]] || die "install.sh is baked for ${baked:-nothing}, not ${tag}"
+    for var in LINUX_X64:x86_64-unknown-linux-musl LINUX_ARM64:aarch64-unknown-linux-musl \
+        DARWIN_X64:x86_64-apple-darwin DARWIN_ARM64:aarch64-apple-darwin; do
+        target="${var#*:}"
+        have="$(grep "^DOTAGENT_SHA256_${var%%:*}=" "${dir}/install.sh" | head -n 1 | cut -d'"' -f2)"
+        want="$(grep -F "  dotagent-${tag}-${target}.tar.gz" "${dir}/SHA256SUMS" | head -n 1 | cut -d' ' -f1)"
+        [[ -n "${have}" && "${have}" == "${want}" ]] || die "install.sh digest for ${target} differs from SHA256SUMS"
+    done
+}
+
+# Prints the release tag baked into an install.sh file (empty when absent).
+baked_tag() {
+    grep '^DOTAGENT_RELEASE_TAG=' "$1" 2>/dev/null | head -n 1 | cut -d'"' -f2
 }
 
 pinned_blob() {
     local line
     line="$(grep '^DOTAGENT_SIGNER_LINE=' "$1" | head -n 1)"
     [[ -n "${line}" ]] || die "install.sh carries no pinned signer"
-    printf '%s' "${line}" | tr -s ' "' '\n' | grep -E '^AAAA' | head -n 1
+    printf '%s' "${line}" | tr -s " \"'" '\n' | grep -E '^AAAA' | head -n 1
 }
 
 sign_file() {
@@ -155,7 +182,11 @@ main() {
     [[ -f "${DOTAGENT_SIGN_KEY}.pub" ]] || die "missing ${DOTAGENT_SIGN_KEY}.pub"
     for t in git gh ssh-keygen tar cut tr grep; do require_tool "${t}"; done
 
+    DOTAGENT_SIGN_KEY="$(cd "$(dirname "${DOTAGENT_SIGN_KEY}")" && pwd)/$(basename "${DOTAGENT_SIGN_KEY}")"
+    cd "$(dirname "${BASH_SOURCE[0]}")/.."
     verify_tag "${tag}"
+    local source_digest
+    source_digest="$(git rev-parse "${tag}^{commit}")"
 
     local state="${HOME}/.local/state/dotagent-release" dir
     mkdir -p "${state}"
@@ -165,8 +196,9 @@ main() {
     mkdir -m 0700 "${dir}"
 
     download_assets "${tag}" "${dir}"
-    verify_attestations "${tag}" "${dir}"
+    verify_attestations "${tag}" "${dir}" "${source_digest}"
     verify_sums "${dir}"
+    verify_installer "${tag}" "${dir}"
 
     local pub_type pub_blob signers
     pub_type="$(cut -d' ' -f1 "${DOTAGENT_SIGN_KEY}.pub")"
@@ -177,29 +209,33 @@ main() {
     signers="${dir}/allowed_signers"
     printf '%s namespaces="%s" %s %s\n' "${SIGNER_ID}" "${NAMESPACE}" "${pub_type}" "${pub_blob}" > "${signers}"
 
-    local uploads="SHA256SUMS.sshsig"
+    local -a uploads=("${dir}/SHA256SUMS.sshsig")
     sign_file "${dir}/SHA256SUMS" "${signers}"
 
     local pkg="dotagent-${tag}-universal-apple-darwin.pkg"
-    if build_pkg "${tag}" "${dir}"; then
+    if pkg_wanted; then
+        build_pkg "${tag}" "${dir}"
         printf '%s  %s\n' "$(hash_file "${dir}/${pkg}")" "${pkg}" > "${dir}/SHA256SUMS.macos"
         sign_file "${dir}/SHA256SUMS.macos" "${signers}"
-        uploads="${uploads} ${pkg} SHA256SUMS.macos SHA256SUMS.macos.sshsig"
+        uploads+=("${dir}/${pkg}" "${dir}/SHA256SUMS.macos" "${dir}/SHA256SUMS.macos.sshsig")
     fi
 
-    note "touch your YubiKey for any further prompts; uploading: ${uploads}"
-    local files="" name
-    for name in ${uploads}; do files="${files} ${dir}/${name}"; done
-    # shellcheck disable=SC2086
-    gh release upload "${tag}" ${files} --repo "${REPO}" --clobber
+    note "touch your YubiKey for any further prompts; uploading ${#uploads[@]} assets"
+    gh release upload "${tag}" "${uploads[@]}" --repo "${REPO}" --clobber
 
     if [[ -n "${DOTAGENT_WEB_DIR:-}" ]]; then
+        local current
         mkdir -p "${DOTAGENT_WEB_DIR}/dotagent/${tag}"
         cp "${dir}/install.sh" "${DOTAGENT_WEB_DIR}/dotagent/${tag}/install.sh"
-        cp "${dir}/install.sh" "${DOTAGENT_WEB_DIR}/dotagent/install.sh"
-        note "staged install.sh under ${DOTAGENT_WEB_DIR}/dotagent/ (deploy it as static bytes)"
+        current="$(baked_tag "${DOTAGENT_WEB_DIR}/dotagent/install.sh")"
+        if [[ -z "${current}" || "$(printf '%s\n%s\n' "${current}" "${tag}" | sort -V | tail -n 1)" == "${tag}" ]]; then
+            cp "${dir}/install.sh" "${DOTAGENT_WEB_DIR}/dotagent/install.sh"
+            note "staged install.sh as latest and under /dotagent/${tag}/ (deploy as static bytes)"
+        else
+            note "kept latest install.sh at ${current} (older than ${tag} is not promoted); staged ${tag} only"
+        fi
     else
-        note "install.sh sha256 $(hash_file "${dir}/install.sh"): publish it at /dotagent/${tag}/install.sh and /dotagent/install.sh"
+        note "install.sh sha256 $(hash_file "${dir}/install.sh"): publish it at /dotagent/${tag}/install.sh and, if newest, /dotagent/install.sh"
     fi
     note "done: ${tag} is signed"
 }

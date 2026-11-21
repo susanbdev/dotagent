@@ -114,8 +114,8 @@ class RepackageTests(unittest.TestCase):
         raw = slurp(os.path.join(out, "web", "install.sh"), "rb")
         raw.decode("ascii")
         text = raw.decode("ascii")
-        self.assertTrue(text.endswith('dotagent_install_main "$@"\n'))
-        self.assertEqual(text.count('dotagent_install_main "$@"'), 1)
+        self.assertTrue(text.endswith('dotagent_bootstrap "$@" --eof-v1\n'))
+        self.assertEqual(text.count("--eof-v1\n"), 1)
         self.assertIsNone(re.search(r"@[A-Z0-9_]{3,}@", text))
         self.assertEqual(subprocess.run(["bash", "-n"], input=raw).returncode, 0)
 

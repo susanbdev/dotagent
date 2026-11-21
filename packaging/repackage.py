@@ -177,7 +177,7 @@ def render_installer(template_path, tag, digests, signer):
     if leftover:
         raise RepackageError("unrendered placeholders: %s" % ", ".join(sorted(set(leftover))))
     assert_ascii("install.sh", text)
-    if not text.endswith('dotagent_install_main "$@"\n'):
+    if not text.endswith('dotagent_bootstrap "$@" --eof-v1\n'):
         raise RepackageError("install.sh must end with the EOF function gate")
     bash = shutil.which("bash")
     if bash:
@@ -302,7 +302,13 @@ def dump_json(value):
     return text.encode("ascii")
 
 
+def npm_license(license_id):
+    """npm only accepts SPDX ids, UNLICENSED, or SEE LICENSE IN <file>."""
+    return "UNLICENSED" if license_id.startswith("LicenseRef-") else license_id
+
+
 def build_npm(out_dir, version, license_id, trees):
+    license_id = npm_license(license_id)
     paths = []
     package_map = {}
     for target, spec in sorted(TARGETS.items()):

@@ -10,10 +10,16 @@ DOTAGENT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 BIN_DIR="${HOME}/.local/bin"
 TARGET_WORKSPACE=""
 PREBUILT_DIR=""
+PREBUILT_SUMS=""
 
-# Usage: activate-local.sh [workspace] [--from-prebuilt <dir>]
-#   --from-prebuilt <dir>  skip `cargo build` and install the already-verified release
-#                          binaries found in <dir>/bin (for example an extracted release archive).
+# Usage: activate-local.sh [workspace] [--from-prebuilt <dir> --prebuilt-sums <file>]
+#   --from-prebuilt <dir>   skip `cargo build` and install release binaries found in <dir>/bin
+#                           (for example an extracted release archive).
+#   --prebuilt-sums <file>  REQUIRED with --from-prebuilt: sha256sum-format lines
+#                           "<hex>  bin/<name>" (paths relative to <dir>). Every binary is hashed
+#                           and compared before anything is installed. The caller is responsible
+#                           for obtaining this file from a source it verified (for example a
+#                           signed SHA256SUMS or an attested release archive).
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --from-prebuilt)
@@ -22,6 +28,14 @@ while [[ $# -gt 0 ]]; do
                 exit 2
             fi
             PREBUILT_DIR="$(cd "$2" && pwd)"
+            shift 2
+            ;;
+        --prebuilt-sums)
+            if [[ $# -lt 2 ]]; then
+                echo "[activate-local] usage: --prebuilt-sums <file>" >&2
+                exit 2
+            fi
+            PREBUILT_SUMS="$2"
             shift 2
             ;;
         -*)
@@ -39,6 +53,14 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 TARGET_WORKSPACE="${TARGET_WORKSPACE:-${HOME}}"
+if [[ -n "${PREBUILT_DIR}" && -z "${PREBUILT_SUMS}" ]]; then
+    echo "[activate-local] HARD DENY: --from-prebuilt requires --prebuilt-sums <file>" >&2
+    exit 2
+fi
+if [[ -z "${PREBUILT_DIR}" && -n "${PREBUILT_SUMS}" ]]; then
+    echo "[activate-local] --prebuilt-sums is only valid with --from-prebuilt" >&2
+    exit 2
+fi
 
 mkdir -p "${BIN_DIR}" "${HOME}/.local/state/agent-guard/sessions"
 chmod 700 "${HOME}/.local/state/agent-guard" "${HOME}/.local/state/agent-guard/sessions"
@@ -102,12 +124,37 @@ done < <(compgen -e)
 # 1. Build static release binaries and install with read-execute-only VFS mode (0555)
 if [[ -n "${PREBUILT_DIR}" ]]; then
     BIN_SRC="${PREBUILT_DIR}/bin"
-    for bin_name in agent-guard dotagent-compiler swarm-tool dotagent; do
-        if [[ -L "${BIN_SRC}/${bin_name}" || ! -f "${BIN_SRC}/${bin_name}" ]]; then
-            echo "[activate-local] HARD DENY: prebuilt binary '${bin_name}' missing or a symlink in ${BIN_SRC}" >&2
+    for bin_name in agent-guard dotagent-compiler swarm-tool dotagent dotagent-harness; do
+        if [[ -L "${BIN_SRC}/${bin_name}" ]]; then
+            echo "[activate-local] HARD DENY: prebuilt binary '${bin_name}' is a symlink in ${BIN_SRC}" >&2
             exit 2
         fi
     done
+    for bin_name in agent-guard dotagent-compiler swarm-tool dotagent; do
+        if [[ ! -f "${BIN_SRC}/${bin_name}" ]]; then
+            echo "[activate-local] HARD DENY: prebuilt binary '${bin_name}' missing in ${BIN_SRC}" >&2
+            exit 2
+        fi
+    done
+    if [[ -L "${PREBUILT_SUMS}" || ! -f "${PREBUILT_SUMS}" ]]; then
+        echo "[activate-local] HARD DENY: --prebuilt-sums must be a regular file" >&2
+        exit 2
+    fi
+    verified_count=0
+    for bin_name in agent-guard dotagent-compiler swarm-tool dotagent dotagent-harness; do
+        [[ -f "${BIN_SRC}/${bin_name}" ]] || continue
+        if command -v sha256sum >/dev/null 2>&1; then
+            actual_sha="$(sha256sum "${BIN_SRC}/${bin_name}" | cut -d' ' -f1)"
+        else
+            actual_sha="$(shasum -a 256 "${BIN_SRC}/${bin_name}" | cut -d' ' -f1)"
+        fi
+        if ! grep -qx "${actual_sha}  bin/${bin_name}" "${PREBUILT_SUMS}"; then
+            echo "[activate-local] HARD DENY: SHA-256 of prebuilt '${bin_name}' is not listed in ${PREBUILT_SUMS}" >&2
+            exit 2
+        fi
+        verified_count=$((verified_count + 1))
+    done
+    echo "[activate-local] verified ${verified_count} prebuilt binaries against ${PREBUILT_SUMS}" >&2
 else
     BIN_SRC="${DOTAGENT_ROOT}/target/release"
     cargo build --release --manifest-path "${DOTAGENT_ROOT}/Cargo.toml" --offline 2>/dev/null \

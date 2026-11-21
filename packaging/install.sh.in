@@ -33,7 +33,7 @@ DOTAGENT_SHA256_DARWIN_ARM64="@SHA256_AARCH64_APPLE_DARWIN@"
 DOTAGENT_SIGNER_LINE='@ALLOWED_SIGNERS@'
 DOTAGENT_SIGNER_ID="release@susanb.dev"
 DOTAGENT_SIGNER_NAMESPACE="dotagent-release-v1"
-DOTAGENT_BINARIES="dotagent agent-guard agent-guard-sh dotagent-compiler swarm-tool dotagent-harness"
+DOTAGENT_BINARIES=(dotagent agent-guard agent-guard-sh dotagent-compiler swarm-tool dotagent-harness)
 
 DOTAGENT_STAGE=""
 DOTAGENT_TARGET=""
@@ -75,7 +75,7 @@ dotagent_scrub_env() {
         CURL_CA_BUNDLE SSL_CERT_FILE SSL_CERT_DIR
     while IFS= read -r name; do
         case "${name}" in
-            DYLD_*|BASH_FUNC_*|LD_*) unset "${name}" ;;
+            DYLD_*|LD_*) unset "${name}" ;;
         esac
     done < <(compgen -e)
     IFS=$' \t\n'
@@ -137,10 +137,15 @@ dotagent_sha256() {
 dotagent_fetch() {
     local url="$1" dest="$2" cap="$3"
     command -v curl >/dev/null 2>&1 || dotagent_die "curl not found in the system PATH"
-    curl -q --proto '=https' --proto-redir '=https' --tlsv1.2 \
-        --fail --silent --show-error --location --max-redirs 5 \
-        --max-filesize "${cap}" --connect-timeout 10 --max-time 300 \
-        --output "${dest}" -- "${url}" </dev/null
+    # --max-filesize is not enforced for chunked bodies, so also cap file size with ulimit -f
+    # (1024-byte blocks in bash) inside a subshell; SIGXFSZ kills curl if the cap is exceeded.
+    (
+        ulimit -f "$(( cap / 1024 + 1 ))"
+        curl -q --proto '=https' --proto-redir '=https' --tlsv1.2 \
+            --fail --silent --show-error --location --max-redirs 5 \
+            --max-filesize "${cap}" --connect-timeout 10 --max-time 300 \
+            --output "${dest}" -- "${url}" </dev/null
+    )
 }
 
 dotagent_make_stage() {
@@ -171,7 +176,7 @@ dotagent_check_sums() {
 
 dotagent_check_sig() {
     local sums="$1" sig="$2" signers="${DOTAGENT_STAGE}/allowed_signers"
-    command -v ssh-keygen >/dev/null 2>&1 || dotagent_die "ssh-keygen (OpenSSH 8.1+) is required to verify the release signature"
+    command -v ssh-keygen >/dev/null 2>&1 || dotagent_die "ssh-keygen (OpenSSH 8.2+) is required to verify the release signature"
     case "${DOTAGENT_SIGNER_LINE}" in
         ""|"@"*) dotagent_die "this installer has no baked release signer (unrendered template?)" ;;
     esac
@@ -209,9 +214,11 @@ dotagent_extract() {
     mkdir -m 0700 "${dest}"
     tar -xzf "${archive}" -C "${dest}" --no-same-owner --no-same-permissions
     [[ -d "${dest}/${prefix}" && ! -L "${dest}/${prefix}" ]] || dotagent_die "archive root missing after extraction"
-    odd="$(find "${dest}" ! -type f ! -type d -print -quit)"
+    odd="$(find "${dest}" ! -type f ! -type d -print | head -n 1 || true)"
     [[ -z "${odd}" ]] || dotagent_die "extraction produced a non-regular entry: refusing"
-    for bin in ${DOTAGENT_BINARIES}; do
+    odd="$(find "${dest}" -type f -links +1 -print | head -n 1 || true)"
+    [[ -z "${odd}" ]] || dotagent_die "extraction produced a hard-linked file: refusing"
+    for bin in "${DOTAGENT_BINARIES[@]}"; do
         [[ -f "${dest}/${prefix}/bin/${bin}" && ! -L "${dest}/${prefix}/bin/${bin}" ]] \
             || dotagent_die "archive is missing binary ${bin}"
     done
@@ -258,9 +265,14 @@ dotagent_usage() {
 }
 
 dotagent_install_main() {
-    local activate=0 system=0 want_attest=0 workspace="" bin_dir=""
+    local activate=0 system=0 want_attest=0 workspace="" bin_dir="" saw_eof=0
     while [[ $# -gt 0 ]]; do
         case "$1" in
+            --eof-v1)
+                [[ $# -eq 1 ]] || { dotagent_usage; dotagent_die "misplaced end-of-script sentinel" 2; }
+                saw_eof=1
+                shift
+                ;;
             --activate) activate=1; shift ;;
             --system) system=1; shift ;;
             --require-attestation) want_attest=1; shift ;;
@@ -270,6 +282,7 @@ dotagent_install_main() {
             *) dotagent_usage; dotagent_die "unrecognized argument" 2 ;;
         esac
     done
+    [[ "${saw_eof}" -eq 1 ]] || dotagent_die "installer stream was truncated (missing end-of-script sentinel): nothing was done" 2
 
     set -euo pipefail
     dotagent_scrub_env
@@ -288,6 +301,8 @@ dotagent_install_main() {
     euid="$(id -u)"
     if [[ "${system}" -eq 1 ]]; then
         [[ "${euid}" -eq 0 ]] || dotagent_die "--system requires an existing root shell (this installer never invokes sudo)"
+        [[ -O "${HOME}" && ! -L "${HOME}" ]] \
+            || dotagent_die "--system needs a root-owned HOME (use a real root login shell, not sudo with the caller's HOME)"
     elif [[ "${euid}" -eq 0 ]]; then
         dotagent_die "refusing to install into a root home; run as your user or pass --system"
     fi
@@ -325,7 +340,9 @@ dotagent_install_main() {
             if [[ -x "${cand}" ]]; then gh_bin="${cand}"; break; fi
         done
         [[ -n "${gh_bin}" ]] || dotagent_die "--require-attestation set but gh was not found"
-        "${gh_bin}" attestation verify "${stage}/${archive}" --owner susanbdev </dev/null \
+        "${gh_bin}" attestation verify "${stage}/${archive}" --repo susanbdev/dotagent \
+            --signer-workflow susanbdev/dotagent/.github/workflows/release.yml \
+            --source-ref "refs/tags/${tag}" </dev/null \
             || dotagent_die "GitHub build-provenance attestation failed"
     fi
 
@@ -346,7 +363,7 @@ dotagent_install_main() {
     dotagent_swap_dir "${fresh}" "${share_root}"
 
     local bin
-    for bin in ${DOTAGENT_BINARIES}; do
+    for bin in "${DOTAGENT_BINARIES[@]}"; do
         dotagent_swap_file "${share_root}/bin/${bin}" "${bin_final}/${bin}"
     done
     dotagent_note "installed to ${share_root}; binaries in ${bin_final}"
@@ -365,4 +382,20 @@ dotagent_install_main() {
     esac
 }
 
-dotagent_install_main "$@"
+# Exported shell functions inherited from the caller (BASH_FUNC_*) would shadow `command`,
+# `tar`, `sha256sum`, `ssh-keygen` and friends and defeat the PATH pin. Remove everything that
+# is not ours before doing any work. Uses only shell syntax and `builtin` so it cannot be shadowed.
+# (BASH_ENV, SHELLOPTS and PS4 act at shell start-up and cannot be scrubbed from inside a script.)
+dotagent_bootstrap() {
+    IFS=$' \t\n'
+    for DOTAGENT_FN in $(builtin compgen -A function); do
+        case "${DOTAGENT_FN}" in
+            dotagent_*) ;;
+            *) builtin unset -f "${DOTAGENT_FN}" ;;
+        esac
+    done
+    builtin unset DOTAGENT_FN
+    dotagent_install_main "$@"
+}
+
+dotagent_bootstrap "$@" --eof-v1

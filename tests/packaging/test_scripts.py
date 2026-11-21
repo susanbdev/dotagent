@@ -33,6 +33,16 @@ class ActivateTests(unittest.TestCase):
                 handle.write(fx.stub_script(name))
             os.chmod(path, 0o755)
 
+    def write_sums(self, tamper=False):
+        lines = []
+        for name in fx.BINARIES:
+            digest = fx.sha256_file(os.path.join(self.prebuilt, "bin", name))
+            lines.append("%s  bin/%s" % (("0" * 64) if tamper and name == "swarm-tool" else digest, name))
+        path = os.path.join(self.scratch, "prebuilt.sums")
+        with open(path, "w", encoding="ascii") as handle:
+            handle.write("\n".join(lines) + "\n")
+        return path
+
     def run_activate(self, *args):
         return subprocess.run(
             ["bash", ACTIVATE] + list(args),
@@ -43,7 +53,7 @@ class ActivateTests(unittest.TestCase):
         )
 
     def test_from_prebuilt_skips_cargo_and_installs_sealed_binaries(self):
-        result = self.run_activate("--from-prebuilt", self.prebuilt, self.home)
+        result = self.run_activate("--from-prebuilt", self.prebuilt, "--prebuilt-sums", self.write_sums(), self.home)
         self.assertEqual(result.returncode, 0, result.stderr)
         for name in fx.BINARIES:
             if name == "agent-guard-sh":
@@ -58,14 +68,36 @@ class ActivateTests(unittest.TestCase):
         target = os.path.join(self.prebuilt, "bin", "swarm-tool")
         os.remove(target)
         os.symlink("/bin/true", target)
-        result = self.run_activate("--from-prebuilt", self.prebuilt)
+        result = self.run_activate("--from-prebuilt", self.prebuilt, "--prebuilt-sums", self.write_sums())
         self.assertEqual(result.returncode, 2)
         self.assertIn("symlink", result.stderr)
 
-    def test_from_prebuilt_rejects_missing_binary(self):
-        os.remove(os.path.join(self.prebuilt, "bin", "agent-guard"))
+    def test_from_prebuilt_rejects_symlinked_optional_harness(self):
+        target = os.path.join(self.prebuilt, "bin", "dotagent-harness")
+        os.remove(target)
+        os.symlink("/bin/true", target)
+        result = self.run_activate("--from-prebuilt", self.prebuilt, "--prebuilt-sums", self.write_sums())
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("symlink", result.stderr)
+
+    def test_from_prebuilt_requires_sums(self):
         result = self.run_activate("--from-prebuilt", self.prebuilt)
         self.assertEqual(result.returncode, 2)
+        self.assertIn("--prebuilt-sums", result.stderr)
+        self.assertFalse(os.path.exists(os.path.join(self.home, ".local", "bin", "dotagent")))
+
+    def test_from_prebuilt_rejects_tampered_binary_before_installing_anything(self):
+        result = self.run_activate("--from-prebuilt", self.prebuilt, "--prebuilt-sums", self.write_sums(tamper=True))
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("not listed", result.stderr)
+        self.assertFalse(os.path.exists(os.path.join(self.home, ".local", "bin", "dotagent")))
+
+    def test_from_prebuilt_rejects_missing_binary(self):
+        sums = self.write_sums()
+        os.remove(os.path.join(self.prebuilt, "bin", "agent-guard"))
+        result = self.run_activate("--from-prebuilt", self.prebuilt, "--prebuilt-sums", sums)
+        self.assertEqual(result.returncode, 2)
+        self.assertFalse(os.path.exists(os.path.join(self.home, ".local", "bin", "dotagent")))
 
     def test_unknown_option_is_rejected(self):
         self.assertEqual(self.run_activate("--bogus").returncode, 2)
@@ -114,6 +146,56 @@ class HygieneTests(unittest.TestCase):
             text = handle.read()
         for forbidden in ("NPM_TOKEN", "PYPI_TOKEN", "PYPI_API_TOKEN", "NODE_AUTH_TOKEN", "TWINE_PASSWORD"):
             self.assertNotIn(forbidden, text)
+
+    def load_workflow(self):
+        try:
+            import yaml
+        except ImportError:
+            self.skipTest("PyYAML not installed")
+        with open(os.path.join(fx.ROOT, ".github", "workflows", "release.yml"), encoding="ascii") as handle:
+            return yaml.safe_load(handle)
+
+    def test_workflow_permissions_are_least_privilege(self):
+        flow = self.load_workflow()
+        self.assertEqual(flow["permissions"], {"contents": "read"})
+        for name in ("publish-pypi", "publish-npm", "publish-homebrew", "repackage-ecosystem"):
+            self.assertNotIn("contents: write", str(flow["jobs"][name].get("permissions")), name)
+        self.assertEqual(flow["jobs"]["publish-pypi"]["permissions"], {"contents": "read", "id-token": "write"})
+        self.assertEqual(flow["jobs"]["publish-npm"]["permissions"], {"contents": "read", "id-token": "write"})
+        self.assertNotIn("packages", flow["jobs"]["publish-pypi"]["permissions"])
+
+    def test_every_publish_job_sits_behind_a_named_environment(self):
+        flow = self.load_workflow()
+        for name in ("publish-attested-release", "publish-ghcr", "publish-pypi", "publish-npm", "publish-homebrew"):
+            self.assertIn("environment", flow["jobs"][name], name)
+
+    def test_publish_chain_is_ordered_and_gated(self):
+        flow = self.load_workflow()
+        jobs = flow["jobs"]
+        self.assertEqual(jobs["build-archives"]["needs"], "verify-release-gate")
+        self.assertEqual(jobs["repackage-ecosystem"]["needs"], "build-archives")
+        self.assertEqual(jobs["publish-attested-release"]["needs"], "repackage-ecosystem")
+        for name in ("publish-ghcr", "publish-pypi", "publish-npm", "publish-homebrew"):
+            self.assertEqual(jobs[name]["needs"], "publish-attested-release", name)
+        gate = "\n".join(str(step.get("run", "")) for step in jobs["verify-release-gate"]["steps"])
+        self.assertIn("merge-base --is-ancestor", gate)
+        self.assertIn("verification.verified", gate)
+
+    def test_release_job_has_an_explicit_repo_context(self):
+        flow = self.load_workflow()
+        step = [s for s in flow["jobs"]["publish-attested-release"]["steps"] if "gh release create" in str(s.get("run", ""))][0]
+        self.assertEqual(step["env"]["GH_REPO"], "${{ github.repository }}")
+
+    def test_downstream_jobs_verify_provenance_before_using_assets(self):
+        flow = self.load_workflow()
+        for name in ("publish-ghcr", "publish-pypi", "publish-npm", "publish-homebrew"):
+            runs = [str(step.get("run", "")) for step in flow["jobs"][name]["steps"]]
+            self.assertTrue(any("gh attestation verify" in run and "--source-digest" in run for run in runs), name)
+
+    def test_multiarch_build_uses_a_container_builder(self):
+        flow = self.load_workflow()
+        text = "\n".join(str(step.get("run", "")) for step in flow["jobs"]["publish-ghcr"]["steps"])
+        self.assertLess(text.index("buildx create --name dotagent --driver docker-container"), text.index("buildx build"))
 
     def test_shellcheck_is_clean_when_available(self):
         if shutil.which("shellcheck") is None:
