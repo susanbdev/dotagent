@@ -134,28 +134,44 @@ git -C "${SAMPLE_REPO}" commit -m "chore: cleanroom baseline" >/dev/null
 echo "[cleanroom-smoke] ok 2 - activate deployed harness configs & all 19 global git keys"
 
 # 3. Doctor & Sandbox Mode Parity
-DOCTOR_JSON="$(cd "${SAMPLE_REPO}" && run_bin "${DOTAGENT_DIR}/bin/dotagent" doctor --json "${SAMPLE_REPO}")"
-DOCTOR_COMPACT="$(printf '%s' "${DOCTOR_JSON}" | tr -d ' \n\r\t')"
-[[ "${DOCTOR_COMPACT}" == *'"healthy":true'* ]] || fail "doctor reported unhealthy: ${DOCTOR_JSON}"
-
 case "${EXPECT_MODE}" in
     landlock)
+        DOCTOR_JSON="$(cd "${SAMPLE_REPO}" && run_bin "${DOTAGENT_DIR}/bin/dotagent" doctor --json "${SAMPLE_REPO}")"
+        DOCTOR_COMPACT="$(printf '%s' "${DOCTOR_JSON}" | tr -d ' \n\r\t')"
+        [[ "${DOCTOR_COMPACT}" == *'"healthy":true'* ]] || fail "doctor reported unhealthy: ${DOCTOR_JSON}"
         [[ "${DOCTOR_JSON}" == *"mode=linux-landlock-enforced"* ]] || fail "expected linux-landlock-enforced: ${DOCTOR_JSON}"
         (cd "${SAMPLE_REPO}" && run_bin "${DOTAGENT_DIR}/bin/agent-guard" exec-sandbox --require-kernel -- "true") >/dev/null
         ;;
     landlock-any)
+        DOCTOR_JSON="$(cd "${SAMPLE_REPO}" && run_bin "${DOTAGENT_DIR}/bin/dotagent" doctor --json "${SAMPLE_REPO}")"
+        DOCTOR_COMPACT="$(printf '%s' "${DOCTOR_JSON}" | tr -d ' \n\r\t')"
+        [[ "${DOCTOR_COMPACT}" == *'"healthy":true'* ]] || fail "doctor reported unhealthy: ${DOCTOR_JSON}"
         [[ "${DOCTOR_JSON}" == *"mode=linux-landlock-"* ]] || fail "expected linux-landlock-* mode: ${DOCTOR_JSON}"
         (cd "${SAMPLE_REPO}" && run_bin "${DOTAGENT_DIR}/bin/agent-guard" exec-sandbox --require-kernel -- "true") >/dev/null
         ;;
     seatbelt)
+        DOCTOR_JSON="$(cd "${SAMPLE_REPO}" && run_bin "${DOTAGENT_DIR}/bin/dotagent" doctor --json "${SAMPLE_REPO}")"
+        DOCTOR_COMPACT="$(printf '%s' "${DOCTOR_JSON}" | tr -d ' \n\r\t')"
+        [[ "${DOCTOR_COMPACT}" == *'"healthy":true'* ]] || fail "doctor reported unhealthy: ${DOCTOR_JSON}"
         [[ "${DOCTOR_JSON}" == *"mode=macos-seatbelt-enforced"* ]] || fail "expected macos-seatbelt-enforced: ${DOCTOR_JSON}"
         (cd "${SAMPLE_REPO}" && run_bin "${DOTAGENT_DIR}/bin/agent-guard" exec-sandbox --require-kernel -- "true") >/dev/null
         ;;
     seccomp-only)
+        doc_strict_rc=0
+        (cd "${SAMPLE_REPO}" && run_bin "${DOTAGENT_DIR}/bin/dotagent" doctor --json "${SAMPLE_REPO}") >/dev/null 2>&1 || doc_strict_rc=$?
+        [[ "${doc_strict_rc}" -eq 2 ]] || fail "expected strict doctor exit 2 in degraded seccomp-only mode, got ${doc_strict_rc}"
+        DOCTOR_JSON="$(cd "${SAMPLE_REPO}" && run_bin "${DOTAGENT_DIR}/bin/dotagent" doctor --allow-degraded --json "${SAMPLE_REPO}")"
+        DOCTOR_COMPACT="$(printf '%s' "${DOCTOR_JSON}" | tr -d ' \n\r\t')"
+        [[ "${DOCTOR_COMPACT}" == *'"healthy":true'* ]] || fail "doctor --allow-degraded reported unhealthy: ${DOCTOR_JSON}"
         rk_rc=0
         (cd "${SAMPLE_REPO}" && run_bin "${DOTAGENT_DIR}/bin/agent-guard" exec-sandbox --require-kernel -- "true") >/dev/null 2>&1 || rk_rc=$?
         [[ "${rk_rc}" -eq 2 ]] || fail "expected exec-sandbox --require-kernel exit 2 in seccomp-only mode, got ${rk_rc}"
         (cd "${SAMPLE_REPO}" && run_bin "${DOTAGENT_DIR}/bin/agent-guard" exec-sandbox --deny-net -- "true") >/dev/null
+        ;;
+    *)
+        DOCTOR_JSON="$(cd "${SAMPLE_REPO}" && run_bin "${DOTAGENT_DIR}/bin/dotagent" doctor --allow-degraded --json "${SAMPLE_REPO}")"
+        DOCTOR_COMPACT="$(printf '%s' "${DOCTOR_JSON}" | tr -d ' \n\r\t')"
+        [[ "${DOCTOR_COMPACT}" == *'"healthy":true'* ]] || fail "doctor reported unhealthy: ${DOCTOR_JSON}"
         ;;
 esac
 echo "[cleanroom-smoke] ok 3 - doctor healthy & sandbox mode parity verified (${EXPECT_MODE:-auto})"

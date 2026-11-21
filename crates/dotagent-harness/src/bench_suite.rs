@@ -186,6 +186,9 @@ pub fn run_benchmarks(cfg: &HarnessConfig, quick: bool) -> Result<BenchReport, S
         let mut child = Command::new(&bins.agent_guard)
             .arg("pre-tool")
             .current_dir(&repo)
+            .env_remove("LD_LIBRARY_PATH")
+            .env_remove("DYLD_LIBRARY_PATH")
+            .env_remove("DYLD_FALLBACK_LIBRARY_PATH")
             .env("HOME", &home)
             .env(
                 "GIT_CONFIG_GLOBAL",

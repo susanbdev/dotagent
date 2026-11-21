@@ -419,6 +419,7 @@ pub struct RuntimeProfile {
     pub max_turn_tool_calls: usize,
     pub max_direct_discovery_calls: usize,
     pub max_return_summary_ascii_tokens: Option<usize>,
+    pub pinned_plugins: std::collections::BTreeMap<String, String>,
 }
 
 pub const DEFAULT_MAX_DIRECT_DISCOVERY_CALLS: usize = 4;
@@ -438,6 +439,7 @@ impl RuntimeProfile {
             max_turn_tool_calls: MAX_TURN_TOOL_CALLS,
             max_direct_discovery_calls: DEFAULT_MAX_DIRECT_DISCOVERY_CALLS,
             max_return_summary_ascii_tokens: Some(200),
+            pinned_plugins: std::collections::BTreeMap::new(),
         }
     }
 
@@ -455,6 +457,7 @@ impl RuntimeProfile {
             max_turn_tool_calls: MAX_TURN_TOOL_CALLS,
             max_direct_discovery_calls: MAX_TURN_TOOL_CALLS,
             max_return_summary_ascii_tokens: Some(200),
+            pinned_plugins: std::collections::BTreeMap::new(),
         }
     }
 
@@ -624,6 +627,102 @@ pub fn load_profile_by_id(
     Ok(profile)
 }
 
+pub const MAX_PLUGIN_FILE_BYTES: u64 = 32_768;
+
+pub fn load_verified_profile_plugins(
+    repo_root: &Path,
+    profile: &RuntimeProfile,
+) -> Result<Vec<(String, String)>, (&'static str, String)> {
+    let mut pins = profile.pinned_plugins.clone();
+    let dir = repo_root.join("profiles/plugins");
+    let dir_exists = std::fs::symlink_metadata(&dir).is_ok();
+    if pins.is_empty() && !dir_exists {
+        return Ok(Vec::new());
+    }
+    if let Ok(raw) = std::fs::read_to_string(repo_root.join("dist/profiles/policy_ir.json"))
+        && let Ok(v) = crate::json::JsonValue::parse(&raw)
+        && let Some(crate::json::JsonValue::Object(entries)) = v.get("plugins")
+    {
+        for (k, val) in entries {
+            if let Some(h) = val.as_str() {
+                if pins.get(k).is_some_and(|prev| prev != h) {
+                    return Err((
+                        "PLUGIN_INTEGRITY_VIOLATION",
+                        format!("Conflicting SHA-256 pin for plugin '{k}'."),
+                    ));
+                }
+                pins.entry(k.clone()).or_insert_with(|| h.to_string());
+            }
+        }
+    }
+    let dir_meta = std::fs::symlink_metadata(&dir).map_err(|_| {
+        (
+            "PLUGIN_INTEGRITY_VIOLATION",
+            "Pinned 'profiles/plugins/' directory missing.".to_string(),
+        )
+    })?;
+    if dir_meta.file_type().is_symlink() || !dir_meta.is_dir() {
+        return Err((
+            "PLUGIN_INTEGRITY_VIOLATION",
+            "'profiles/plugins' must be a regular directory.".to_string(),
+        ));
+    }
+    let rd = std::fs::read_dir(&dir).map_err(|e| {
+        (
+            "PLUGIN_INTEGRITY_VIOLATION",
+            format!("Cannot read 'profiles/plugins': {e}"),
+        )
+    })?;
+    let mut found = std::collections::BTreeMap::new();
+    for entry in rd {
+        let entry =
+            entry.map_err(|e| ("PLUGIN_INTEGRITY_VIOLATION", format!("Dir read error: {e}")))?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name.starts_with('.') {
+            continue;
+        }
+        let meta = std::fs::symlink_metadata(entry.path())
+            .map_err(|e| ("PLUGIN_INTEGRITY_VIOLATION", format!("Stat failed: {e}")))?;
+        if meta.file_type().is_symlink()
+            || !meta.file_type().is_file()
+            || meta.len() > MAX_PLUGIN_FILE_BYTES
+            || !(name.ends_with(".rego") || name.ends_with(".toml"))
+        {
+            return Err((
+                "PLUGIN_INTEGRITY_VIOLATION",
+                format!("Invalid or oversized plugin 'profiles/plugins/{name}'."),
+            ));
+        }
+        let bytes = std::fs::read(entry.path())
+            .map_err(|e| ("PLUGIN_INTEGRITY_VIOLATION", format!("Read failed: {e}")))?;
+        if bytes.iter().any(|&b| b >= 0x80 || b == 0) {
+            return Err((
+                "PLUGIN_INTEGRITY_VIOLATION",
+                format!("Plugin '{name}' violates 7-bit ASCII."),
+            ));
+        }
+        let actual = crate::crypto::sha256_hex(&bytes);
+        if pins.get(&name) != Some(&actual) {
+            return Err((
+                "PLUGIN_INTEGRITY_VIOLATION",
+                format!("Unpinned or SHA-256-mismatched plugin 'profiles/plugins/{name}'."),
+            ));
+        }
+        let text = String::from_utf8(bytes)
+            .map_err(|_| ("PLUGIN_INTEGRITY_VIOLATION", "Non-UTF8 plugin.".to_string()))?;
+        found.insert(name, text);
+    }
+    for pinned_name in pins.keys() {
+        if !found.contains_key(pinned_name) {
+            return Err((
+                "PLUGIN_INTEGRITY_VIOLATION",
+                format!("Pinned plugin 'profiles/plugins/{pinned_name}' missing."),
+            ));
+        }
+    }
+    Ok(found.into_iter().collect())
+}
+
 fn strip_toml_comment(line: &str) -> &str {
     let mut in_quotes = false;
     let mut escape = false;
@@ -682,7 +781,7 @@ fn apply_profile_toml_tightening(
             let sec = line[1..line.len() - 1].trim();
             match sec {
                 "authority" | "git" | "traversal" | "sanitization" | "budgets" | "isolation"
-                | "swarm" | "mcp" => {
+                | "swarm" | "mcp" | "plugins" => {
                     section = sec.to_string();
                     continue;
                 }
@@ -980,6 +1079,39 @@ fn apply_profile_toml_tightening(
             }
             ("mcp", "ban_stdio_npx_servers") => {
                 require_invariant(val == "true", key, "must equal true")?;
+            }
+            ("plugins", plugin_key) => {
+                let unquoted = plugin_key.trim_matches('"').trim_matches('\'');
+                let fname = unquoted
+                    .strip_prefix("profiles/plugins/")
+                    .unwrap_or(unquoted);
+                let valid_name = !fname.is_empty()
+                    && !fname.contains(['/', '\\'])
+                    && !fname.contains("..")
+                    && (fname.ends_with(".rego") || fname.ends_with(".toml"));
+                if !valid_name {
+                    return Err(BudgetViolation {
+                        code: "MALFORMED_PROFILE_TOML",
+                        detail: format!(
+                            "Invalid plugin filename '{plugin_key}' in [plugins] (expected '<name>.rego' or '<name>.toml')."
+                        ),
+                    });
+                }
+                let valid_hex = val.len() == 64
+                    && val
+                        .bytes()
+                        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
+                if !valid_hex {
+                    return Err(BudgetViolation {
+                        code: "MALFORMED_PROFILE_TOML",
+                        detail: format!(
+                            "Invalid SHA-256 pin '{val}' for plugin '{fname}' (expected 64 lowercase hex chars)."
+                        ),
+                    });
+                }
+                profile
+                    .pinned_plugins
+                    .insert(fname.to_string(), val.to_string());
             }
             (sec, other) => {
                 return Err(BudgetViolation {

@@ -1148,6 +1148,18 @@ fn check_single_command(
                 }
                 return Ok(());
             }
+            if sub == "feedback" {
+                if sub_args.get(1).map(String::as_str) != Some("submit") || !cmd.redirs.is_empty() {
+                    return Err(CommandViolation {
+                        code: "SELF_TAMPERING_BLOCKED",
+                        detail:
+                            "Agents may only invoke `dotagent feedback submit` without shell redirections; `status`, `export`, and `triage` are human-operator-only."
+                                .to_string(),
+                        halt_session: true,
+                    });
+                }
+                return Ok(());
+            }
             if matches!(sub, "sanitize-stream" | "sandbox-status") {
                 return Ok(());
             }

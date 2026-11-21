@@ -518,6 +518,32 @@ pub fn run_telemetry_cli(args: &[String]) -> ExitCode {
         return ExitCode::from(2);
     }
 
+    let mut sshsig_file: Option<PathBuf> = None;
+    let mut filtered: Vec<String> = Vec::with_capacity(args.len());
+    let mut idx = 0usize;
+    while idx < args.len() {
+        if args[idx] == "--sshsig" {
+            let Some(v) = args.get(idx + 1) else {
+                eprintln!("[AGENT-GUARD HARD DENY :: SSHSIG_REQUIRED] missing path after --sshsig");
+                return ExitCode::from(2);
+            };
+            sshsig_file = Some(PathBuf::from(v));
+            idx += 2;
+        } else {
+            filtered.push(args[idx].clone());
+            idx += 1;
+        }
+    }
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let repo_root = crate::resolve_repo_root(&cwd);
+    if let Err(ge) =
+        crate::operator::verify_operator_sshsig_gate(&repo_root, sshsig_file.as_deref())
+    {
+        eprintln!("[AGENT-GUARD HARD DENY :: {}] {}", ge.code, ge.detail);
+        return ExitCode::from(2);
+    }
+
+    let args = filtered.as_slice();
     let sub = args.first().map(String::as_str).unwrap_or("summary");
     let audit_path = crate::traversal_ledger::audit_log_path();
 
@@ -680,6 +706,218 @@ pub fn run_telemetry_cli(args: &[String]) -> ExitCode {
             ExitCode::from(2)
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TriageClusterItem {
+    pub cluster_key: String,
+    pub category: String,
+    pub deny_code: String,
+    pub normalized_shape: String,
+    pub unique_votes: usize,
+    pub anomaly_count: usize,
+    pub ring0_locked: bool,
+}
+
+impl TriageClusterItem {
+    pub fn to_json_value(&self) -> JsonValue {
+        JsonValue::Object(vec![
+            (
+                "cluster_key".to_string(),
+                JsonValue::Str(self.cluster_key.clone()),
+            ),
+            (
+                "category".to_string(),
+                JsonValue::Str(self.category.clone()),
+            ),
+            (
+                "deny_code".to_string(),
+                JsonValue::Str(self.deny_code.clone()),
+            ),
+            (
+                "normalized_shape".to_string(),
+                JsonValue::Str(self.normalized_shape.clone()),
+            ),
+            (
+                "unique_votes".to_string(),
+                JsonValue::Uint(self.unique_votes as u64),
+            ),
+            (
+                "anomaly_count".to_string(),
+                JsonValue::Uint(self.anomaly_count as u64),
+            ),
+            (
+                "ring0_locked".to_string(),
+                JsonValue::Bool(self.ring0_locked),
+            ),
+        ])
+    }
+}
+
+pub fn aggregate_ballot_worklist(
+    ballots_raw: &str,
+    quarantine_raw: &str,
+    vault_key: &[u8; 32],
+    min_votes: usize,
+) -> Vec<TriageClusterItem> {
+    let mut anomalies: BTreeMap<String, usize> = BTreeMap::new();
+    for line in quarantine_raw
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+    {
+        if let Ok(v) = JsonValue::parse(line)
+            && let Some(ck) = v.get("cluster_key").and_then(JsonValue::as_str)
+        {
+            *anomalies.entry(ck.to_string()).or_insert(0) += 1;
+        }
+    }
+
+    struct Acc {
+        category: String,
+        deny_code: String,
+        shape: String,
+        ring0: bool,
+        voters: std::collections::BTreeSet<String>,
+    }
+    let mut grouped: BTreeMap<String, Acc> = BTreeMap::new();
+    for line in ballots_raw.lines().map(str::trim).filter(|l| !l.is_empty()) {
+        let Ok(v) = JsonValue::parse(line) else {
+            continue;
+        };
+        if v.get("vote_counted").and_then(JsonValue::as_bool) == Some(false) {
+            continue;
+        }
+        let Ok(b) = crate::feedback::SignedBallotRecord::from_json_value(&v) else {
+            continue;
+        };
+        let Ok(expected_mac) = crate::coordinator::compute_domain_tag_for_feedback(
+            vault_key,
+            crate::feedback::FEEDBACK_BALLOT_HMAC_DOMAIN,
+            &b.canonical_mac_bytes(),
+        ) else {
+            continue;
+        };
+        let Ok(given_mac) = crate::crypto::hex_decode_bytes(&b.mac_hex) else {
+            continue;
+        };
+        if !crate::crypto::constant_time_eq_bytes(&expected_mac, &given_mac) {
+            continue;
+        }
+        let dc = b.deny_code.unwrap_or(b.reason_code);
+        let ring0 = crate::feedback::is_ring0_constitutional_code(&dc);
+        let entry = grouped.entry(b.cluster_key).or_insert_with(|| Acc {
+            category: b.category,
+            deny_code: dc,
+            shape: b.canonical_shape,
+            ring0,
+            voters: std::collections::BTreeSet::new(),
+        });
+        entry.voters.insert(b.voter_token);
+    }
+
+    let mut out: Vec<TriageClusterItem> = grouped
+        .into_iter()
+        .filter_map(|(ck, acc)| {
+            let votes = acc.voters.len();
+            (votes >= min_votes).then(|| TriageClusterItem {
+                anomaly_count: anomalies.get(&ck).copied().unwrap_or(0),
+                cluster_key: ck,
+                category: acc.category,
+                deny_code: acc.deny_code,
+                normalized_shape: acc.shape,
+                unique_votes: votes,
+                ring0_locked: acc.ring0,
+            })
+        })
+        .collect();
+    out.sort_by(|a, b| {
+        b.unique_votes
+            .cmp(&a.unique_votes)
+            .then_with(|| a.anomaly_count.cmp(&b.anomaly_count))
+            .then_with(|| a.cluster_key.cmp(&b.cluster_key))
+    });
+    out
+}
+
+pub fn run_operator_feedback_triage_cli(args: &[String], cwd: &Path) -> ExitCode {
+    if let Err((code, detail)) = verify_human_tty_telemetry_gate() {
+        eprintln!("[AGENT-GUARD HARD DENY :: {code}] {detail}");
+        return ExitCode::from(2);
+    }
+    let mut min_votes = 2usize;
+    let mut json_mode = false;
+    let mut sshsig_file: Option<PathBuf> = None;
+    let mut i = 0usize;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--min-votes" if i + 1 < args.len() => {
+                min_votes = args[i + 1].parse::<usize>().unwrap_or(2).max(1);
+                i += 2;
+            }
+            "--sshsig" if i + 1 < args.len() => {
+                sshsig_file = Some(PathBuf::from(&args[i + 1]));
+                i += 2;
+            }
+            "--json" => {
+                json_mode = true;
+                i += 1;
+            }
+            other => {
+                eprintln!("[dotagent feedback triage] unrecognized argument '{other}'");
+                return ExitCode::from(2);
+            }
+        }
+    }
+    let repo_root = crate::resolve_repo_root(cwd);
+    if let Ok(home) = std::env::var("HOME") {
+        match crate::sshsig_touch::load_operator_sk_keys_from_home(Path::new(&home)) {
+            Ok(Some(_)) => {
+                if let Err(ge) =
+                    crate::operator::verify_operator_sshsig_gate(&repo_root, sshsig_file.as_deref())
+                {
+                    eprintln!("[AGENT-GUARD HARD DENY :: {}] {}", ge.code, ge.detail);
+                    return ExitCode::from(2);
+                }
+            }
+            Ok(None) => {}
+            Err(ge) => {
+                eprintln!("[AGENT-GUARD HARD DENY :: {}] {}", ge.code, ge.detail);
+                return ExitCode::from(2);
+            }
+        }
+    }
+    let key = match crate::breadcrumbs::load_or_init_hmac_key(&repo_root) {
+        Ok(k) => crate::crypto::ZeroizingKey::new(k),
+        Err(e) => {
+            eprintln!("[dotagent feedback triage] failed loading vault key: {e}");
+            return ExitCode::from(2);
+        }
+    };
+    let fdir = crate::feedback::feedback_state_dir().unwrap_or_default();
+    let ballots_raw = fs::read_to_string(fdir.join("ballots.jsonl")).unwrap_or_default();
+    let quar_raw = fs::read_to_string(fdir.join("quarantine.jsonl")).unwrap_or_default();
+    let items = aggregate_ballot_worklist(&ballots_raw, &quar_raw, key.as_bytes(), min_votes);
+    if json_mode {
+        let arr: Vec<JsonValue> = items.iter().map(TriageClusterItem::to_json_value).collect();
+        println!("{}", JsonValue::Array(arr).to_json_string());
+    } else {
+        println!("| Cluster | Votes | Anomalies | Ring0 | Category | Code | Shape |");
+        println!("| --- | --- | --- | --- | --- | --- | --- |");
+        for it in &items {
+            println!(
+                "| `{}` | {} | {} | {} | `{}` | `{}` | `{}` |",
+                it.cluster_key,
+                it.unique_votes,
+                it.anomaly_count,
+                it.ring0_locked,
+                it.category,
+                it.deny_code,
+                it.normalized_shape
+            );
+        }
+    }
+    ExitCode::SUCCESS
 }
 
 #[cfg(test)]

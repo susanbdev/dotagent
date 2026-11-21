@@ -58,6 +58,7 @@ pub struct StopReceipt {
     pub head_commit_oid: String,
     pub work_tree_oid: String,
     pub bundle_manifest_sha256: String,
+    pub smoke_gate_digest: String,
     pub ledger: LedgerCleanSummary,
     pub issued_at_unix: u64,
     pub pubkey_ed25519_hex: String,
@@ -66,13 +67,14 @@ pub struct StopReceipt {
 
 impl StopReceipt {
     pub fn canonical_signing_bytes(&self) -> Vec<u8> {
-        let mut buf = Vec::with_capacity(384);
+        let mut buf = Vec::with_capacity(448);
         push_lp_bytes(&mut buf, STOP_RECEIPT_DOMAIN);
         push_lp_str(&mut buf, &self.schema);
         push_lp_str(&mut buf, &self.repo_id);
         push_lp_str(&mut buf, &self.head_commit_oid);
         push_lp_str(&mut buf, &self.work_tree_oid);
         push_lp_str(&mut buf, &self.bundle_manifest_sha256);
+        push_lp_str(&mut buf, &self.smoke_gate_digest);
         push_lp_str(&mut buf, &self.ledger.session_id);
         buf.push(u8::from(self.ledger.halted));
         buf.push(u8::from(self.ledger.tainted));
@@ -100,6 +102,10 @@ impl StopReceipt {
             (
                 "bundle_manifest_sha256".to_string(),
                 JsonValue::Str(self.bundle_manifest_sha256.clone()),
+            ),
+            (
+                "smoke_gate_digest".to_string(),
+                JsonValue::Str(self.smoke_gate_digest.clone()),
             ),
             (
                 "ledger_clean_summary".to_string(),
@@ -183,6 +189,7 @@ impl StopReceipt {
             head_commit_oid: req_str(&v, "head_commit_oid")?,
             work_tree_oid: req_str(&v, "work_tree_oid")?,
             bundle_manifest_sha256: req_str(&v, "bundle_manifest_sha256")?,
+            smoke_gate_digest: req_str(&v, "smoke_gate_digest")?,
             ledger: LedgerCleanSummary {
                 session_id: req_str(summary, "session_id")?,
                 halted: req_bool(summary, "halted")?,
@@ -455,7 +462,7 @@ fn normalize_remote_origin_for_repo_id(raw_url: &str) -> Option<String> {
     None
 }
 
-fn derive_portable_repo_id(canon_repo: &Path) -> String {
+pub(crate) fn derive_portable_repo_id(canon_repo: &Path) -> String {
     if let Ok(explicit) = std::env::var("DOTAGENT_REPO_ID") {
         let t = explicit.trim();
         if !t.is_empty() {
@@ -512,6 +519,12 @@ fn parse_porcelain_v1_z_paths(porcelain_z: &[u8]) -> Vec<String> {
     paths.sort();
     paths.dedup();
     paths
+}
+
+pub(crate) fn dirty_porcelain_paths(canon_repo: &Path) -> Vec<String> {
+    run_git_capture_raw(canon_repo, &["status", "--porcelain=v1", "-z", "-uall"])
+        .map(|raw| parse_porcelain_v1_z_paths(&raw))
+        .unwrap_or_default()
 }
 
 /// Computes canonical `(repo_id, head_commit_oid, work_tree_oid, bundle_manifest_sha256)`
@@ -656,6 +669,7 @@ pub fn issue_verified_stop_receipt(
     }
 
     let epoch_id = crate::coordinator::current_hmac_epoch_id(&canon).unwrap_or(1);
+    let smoke = crate::smoke_gate::verify_repo_smoke_gate(&canon)?;
     let (repo_id, head_commit_oid, work_tree_oid, bundle_manifest_sha256) =
         snapshot_repo_attestation_digests(&canon)?;
 
@@ -673,6 +687,7 @@ pub fn issue_verified_stop_receipt(
         head_commit_oid,
         work_tree_oid,
         bundle_manifest_sha256,
+        smoke_gate_digest: smoke.smoke_gate_digest,
         ledger: LedgerCleanSummary {
             session_id: sid,
             halted: ledger.halted,
@@ -885,6 +900,21 @@ pub fn run_verify_receipt_cli(args: &[String], cwd: &Path) -> ExitCode {
         }
     }
 
+    match crate::smoke_gate::verify_repo_smoke_gate(&target_repo) {
+        Ok(live_smoke) if receipt.smoke_gate_digest == live_smoke.smoke_gate_digest => {}
+        Ok(live_smoke) => {
+            eprintln!(
+                "[AGENT-GUARD RECEIPT FAIL] RECEIPT_SMOKE_GATE_DRIFT: receipt smoke_gate_digest '{}' != live '{}'",
+                receipt.smoke_gate_digest, live_smoke.smoke_gate_digest
+            );
+            return ExitCode::from(2);
+        }
+        Err(e) => {
+            eprintln!("[AGENT-GUARD RECEIPT FAIL] {e}");
+            return ExitCode::from(2);
+        }
+    }
+
     println!(
         "[AGENT-GUARD RECEIPT VERIFIED] repo_id={} head={} tree={} epoch={} pubkey={}",
         receipt.repo_id,
@@ -950,6 +980,7 @@ mod tests {
             head_commit_oid: "88e93a5".to_string(),
             work_tree_oid: "tree1234".to_string(),
             bundle_manifest_sha256: "bundle5678".to_string(),
+            smoke_gate_digest: "smoke9abc".to_string(),
             ledger: LedgerCleanSummary {
                 session_id: "default".to_string(),
                 halted: false,
@@ -970,10 +1001,14 @@ mod tests {
         let parsed = StopReceipt::from_json_str(&serialized).expect("valid JSON");
         assert!(parsed.verify_signature(&pub_hex).is_ok());
 
-        // Tamper with work_tree_oid -> must fail Ed25519 verification
+        // Tamper with work_tree_oid or smoke_gate_digest -> must fail Ed25519 verification
         let mut tampered = parsed.clone();
         tampered.work_tree_oid = "tree_forged".to_string();
         assert!(tampered.verify_signature(&pub_hex).is_err());
+
+        let mut tampered_smoke = parsed.clone();
+        tampered_smoke.smoke_gate_digest = "smoke_forged".to_string();
+        assert!(tampered_smoke.verify_signature(&pub_hex).is_err());
 
         // Wrong pinned pubkey -> must fail
         let wrong_sk = SigningKey::from_bytes(&[0x99u8; 32]);

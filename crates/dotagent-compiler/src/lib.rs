@@ -199,21 +199,36 @@ pub struct PolicyBundleIr {
     pub compiler_version: String,
     pub profiles: Vec<ProfileIr>,
     pub skills: Vec<SkillIr>,
+    pub plugins: BTreeMap<String, String>,
 }
 
 impl PolicyBundleIr {
     pub fn new(profiles: Vec<ProfileIr>, skills: Vec<SkillIr>) -> Self {
+        Self::with_plugins(profiles, skills, BTreeMap::new())
+    }
+
+    pub fn with_plugins(
+        profiles: Vec<ProfileIr>,
+        skills: Vec<SkillIr>,
+        plugins: BTreeMap<String, String>,
+    ) -> Self {
         Self {
             schema: "dotagent.policy_ir.v2".to_string(),
             compiler_version: env!("CARGO_PKG_VERSION").to_string(),
             profiles,
             skills,
+            plugins,
         }
     }
 
     pub fn to_json_value(&self) -> JsonValue {
         let prof_arr: Vec<JsonValue> = self.profiles.iter().map(ProfileIr::to_json_value).collect();
         let skill_arr: Vec<JsonValue> = self.skills.iter().map(SkillIr::to_json_value).collect();
+        let plugin_obj: Vec<(String, JsonValue)> = self
+            .plugins
+            .iter()
+            .map(|(k, v)| (k.clone(), JsonValue::Str(v.clone())))
+            .collect();
         let mcp_rules: Vec<JsonValue> = MCP_CAPABILITY_MANIFEST
             .iter()
             .map(|r| {
@@ -239,6 +254,7 @@ impl PolicyBundleIr {
             ),
             ("profiles".to_string(), JsonValue::Array(prof_arr)),
             ("skills".to_string(), JsonValue::Array(skill_arr)),
+            ("plugins".to_string(), JsonValue::Object(plugin_obj)),
             (
                 "mcp_capability_manifest".to_string(),
                 JsonValue::Array(mcp_rules),
@@ -813,7 +829,15 @@ pub fn parse_profile_toml_to_ir(file_name: &str, raw_toml: &str) -> Result<Profi
 /// Compiles all parsed `ProfileIr`s, `SkillIr`s, and the declarative `MCP_CAPABILITY_MANIFEST`
 /// into `dist/profiles/policy_ir.json`.
 pub fn compile_policy_bundle_ir_json(profiles: &[ProfileIr], skills: &[SkillIr]) -> String {
-    let bundle = PolicyBundleIr::new(profiles.to_vec(), skills.to_vec());
+    compile_policy_bundle_ir_json_with_plugins(profiles, skills, &BTreeMap::new())
+}
+
+pub fn compile_policy_bundle_ir_json_with_plugins(
+    profiles: &[ProfileIr],
+    skills: &[SkillIr],
+    plugins: &BTreeMap<String, String>,
+) -> String {
+    let bundle = PolicyBundleIr::with_plugins(profiles.to_vec(), skills.to_vec(), plugins.clone());
     format!("{}\n", bundle.to_json_value().to_json_string())
 }
 
@@ -866,6 +890,10 @@ pub fn render_claude_settings_from_ir(coding: &ProfileIr) -> String {
         "Read(.github/copilot-instructions.md)",
         "Edit(AGENTS.md)",
         "Write(AGENTS.md)",
+        "Edit(.dotagent-smoke.toml)",
+        "Write(.dotagent-smoke.toml)",
+        "Edit(profiles/**)",
+        "Write(profiles/**)",
         "Edit(.claude/**)",
         "Write(.claude/**)",
         "Edit(.guard/**)",

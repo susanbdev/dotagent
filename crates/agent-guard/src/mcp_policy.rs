@@ -47,9 +47,9 @@ pub const MCP_CAPABILITY_MANIFEST: &[McpManifestRule] = &[
         description: "Liveness and pure read-only health metadata",
     },
     McpManifestRule {
-        pattern: "get_*|list_*|read_*|search|search_*|query|query_*|inspect_*|describe_*|explain_*|verify_*|diff|diff_*|check_*|audit_*|lookup_*|dotagent_read_file|dotagent_search",
+        pattern: "get_*|list_*|read_*|search|search_*|query|query_*|inspect_*|describe_*|explain_*|verify_*|diff|diff_*|check_*|audit_*|lookup_*|dotagent_read_file|dotagent_search|dotagent_submit_friction",
         class: McpRpcClass::ReadOnly,
-        description: "Pure read-only lookup, search, and verification RPCs",
+        description: "Pure read-only lookup, search, verification, and write-only friction ballot RPCs",
     },
     McpManifestRule {
         pattern: "dotagent_submit_friction",
@@ -87,6 +87,7 @@ const READONLY_EXACT_METHODS: &[&str] = &[
     "dotagent_read_file",
     "dotagent_search",
     "dotagent_status",
+    "dotagent_submit_friction",
 ];
 
 const FEEDBACK_TELEMETRY_EXACT: &[&str] = &["dotagent_submit_friction"];

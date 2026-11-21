@@ -350,6 +350,12 @@ vectors = [
   { kind = "cmd", payload = "timeout 5 dotagent feedback submit --denial-id dnl_0123456789abcdef --category false_positive_block" },
   { kind = "mcp", payload = "mcp__github__delete_repository" },
   { kind = "mcp", payload = "mcp__susanbdev__get_and_deleteAll" },
-  { kind = "cmd", payload = "cargo run -q -p agent-guard -- feedback submit --category missing_safe_flag" }
+  { kind = "cmd", payload = "cargo run -q -p agent-guard -- feedback submit --category missing_safe_flag" },
+  { kind = "cmd", payload = "dotagent feedback triage --json" },
+  { kind = "cmd", payload = "agent-guard feedback triage --min-votes 1" },
+  { kind = "cmd", payload = "dotagent verify-ring0-ratchet --base HEAD --mode automated-pr" },
+  { kind = "write_path", payload = "profiles/plugins/rogue.rego" },
+  { kind = "write_path", payload = "profiles/coding-agent.toml" },
+  { kind = "write_path", payload = ".dotagent-smoke.toml" }
 ]
 

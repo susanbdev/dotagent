@@ -849,6 +849,136 @@ pub fn append_breadcrumb_for_path(
     Ok(signed)
 }
 
+pub fn record_quorum_approval_breadcrumb(
+    repo_root: &Path,
+    reviewer_session_id: &str,
+    task_id: &str,
+    target_rel_path: &str,
+) -> Result<SignedBreadcrumbRecord, String> {
+    let local_root = fs::canonicalize(repo_root).unwrap_or_else(|_| repo_root.to_path_buf());
+    let common_repo = crate::resolve_common_repo_root(&local_root);
+    let repo_sha256 = sha256_digest(common_repo.to_string_lossy().as_bytes());
+    let spool_path = spool_file_path(&common_repo, reviewer_session_id)?;
+    let _spool_lock = ExclusiveFileLockGuard::acquire(&spool_path)?;
+    let recovery = recover_spool_frames(&spool_path)?;
+    let (seq_no, prev_event_mac) = match recovery.valid_records.last() {
+        Some(prev) => (prev.event.seq_no.saturating_add(1), prev.record_mac),
+        None => (1, [0u8; 32]),
+    };
+    let clean_rel = target_rel_path.trim().trim_start_matches("./");
+    let event = AuthenticatedEvent {
+        schema_version: AUTH_EVENT_SCHEMA_V1,
+        repo_sha256,
+        plan_sha256: [0u8; 32],
+        session_id: reviewer_session_id.to_string(),
+        task_id: task_id.to_string(),
+        seq_no,
+        prev_event_mac,
+        op: EventOp::ReviewApprove,
+        canonical_rel_path: clean_rel.to_string(),
+        line_range: None,
+        doc_sha256: [0u8; 32],
+    };
+    let record_mac = compute_event_mac_for_repo(&common_repo, &event)?;
+    let signed = SignedBreadcrumbRecord { event, record_mac };
+    append_spool_frame_unlocked(&spool_path, &signed)?;
+    let _ = ensure_git_info_exclude(&local_root);
+    let root_trail = local_root.join(".breadcrumbs.jsonl");
+    let target_trail = trail_path_for_rel_path(&local_root, clean_rel)
+        .ok()
+        .filter(|tp| tp.parent().is_some_and(Path::is_dir))
+        .unwrap_or_else(|| root_trail.clone());
+    if flush_records_idempotent(&target_trail, std::slice::from_ref(&signed)).is_err() {
+        flush_records_idempotent(&root_trail, std::slice::from_ref(&signed))?;
+    }
+    Ok(signed)
+}
+
+pub fn count_verified_quorum_approvals(
+    repo_root: &Path,
+    actor_session_id: &str,
+    target_rel_paths: &[String],
+    allowed_roles: &[String],
+) -> usize {
+    use crate::role_sandbox::load_session_capability;
+    use crate::swarm_contracts::SwarmRole;
+    use crate::traversal_ledger::SessionLedger;
+
+    let canon_repo = fs::canonicalize(repo_root).unwrap_or_else(|_| repo_root.to_path_buf());
+    let common_repo = crate::resolve_common_repo_root(&canon_repo);
+    let expected_repo_sha = sha256_digest(common_repo.to_string_lossy().as_bytes());
+    let targets: Vec<&str> = if target_rel_paths.is_empty() {
+        vec!["*"]
+    } else {
+        target_rel_paths.iter().map(String::as_str).collect()
+    };
+    let mut min_verified: Option<usize> = None;
+    for target in targets {
+        let clean_t = target.trim().trim_start_matches("./");
+        let mut trails = vec![canon_repo.join(".breadcrumbs.jsonl")];
+        if clean_t != "*"
+            && let Ok(tp) = trail_path_for_rel_path(&canon_repo, clean_t)
+            && !trails.contains(&tp)
+        {
+            trails.push(tp);
+        }
+        let mut approvers = BTreeSet::new();
+        for trail in trails {
+            let Ok(meta) = fs::symlink_metadata(&trail) else {
+                continue;
+            };
+            if meta.file_type().is_symlink() || !meta.file_type().is_file() {
+                continue;
+            }
+            let Ok(raw) = fs::read_to_string(&trail) else {
+                continue;
+            };
+            for line in raw.lines().map(str::trim).filter(|l| !l.is_empty()) {
+                let Ok(rec) = SignedBreadcrumbRecord::from_json_line(line) else {
+                    continue;
+                };
+                if rec.event.op != EventOp::ReviewApprove
+                    || rec.event.repo_sha256 != expected_repo_sha
+                    || rec.event.session_id == actor_session_id
+                    || (rec.event.canonical_rel_path != clean_t
+                        && rec.event.canonical_rel_path != "*")
+                {
+                    continue;
+                }
+                if verify_event_mac_for_repo(&common_repo, &rec.event, &rec.record_mac).is_err() {
+                    continue;
+                }
+                if SessionLedger::load_or_create(repo_root, &rec.event.session_id).tainted {
+                    continue;
+                }
+                let Ok(cap) = load_session_capability(repo_root, &rec.event.session_id) else {
+                    continue;
+                };
+                let role_ok = cap.malicious_flags == 0
+                    && if allowed_roles.is_empty() {
+                        matches!(
+                            cap.role,
+                            SwarmRole::AdversarialReviewer
+                                | SwarmRole::QaEngineer
+                                | SwarmRole::Master
+                        )
+                    } else {
+                        allowed_roles
+                            .iter()
+                            .filter_map(|r| SwarmRole::from_str_id(r))
+                            .any(|r| r == cap.role)
+                    };
+                if !role_ok {
+                    continue;
+                }
+                approvers.insert(rec.event.session_id);
+            }
+        }
+        min_verified = Some(min_verified.map_or(approvers.len(), |m| m.min(approvers.len())));
+    }
+    min_verified.unwrap_or(0)
+}
+
 /// Resolves the validated `<parent_dir>/.breadcrumbs.jsonl` trail path for `canonical_rel_path`,
 /// refusing symlinks or path traversal outside `repo_root`.
 pub fn trail_path_for_rel_path(
