@@ -32,3 +32,9 @@ sha2 = "0.10"
 landlock = "0.4.7"
 seccompiler = { version = "0.5", default-features = false }
 
+
+# `cargo binstall --git https://github.com/susanbdev/dotagent agent-guard` downloads the attested release archive.
+[package.metadata.binstall]
+pkg-url = "https://github.com/susanbdev/dotagent/releases/download/v{ version }/dotagent-v{ version }-{ target }.tar.gz"
+bin-dir = "dotagent-v{ version }-{ target }/bin/{ bin }{ binary-ext }"
+pkg-fmt = "tgz"

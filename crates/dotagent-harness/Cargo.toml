@@ -16,3 +16,9 @@ path = "src/main.rs"
 
 [dependencies]
 agent-guard = { path = "../agent-guard" }
+
+# `cargo binstall --git https://github.com/susanbdev/dotagent dotagent-harness` downloads the attested release archive.
+[package.metadata.binstall]
+pkg-url = "https://github.com/susanbdev/dotagent/releases/download/v{ version }/dotagent-v{ version }-{ target }.tar.gz"
+bin-dir = "dotagent-v{ version }-{ target }/bin/{ bin }{ binary-ext }"
+pkg-fmt = "tgz"

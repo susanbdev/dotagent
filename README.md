@@ -75,6 +75,27 @@ What `dotagent activate` guarantees:
 - **GUI IDE Hook Pinning**: Rewrites hook commands to absolute `~/.local/bin/agent-guard` paths on external workspaces and `~/.gemini/settings.json` so GUI apps (Cursor, Claude Desktop, VS Code) never fail when launched outside an interactive shell `PATH`, while configuring `~/.bashrc` and `~/.zshenv`.
 - **Instant Self-Remediation**: Every `[agent-guard HARD DENY :: <CODE>]` diagnostic includes an actionable `Remediation:` line and maps to `dotagent explain <CODE>`.
 
+## Install Channels (prebuilt, attested, no recompilation)
+
+Every channel repackages the same four attested release archives (`x86_64`/`aarch64` x `linux-musl`/`apple-darwin`); nothing is rebuilt. Windows is not supported yet.
+
+| Channel | Command | Trust anchor |
+| --- | --- | --- |
+| Installer | `curl -fsSL https://susanb.dev/dotagent/install.sh \| bash` | baked SHA-256 + YubiKey PIV P-256 signature on `SHA256SUMS` (`SHA256SUMS.sig`) |
+| Homebrew | `brew install susanbdev/tap/dotagent` | pinned SHA-256 in formula + GitHub attestation |
+| PyPI / uv | `uv tool install dotagent` (or `pip install dotagent`) | Trusted Publishing + PEP 740 attestations |
+| npm | `npm i -g @susanbdev/dotagent` (no install scripts) | Trusted Publishing + npm provenance |
+| cargo | `cargo binstall --git https://github.com/susanbdev/dotagent dotagent-compiler agent-guard` | GitHub attestation |
+| Linux packages | `.deb` / `.rpm` / `.apk` from the release page (`root:root 0555` `/opt/dotagent`) | GitHub attestation + `SHA256SUMS.sig` |
+| macOS | `dotagent-<tag>-universal-apple-darwin.pkg` (Developer ID signed, notarized) | Apple + `SHA256SUMS.macos.sig` |
+| OCI | `docker pull ghcr.io/susanbdev/dotagent:<version>` | GitHub attestation |
+
+Installer flags (pass after `bash -s --`): `--activate --workspace DIR`, `--bin-dir DIR` (absolute), `--system` (existing root shell with a root-owned `$HOME` only), `--require-attestation` (needs `gh`; pins repo, signer workflow and `refs/tags/<tag>`). The installer refuses to run inside a guarded agent session, refuses a truncated stream (final `--eof-v1` sentinel), purges every non-installer shell function before doing any work, and rejects hardlinks/links/devices in the archive. It cannot defend against a hostile `BASH_ENV`/`SHELLOPTS`/`PS4` exported into the invoking shell; run it from a clean shell. Verify any asset by hand with `gh attestation verify <file> --owner susanbdev`.
+
+The `.deb`/`.rpm`/`.apk` packages are not individually signed; authenticate them through the YubiKey-signed `SHA256SUMS` or the GitHub attestation before installing (`apk` needs `--allow-untrusted` for that reason). `scripts/activate-local.sh --from-prebuilt DIR` requires `--prebuilt-sums FILE`, a `SHA256SUMS`-style list (`<hex>  bin/<name>`) that the caller must itself have obtained from a verified source.
+
+Release maintainers: `packaging/` holds the repackager, installer template and nfpm/OCI definitions; `scripts/sign-release-yk.sh <tag>` is the YubiKey ceremony (see its header for the required environment). The `release` job gate requires the tag commit to be on `main` and the annotated tag to be GitHub-verified; publishing jobs run in the protected environments `release`, `release-pypi`, `release-npm` and `release-homebrew`.
+
 ## Unified `dotagent` Operator CLI
 
 `dotagent` is a single multicall binary providing operator workflows alongside low-level lifecycle hooks:

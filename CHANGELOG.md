@@ -3,6 +3,21 @@
 All notable changes to `dotagent` are documented in this file.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- **Universal distribution (`packaging/`)**: deterministic stdlib `repackage.py` turning the four attested release archives into a hardened `install.sh` (baked SHA-256 digests + pinned YubiKey PIV P-256 SPKI, EOF function gate, `AGENT_GUARD_*` refusal, pre-extraction tar audit, atomic binary swap), four PyPI wheels, four npm platform packages + root package (zero lifecycle scripts), a Homebrew formula, and `.deb`/`.rpm`/`.apk` via `nfpm`, plus a `FROM scratch` OCI image definition.
+- **Release workflow**: `repackage-ecosystem`, `publish-ghcr`, `publish-pypi`, `publish-npm`, and `publish-homebrew` jobs (OIDC trusted publishing, SHA-pinned actions); every release asset including `install.sh` is covered by SLSA build provenance.
+- **`scripts/sign-release-yk.sh`**: local YubiKey PIV ceremony (attestation-gated, macOS universal `.pkg` notarization, ECDSA-SHA256 over `SHA256SUMS`).
+- **`scripts/activate-local.sh --from-prebuilt <dir>`** installs verified release binaries without invoking Cargo; `cargo binstall` metadata added to every binary crate.
+- `tests/packaging/`: installer, repackager, ceremony and workflow-hygiene tests (truncated stream, tampered archive, forged signature, tar traversal/link/device rejection, running-binary atomic replace, byte-identical repackaging).
+
+### Security
+- **Installer**: `--eof-v1` end-of-stream sentinel (every truncated prefix executes nothing), purge of shadowing shell functions, hardlink rejection, bounded download size (`ulimit -f`), array-safe binary lists, `--require-attestation` pinned to repo, signer workflow and tag ref, `--system` requires a root-owned `$HOME`.
+- **`activate-local.sh --from-prebuilt`** requires `--prebuilt-sums` and verifies every binary digest (and rejects symlinks) before installing anything.
+- **Release workflow**: tag must be on `main` and GitHub-verified; `release` environment on the release/ghcr jobs; every downstream registry job re-verifies build provenance of each downloaded asset; idempotent PyPI/npm publishing; npm license `UNLICENSED` for non-SPDX licenses.
+- **Ceremony**: fetches tags, runs from the repo root, pins attestation `--source-digest`, cross-checks the baked installer against the tag and `SHA256SUMS`, aborts on any failed `.pkg` step, and never downgrades the latest `install.sh`.
+
 ## [2.0.0] - 2026-11-20
 
 ### Added

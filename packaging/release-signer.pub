@@ -1,0 +1,6 @@
+# dotagent release signer (PUBLIC key only). The installer pins this key.
+# YubiKey PIV ECDSA P-256 public key (SPKI PEM).
+-----BEGIN PUBLIC KEY-----
+MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEkJH276bJ8VCBYX+WLGScda3HudV/
+gvtxEh7M6Lcm4vmNQowgEwa3FXhsvyQjPz6vSB6TlI4ryhXRiuqk9iNY+w==
+-----END PUBLIC KEY-----

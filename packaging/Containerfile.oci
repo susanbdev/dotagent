@@ -1,0 +1,13 @@
+# OCI image for dotagent. Nothing is compiled or fetched here: the build context
+# is produced by `dotagent fleet build-image --out oci-stage` (one stage-<arch>/
+# tree per platform, already laid out as opt/dotagent/{bin,dist,profiles,skills}).
+#
+#   docker buildx build -f packaging/Containerfile.oci \
+#       --platform linux/amd64,linux/arm64 oci-stage
+#
+# No shell, no package manager, no base image to drift: FROM scratch.
+FROM scratch
+ARG TARGETARCH
+COPY --chown=0:0 stage-${TARGETARCH}/opt/dotagent /opt/dotagent
+USER 65532:65532
+ENTRYPOINT ["/opt/dotagent/bin/dotagent"]
