@@ -45,10 +45,10 @@ jobs:
           PUSH_HEAD_SHA: ${{ github.sha }}
           ENFORCE_HW_VAR: ${{ vars.DOTAGENT_ENFORCE_HW_SIGNERS }}
           BOOTSTRAP_SIGNER_VAR: ${{ vars.DOTAGENT_BOOTSTRAP_SIGNER }}
+          BOOTSTRAP_VERIFIER_SHA256: ${{ vars.DOTAGENT_BOOTSTRAP_VERIFIER_SHA256 }}
+          BOOTSTRAP_EMPTY_OPT_IN: ${{ vars.DOTAGENT_ALLOW_EMPTY_SIGNERS_BOOTSTRAP }}
         run: |
           set -euo pipefail
-          GENESIS_PRE_GATE_SHA="0194af29450aa65d1699337ec731d1740efc00e4"
-          PINNED_GENESIS_VERIFIER_SHA256="3d2d4df39495421f3f1c6d6865dd5b4a55838bd77bb79ee71f52d0ca80ab8d72"
 
           run_trusted_gate() {
             local base_sha="$1"
@@ -57,20 +57,20 @@ jobs:
             if git cat-file -e "${base_sha}:scripts/verify-pr-authority.sh" 2>/dev/null; then
               git show "${base_sha}:scripts/verify-pr-authority.sh" > "${gate_script}"
               chmod 0700 "${gate_script}"
-            elif [[ "${base_sha}" == "${GENESIS_PRE_GATE_SHA}" ]]; then
+            elif [[ "${BOOTSTRAP_VERIFIER_SHA256}" =~ ^[0-9a-f]{64}$ ]]; then
               ACTUAL_SHA256="$(sha256sum scripts/verify-pr-authority.sh | awk '{print $1}')"
-              if [[ "${ACTUAL_SHA256}" != "${PINNED_GENESIS_VERIFIER_SHA256}" ]]; then
-                echo "UNTRUSTED_BOOTSTRAP_VERIFIER: scripts/verify-pr-authority.sh sha256=${ACTUAL_SHA256} != pinned ${PINNED_GENESIS_VERIFIER_SHA256}" >&2
+              if [[ "${ACTUAL_SHA256}" != "${BOOTSTRAP_VERIFIER_SHA256}" ]]; then
+                echo "UNTRUSTED_BOOTSTRAP_VERIFIER: scripts/verify-pr-authority.sh sha256=${ACTUAL_SHA256} != out-of-band vars.DOTAGENT_BOOTSTRAP_VERIFIER_SHA256" >&2
                 exit 2
               fi
               cp scripts/verify-pr-authority.sh "${gate_script}"
               chmod 0700 "${gate_script}"
             else
-              echo "MISSING_TRUSTED_VERIFIER: base commit ${base_sha} lacks scripts/verify-pr-authority.sh" >&2
+              echo "MISSING_TRUSTED_VERIFIER: base commit ${base_sha} lacks scripts/verify-pr-authority.sh and vars.DOTAGENT_BOOTSTRAP_VERIFIER_SHA256 is unset" >&2
               exit 2
             fi
             local extra_args=()
-            if [[ "${ENFORCE_HW_VAR}" != "1" ]]; then
+            if [[ "${BOOTSTRAP_EMPTY_OPT_IN}" == "1" && "${ENFORCE_HW_VAR}" != "1" ]]; then
               extra_args+=(--bootstrap-allow-empty-signers)
             fi
             if [[ -n "${BOOTSTRAP_SIGNER_VAR}" ]]; then
@@ -301,11 +301,11 @@ jobs:
           seccomp = json.load(open(sys.argv[1], "r", encoding="utf-8"))
           assert seccomp.get("defaultAction") == "SCMP_ACT_ERRNO", f"expected SCMP_ACT_ERRNO, got {seccomp.get('defaultAction')}"
           landlock_calls = {"landlock_create_ruleset", "landlock_add_rule", "landlock_restrict_self"}
-          uncond_forbidden = landlock_calls | {"bpf", "kexec_load", "kexec_file_load", "mount", "pivot_root", "ptrace", "setns", "umount2", "unshare"}
+          uncond_forbidden = landlock_calls | {"bpf", "kexec_load", "kexec_file_load", "mount", "pivot_root", "process_vm_readv", "process_vm_writev", "ptrace", "setns", "umount2", "unshare"}
           for rule in seccomp.get("syscalls", []):
               if rule.get("action") == "SCMP_ACT_ALLOW":
                   assert not landlock_calls.intersection(rule.get("names", [])), "Landlock remained allowed"
-                  if not rule.get("includes"):
+                  if not (rule.get("includes") or {}).get("caps"):
                       overlap = uncond_forbidden.intersection(rule.get("names", []))
                       assert not overlap, f"dangerous syscall unconditionally allowed: {overlap}"
           PY
