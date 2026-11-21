@@ -5,6 +5,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 
 use crate::breadcrumbs::{
@@ -12,12 +13,18 @@ use crate::breadcrumbs::{
     verify_arbitrary_hmac_hex,
 };
 use crate::json::JsonValue;
+use crate::path_policy::{PathAccess, check_forbidden_zones_lexical, validate_path_with_max_depth};
 use crate::swarm_contracts::{
     DagTaskSpec, DomainRisk, LockedPlan, SuspectVerdict, TestAttributionRule, hex_encode,
 };
 use crate::unicode_guard::{ScanMode, scan_unicode};
 
 const PLAN_LOCK_HMAC_DOMAIN: &[u8] = b"dotagent-plan-lock-v1";
+const MAX_TEST_SOURCE_DEPTH: usize = 4;
+const MAX_TEST_SCAN_ENTRIES: usize = 4096;
+const MAX_TEST_SCAN_FILES: usize = 512;
+const MAX_TEST_SOURCE_BYTES: usize = 512 * 1024;
+const MAX_TEST_SCAN_BYTES: usize = 8 * 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TaskCoverageTarget {
@@ -736,33 +743,36 @@ pub fn verify_live_integration_contracts(
 ) -> Result<(), String> {
     verify_attribution_against_plan(rules, plan)?;
 
-    let canon_repo = fs::canonicalize(repo_root).unwrap_or_else(|_| repo_root.to_path_buf());
-    let mut test_files = Vec::new();
+    let canon_repo = fs::canonicalize(repo_root)
+        .map_err(|e| format!("LIVE_TEST_SCAN_FAILED: cannot resolve repository: {e}"))?;
     let tests_dir = canon_repo.join("tests");
-    if let Ok(meta) = fs::symlink_metadata(&tests_dir)
-        && !meta.file_type().is_symlink()
-        && meta.file_type().is_dir()
-    {
-        collect_integration_test_sources(&tests_dir, 0, &mut test_files);
-    }
-
     let attributed_names: BTreeSet<&str> = rules.iter().map(|r| r.test_name.as_str()).collect();
     let mut names_found_in_tests_dir = BTreeSet::new();
 
-    for (rel_path, content) in &test_files {
-        let Some(language) = TestSourceLanguage::from_path(Path::new(rel_path)) else {
-            continue;
-        };
-        for (name, skipped) in test_declarations(content, language) {
-            if !attributed_names.contains(name) {
-                continue;
-            }
-            if skipped {
-                return Err(format!(
-                    "SKIPPED_ATTRIBUTED_TEST_FORBIDDEN: attributed test '{name}' is marked ignored/skipped in '{rel_path}'"
-                ));
-            }
-            names_found_in_tests_dir.insert(name);
+    match fs::symlink_metadata(&tests_dir) {
+        Ok(meta) if meta.is_dir() => {
+            let mut scan = TestSourceScan::new(&canon_repo, &tests_dir);
+            scan.walk(&tests_dir, 0, &mut |path, language, content| {
+                for (name, skipped) in test_declarations(content, language) {
+                    if let Some(&attributed_name) = attributed_names.get(name) {
+                        if skipped {
+                            return Err(format!(
+                                "SKIPPED_ATTRIBUTED_TEST_FORBIDDEN: attributed test '{name}' is marked ignored/skipped in '{}'",
+                                path.display()
+                            ));
+                        }
+                        names_found_in_tests_dir.insert(attributed_name);
+                    }
+                }
+                Ok(())
+            })?;
+        }
+        Ok(_) => {
+            return Err("LIVE_TEST_SCAN_FAILED: tests/ must be a non-symlink directory".into());
+        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => {
+            return Err(format!("LIVE_TEST_SCAN_FAILED: cannot inspect tests/: {e}"));
         }
     }
 
@@ -1279,31 +1289,173 @@ fn javascript_test_body(tokens: &[SourceToken<'_>]) -> bool {
         })
 }
 
-fn collect_integration_test_sources(dir: &Path, depth: usize, out: &mut Vec<(String, String)>) {
-    if depth > 4 {
-        return;
-    }
-    let Ok(entries) = fs::read_dir(dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let p = entry.path();
-        let Ok(ft) = entry.file_type() else {
-            continue;
-        };
-        if ft.is_symlink() {
-            continue;
+struct TestSourceScan<'a> {
+    repo: &'a Path,
+    root: &'a Path,
+    entries_left: usize,
+    files_left: usize,
+    bytes_left: usize,
+}
+
+impl<'a> TestSourceScan<'a> {
+    fn new(repo: &'a Path, root: &'a Path) -> Self {
+        Self {
+            repo,
+            root,
+            entries_left: MAX_TEST_SCAN_ENTRIES,
+            files_left: MAX_TEST_SCAN_FILES,
+            bytes_left: MAX_TEST_SCAN_BYTES,
         }
-        if ft.is_dir() {
-            collect_integration_test_sources(&p, depth + 1, out);
-        } else if ft.is_file() {
-            if TestSourceLanguage::from_path(&p).is_some()
-                && let Ok(text) = fs::read_to_string(&p)
+    }
+
+    fn walk(
+        &mut self,
+        dir: &Path,
+        depth: usize,
+        visit: &mut impl FnMut(&Path, TestSourceLanguage, &str) -> Result<(), String>,
+    ) -> Result<(), String> {
+        if !self.path_allowed(
+            dir,
+            PathAccess::ListSearch {
+                requested_depth: Some(1),
+            },
+        )? {
+            return Ok(());
+        }
+        let entries = fs::read_dir(dir).map_err(|e| test_source_error(dir, e))?;
+        for entry in entries {
+            self.entries_left = self
+                .entries_left
+                .checked_sub(1)
+                .ok_or("LIVE_TEST_SCAN_LIMIT: tests/ exceeds the directory-entry budget")?;
+            let entry = entry.map_err(|e| test_source_error(dir, e))?;
+            let path = entry.path();
+            let file_type = entry.file_type().map_err(|e| test_source_error(&path, e))?;
+            if file_type.is_dir() && depth < MAX_TEST_SOURCE_DEPTH {
+                self.walk(&path, depth + 1, visit)?;
+            } else if file_type.is_file()
+                && let Some(language) = TestSourceLanguage::from_path(&path)
+                && self.path_allowed(&path, PathAccess::Read)?
             {
-                out.push((p.to_string_lossy().into_owned(), text));
+                self.files_left = self
+                    .files_left
+                    .checked_sub(1)
+                    .ok_or("LIVE_TEST_SCAN_LIMIT: tests/ exceeds the source-file budget")?;
+                let limit = self.bytes_left.min(MAX_TEST_SOURCE_BYTES);
+                let content = read_scoped_test_source(&path, limit)?;
+                self.bytes_left -= content.len();
+                visit(&path, language, &content)?;
             }
         }
+        Ok(())
     }
+
+    fn path_allowed(&self, path: &Path, access: PathAccess) -> Result<bool, String> {
+        let Some(raw) = path.to_str() else {
+            return Ok(false);
+        };
+        if path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.eq_ignore_ascii_case(".git"))
+            || check_forbidden_zones_lexical(raw, raw).is_err()
+        {
+            return Ok(false);
+        }
+        let canonical = fs::canonicalize(path).map_err(|e| test_source_error(path, e))?;
+        if canonical != path || !canonical.starts_with(self.root) {
+            return Err(test_source_error(
+                path,
+                "source escaped the canonical tests/ path",
+            ));
+        }
+        Ok(
+            validate_path_with_max_depth(self.repo, self.repo, raw, access, MAX_TEST_SOURCE_DEPTH)
+                .is_ok_and(|validated| validated.canonical_or_norm == canonical),
+        )
+    }
+}
+
+fn test_source_error(path: &Path, detail: impl std::fmt::Display) -> String {
+    format!("LIVE_TEST_SCAN_FAILED: '{}': {detail}", path.display())
+}
+
+fn read_scoped_test_source(path: &Path, limit: usize) -> Result<String, String> {
+    let bound = limit as u64;
+    let size_error = || {
+        format!(
+            "LIVE_TEST_SCAN_LIMIT: source '{}' exceeds the per-file or aggregate byte budget",
+            path.display()
+        )
+    };
+    let before = fs::symlink_metadata(path).map_err(|e| test_source_error(path, e))?;
+    if !before.is_file() {
+        return Err(test_source_error(
+            path,
+            "source is no longer a regular file",
+        ));
+    }
+    if before.len() > bound {
+        return Err(size_error());
+    }
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        let nofollow = crate::traversal_ledger::O_NOFOLLOW_FLAG;
+        if nofollow == 0 {
+            return Err(test_source_error(
+                path,
+                "non-symlink source reads are unsupported",
+            ));
+        }
+        let nonblocking = if cfg!(target_os = "macos") {
+            0x4
+        } else {
+            0o4000
+        };
+        options.custom_flags(nofollow | nonblocking);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x00200000;
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    let mut file = options.open(path).map_err(|e| test_source_error(path, e))?;
+    let opened = file.metadata().map_err(|e| test_source_error(path, e))?;
+    let canonical = fs::canonicalize(path).map_err(|e| test_source_error(path, e))?;
+    let named = fs::symlink_metadata(path).map_err(|e| test_source_error(path, e))?;
+    if canonical != path || !opened.is_file() || !named.is_file() || opened.len() != before.len() {
+        return Err(test_source_error(path, "source changed while opening"));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let opened_identity = (opened.dev(), opened.ino());
+        if opened_identity != (before.dev(), before.ino())
+            || opened_identity != (named.dev(), named.ino())
+            || opened.nlink() != 1
+        {
+            return Err(test_source_error(
+                path,
+                "source identity is shared or changed while opening",
+            ));
+        }
+    }
+    let mut source = String::new();
+    (&mut file)
+        .take(bound + 1)
+        .read_to_string(&mut source)
+        .map_err(|e| test_source_error(path, e))?;
+    if source.len() > limit {
+        return Err(size_error());
+    }
+    if source.len() as u64 != opened.len() {
+        return Err(test_source_error(path, "source changed while reading"));
+    }
+    Ok(source)
 }
 
 /// Deterministic fault-isolation solver (`F27`).
@@ -1455,7 +1607,96 @@ fn parse_toml_str_array(raw: &str) -> Result<Vec<String>, String> {
 
 #[cfg(test)]
 mod source_declaration_tests {
-    use super::{TestSourceLanguage, test_declarations};
+    use super::{MAX_TEST_SOURCE_BYTES, TestSourceLanguage, TestSourceScan, test_declarations};
+    use std::fs;
+    use std::path::PathBuf;
+
+    struct ScanFixture(PathBuf);
+
+    impl ScanFixture {
+        fn new(prefix: &str) -> Self {
+            let repo = std::env::current_dir()
+                .expect("test cwd")
+                .join(format!("live-test-scan-{prefix}-{}", std::process::id()));
+            fs::create_dir(&repo).expect("new scan fixture");
+            let fixture = Self(repo);
+            fs::create_dir(fixture.0.join("tests")).expect("tests directory");
+            fixture
+        }
+    }
+
+    impl Drop for ScanFixture {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn scanner_visits_supported_sources_only_in_allowed_directories() {
+        let fixture = ScanFixture::new("paths");
+        let tests = fixture.0.join("tests");
+        for dir in ["vendor", ".cache", "node_modules", "integration"] {
+            let path = tests.join(dir);
+            fs::create_dir(&path).expect("fixture subdirectory");
+            fs::write(path.join("example.rs"), "const COUNT: usize = 3;\n")
+                .expect("fixture source");
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+            let fixture_dir = fixture.0.join("other");
+            fs::create_dir(&fixture_dir).expect("non-test directory");
+            fs::write(fixture_dir.join("outside.rs"), "").expect("fixture source");
+            symlink(fixture_dir, tests.join("alias")).expect("fixture directory alias");
+        }
+        let mut scan = TestSourceScan::new(&fixture.0, &tests);
+        let mut visited = Vec::new();
+        scan.walk(&tests, 0, &mut |path, _, _| {
+            visited.push(path.to_path_buf());
+            Ok(())
+        })
+        .expect("bounded in-scope scan");
+        assert_eq!(visited, [tests.join("integration/example.rs")]);
+    }
+
+    #[test]
+    fn scanner_enforces_entry_file_and_byte_budgets_before_visiting() {
+        let fixture = ScanFixture::new("limits");
+        let tests = fixture.0.join("tests");
+        for filename in ["one.rs", "two.rs"] {
+            fs::write(tests.join(filename), "1234").expect("fixture source");
+        }
+        for (entries, files, bytes) in [(1, 2, 8), (2, 1, 8), (2, 2, 4)] {
+            let mut scan = TestSourceScan {
+                entries_left: entries,
+                files_left: files,
+                bytes_left: bytes,
+                ..TestSourceScan::new(&fixture.0, &tests)
+            };
+            let mut visited = 0;
+            let error = scan
+                .walk(&tests, 0, &mut |_, _, _| {
+                    visited += 1;
+                    Ok(())
+                })
+                .expect_err("scan budget must fail closed");
+            assert!(error.starts_with("LIVE_TEST_SCAN_LIMIT"), "{error}");
+            assert_eq!(visited, 1);
+        }
+        let oversized = tests.join("oversized.rs");
+        fs::File::create(&oversized)
+            .expect("oversized source fixture")
+            .set_len(MAX_TEST_SOURCE_BYTES as u64 + 1)
+            .expect("oversized fixture length");
+        let mut scan = TestSourceScan::new(&fixture.0, &tests);
+        let error = scan
+            .walk(&tests, 0, &mut |path, _, _| {
+                assert_ne!(path, oversized);
+                Ok(())
+            })
+            .expect_err("per-file cap must fail closed");
+        assert!(error.starts_with("LIVE_TEST_SCAN_LIMIT"), "{error}");
+    }
 
     #[test]
     fn rust_requires_an_attributed_function_body() {
