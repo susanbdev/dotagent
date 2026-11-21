@@ -5,9 +5,11 @@
 
 use std::collections::BTreeMap;
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
+use agent_guard::budget_guard::MAX_PLUGIN_FILE_BYTES;
 use agent_guard::crypto::sha256_hex;
 use agent_guard::json::JsonValue;
 use agent_guard::unicode_guard::{ScanMode, scan_unicode};
@@ -286,6 +288,14 @@ fn ensure_no_symlink_components_under(root: &Path, target: &Path) -> Result<Path
 }
 
 fn read_contained_regular_file(base_dir: &Path, target: &Path) -> Result<String, String> {
+    read_contained_regular_file_with_limit(base_dir, target, None)
+}
+
+fn read_contained_regular_file_with_limit(
+    base_dir: &Path,
+    target: &Path,
+    max_bytes: Option<u64>,
+) -> Result<String, String> {
     let canon_base = ensure_no_symlink_components_under(base_dir, target)?;
     let meta = fs::symlink_metadata(target)
         .map_err(|e| format!("cannot stat '{}': {e}", target.display()))?;
@@ -304,7 +314,20 @@ fn read_contained_regular_file(base_dir: &Path, target: &Path) -> Result<String,
             canon_base.display()
         ));
     }
-    fs::read_to_string(&canon_file).map_err(|e| format!("cannot read '{}': {e}", target.display()))
+    let read_error = |e| format!("cannot read '{}': {e}", target.display());
+    let Some(max_bytes) = max_bytes else {
+        return fs::read_to_string(&canon_file).map_err(read_error);
+    };
+    let mut body = String::new();
+    fs::File::open(&canon_file)
+        .map_err(read_error)?
+        .take(max_bytes + 1)
+        .read_to_string(&mut body)
+        .map_err(read_error)?;
+    if body.len() as u64 > max_bytes {
+        return Err(format!("'{}' exceeds {max_bytes} bytes", target.display()));
+    }
+    Ok(body)
 }
 
 fn validate_and_lock_skills(repo_root: &Path) -> Result<(String, Vec<SkillIr>), String> {
@@ -483,24 +506,48 @@ fn validate_profiles(
     if dir_meta.file_type().is_symlink() || !dir_meta.file_type().is_dir() {
         return Err("profiles/ must be a regular non-symlink directory".to_string());
     }
-    if let Ok(entries) = fs::read_dir(&profiles_dir) {
-        for entry in entries.flatten() {
-            let p = entry.path();
-            let ft = entry
-                .file_type()
-                .map_err(|e| format!("cannot inspect '{}': {e}", p.display()))?;
-            if ft.is_symlink() || !ft.is_file() {
-                return Err(format!(
-                    "non-regular or symlinked entry '{}' inside profiles/ is forbidden",
-                    p.display()
-                ));
+    let entries = fs::read_dir(&profiles_dir)
+        .map_err(|e| format!("cannot read profiles dir '{}': {e}", profiles_dir.display()))?;
+    for entry_res in entries {
+        let entry = entry_res
+            .map_err(|e| format!("cannot read entry in '{}': {e}", profiles_dir.display()))?;
+        let p = entry.path();
+        let ft = entry
+            .file_type()
+            .map_err(|e| format!("cannot inspect '{}': {e}", p.display()))?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if ft.is_dir() && name == "plugins" && !ft.is_symlink() {
+            let plug_entries = fs::read_dir(&p)
+                .map_err(|e| format!("cannot read plugins dir '{}': {e}", p.display()))?;
+            for pe_res in plug_entries {
+                let pe =
+                    pe_res.map_err(|e| format!("cannot read entry in '{}': {e}", p.display()))?;
+                let pn = pe.file_name().to_string_lossy().into_owned();
+                let pft = pe
+                    .file_type()
+                    .map_err(|e| format!("cannot inspect '{}': {e}", pe.path().display()))?;
+                if pft.is_symlink()
+                    || !pft.is_file()
+                    || pn.starts_with('.')
+                    || !(pn.ends_with(".rego") || pn.ends_with(".toml"))
+                {
+                    return Err(format!(
+                        "forbidden or hidden entry 'profiles/plugins/{pn}' inside profiles/plugins/"
+                    ));
+                }
             }
-            let name = entry.file_name().to_string_lossy().into_owned();
-            if !REQUIRED_PROFILES.contains(&name.as_str()) {
-                return Err(format!(
-                    "unexpected untracked profile 'profiles/{name}' (must be declared in REQUIRED_PROFILES)"
-                ));
-            }
+            continue;
+        }
+        if ft.is_symlink() || !ft.is_file() {
+            return Err(format!(
+                "non-regular or symlinked entry '{}' inside profiles/ is forbidden",
+                p.display()
+            ));
+        }
+        if !REQUIRED_PROFILES.contains(&name.as_str()) {
+            return Err(format!(
+                "unexpected untracked profile 'profiles/{name}' (must be declared in REQUIRED_PROFILES)"
+            ));
         }
     }
 
@@ -561,8 +608,61 @@ fn validate_profiles(
             &toml_json.to_json_string(),
         )?;
         let ir = parse_profile_toml_to_ir(required, &text)?;
+        for (plug_name, exp_hex) in &ir.pinned_plugins {
+            let plug_dir = profiles_dir.join("plugins");
+            let plug_path = plug_dir.join(plug_name);
+            let plug_body = read_contained_regular_file_with_limit(
+                &plug_dir,
+                &plug_path,
+                Some(MAX_PLUGIN_FILE_BYTES),
+            )
+            .map_err(|e| {
+                format!(
+                    "profile '{required}' pins missing or invalid plugin 'profiles/plugins/{plug_name}': {e}"
+                )
+            })?;
+            if !plug_body.is_ascii() || plug_body.as_bytes().contains(&0) {
+                return Err(format!(
+                    "profile '{required}' plugin 'profiles/plugins/{plug_name}' must be 7-bit ASCII without NUL bytes"
+                ));
+            }
+            let actual_hex = sha256_hex(plug_body.as_bytes());
+            if actual_hex != *exp_hex {
+                return Err(format!(
+                    "profile '{required}' plugin 'profiles/plugins/{plug_name}' sha256 mismatch (expected {exp_hex}, got {actual_hex})"
+                ));
+            }
+            hashes.insert(format!("profiles/plugins/{plug_name}"), actual_hex);
+        }
         profile_irs.push(ir);
         hashes.insert(format!("profiles/{required}"), sha256_hex(text.as_bytes()));
+    }
+    let plug_dir = profiles_dir.join("plugins");
+    match fs::symlink_metadata(&plug_dir) {
+        Ok(pm) => {
+            if pm.file_type().is_symlink() || !pm.file_type().is_dir() {
+                return Err("profiles/plugins must be a regular non-symlink directory".to_string());
+            }
+            let plug_entries = fs::read_dir(&plug_dir)
+                .map_err(|e| format!("cannot read plugins dir '{}': {e}", plug_dir.display()))?;
+            for pe_res in plug_entries {
+                let pe = pe_res
+                    .map_err(|e| format!("cannot read entry in '{}': {e}", plug_dir.display()))?;
+                let pn = pe.file_name().to_string_lossy().into_owned();
+                if !hashes.contains_key(&format!("profiles/plugins/{pn}")) {
+                    return Err(format!(
+                        "unpinned plugin 'profiles/plugins/{pn}' must be SHA-256 pinned in profiles/*.toml"
+                    ));
+                }
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            return Err(format!(
+                "cannot stat plugins dir '{}': {e}",
+                plug_dir.display()
+            ));
+        }
     }
     Ok((hashes, profile_irs))
 }

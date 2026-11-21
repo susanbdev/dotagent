@@ -42,6 +42,7 @@ pub struct ProfileIr {
     pub max_direct_discovery_calls: u64,
     pub mcp_allowed_endpoint: String,
     pub ban_stdio_npx_servers: bool,
+    pub pinned_plugins: BTreeMap<String, String>,
 }
 
 impl ProfileIr {
@@ -199,21 +200,36 @@ pub struct PolicyBundleIr {
     pub compiler_version: String,
     pub profiles: Vec<ProfileIr>,
     pub skills: Vec<SkillIr>,
+    pub plugins: BTreeMap<String, String>,
 }
 
 impl PolicyBundleIr {
     pub fn new(profiles: Vec<ProfileIr>, skills: Vec<SkillIr>) -> Self {
+        Self::with_plugins(profiles, skills, BTreeMap::new())
+    }
+
+    pub fn with_plugins(
+        profiles: Vec<ProfileIr>,
+        skills: Vec<SkillIr>,
+        plugins: BTreeMap<String, String>,
+    ) -> Self {
         Self {
             schema: "dotagent.policy_ir.v2".to_string(),
             compiler_version: env!("CARGO_PKG_VERSION").to_string(),
             profiles,
             skills,
+            plugins,
         }
     }
 
     pub fn to_json_value(&self) -> JsonValue {
         let prof_arr: Vec<JsonValue> = self.profiles.iter().map(ProfileIr::to_json_value).collect();
         let skill_arr: Vec<JsonValue> = self.skills.iter().map(SkillIr::to_json_value).collect();
+        let plugin_obj: Vec<(String, JsonValue)> = self
+            .plugins
+            .iter()
+            .map(|(k, v)| (k.clone(), JsonValue::Str(v.clone())))
+            .collect();
         let mcp_rules: Vec<JsonValue> = MCP_CAPABILITY_MANIFEST
             .iter()
             .map(|r| {
@@ -239,6 +255,7 @@ impl PolicyBundleIr {
             ),
             ("profiles".to_string(), JsonValue::Array(prof_arr)),
             ("skills".to_string(), JsonValue::Array(skill_arr)),
+            ("plugins".to_string(), JsonValue::Object(plugin_obj)),
             (
                 "mcp_capability_manifest".to_string(),
                 JsonValue::Array(mcp_rules),
@@ -783,6 +800,37 @@ pub fn parse_profile_toml_to_ir(file_name: &str, raw_toml: &str) -> Result<Profi
         .and_then(JsonValue::as_bool)
         .unwrap_or(true);
 
+    let mut pinned_plugins = BTreeMap::new();
+    match ast.get("plugins") {
+        None => {}
+        Some(JsonValue::Object(entries)) => {
+            for (k, val) in entries {
+                let valid_name = !k.is_empty()
+                    && !k.starts_with('.')
+                    && !k.contains('/')
+                    && !k.contains('\\')
+                    && !k.contains("..")
+                    && (k.ends_with(".rego") || k.ends_with(".toml"));
+                let Some(hex) = val.as_str() else {
+                    return Err(format!(
+                        "profile '{file_name}' plugin '{k}' must map to a 64-hex SHA-256 string"
+                    ));
+                };
+                if !valid_name || hex.len() != 64 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+                    return Err(format!(
+                        "profile '{file_name}' has invalid plugin name or SHA-256 digest for '{k}'"
+                    ));
+                }
+                pinned_plugins.insert(k.clone(), hex.to_ascii_lowercase());
+            }
+        }
+        Some(_) => {
+            return Err(format!(
+                "profile '{file_name}' [plugins] must be a key-value table"
+            ));
+        }
+    }
+
     Ok(ProfileIr {
         file_name: file_name.to_string(),
         profile_id,
@@ -807,13 +855,28 @@ pub fn parse_profile_toml_to_ir(file_name: &str, raw_toml: &str) -> Result<Profi
         max_direct_discovery_calls,
         mcp_allowed_endpoint,
         ban_stdio_npx_servers,
+        pinned_plugins,
     })
 }
 
 /// Compiles all parsed `ProfileIr`s, `SkillIr`s, and the declarative `MCP_CAPABILITY_MANIFEST`
 /// into `dist/profiles/policy_ir.json`.
 pub fn compile_policy_bundle_ir_json(profiles: &[ProfileIr], skills: &[SkillIr]) -> String {
-    let bundle = PolicyBundleIr::new(profiles.to_vec(), skills.to_vec());
+    let mut merged = BTreeMap::new();
+    for p in profiles {
+        for (k, v) in &p.pinned_plugins {
+            merged.insert(k.clone(), v.clone());
+        }
+    }
+    compile_policy_bundle_ir_json_with_plugins(profiles, skills, &merged)
+}
+
+pub fn compile_policy_bundle_ir_json_with_plugins(
+    profiles: &[ProfileIr],
+    skills: &[SkillIr],
+    plugins: &BTreeMap<String, String>,
+) -> String {
+    let bundle = PolicyBundleIr::with_plugins(profiles.to_vec(), skills.to_vec(), plugins.clone());
     format!("{}\n", bundle.to_json_value().to_json_string())
 }
 
@@ -866,6 +929,10 @@ pub fn render_claude_settings_from_ir(coding: &ProfileIr) -> String {
         "Read(.github/copilot-instructions.md)",
         "Edit(AGENTS.md)",
         "Write(AGENTS.md)",
+        "Edit(.dotagent-smoke.toml)",
+        "Write(.dotagent-smoke.toml)",
+        "Edit(profiles/**)",
+        "Write(profiles/**)",
         "Edit(.claude/**)",
         "Write(.claude/**)",
         "Edit(.guard/**)",

@@ -136,6 +136,44 @@ pub fn constant_time_eq_bytes(a: &[u8], b: &[u8]) -> bool {
     std::hint::black_box(diff) == 0
 }
 
+/// Decodes RFC 4648 Base64 ignoring ASCII whitespace, capped at `max_b64_bytes`.
+pub fn base64_decode_clean(b64: &str, max_b64_bytes: usize) -> Result<Vec<u8>, &'static str> {
+    let clean: Vec<u8> = b64.bytes().filter(|b| !b.is_ascii_whitespace()).collect();
+    if clean.is_empty() || !clean.len().is_multiple_of(4) || clean.len() > max_b64_bytes {
+        return Err("invalid base64 length");
+    }
+    let val = |c: u8| match c {
+        b'A'..=b'Z' => Ok(c - b'A'),
+        b'a'..=b'z' => Ok(c - b'a' + 26),
+        b'0'..=b'9' => Ok(c - b'0' + 52),
+        b'+' => Ok(62),
+        b'/' => Ok(63),
+        _ => Err("invalid base64 character"),
+    };
+    let mut out = Vec::with_capacity((clean.len() / 4) * 3);
+    let (quads, _) = clean.as_chunks::<4>();
+    for (idx, ch) in quads.iter().enumerate() {
+        let pad = match (ch[0] == b'=', ch[1] == b'=', ch[2] == b'=', ch[3] == b'=') {
+            (false, false, false, false) => 0usize,
+            (false, false, false, true) if idx + 1 == quads.len() => 1usize,
+            (false, false, true, true) if idx + 1 == quads.len() => 2usize,
+            _ => return Err("invalid base64 padding"),
+        };
+        let (a, b) = (val(ch[0])?, val(ch[1])?);
+        let c = if pad == 2 { 0 } else { val(ch[2])? };
+        let d = if pad >= 1 { 0 } else { val(ch[3])? };
+        let t = (u32::from(a) << 18) | (u32::from(b) << 12) | (u32::from(c) << 6) | u32::from(d);
+        out.push(((t >> 16) & 0xff) as u8);
+        if pad < 2 {
+            out.push(((t >> 8) & 0xff) as u8);
+        }
+        if pad < 1 {
+            out.push((t & 0xff) as u8);
+        }
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{ZeroizingKey, constant_time_eq_bytes, hex_decode_32, sha256_hex, zeroize_slice};

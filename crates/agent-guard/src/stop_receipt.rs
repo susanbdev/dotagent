@@ -58,6 +58,7 @@ pub struct StopReceipt {
     pub head_commit_oid: String,
     pub work_tree_oid: String,
     pub bundle_manifest_sha256: String,
+    pub smoke_gate_digest: String,
     pub ledger: LedgerCleanSummary,
     pub issued_at_unix: u64,
     pub pubkey_ed25519_hex: String,
@@ -66,13 +67,14 @@ pub struct StopReceipt {
 
 impl StopReceipt {
     pub fn canonical_signing_bytes(&self) -> Vec<u8> {
-        let mut buf = Vec::with_capacity(384);
+        let mut buf = Vec::with_capacity(448);
         push_lp_bytes(&mut buf, STOP_RECEIPT_DOMAIN);
         push_lp_str(&mut buf, &self.schema);
         push_lp_str(&mut buf, &self.repo_id);
         push_lp_str(&mut buf, &self.head_commit_oid);
         push_lp_str(&mut buf, &self.work_tree_oid);
         push_lp_str(&mut buf, &self.bundle_manifest_sha256);
+        push_lp_str(&mut buf, &self.smoke_gate_digest);
         push_lp_str(&mut buf, &self.ledger.session_id);
         buf.push(u8::from(self.ledger.halted));
         buf.push(u8::from(self.ledger.tainted));
@@ -100,6 +102,10 @@ impl StopReceipt {
             (
                 "bundle_manifest_sha256".to_string(),
                 JsonValue::Str(self.bundle_manifest_sha256.clone()),
+            ),
+            (
+                "smoke_gate_digest".to_string(),
+                JsonValue::Str(self.smoke_gate_digest.clone()),
             ),
             (
                 "ledger_clean_summary".to_string(),
@@ -183,6 +189,7 @@ impl StopReceipt {
             head_commit_oid: req_str(&v, "head_commit_oid")?,
             work_tree_oid: req_str(&v, "work_tree_oid")?,
             bundle_manifest_sha256: req_str(&v, "bundle_manifest_sha256")?,
+            smoke_gate_digest: req_str(&v, "smoke_gate_digest")?,
             ledger: LedgerCleanSummary {
                 session_id: req_str(summary, "session_id")?,
                 halted: req_bool(summary, "halted")?,
@@ -455,7 +462,7 @@ fn normalize_remote_origin_for_repo_id(raw_url: &str) -> Option<String> {
     None
 }
 
-fn derive_portable_repo_id(canon_repo: &Path) -> String {
+pub(crate) fn derive_portable_repo_id(canon_repo: &Path) -> String {
     if let Ok(explicit) = std::env::var("DOTAGENT_REPO_ID") {
         let t = explicit.trim();
         if !t.is_empty() {
@@ -512,6 +519,213 @@ fn parse_porcelain_v1_z_paths(porcelain_z: &[u8]) -> Vec<String> {
     paths.sort();
     paths.dedup();
     paths
+}
+
+pub(crate) fn clean_smoke_rel_nonsymlink(
+    canon_repo: &Path,
+    rel: &str,
+) -> Result<(PathBuf, String), String> {
+    use std::path::Component;
+    let trimmed = rel.trim().trim_start_matches("./");
+    if trimmed.is_empty() || Path::new(trimmed).is_absolute() {
+        return Err(format!("SMOKE_ARTIFACT_MISSING: invalid path '{rel}'"));
+    }
+    let (mut cur, mut norm) = (canon_repo.to_path_buf(), Vec::new());
+    for comp in Path::new(trimmed).components() {
+        match comp {
+            Component::CurDir => {}
+            Component::Normal(seg) => {
+                let s = seg.to_string_lossy().into_owned();
+                cur.push(&s);
+                if fs::symlink_metadata(&cur).is_ok_and(|m| m.file_type().is_symlink()) {
+                    return Err(format!("SMOKE_ARTIFACT_MISSING: symlink '{rel}'"));
+                }
+                norm.push(s);
+            }
+            _ => return Err(format!("SMOKE_ARTIFACT_MISSING: traversal '{rel}'")),
+        }
+    }
+    Ok((cur, norm.join("/")))
+}
+
+pub(crate) fn verify_smoke_artifact(
+    canon: &Path,
+    rel: &str,
+    hint: &str,
+    out: &mut std::collections::BTreeMap<String, String>,
+    mut contents: impl Write,
+) -> Result<(), String> {
+    const MAX_ARTIFACT_BYTES: u64 = 268_435_456;
+    let (full, norm) = clean_smoke_rel_nonsymlink(canon, rel)?;
+    let io_error = |e| format!("SMOKE_ARTIFACT_MISSING: '{norm}' ({hint}): {e}");
+    let meta = fs::symlink_metadata(&full)
+        .map_err(|_| format!("SMOKE_ARTIFACT_MISSING: '{norm}' ({hint}) missing"))?;
+    if !meta.is_file() || !(1..=MAX_ARTIFACT_BYTES).contains(&meta.len()) {
+        return Err(format!(
+            "SMOKE_ARTIFACT_MISSING: '{norm}' ({hint}) empty, oversized, or non-regular"
+        ));
+    }
+    let mut file = open_smoke_artifact_nofollow(&full).map_err(io_error)?;
+    let opened = file.metadata().map_err(io_error)?;
+    if !opened.is_file() || !same_smoke_artifact(&meta, &opened) {
+        return Err(format!(
+            "SMOKE_ARTIFACT_MISSING: '{norm}' ({hint}) changed while opening"
+        ));
+    }
+    let mut reader = (&mut file).take(opened.len() + 1);
+    let mut head = Vec::with_capacity(8);
+    let mut hasher = Sha256::new();
+    let mut buf = [0u8; 65_536];
+    loop {
+        let n = reader.read(&mut buf).map_err(io_error)?;
+        if n == 0 {
+            break;
+        }
+        if head.len() < 8 {
+            let take = (8 - head.len()).min(n);
+            head.extend_from_slice(&buf[..take]);
+        }
+        hasher.update(&buf[..n]);
+        contents.write_all(&buf[..n]).map_err(io_error)?;
+    }
+    if reader.limit() != 1 || !same_smoke_artifact(&opened, &file.metadata().map_err(io_error)?) {
+        return Err(format!(
+            "SMOKE_ARTIFACT_MISSING: '{norm}' ({hint}) changed while reading"
+        ));
+    }
+    if norm.ends_with(".wasm") && head.as_slice() != b"\0asm\x01\0\0\0" {
+        return Err(format!(
+            "SMOKE_WASM_MAGIC_INVALID: '{norm}' lacks valid Wasm v1 magic"
+        ));
+    }
+    out.insert(norm, crate::crypto::hex_encode(&hasher.finalize()));
+    Ok(())
+}
+
+#[cfg(unix)]
+fn open_smoke_artifact_nofollow(path: &Path) -> std::io::Result<File> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let nofollow = crate::traversal_ledger::O_NOFOLLOW_FLAG;
+    if nofollow == 0 {
+        return Err(std::io::ErrorKind::Unsupported.into());
+    }
+    // A replacement FIFO must not block the open before the descriptor can be checked.
+    let nonblock = if cfg!(target_os = "macos") {
+        0x4
+    } else {
+        0o4000
+    };
+    fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(nofollow | nonblock)
+        .open(path)
+}
+
+#[cfg(not(unix))]
+fn open_smoke_artifact_nofollow(_path: &Path) -> std::io::Result<File> {
+    Err(std::io::ErrorKind::Unsupported.into())
+}
+
+#[cfg(unix)]
+fn same_smoke_artifact(before: &fs::Metadata, after: &fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+
+    before.dev() == after.dev()
+        && before.ino() == after.ino()
+        && before.size() == after.size()
+        && before.mtime() == after.mtime()
+        && before.mtime_nsec() == after.mtime_nsec()
+        && before.ctime() == after.ctime()
+        && before.ctime_nsec() == after.ctime_nsec()
+}
+
+#[cfg(not(unix))]
+fn same_smoke_artifact(_before: &fs::Metadata, _after: &fs::Metadata) -> bool {
+    false
+}
+
+pub(crate) fn recent_or_dirty_repo_paths(canon_repo: &Path) -> Result<Vec<String>, String> {
+    let mut set = std::collections::BTreeSet::new();
+    if canon_repo.join(".git").exists() {
+        let raw = run_git_capture_raw(canon_repo, &["status", "--porcelain=v1", "-z", "-uall"])
+            .ok_or_else(|| "SMOKE_CONFIG_INVALID: git status failed".to_string())?;
+        for p in parse_porcelain_v1_z_paths(&raw) {
+            set.insert(p);
+        }
+        if let Some(head_raw) = run_git_capture_raw(
+            canon_repo,
+            &[
+                "diff-tree",
+                "--root",
+                "--no-commit-id",
+                "--name-only",
+                "-z",
+                "-r",
+                "HEAD",
+            ],
+        ) {
+            for entry in head_raw.split(|&b| b == 0).filter(|s| !s.is_empty()) {
+                set.insert(String::from_utf8_lossy(entry).into_owned());
+            }
+        }
+    }
+    Ok(set.into_iter().collect())
+}
+
+pub(crate) fn strip_code_comments_preserve_lines(src: &str, allow_hash: bool) -> String {
+    let bytes = src.as_bytes();
+    let mut out = String::with_capacity(src.len());
+    let (mut i, mut in_str, mut str_delim, mut in_block) = (0usize, false, b'"', false);
+    while i < bytes.len() {
+        let b = bytes[i];
+        if in_block {
+            if b == b'\n' {
+                out.push('\n');
+                i += 1;
+            } else if b == b'*' && bytes.get(i + 1) == Some(&b'/') {
+                in_block = false;
+                i += 2;
+            } else {
+                i += 1;
+            }
+            continue;
+        }
+        if in_str {
+            out.push(b as char);
+            if b == b'\\' && i + 1 < bytes.len() {
+                out.push(bytes[i + 1] as char);
+                i += 2;
+                continue;
+            }
+            if b == str_delim {
+                in_str = false;
+            }
+            i += 1;
+            continue;
+        }
+        if b == b'"' || b == b'\'' {
+            in_str = true;
+            str_delim = b;
+            out.push(b as char);
+            i += 1;
+            continue;
+        }
+        if b == b'/' && bytes.get(i + 1) == Some(&b'*') {
+            in_block = true;
+            i += 2;
+            continue;
+        }
+        if (b == b'/' && bytes.get(i + 1) == Some(&b'/')) || (allow_hash && b == b'#') {
+            while i < bytes.len() && bytes[i] != b'\n' {
+                i += 1;
+            }
+            continue;
+        }
+        out.push(b as char);
+        i += 1;
+    }
+    out
 }
 
 /// Computes canonical `(repo_id, head_commit_oid, work_tree_oid, bundle_manifest_sha256)`
@@ -656,6 +870,7 @@ pub fn issue_verified_stop_receipt(
     }
 
     let epoch_id = crate::coordinator::current_hmac_epoch_id(&canon).unwrap_or(1);
+    let smoke = crate::smoke_gate::verify_repo_smoke_gate(&canon)?;
     let (repo_id, head_commit_oid, work_tree_oid, bundle_manifest_sha256) =
         snapshot_repo_attestation_digests(&canon)?;
 
@@ -673,6 +888,7 @@ pub fn issue_verified_stop_receipt(
         head_commit_oid,
         work_tree_oid,
         bundle_manifest_sha256,
+        smoke_gate_digest: smoke.smoke_gate_digest,
         ledger: LedgerCleanSummary {
             session_id: sid,
             halted: ledger.halted,
@@ -885,6 +1101,21 @@ pub fn run_verify_receipt_cli(args: &[String], cwd: &Path) -> ExitCode {
         }
     }
 
+    match crate::smoke_gate::verify_repo_smoke_gate(&target_repo) {
+        Ok(live_smoke) if receipt.smoke_gate_digest == live_smoke.smoke_gate_digest => {}
+        Ok(live_smoke) => {
+            eprintln!(
+                "[AGENT-GUARD RECEIPT FAIL] RECEIPT_SMOKE_GATE_DRIFT: receipt smoke_gate_digest '{}' != live '{}'",
+                receipt.smoke_gate_digest, live_smoke.smoke_gate_digest
+            );
+            return ExitCode::from(2);
+        }
+        Err(e) => {
+            eprintln!("[AGENT-GUARD RECEIPT FAIL] {e}");
+            return ExitCode::from(2);
+        }
+    }
+
     println!(
         "[AGENT-GUARD RECEIPT VERIFIED] repo_id={} head={} tree={} epoch={} pubkey={}",
         receipt.repo_id,
@@ -950,6 +1181,7 @@ mod tests {
             head_commit_oid: "88e93a5".to_string(),
             work_tree_oid: "tree1234".to_string(),
             bundle_manifest_sha256: "bundle5678".to_string(),
+            smoke_gate_digest: "smoke9abc".to_string(),
             ledger: LedgerCleanSummary {
                 session_id: "default".to_string(),
                 halted: false,
@@ -970,10 +1202,14 @@ mod tests {
         let parsed = StopReceipt::from_json_str(&serialized).expect("valid JSON");
         assert!(parsed.verify_signature(&pub_hex).is_ok());
 
-        // Tamper with work_tree_oid -> must fail Ed25519 verification
+        // Tamper with work_tree_oid or smoke_gate_digest -> must fail Ed25519 verification
         let mut tampered = parsed.clone();
         tampered.work_tree_oid = "tree_forged".to_string();
         assert!(tampered.verify_signature(&pub_hex).is_err());
+
+        let mut tampered_smoke = parsed.clone();
+        tampered_smoke.smoke_gate_digest = "smoke_forged".to_string();
+        assert!(tampered_smoke.verify_signature(&pub_hex).is_err());
 
         // Wrong pinned pubkey -> must fail
         let wrong_sk = SigningKey::from_bytes(&[0x99u8; 32]);

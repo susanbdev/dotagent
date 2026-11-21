@@ -893,6 +893,85 @@ fn check_single_command(
         return Ok(());
     }
 
+    if matches!(bin, "swarm-tool" | "agent-guard" | "dotagent" | "git") {
+        let raw_bin = cmd.argv.first().map(String::as_str).unwrap_or("");
+        let canonical_root =
+            std::fs::canonicalize(repo_root).unwrap_or_else(|_| repo_root.to_path_buf());
+        if raw_bin.contains('/') || raw_bin.contains('\\') {
+            let p = Path::new(raw_bin);
+            let canonical_bin = std::fs::canonicalize(p).ok();
+            let untrusted = !p.is_absolute()
+                || raw_bin.contains('\\') && cfg!(not(windows))
+                || raw_bin.contains("..")
+                || p.starts_with(repo_root)
+                || p.starts_with(cwd)
+                || canonical_bin
+                    .as_ref()
+                    .is_some_and(|c| c.starts_with(&canonical_root));
+            if untrusted {
+                return Err(CommandViolation {
+                    code: "SELF_TAMPERING_BLOCKED",
+                    detail: format!(
+                        "Relative or workspace-local binary path `{raw_bin}` is forbidden for `{bin}`; invoke the installed system/user binary."
+                    ),
+                    halt_session: true,
+                });
+            }
+        } else {
+            if cmd
+                .env_vars
+                .iter()
+                .any(|(k, _)| k.eq_ignore_ascii_case("PATH"))
+            {
+                return Err(CommandViolation {
+                    code: "SELF_TAMPERING_BLOCKED",
+                    detail: format!("Overriding `PATH` for `{bin}` is forbidden."),
+                    halt_session: true,
+                });
+            }
+            if let Some(os_path) = std::env::var_os("PATH") {
+                for dir in std::env::split_paths(&os_path) {
+                    let is_rel = dir.as_os_str().is_empty() || !dir.is_absolute();
+                    let abs_dir = if is_rel { cwd.join(&dir) } else { dir.clone() };
+                    let in_ws = is_rel
+                        || abs_dir.starts_with(repo_root)
+                        || abs_dir.starts_with(cwd)
+                        || std::fs::canonicalize(&abs_dir)
+                            .is_ok_and(|c| c.starts_with(&canonical_root));
+                    let cand = abs_dir.join(bin);
+                    let cand_exe = abs_dir.join(format!("{bin}.exe"));
+                    let hit = if std::fs::symlink_metadata(&cand).is_ok() {
+                        Some(cand)
+                    } else if std::fs::symlink_metadata(&cand_exe).is_ok() {
+                        Some(cand_exe)
+                    } else {
+                        None
+                    };
+                    if let Some(found) = hit {
+                        let canon_found = std::fs::canonicalize(&found).ok();
+                        if in_ws
+                            || canon_found.as_ref().is_none_or(|c| {
+                                c.starts_with(&canonical_root)
+                                    || !crate::coordinator::is_trusted_executable_file(c)
+                            })
+                            || !crate::coordinator::has_trusted_executable_ancestors(&found)
+                        {
+                            return Err(CommandViolation {
+                                code: "SELF_TAMPERING_BLOCKED",
+                                detail: format!(
+                                    "Workspace-local, relative, or untrusted `PATH` binary `{}` is forbidden for `{bin}`.",
+                                    found.display()
+                                ),
+                                halt_session: true,
+                            });
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
     if bin == "swarm-tool"
         && args.iter().any(|a| {
             a == "--internal-exec-sandbox"
@@ -976,12 +1055,13 @@ fn check_single_command(
                     });
                 }
                 let raw_bin = cmd.argv.first().map(String::as_str).unwrap_or("");
-                if raw_bin.contains('/') {
+                let canonical_root =
+                    std::fs::canonicalize(repo_root).unwrap_or_else(|_| repo_root.to_path_buf());
+                if raw_bin.contains('/') || raw_bin.contains('\\') {
                     let p = Path::new(raw_bin);
-                    let canonical_root = std::fs::canonicalize(repo_root)
-                        .unwrap_or_else(|_| repo_root.to_path_buf());
                     let canonical_bin = std::fs::canonicalize(p).ok();
                     let untrusted = !p.is_absolute()
+                        || raw_bin.contains('\\') && cfg!(not(windows))
                         || raw_bin.contains("..")
                         || p.starts_with(repo_root)
                         || p.starts_with(cwd)
@@ -997,6 +1077,30 @@ fn check_single_command(
                             ),
                             halt_session: true,
                         });
+                    }
+                } else if let Some(os_path) = std::env::var_os("PATH") {
+                    for dir in std::env::split_paths(&os_path) {
+                        if dir.as_os_str().is_empty() || !dir.is_absolute() {
+                            continue;
+                        }
+                        let cand = dir.join(bin);
+                        if std::fs::symlink_metadata(&cand).is_ok() {
+                            let ok = std::fs::canonicalize(&cand).is_ok_and(|c| {
+                                !c.starts_with(&canonical_root)
+                                    && crate::coordinator::is_trusted_executable_file(&c)
+                            });
+                            if !ok {
+                                return Err(CommandViolation {
+                                    code: "SELF_TAMPERING_BLOCKED",
+                                    detail: format!(
+                                        "Resolved `PATH` binary `{}` for `dotagent feedback` is untrusted or writable.",
+                                        cand.display()
+                                    ),
+                                    halt_session: true,
+                                });
+                            }
+                            break;
+                        }
                     }
                 }
                 if !cmd.env_vars.is_empty() {
@@ -1145,6 +1249,18 @@ fn check_single_command(
                             halt_session: pv.is_poisoned_zone,
                         }
                     })?;
+                }
+                return Ok(());
+            }
+            if sub == "feedback" {
+                if sub_args.get(1).map(String::as_str) != Some("submit") || !cmd.redirs.is_empty() {
+                    return Err(CommandViolation {
+                        code: "SELF_TAMPERING_BLOCKED",
+                        detail:
+                            "Agents may only invoke `dotagent feedback submit` without shell redirections; `status`, `export`, and `triage` are human-operator-only."
+                                .to_string(),
+                        halt_session: true,
+                    });
                 }
                 return Ok(());
             }
@@ -4746,7 +4862,8 @@ fn maybe_rewrite_top_level_find(_raw_script: &str, commands: &[ParsedCommand]) -
 }
 
 fn basename(s: &str) -> &str {
-    s.rsplit('/').next().unwrap_or(s)
+    let leaf = s.rsplit(['/', '\\']).next().unwrap_or(s);
+    leaf.strip_suffix(".exe").unwrap_or(leaf)
 }
 
 fn strip_leading_flags(args: &[String]) -> &[String] {

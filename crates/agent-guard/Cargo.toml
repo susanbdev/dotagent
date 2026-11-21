@@ -26,6 +26,7 @@ path = "src/bin/agent-guard-sh.rs"
 crc32fast = "1.4"
 ed25519-dalek = { version = "2.1", default-features = false, features = ["fast", "std", "zeroize"] }
 hmac = "0.12"
+regorus = { version = "0.10", default-features = false, features = ["std", "arc"] }
 sha2 = "0.10"
 
 [target.'cfg(target_os = "linux")'.dependencies]

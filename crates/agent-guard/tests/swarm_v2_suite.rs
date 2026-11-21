@@ -1194,3 +1194,138 @@ fn investigator_blocks_raw_search_and_shell_wandering_while_allowing_scout_and_r
         "bounded Read tool must remain allowed for Investigator slice verification"
     );
 }
+
+#[test]
+fn concurrent_threads_and_processes_preserve_spool_and_ordered_trail_under_contention() {
+    if let Ok(child_spec) = std::env::var("SWARM_CONTENTION_CHILD") {
+        let mut parts = child_spec.splitn(3, '|');
+        let proc_idx: u8 = parts.next().unwrap().parse().unwrap();
+        let sid = parts.next().unwrap().to_string();
+        let repo = PathBuf::from(parts.next().unwrap());
+        for iter in 0..10u8 {
+            append_breadcrumb_for_path(
+                &repo,
+                &sid,
+                "TASK-CONTEND",
+                [0x55; 32],
+                EventOp::FileEdit,
+                "src/b.rs",
+                Some((1, 1)),
+                [0x80u8
+                    .wrapping_add(proc_idx.wrapping_mul(16))
+                    .wrapping_add(iter); 32],
+            )
+            .expect("child process concurrent append_breadcrumb_for_path");
+        }
+        return;
+    }
+
+    let (repo, _) = isolated_sandbox("pr17_contention_stress");
+    fs::create_dir_all(repo.join("src")).unwrap();
+    fs::write(repo.join("src/b.rs"), "pub fn b() -> u32 { 2 }\n").unwrap();
+
+    let dag = r#"{
+      "plan_id": "PR17-CONTENTION",
+      "tasks": [{
+        "id": "TASK-CONTEND",
+        "wave": "W1",
+        "depends_on": [],
+        "domain_risk": "core_logic",
+        "assigned_read_paths": ["src/b.rs"],
+        "allowed_write_paths": ["src/b.rs"],
+        "assigned_tests": []
+      }]
+    }"#;
+    let plan = parse_and_validate_dag_json(dag).unwrap();
+    save_locked_plan(&repo, &plan, false).unwrap();
+    let cap = mint_session_capability(&repo, SwarmRole::Grunt, "TASK-CONTEND", 1).unwrap();
+
+    let exe = std::env::current_exe().expect("current test binary");
+    let mut children = Vec::new();
+    for p_idx in 0..4u8 {
+        let spec = format!("{}|{}|{}", p_idx, cap.session_id, repo.display());
+        let child = Command::new(&exe)
+            .args([
+                "--exact",
+                "concurrent_threads_and_processes_preserve_spool_and_ordered_trail_under_contention",
+                "--nocapture",
+            ])
+            .env("SWARM_CONTENTION_CHILD", spec)
+            .spawn()
+            .expect("spawn contention child process");
+        children.push(child);
+    }
+
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(16));
+    let mut threads = Vec::new();
+    for t_idx in 0..16u8 {
+        let repo_c = repo.clone();
+        let sid_c = cap.session_id.clone();
+        let bar_c = std::sync::Arc::clone(&barrier);
+        threads.push(std::thread::spawn(move || {
+            bar_c.wait();
+            for iter in 0..10u8 {
+                append_breadcrumb_for_path(
+                    &repo_c,
+                    &sid_c,
+                    "TASK-CONTEND",
+                    [0x55; 32],
+                    EventOp::FileEdit,
+                    "src/b.rs",
+                    Some((1, 1)),
+                    [t_idx.wrapping_mul(11).wrapping_add(iter); 32],
+                )
+                .expect("in-process concurrent append_breadcrumb_for_path");
+            }
+        }));
+    }
+
+    let thread_outcomes: Vec<_> = threads.into_iter().map(|th| th.join()).collect();
+    let child_statuses: Vec<_> = children.into_iter().map(|mut ch| ch.wait()).collect();
+    for res in thread_outcomes {
+        res.expect("join contention thread");
+    }
+    for st_res in child_statuses {
+        let st = st_res.expect("wait contention child");
+        assert!(st.success(), "contention child failed: {st}");
+    }
+
+    // 1. Spool has 1 SessionMint + 200 concurrent FileEdits = 201 contiguous MAC-valid frames
+    let spool_report = recover_spool_frames(&spool_file_path(&repo, &cap.session_id).unwrap())
+        .expect("recover contended spool");
+    assert_eq!(spool_report.quarantined_tail_bytes, 0);
+    assert_eq!(spool_report.valid_records.len(), 201);
+    let mut prev_mac = [0u8; 32];
+    for (idx, rec) in spool_report.valid_records.iter().enumerate() {
+        assert_eq!(rec.event.seq_no, (idx as u64) + 1);
+        assert_eq!(rec.event.prev_event_mac, prev_mac);
+        agent_guard::breadcrumbs::verify_event_mac_for_repo(&repo, &rec.event, &rec.record_mac)
+            .expect("valid event MAC");
+        prev_mac = rec.record_mac;
+    }
+
+    // 2. Trail projection is strictly ordered (seq_no 2..=201) and passes verify_breadcrumbs_file
+    let trail_path = repo.join("src/.breadcrumbs.jsonl");
+    let verified_count = verify_breadcrumbs_file(&repo, &trail_path)
+        .expect("verify_breadcrumbs_file on contended trail");
+    assert_eq!(verified_count, 200);
+    let trail_lines: Vec<SignedBreadcrumbRecord> = fs::read_to_string(&trail_path)
+        .unwrap()
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| SignedBreadcrumbRecord::from_json_line(l).unwrap())
+        .collect();
+    assert_eq!(trail_lines.len(), 200);
+    for (idx, rec) in trail_lines.iter().enumerate() {
+        assert_eq!(rec.event.seq_no, (idx as u64) + 2);
+    }
+
+    // 3. Local repo .git/info/exclude was populated directly without leaking to parent repo
+    let exclude_raw = fs::read_to_string(repo.join(".git/info/exclude"))
+        .expect("local .git/info/exclude must exist");
+    assert!(
+        exclude_raw
+            .lines()
+            .any(|l| l.trim() == ".breadcrumbs.jsonl")
+    );
+}

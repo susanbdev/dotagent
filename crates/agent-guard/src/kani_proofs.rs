@@ -113,11 +113,37 @@ mod proofs {
         );
         assert!(scan_shell_brace_and_quote_bytes(b"${a}").is_ok());
     }
+
+    #[kani::proof]
+    fn proof_plugin_lattice_monotonicity() {
+        use crate::plugin_lattice::{VerdictLevel, combine_verdicts};
+        let Some(ring0) = VerdictLevel::from_u8(kani::any()) else {
+            return;
+        };
+        let Some(p1) = VerdictLevel::from_u8(kani::any()) else {
+            return;
+        };
+        let Some(p2) = VerdictLevel::from_u8(kani::any()) else {
+            return;
+        };
+        let Some(p3) = VerdictLevel::from_u8(kani::any()) else {
+            return;
+        };
+        let Some(p4) = VerdictLevel::from_u8(kani::any()) else {
+            return;
+        };
+        let combined = combine_verdicts(ring0, &[p1, p2, p3, p4]);
+        assert!(combined >= ring0);
+        if ring0 >= VerdictLevel::Deny {
+            assert!(combined >= VerdictLevel::Deny);
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::plugin_lattice::{VerdictLevel, combine_verdicts};
 
     #[test]
     fn verifies_formal_postconditions_across_adversarial_byte_boundaries() {
@@ -143,6 +169,32 @@ mod tests {
             "((1+1)); $(true)",
         ] {
             assert!(check_cmd_policy_no_panic(cmd));
+        }
+    }
+
+    #[test]
+    fn verifies_plugin_lattice_monotonicity_across_all_7776_five_tuples() {
+        for r0_u in 0u8..=5 {
+            let ring0 = VerdictLevel::from_u8(r0_u).expect("level");
+            for a in 0u8..=5 {
+                for b in 0u8..=5 {
+                    for c in 0u8..=5 {
+                        for d in 0u8..=5 {
+                            let ps = [
+                                VerdictLevel::from_u8(a).expect("a"),
+                                VerdictLevel::from_u8(b).expect("b"),
+                                VerdictLevel::from_u8(c).expect("c"),
+                                VerdictLevel::from_u8(d).expect("d"),
+                            ];
+                            let out = combine_verdicts(ring0, &ps);
+                            assert!(out >= ring0);
+                            if ring0 >= VerdictLevel::Deny {
+                                assert!(out >= VerdictLevel::Deny);
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 }

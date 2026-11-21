@@ -62,6 +62,7 @@ struct DoctorCheck {
 
 pub fn run_doctor_cli(args: &[String], cwd: &Path) -> ExitCode {
     let json_mode = args.iter().any(|a| a == "--json");
+    let allow_degraded = args.iter().any(|a| a == "--allow-degraded");
     let target_dir = args
         .iter()
         .find(|a| !a.starts_with('-'))
@@ -77,11 +78,12 @@ pub fn run_doctor_cli(args: &[String], cwd: &Path) -> ExitCode {
     let sbx_mode = probe_host_sandbox_mode();
     checks.push(DoctorCheck {
         name: "kernel_sandbox",
-        ok: true,
+        ok: sbx_mode.is_kernel_enforced() || allow_degraded,
         detail: format!(
-            "mode={} kernel_enforced={} (use --require-kernel in CI/production to mandate kernel VFS isolation)",
+            "mode={} kernel_enforced={} allow_degraded={} (pass --allow-degraded to permit non-kernel environments)",
             sbx_mode.as_str(),
-            sbx_mode.is_kernel_enforced()
+            sbx_mode.is_kernel_enforced(),
+            allow_degraded
         ),
     });
 
@@ -312,7 +314,210 @@ fn check_session_state_health(repo_root: &Path) -> DoctorCheck {
     }
 }
 
-/// Interactive human-TTY-gated circuit breaker reset (`dotagent session-reset [--session <id>] [--all]`).
+fn consume_sshsig_once(pem: &str) -> Result<(), crate::sshsig_touch::GuardError> {
+    use crate::breadcrumbs::ExclusiveFileLockGuard;
+    use crate::sshsig_touch::GuardError;
+    use std::io::Write as _;
+    let (_, rest) = pem
+        .split_once("-----BEGIN SSH SIGNATURE-----")
+        .ok_or_else(|| GuardError::new("SSHSIG_MALFORMED", "missing BEGIN SSH SIGNATURE"))?;
+    let (body_b64, _) = rest
+        .split_once("-----END SSH SIGNATURE-----")
+        .ok_or_else(|| GuardError::new("SSHSIG_MALFORMED", "missing END SSH SIGNATURE"))?;
+    let wire_bytes = crate::crypto::base64_decode_clean(body_b64, 16_384)
+        .map_err(|m| GuardError::new("SSHSIG_MALFORMED", m))?;
+    let digest = crate::crypto::sha256_hex(&wire_bytes);
+    let dir = crate::feedback::feedback_state_dir().map_err(|e| GuardError::new("SSHSIG_IO", e))?;
+    let _lock = ExclusiveFileLockGuard::acquire(&dir.join("consumed_sshsig.lock"))
+        .map_err(|e| GuardError::new("SSHSIG_IO", e))?;
+    let log_path = dir.join("consumed_sshsig.log");
+    let pre_meta = match fs::symlink_metadata(&log_path) {
+        Ok(m) => {
+            if m.file_type().is_symlink() || !m.file_type().is_file() {
+                return Err(GuardError::new(
+                    "SSHSIG_SYMLINK_TAMPER",
+                    "consumed_sshsig.log is symlink or non-regular file",
+                ));
+            }
+            Some(m)
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => return Err(GuardError::new("SSHSIG_IO", e.to_string())),
+    };
+    let existing = crate::traversal_ledger::read_nonsymlink_state_file(&log_path)
+        .map_err(|e| GuardError::new("SSHSIG_SYMLINK_TAMPER", e))?
+        .unwrap_or_default();
+    if existing.lines().any(|l| l.trim() == digest) {
+        return Err(GuardError::new(
+            "SSHSIG_REPLAY_DETECTED",
+            "SSHSIG signature was already consumed",
+        ));
+    }
+    let mut opts = fs::OpenOptions::new();
+    opts.create(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    #[cfg(any(
+        all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ),
+        target_os = "macos"
+    ))]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.custom_flags(crate::traversal_ledger::O_NOFOLLOW_FLAG);
+    }
+    let mut f = opts
+        .open(&log_path)
+        .map_err(|e| GuardError::new("SSHSIG_SYMLINK_TAMPER", e.to_string()))?;
+    let post_meta = f
+        .metadata()
+        .map_err(|e| GuardError::new("SSHSIG_IO", e.to_string()))?;
+    if !post_meta.is_file() {
+        return Err(GuardError::new(
+            "SSHSIG_SYMLINK_TAMPER",
+            "consumed_sshsig.log opened non-regular file",
+        ));
+    }
+    #[cfg(unix)]
+    if let Some(pm) = pre_meta {
+        use std::os::unix::fs::MetadataExt;
+        if pm.dev() != post_meta.dev() || pm.ino() != post_meta.ino() {
+            return Err(GuardError::new(
+                "SSHSIG_SYMLINK_TAMPER",
+                "consumed_sshsig.log inode changed during open",
+            ));
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = pre_meta;
+    writeln!(f, "{digest}")
+        .and_then(|()| f.sync_all())
+        .map_err(|e| GuardError::new("SSHSIG_IO", e.to_string()))
+}
+
+pub(crate) fn verify_plugin_human_touch(
+    repo_root: &Path,
+    session_id: &str,
+    tool_name: &str,
+    target_rel_paths: &[String],
+) -> bool {
+    use crate::coordinator::current_hmac_epoch_id;
+    use crate::sshsig_touch::{load_operator_sk_keys_from_home, verify_fido2_sshsig_ed25519};
+    use crate::stop_receipt::derive_portable_repo_id;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let Ok(sig_path_raw) = std::env::var("AGENT_GUARD_PLUGIN_SSHSIG") else {
+        return false;
+    };
+    let sig_path = Path::new(&sig_path_raw);
+    let Ok(meta) = fs::symlink_metadata(sig_path) else {
+        return false;
+    };
+    if meta.file_type().is_symlink() || !meta.file_type().is_file() || meta.len() > 16_384 {
+        return false;
+    }
+    let Ok(pem) = fs::read_to_string(sig_path) else {
+        return false;
+    };
+    let Ok(home_raw) = std::env::var("HOME") else {
+        return false;
+    };
+    let Ok(Some(keys)) = load_operator_sk_keys_from_home(Path::new(&home_raw)) else {
+        return false;
+    };
+    let canon = fs::canonicalize(repo_root).unwrap_or_else(|_| repo_root.to_path_buf());
+    let repo_id = derive_portable_repo_id(&canon);
+    let epoch_id = current_hmac_epoch_id(&canon).unwrap_or(0);
+    let paths_hash = &crate::crypto::sha256_hex(target_rel_paths.join("\0").as_bytes())[..16];
+    let now_s = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let floor_now = (now_s / 60) * 60;
+    let c0 = format!(
+        "dotagent:plugin-touch:v1:{repo_id}:{epoch_id}:{session_id}:{tool_name}:{paths_hash}:{floor_now}"
+    );
+    let c1 = format!(
+        "dotagent:plugin-touch:v1:{repo_id}:{epoch_id}:{session_id}:{tool_name}:{paths_hash}:{}",
+        floor_now.saturating_sub(60)
+    );
+    let verified =
+        verify_fido2_sshsig_ed25519("dotagent-plugin-touch-v1", c0.as_bytes(), &pem, &keys)
+            .or_else(|_| {
+                verify_fido2_sshsig_ed25519("dotagent-plugin-touch-v1", c1.as_bytes(), &pem, &keys)
+            })
+            .is_ok();
+    verified && consume_sshsig_once(&pem).is_ok()
+}
+
+pub(crate) fn verify_operator_sshsig_gate(
+    repo_root: &Path,
+    action: &str,
+    sshsig_file: Option<&Path>,
+) -> Result<(), crate::sshsig_touch::GuardError> {
+    use crate::coordinator::current_hmac_epoch_id;
+    use crate::sshsig_touch::{
+        GuardError, OPERATOR_SSHSIG_NAMESPACE, format_operator_challenge,
+        load_operator_sk_keys_from_home, verify_fido2_sshsig_ed25519,
+    };
+    use crate::stop_receipt::derive_portable_repo_id;
+    use std::io::Read as _;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let home_raw = std::env::var("HOME")
+        .map_err(|_| GuardError::new("SSHSIG_CONFIG_INVALID", "HOME is not set"))?;
+    let Some(keys) = load_operator_sk_keys_from_home(Path::new(&home_raw))? else {
+        return Ok(());
+    };
+    let canon = fs::canonicalize(repo_root).unwrap_or_else(|_| repo_root.to_path_buf());
+    let repo_id = derive_portable_repo_id(&canon);
+    let epoch_id = current_hmac_epoch_id(&canon).unwrap_or(0);
+    let now_s = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let floor_now = (now_s / 60) * 60;
+    let c0 = format_operator_challenge(action, &repo_id, epoch_id, floor_now);
+    let pem = if let Some(p) = sshsig_file {
+        let m = fs::symlink_metadata(p).map_err(|e| {
+            GuardError::new("SSHSIG_REQUIRED", format!("cannot stat --sshsig: {e}"))
+        })?;
+        if m.file_type().is_symlink() || !m.file_type().is_file() || m.len() > 16_384 {
+            return Err(GuardError::new(
+                "SSHSIG_MALFORMED",
+                "--sshsig must be a regular file <= 16 KiB",
+            ));
+        }
+        fs::read_to_string(p).map_err(|e| GuardError::new("SSHSIG_IO", e.to_string()))?
+    } else if io::stdin().is_terminal() {
+        eprintln!(
+            "[DOTAGENT FIDO2 TOUCH] Paste SSHSIG for challenge '{c0}' (namespace='{OPERATOR_SSHSIG_NAMESPACE}'):"
+        );
+        let mut buf = String::new();
+        io::stdin()
+            .take(16_384)
+            .read_to_string(&mut buf)
+            .map_err(|e| GuardError::new("SSHSIG_IO", e.to_string()))?;
+        buf
+    } else {
+        return Err(GuardError::new(
+            "SSHSIG_REQUIRED",
+            format!("operator_sk_keys configured; pass --sshsig <file> over challenge '{c0}'"),
+        ));
+    };
+    let c1 = format_operator_challenge(action, &repo_id, epoch_id, floor_now.saturating_sub(60));
+    verify_fido2_sshsig_ed25519(OPERATOR_SSHSIG_NAMESPACE, c0.as_bytes(), &pem, &keys).or_else(
+        |_| verify_fido2_sshsig_ed25519(OPERATOR_SSHSIG_NAMESPACE, c1.as_bytes(), &pem, &keys),
+    )?;
+    consume_sshsig_once(&pem)
+}
+
+/// Interactive human-TTY-gated circuit breaker reset (`dotagent session-reset [--session <id>] [--sshsig <file>] [--all]`).
 pub fn run_session_reset_cli(args: &[String], cwd: &Path) -> ExitCode {
     if std::env::var("AGENT_GUARD_IN_SANDBOX").as_deref() == Ok("1")
         || std::env::var("AGENT_GUARD_WORKER_LOCK").as_deref() == Ok("1")
@@ -333,14 +538,25 @@ pub fn run_session_reset_cli(args: &[String], cwd: &Path) -> ExitCode {
     let repo_root = resolve_repo_root(cwd);
     let reset_all = args.iter().any(|a| a == "--all");
     let mut explicit_sid: Option<String> = None;
+    let mut sshsig_file: Option<PathBuf> = None;
     let mut i = 0usize;
     while i < args.len() {
         if args[i] == "--session" {
             explicit_sid = args.get(i + 1).cloned();
             i += 2;
+        } else if args[i] == "--sshsig" {
+            sshsig_file = args.get(i + 1).map(PathBuf::from);
+            i += 2;
         } else {
             i += 1;
         }
+    }
+
+    if let Err(ge) =
+        verify_operator_sshsig_gate(&repo_root, "session-reset", sshsig_file.as_deref())
+    {
+        eprintln!("[AGENT-GUARD HARD DENY :: {}] {}", ge.code, ge.detail);
+        return ExitCode::from(2);
     }
 
     if reset_all {
@@ -486,7 +702,7 @@ pub fn run_activate_cli(args: &[String], cwd: &Path) -> ExitCode {
     }
 }
 
-pub fn run_deactivate_cli(args: &[String], _cwd: &Path) -> ExitCode {
+pub fn run_deactivate_cli(args: &[String], cwd: &Path) -> ExitCode {
     if std::env::var("AGENT_GUARD_IN_SANDBOX").as_deref() == Ok("1")
         || std::env::var("AGENT_GUARD_WORKER_LOCK").as_deref() == Ok("1")
     {
@@ -495,7 +711,9 @@ pub fn run_deactivate_cli(args: &[String], _cwd: &Path) -> ExitCode {
         );
         return ExitCode::from(2);
     }
+
     let mut workspace: Option<PathBuf> = None;
+    let mut sshsig_file: Option<PathBuf> = None;
     let mut dry_run = false;
     let mut i = 0usize;
     while i < args.len() {
@@ -506,6 +724,14 @@ pub fn run_deactivate_cli(args: &[String], _cwd: &Path) -> ExitCode {
                     return ExitCode::from(2);
                 };
                 workspace = Some(PathBuf::from(v));
+                i += 2;
+            }
+            "--sshsig" => {
+                let Some(v) = args.get(i + 1) else {
+                    eprintln!("[deactivate] missing path after --sshsig");
+                    return ExitCode::from(2);
+                };
+                sshsig_file = Some(PathBuf::from(v));
                 i += 2;
             }
             "--dry-run" => {
@@ -528,7 +754,37 @@ pub fn run_deactivate_cli(args: &[String], _cwd: &Path) -> ExitCode {
         return ExitCode::from(2);
     };
     let home = PathBuf::from(home_raw);
+    for marker in [
+        "CLAUDECODE",
+        "GEMINI_CLI",
+        "ANTIGRAVITY_AGENT",
+        "CURSOR_TRACE_ID",
+        "CODEX_SANDBOX",
+    ] {
+        if std::env::var(marker)
+            .ok()
+            .is_some_and(|v| !v.trim().is_empty())
+        {
+            eprintln!(
+                "[AGENT-GUARD HARD DENY :: DEACTIVATE_DENIED_IN_HARNESS] deactivate cannot be invoked from inside AI agent harness '{marker}'."
+            );
+            return ExitCode::from(2);
+        }
+    }
+    if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
+        eprintln!(
+            "[AGENT-GUARD HARD DENY :: DEACTIVATE_REQUIRES_HUMAN_TTY] deactivate requires an interactive human terminal (stdin/stdout TTY)."
+        );
+        return ExitCode::from(2);
+    }
+
     let target_ws = workspace.unwrap_or_else(|| home.clone());
+    let repo_root = resolve_repo_root(if target_ws != home { &target_ws } else { cwd });
+
+    if let Err(ge) = verify_operator_sshsig_gate(&repo_root, "deactivate", sshsig_file.as_deref()) {
+        eprintln!("[AGENT-GUARD HARD DENY :: {}] {}", ge.code, ge.detail);
+        return ExitCode::from(2);
+    }
 
     match execute_deactivate(&home, &target_ws, dry_run) {
         Ok(lines) => {
@@ -1213,7 +1469,11 @@ fn invalidate_or_purge_swarm_state(
     Ok(())
 }
 
-fn execute_deactivate(home: &Path, target_ws: &Path, dry_run: bool) -> Result<Vec<String>, String> {
+pub fn execute_deactivate(
+    home: &Path,
+    target_ws: &Path,
+    dry_run: bool,
+) -> Result<Vec<String>, String> {
     let mut log = Vec::new();
     let mut managed = vec![
         target_ws.join("AGENTS.md"),

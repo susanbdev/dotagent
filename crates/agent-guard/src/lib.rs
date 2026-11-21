@@ -37,12 +37,15 @@ pub mod mcp_gateway;
 pub mod mcp_policy;
 pub mod operator;
 pub mod path_policy;
+pub mod plugin_lattice;
 pub mod qa_suspects;
 pub mod repo_audit;
 pub mod ring0_ratchet;
 pub mod role_sandbox;
 pub mod sanitizer;
 pub mod shell_wrapper;
+pub mod smoke_gate;
+pub mod sshsig_touch;
 pub mod stop_receipt;
 pub mod sudo_broker;
 pub mod swarm_contracts;
@@ -411,7 +414,7 @@ pub fn handle_pre_tool_hook_with_context(
         }
     };
 
-    let mut decision = if let Some(role_denial) = role_sandbox::enforce_role_pre_tool(
+    let ring0_decision = if let Some(role_denial) = role_sandbox::enforce_role_pre_tool(
         role,
         cap_opt.as_ref(),
         &tool_name,
@@ -436,6 +439,19 @@ pub fn handle_pre_tool_hook_with_context(
                 payload_is_airlock_subagent,
             ),
         )
+    };
+    let mut decision = if budget_guard::repo_has_configured_plugins(&repo_root, &profile) {
+        let snap =
+            build_pre_tool_hook_snapshot(&repo_root, &cwd, role, &tool_name, tool_input, &ledger);
+        plugin_lattice::apply_pre_tool_plugin_lattice(
+            &repo_root,
+            &session_id,
+            &profile,
+            snap,
+            ring0_decision,
+        )
+    } else {
+        ring0_decision
     };
     match &mut decision {
         Decision::Deny {
@@ -517,6 +533,134 @@ pub fn handle_pre_tool_hook_with_context(
     }
     let _ = ledger.save_locked_with_cache(&repo_root, hot_cache);
     decision
+}
+
+fn build_pre_tool_hook_snapshot(
+    repo_root: &Path,
+    cwd: &Path,
+    role: swarm_contracts::SwarmRole,
+    tool_name: &str,
+    input: &JsonValue,
+    ledger: &SessionLedger,
+) -> plugin_lattice::HookSnapshot {
+    let norm = tool_name.to_ascii_lowercase();
+    let mut is_write = matches!(
+        norm.as_str(),
+        "write"
+            | "edit"
+            | "multiedit"
+            | "write_file"
+            | "write_to_file"
+            | "replace"
+            | "replace_file_content"
+            | "multi_replace_file_content"
+            | "notebookedit"
+            | "apply_patch"
+            | "patch"
+    );
+    let mut cmd_program = String::new();
+    let mut cmd_args_sanitized = Vec::new();
+    let mut raw_paths = Vec::new();
+    if let Some(p) = extract_first_str(
+        input,
+        &[
+            "file_path",
+            "TargetFile",
+            "AbsolutePath",
+            "path",
+            "target_file",
+            "notebook_path",
+        ],
+    ) {
+        raw_paths.push(p.to_string());
+    }
+    collect_nested_path_fields(input, &mut raw_paths);
+    if matches!(norm.as_str(), "apply_patch" | "patch")
+        && let Some(patch_body) = extract_first_str(
+            input,
+            &[
+                "patch",
+                "input",
+                "diff",
+                "content",
+                "raw_patch",
+                "patchText",
+            ],
+        )
+    {
+        raw_paths.extend(extract_patch_target_paths(patch_body));
+    }
+    if let Some(cmd_str) = extract_first_str(input, &["command", "CommandLine", "cmd", "script"]) {
+        if let Ok(plan) = evaluate_shell_command(cmd_str, repo_root, cwd, ledger.tainted) {
+            if !plan.write_files.is_empty() {
+                is_write = true;
+            }
+            for (rel, _) in plan.write_files {
+                raw_paths.push(rel);
+            }
+            for (rel, _, _) in plan.read_files {
+                raw_paths.push(rel);
+            }
+        }
+        let unquote_tok = |s: &str| -> String {
+            s.chars()
+                .filter(|&c| c != '\'' && c != '"' && c != '\\')
+                .collect()
+        };
+        let mut toks = cmd_str
+            .split([' ', '\t', ';', '|', '&', '\n'])
+            .map(unquote_tok)
+            .filter(|t| !t.is_empty() && (!t.contains('=') || t.starts_with('-')));
+        if let Some(first) = toks.next() {
+            let base = first.rsplit('/').next().unwrap_or(&first);
+            cmd_program = neuter_to_clean_ascii(base).clean_ascii;
+            for arg in toks.take(16) {
+                let clean = if arg.contains('=') {
+                    "<redacted-kv>".to_string()
+                } else {
+                    let b = arg.rsplit('/').next().unwrap_or(&arg);
+                    neuter_to_clean_ascii(b).clean_ascii
+                };
+                cmd_args_sanitized.push(clean);
+            }
+        }
+    }
+    let canon_repo = fs::canonicalize(repo_root).unwrap_or_else(|_| repo_root.to_path_buf());
+    let mut target_rel_paths = Vec::new();
+    for rp in raw_paths {
+        let abs = if Path::new(&rp).is_absolute() {
+            lexical_normalize(Path::new(&rp))
+        } else {
+            lexical_normalize(&cwd.join(&rp))
+        };
+        let rel = abs
+            .strip_prefix(&canon_repo)
+            .or_else(|_| abs.strip_prefix(repo_root))
+            .map(|r| r.to_string_lossy().replace('\\', "/"))
+            .unwrap_or_else(|_| rp.trim_start_matches("./").to_string());
+        if !rel.is_empty() && !target_rel_paths.contains(&rel) {
+            target_rel_paths.push(rel);
+        }
+    }
+    let _now_ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    plugin_lattice::HookSnapshot {
+        phase: "PreToolUse".to_string(),
+        repo_id: stop_receipt::derive_portable_repo_id(repo_root),
+        role: role.as_str_id().to_string(),
+        tool_name: tool_name.to_string(),
+        is_write,
+        cmd_program,
+        cmd_args_sanitized,
+        target_rel_paths,
+        tainted: ledger.tainted,
+        step_count: ledger.tool_calls as u32,
+        recent_denial_count_60s: ledger.recent_traces.len() as u32,
+        ballot_anomaly_count: ledger.ballot_submissions,
+        active_quorum_approvals: 0,
+    }
 }
 
 fn is_vetted_local_gateway_mcp_tool(norm_tool: &str) -> Option<&str> {

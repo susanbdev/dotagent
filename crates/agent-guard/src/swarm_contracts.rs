@@ -208,6 +208,7 @@ pub enum EventOp {
     TestGreen,
     TestFail,
     LedgerSubmit,
+    ReviewApprove,
 }
 
 impl EventOp {
@@ -219,6 +220,7 @@ impl EventOp {
             Self::TestGreen => "test_green",
             Self::TestFail => "test_fail",
             Self::LedgerSubmit => "ledger_submit",
+            Self::ReviewApprove => "review_approve",
         }
     }
 
@@ -230,6 +232,7 @@ impl EventOp {
             "test_green" => Some(Self::TestGreen),
             "test_fail" => Some(Self::TestFail),
             "ledger_submit" => Some(Self::LedgerSubmit),
+            "review_approve" => Some(Self::ReviewApprove),
             _ => None,
         }
     }

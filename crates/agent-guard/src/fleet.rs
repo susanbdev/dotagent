@@ -640,6 +640,9 @@ pub fn run_fleet_cli(args: &[String], cwd: &Path) -> ExitCode {
 
     let sub = args.first().map(String::as_str).unwrap_or("audit");
     if sub == "configure-github" {
+        if args.iter().any(|a| a == "--owner") {
+            return run_fleet_configure_github_cli(&args[1..], cwd);
+        }
         return crate::github_governance::run_configure_github_cli(&args[1..]);
     }
     let json_mode = args.iter().any(|a| a == "--json");
@@ -1317,4 +1320,507 @@ pub fn run_self_verify_cli(args: &[String]) -> ExitCode {
             ExitCode::from(2)
         }
     }
+}
+
+pub fn build_github_repo_ruleset_payload() -> JsonValue {
+    let kv = |k: &str, v: &str| (k.to_string(), JsonValue::Str(v.to_string()));
+    let kb = |k: &str, v: bool| (k.to_string(), JsonValue::Bool(v));
+    let ku = |k: &str, v: u64| (k.to_string(), JsonValue::Uint(v));
+    let actor = |id: u64, ty: &str| {
+        JsonValue::Object(vec![
+            ku("actor_id", id),
+            kv("actor_type", ty),
+            kv("bypass_mode", "pull_request"),
+        ])
+    };
+    JsonValue::Object(vec![
+        kv("name", "dotagent-ring0-main-protection"),
+        kv("target", "branch"),
+        kv("enforcement", "active"),
+        (
+            "bypass_actors".to_string(),
+            JsonValue::Array(vec![
+                actor(5, "RepositoryRole"),
+                actor(1, "OrganizationAdmin"),
+            ]),
+        ),
+        (
+            "conditions".to_string(),
+            JsonValue::Object(vec![(
+                "ref_name".to_string(),
+                JsonValue::Object(vec![
+                    (
+                        "include".to_string(),
+                        JsonValue::Array(vec![JsonValue::Str("~DEFAULT_BRANCH".to_string())]),
+                    ),
+                    ("exclude".to_string(), JsonValue::Array(Vec::new())),
+                ]),
+            )]),
+        ),
+        (
+            "rules".to_string(),
+            JsonValue::Array(vec![
+                JsonValue::Object(vec![kv("type", "deletion")]),
+                JsonValue::Object(vec![kv("type", "non_fast_forward")]),
+                JsonValue::Object(vec![kv("type", "required_linear_history")]),
+                JsonValue::Object(vec![
+                    kv("type", "pull_request"),
+                    (
+                        "parameters".to_string(),
+                        JsonValue::Object(vec![
+                            (
+                                "allowed_merge_methods".to_string(),
+                                JsonValue::Array(vec![JsonValue::Str("squash".to_string())]),
+                            ),
+                            ku("required_approving_review_count", 1),
+                            kb("required_review_thread_resolution", true),
+                            kb("dismiss_stale_reviews_on_push", true),
+                            kb("require_code_owner_review", false),
+                            kb("require_last_push_approval", false),
+                        ]),
+                    ),
+                ]),
+            ]),
+        ),
+    ])
+}
+
+pub fn build_github_fleet_governance_plan(owner: &str, repos: &[String]) -> JsonValue {
+    let kv = |k: &str, v: &str| (k.to_string(), JsonValue::Str(v.to_string()));
+    let kb = |k: &str, v: bool| (k.to_string(), JsonValue::Bool(v));
+    let ruleset = build_github_repo_ruleset_payload();
+    let targets: Vec<JsonValue> = repos
+        .iter()
+        .map(|repo| {
+            JsonValue::Object(vec![
+                kv("owner", owner),
+                kv("repo", repo),
+                (
+                    "actions_permissions".to_string(),
+                    JsonValue::Object(vec![
+                        kv(
+                            "endpoint",
+                            &format!("/repos/{owner}/{repo}/actions/permissions"),
+                        ),
+                        kb("enabled", true),
+                        kb("sha_pinning_required", true),
+                    ]),
+                ),
+                (
+                    "workflow_permissions".to_string(),
+                    JsonValue::Object(vec![
+                        kv(
+                            "endpoint",
+                            &format!("/repos/{owner}/{repo}/actions/permissions/workflow"),
+                        ),
+                        kv("default_workflow_permissions", "read"),
+                        kb("can_approve_pull_request_reviews", false),
+                    ]),
+                ),
+                (
+                    "ruleset".to_string(),
+                    JsonValue::Object(vec![
+                        kv("endpoint", &format!("/repos/{owner}/{repo}/rulesets")),
+                        ("payload".to_string(), ruleset.clone()),
+                    ]),
+                ),
+            ])
+        })
+        .collect();
+    JsonValue::Object(vec![
+        kv("schema", "dotagent.fleet.github_governance.v1"),
+        kv("owner", owner),
+        ("targets".to_string(), JsonValue::Array(targets)),
+    ])
+}
+
+fn is_safe_gh_slug(s: &str) -> bool {
+    let t = s.trim();
+    !t.is_empty()
+        && t.len() <= 100
+        && t != "."
+        && t != ".."
+        && !t.starts_with('-')
+        && t.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+}
+
+pub fn verify_github_governance_state(
+    actions_perms: &JsonValue,
+    workflow_perms: &JsonValue,
+    ruleset: &JsonValue,
+) -> Result<(), Vec<String>> {
+    let mut errs = Vec::new();
+    if actions_perms.get("enabled").and_then(JsonValue::as_bool) != Some(true) {
+        errs.push("actions enabled must be true".to_string());
+    }
+    if actions_perms
+        .get("sha_pinning_required")
+        .and_then(JsonValue::as_bool)
+        != Some(true)
+    {
+        errs.push("sha_pinning_required must be true".to_string());
+    }
+    if workflow_perms
+        .get("default_workflow_permissions")
+        .and_then(JsonValue::as_str)
+        != Some("read")
+    {
+        errs.push("default_workflow_permissions must equal 'read'".to_string());
+    }
+    if workflow_perms
+        .get("can_approve_pull_request_reviews")
+        .and_then(JsonValue::as_bool)
+        != Some(false)
+    {
+        errs.push("can_approve_pull_request_reviews must be false".to_string());
+    }
+    if ruleset.get("target").and_then(JsonValue::as_str) != Some("branch")
+        || ruleset.get("enforcement").and_then(JsonValue::as_str) != Some("active")
+    {
+        errs.push("ruleset must have target='branch' and enforcement='active'".to_string());
+    }
+    let cond_ok = ruleset
+        .get("conditions")
+        .and_then(|c| c.get("ref_name"))
+        .is_some_and(|rn| {
+            let inc_ok = rn
+                .get("include")
+                .and_then(JsonValue::as_array)
+                .is_some_and(|inc| inc.iter().any(|x| x.as_str() == Some("~DEFAULT_BRANCH")));
+            let exc_empty = rn
+                .get("exclude")
+                .and_then(JsonValue::as_array)
+                .is_none_or(<[JsonValue]>::is_empty);
+            inc_ok && exc_empty
+        });
+    if !cond_ok {
+        errs.push("ruleset must include ~DEFAULT_BRANCH with empty exclude".to_string());
+    }
+    let bypass_ok = ruleset
+        .get("bypass_actors")
+        .and_then(JsonValue::as_array)
+        .is_some_and(|arr| {
+            !arr.is_empty()
+                && arr.iter().all(|a| {
+                    let mode_ok =
+                        a.get("bypass_mode").and_then(JsonValue::as_str) == Some("pull_request");
+                    let atype = a.get("actor_type").and_then(JsonValue::as_str);
+                    let aid = a.get("actor_id").and_then(JsonValue::as_u64);
+                    let admin_ok = matches!(
+                        (atype, aid),
+                        (Some("RepositoryRole"), Some(5)) | (Some("OrganizationAdmin"), Some(1))
+                    );
+                    mode_ok && admin_ok
+                })
+        });
+    if !bypass_ok {
+        errs.push("ruleset bypass_actors must strictly be admin pull_request only".to_string());
+    }
+    let rules = ruleset.get("rules").and_then(JsonValue::as_array);
+    for req_rule in ["deletion", "non_fast_forward", "required_linear_history"] {
+        let present = rules.is_some_and(|rs| {
+            rs.iter()
+                .any(|r| r.get("type").and_then(JsonValue::as_str) == Some(req_rule))
+        });
+        if !present {
+            errs.push(format!("ruleset missing {req_rule}"));
+        }
+    }
+    let pr_ok = rules.is_some_and(|rs| {
+        rs.iter().any(|r| {
+            if r.get("type").and_then(JsonValue::as_str) != Some("pull_request") {
+                return false;
+            }
+            let Some(p) = r.get("parameters") else {
+                return false;
+            };
+            let squash_only = p
+                .get("allowed_merge_methods")
+                .and_then(JsonValue::as_array)
+                .is_some_and(|m| m.len() == 1 && m[0].as_str() == Some("squash"));
+            let rev_cnt = p
+                .get("required_approving_review_count")
+                .and_then(JsonValue::as_u64)
+                .unwrap_or(0)
+                >= 1;
+            let threads = p
+                .get("required_review_thread_resolution")
+                .and_then(JsonValue::as_bool)
+                == Some(true);
+            squash_only && rev_cnt && threads
+        })
+    });
+    if !pr_ok {
+        errs.push(
+            "ruleset pull_request must enforce squash-only, >=1 review, and thread resolution"
+                .into(),
+        );
+    }
+    if errs.is_empty() { Ok(()) } else { Err(errs) }
+}
+
+fn run_fleet_configure_github_cli(args: &[String], cwd: &Path) -> ExitCode {
+    let mut owner: Option<String> = None;
+    let mut single_repo: Option<String> = None;
+    let mut all_fleet = false;
+    let mut org_root: Option<PathBuf> = None;
+    let mut dry_run = false;
+    let mut verify_only = false;
+    let mut sshsig_file: Option<PathBuf> = None;
+    let mut i = 0usize;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--owner" if i + 1 < args.len() => {
+                owner = Some(args[i + 1].clone());
+                i += 2;
+            }
+            "--repo" if i + 1 < args.len() => {
+                single_repo = Some(args[i + 1].clone());
+                i += 2;
+            }
+            "--root" if i + 1 < args.len() => {
+                org_root = Some(PathBuf::from(&args[i + 1]));
+                i += 2;
+            }
+            "--sshsig" if i + 1 < args.len() => {
+                sshsig_file = Some(PathBuf::from(&args[i + 1]));
+                i += 2;
+            }
+            "--all-fleet" => {
+                all_fleet = true;
+                i += 1;
+            }
+            "--dry-run" => {
+                dry_run = true;
+                i += 1;
+            }
+            "--verify" => {
+                verify_only = true;
+                i += 1;
+            }
+            "--json" => i += 1,
+            other => {
+                eprintln!("[dotagent fleet configure-github] unrecognized arg '{other}'");
+                return ExitCode::from(2);
+            }
+        }
+    }
+    let Some(owner_str) = owner.filter(|s| is_safe_gh_slug(s)) else {
+        eprintln!(
+            "[dotagent fleet] usage: dotagent fleet configure-github --owner <org_or_user> [--repo <name> | --all-fleet] [--sshsig <path>] [--dry-run] [--verify]"
+        );
+        return ExitCode::from(2);
+    };
+    let repos: Vec<String> = if let Some(r) = single_repo {
+        vec![r]
+    } else if all_fleet {
+        let root = org_root.unwrap_or_else(|| cwd.to_path_buf());
+        match discover_fleet_repositories(&root) {
+            Ok(paths) => paths
+                .iter()
+                .filter_map(|p| p.file_name().and_then(|n| n.to_str()).map(String::from))
+                .collect(),
+            Err(e) => {
+                eprintln!("[dotagent fleet configure-github] {e}");
+                return ExitCode::from(2);
+            }
+        }
+    } else {
+        eprintln!("[dotagent fleet configure-github] pass --repo <name> or --all-fleet");
+        return ExitCode::from(2);
+    };
+    if repos.is_empty() || repos.iter().any(|r| !is_safe_gh_slug(r)) {
+        eprintln!("[dotagent fleet configure-github] invalid or empty repository slug list");
+        return ExitCode::from(2);
+    }
+
+    let plan = build_github_fleet_governance_plan(&owner_str, &repos);
+    if dry_run {
+        println!("{}", plan.to_json_string());
+        return ExitCode::SUCCESS;
+    }
+    if let Err((code, detail)) = crate::telemetry::verify_human_tty_telemetry_gate() {
+        eprintln!("[AGENT-GUARD HARD DENY :: {code}] {detail}");
+        return ExitCode::from(2);
+    }
+    let repo_root = crate::resolve_repo_root(cwd);
+    if let Err(ge) = crate::operator::verify_operator_sshsig_gate(
+        &repo_root,
+        "configure-github",
+        sshsig_file.as_deref(),
+    ) {
+        eprintln!("[AGENT-GUARD HARD DENY :: {}] {}", ge.code, ge.detail);
+        return ExitCode::from(2);
+    }
+    let canon_root = fs::canonicalize(&repo_root).unwrap_or_else(|_| repo_root.clone());
+    let mut gh_candidates = vec![
+        PathBuf::from("/opt/antigravity/bin/gh"),
+        PathBuf::from("/usr/local/bin/gh"),
+        PathBuf::from("/opt/homebrew/bin/gh"),
+        PathBuf::from("/usr/bin/gh"),
+    ];
+    if let Some(path_os) = std::env::var_os("PATH") {
+        for dir in std::env::split_paths(&path_os) {
+            if dir.is_absolute() {
+                gh_candidates.push(dir.join("gh"));
+            }
+        }
+    }
+    let Some(gh_bin) = gh_candidates.into_iter().find(|p| {
+        p.is_absolute()
+            && !p.starts_with(&repo_root)
+            && fs::canonicalize(p).is_ok_and(|c| {
+                !c.starts_with(&canon_root) && crate::coordinator::is_trusted_executable_file(&c)
+            })
+    }) else {
+        eprintln!("[dotagent fleet configure-github] trusted absolute `gh` binary not found");
+        return ExitCode::from(2);
+    };
+    let build_gh_cmd = || -> std::process::Command {
+        let mut c = std::process::Command::new(&gh_bin);
+        c.env_clear();
+        c.env(
+            "PATH",
+            "/opt/antigravity/bin:/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin",
+        );
+        c.env("GH_PROMPT_DISABLED", "1");
+        c.env("NO_COLOR", "1");
+        for k in [
+            "HOME",
+            "GH_TOKEN",
+            "GITHUB_TOKEN",
+            "GH_CONFIG_DIR",
+            "HTTP_PROXY",
+            "HTTPS_PROXY",
+            "NO_PROXY",
+            "SSL_CERT_FILE",
+            "SSL_CERT_DIR",
+        ] {
+            if let Ok(v) = std::env::var(k) {
+                c.env(k, v);
+            }
+        }
+        c
+    };
+    let gh_get = |ep: &str| -> Result<JsonValue, String> {
+        let out = build_gh_cmd()
+            .args(["api", ep])
+            .output()
+            .map_err(|e| format!("gh api '{ep}' failed: {e}"))?;
+        if !out.status.success() {
+            return Err(format!(
+                "gh api '{ep}' exited {}: {}",
+                out.status,
+                String::from_utf8_lossy(&out.stderr).trim()
+            ));
+        }
+        JsonValue::parse(&String::from_utf8_lossy(&out.stdout))
+            .map_err(|e| format!("invalid JSON from '{ep}': {e}"))
+    };
+    for repo in &repos {
+        if verify_only {
+            let act = match gh_get(&format!("/repos/{owner_str}/{repo}/actions/permissions")) {
+                Ok(v) => v,
+                Err(e) => {
+                    eprintln!("[VERIFY FAIL] {owner_str}/{repo}: {e}");
+                    return ExitCode::from(2);
+                }
+            };
+            let wf = match gh_get(&format!(
+                "/repos/{owner_str}/{repo}/actions/permissions/workflow"
+            )) {
+                Ok(v) => v,
+                Err(e) => {
+                    eprintln!("[VERIFY FAIL] {owner_str}/{repo}: {e}");
+                    return ExitCode::from(2);
+                }
+            };
+            let rs_list = match gh_get(&format!("/repos/{owner_str}/{repo}/rulesets")) {
+                Ok(v) => v,
+                Err(e) => {
+                    eprintln!("[VERIFY FAIL] {owner_str}/{repo}: {e}");
+                    return ExitCode::from(2);
+                }
+            };
+            let rs_ok = rs_list.as_array().is_some_and(|arr| {
+                arr.iter().any(|item| {
+                    item.get("id")
+                        .and_then(JsonValue::as_u64)
+                        .and_then(|id| {
+                            gh_get(&format!("/repos/{owner_str}/{repo}/rulesets/{id}")).ok()
+                        })
+                        .is_some_and(|full| {
+                            verify_github_governance_state(&act, &wf, &full).is_ok()
+                        })
+                })
+            });
+            if !rs_ok {
+                eprintln!(
+                    "[VERIFY FAIL] {owner_str}/{repo}: active GitHub ruleset/Actions governance does not satisfy Ring-0 floor"
+                );
+                return ExitCode::from(2);
+            }
+            println!("[VERIFY OK] {owner_str}/{repo}");
+        } else {
+            let gh_put = |method: &str, ep: &str, body: &str| -> Result<(), String> {
+                use std::io::Write;
+                let mut child = build_gh_cmd()
+                    .args(["api", "--method", method, ep, "--input", "-"])
+                    .stdin(std::process::Stdio::piped())
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::piped())
+                    .spawn()
+                    .map_err(|e| format!("failed spawning gh: {e}"))?;
+                if let Some(mut sin) = child.stdin.take() {
+                    let _ = sin.write_all(body.as_bytes());
+                }
+                let out = child.wait_with_output().map_err(|e| e.to_string())?;
+                if out.status.success() {
+                    Ok(())
+                } else {
+                    Err(String::from_utf8_lossy(&out.stderr).trim().to_string())
+                }
+            };
+            let rs_payload = build_github_repo_ruleset_payload();
+            let rs_name = rs_payload
+                .get("name")
+                .and_then(JsonValue::as_str)
+                .unwrap_or("");
+            let existing_id = gh_get(&format!("/repos/{owner_str}/{repo}/rulesets"))
+                .ok()
+                .and_then(|v| {
+                    v.as_array()?.iter().find_map(|it| {
+                        (it.get("name").and_then(JsonValue::as_str) == Some(rs_name))
+                            .then(|| it.get("id").and_then(JsonValue::as_u64))
+                            .flatten()
+                    })
+                });
+            let (rs_method, rs_ep) = match existing_id {
+                Some(id) => ("PUT", format!("/repos/{owner_str}/{repo}/rulesets/{id}")),
+                None => ("POST", format!("/repos/{owner_str}/{repo}/rulesets")),
+            };
+            let rs_json = rs_payload.to_json_string();
+            for (m, ep, b) in [
+                (
+                    "PUT",
+                    format!("/repos/{owner_str}/{repo}/actions/permissions"),
+                    "{\"enabled\":true,\"sha_pinning_required\":true}".to_string(),
+                ),
+                (
+                    "PUT",
+                    format!("/repos/{owner_str}/{repo}/actions/permissions/workflow"),
+                    "{\"default_workflow_permissions\":\"read\",\"can_approve_pull_request_reviews\":false}".to_string(),
+                ),
+                (rs_method, rs_ep, rs_json),
+            ] {
+                if let Err(e) = gh_put(m, &ep, &b) {
+                    eprintln!("[CONFIGURE FAIL] {ep}: {e}");
+                    return ExitCode::from(2);
+                }
+            }
+            println!("[CONFIGURE OK] {owner_str}/{repo}");
+        }
+    }
+    ExitCode::SUCCESS
 }
