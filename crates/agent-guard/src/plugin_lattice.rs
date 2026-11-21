@@ -27,18 +27,14 @@ pub enum VerdictLevel {
 
 impl VerdictLevel {
     pub const fn from_u8(v: u8) -> Option<Self> {
-        const ALL: [VerdictLevel; 6] = [
-            VerdictLevel::Allow,
-            VerdictLevel::EmitSignal,
-            VerdictLevel::RequireVoteQuorum,
-            VerdictLevel::RequireHumanTouch,
-            VerdictLevel::Deny,
-            VerdictLevel::HaltSession,
-        ];
-        if (v as usize) < ALL.len() {
-            Some(ALL[v as usize])
-        } else {
-            None
+        match v {
+            0 => Some(Self::Allow),
+            1 => Some(Self::EmitSignal),
+            2 => Some(Self::RequireVoteQuorum),
+            3 => Some(Self::RequireHumanTouch),
+            4 => Some(Self::Deny),
+            5 => Some(Self::HaltSession),
+            _ => None,
         }
     }
 
@@ -48,17 +44,16 @@ impl VerdictLevel {
             let n = rest.strip_suffix(')')?.trim().parse::<usize>().ok()?;
             return Some((Self::RequireVoteQuorum, Some(n.clamp(1, 16))));
         }
-        match s.as_str() {
-            "allow" => Some((Self::Allow, None)),
-            "emit_signal" | "signal" => Some((Self::EmitSignal, None)),
-            "require_vote_quorum" | "vote_quorum" | "quorum" => {
-                Some((Self::RequireVoteQuorum, None))
-            }
-            "require_human_touch" | "human_touch" => Some((Self::RequireHumanTouch, None)),
-            "deny" => Some((Self::Deny, None)),
-            "halt_session" | "halt" => Some((Self::HaltSession, None)),
-            _ => None,
-        }
+        let lvl = match s.as_str() {
+            "allow" => Self::Allow,
+            "emit_signal" | "signal" => Self::EmitSignal,
+            "require_vote_quorum" | "vote_quorum" | "quorum" => Self::RequireVoteQuorum,
+            "require_human_touch" | "human_touch" => Self::RequireHumanTouch,
+            "deny" => Self::Deny,
+            "halt_session" | "halt" => Self::HaltSession,
+            _ => return None,
+        };
+        Some((lvl, None))
     }
 }
 
@@ -92,14 +87,9 @@ impl HookSnapshot {
             let v = xs.iter().cloned().map(JsonValue::Str).collect();
             (k.to_string(), JsonValue::Array(v))
         };
-        let (steps, d60) = (
-            u64::from(self.step_count),
-            u64::from(self.recent_denial_count_60s),
-        );
-        let (banom, qapp) = (
-            u64::from(self.ballot_anomaly_count),
-            self.active_quorum_approvals as u64,
-        );
+        let d60 = u64::from(self.recent_denial_count_60s);
+        let banom = u64::from(self.ballot_anomaly_count);
+        let qapp = self.active_quorum_approvals as u64;
         JsonValue::Object(vec![
             kv("phase", &self.phase),
             kv("repo_id", &self.repo_id),
@@ -110,7 +100,7 @@ impl HookSnapshot {
             arr("cmd_args_sanitized", &self.cmd_args_sanitized),
             arr("target_rel_paths", &self.target_rel_paths),
             kb("tainted", self.tainted),
-            ku("step_count", steps),
+            ku("step_count", u64::from(self.step_count)),
             ku("recent_denial_count_60s", d60),
             ku("ballot_anomaly_count", banom),
             ku("active_quorum_approvals", qapp),
