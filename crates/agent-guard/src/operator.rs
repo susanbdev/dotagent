@@ -315,15 +315,20 @@ fn check_session_state_health(repo_root: &Path) -> DoctorCheck {
 }
 
 fn consume_sshsig_once(pem: &str) -> Result<(), crate::sshsig_touch::GuardError> {
+    use crate::breadcrumbs::ExclusiveFileLockGuard;
     use crate::sshsig_touch::GuardError;
     use std::io::Write as _;
     let digest = crate::crypto::sha256_hex(pem.trim().as_bytes());
     let dir = crate::feedback::feedback_state_dir().map_err(|e| GuardError::new("SSHSIG_IO", e))?;
+    let _lock = ExclusiveFileLockGuard::acquire(&dir.join("consumed_sshsig.lock"))
+        .map_err(|e| GuardError::new("SSHSIG_IO", e))?;
     let log_path = dir.join("consumed_sshsig.log");
-    if fs::symlink_metadata(&log_path).is_ok_and(|m| m.file_type().is_symlink()) {
+    if let Ok(m) = fs::symlink_metadata(&log_path)
+        && (m.file_type().is_symlink() || !m.file_type().is_file())
+    {
         return Err(GuardError::new(
             "SSHSIG_SYMLINK_TAMPER",
-            "consumed_sshsig.log is symlink",
+            "consumed_sshsig.log is symlink or non-regular file",
         ));
     }
     let existing = fs::read_to_string(&log_path).unwrap_or_default();
@@ -338,7 +343,9 @@ fn consume_sshsig_once(pem: &str) -> Result<(), crate::sshsig_touch::GuardError>
         .append(true)
         .open(&log_path)
         .map_err(|e| GuardError::new("SSHSIG_IO", e.to_string()))?;
-    writeln!(f, "{digest}").map_err(|e| GuardError::new("SSHSIG_IO", e.to_string()))
+    writeln!(f, "{digest}")
+        .and_then(|()| f.sync_all())
+        .map_err(|e| GuardError::new("SSHSIG_IO", e.to_string()))
 }
 
 pub(crate) fn verify_plugin_human_touch(

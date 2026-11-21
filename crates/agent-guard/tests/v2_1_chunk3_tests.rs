@@ -139,6 +139,12 @@ reason := "SQL migrations require 2 distinct reviewer approvals"
         "{{\"session_id\":\"coder_main\",\"cwd\":\"{}\",\"tool_name\":\"Write\",\"tool_input\":{{\"file_path\":\"migrations/001.sql\",\"content\":\"CREATE TABLE t (id INT);\\n\"}}}}",
         repo.display()
     );
+    fs::create_dir_all(repo.join("migrations")).expect("mkdir migrations");
+    fs::write(
+        repo.join("migrations/001.sql"),
+        "CREATE TABLE t (id INT);\n",
+    )
+    .expect("stage sql");
 
     // 0 approvals -> blocked with PLUGIN_QUORUM_REQUIRED
     let (_c0, out0, err0) = run_pre_tool(&repo, &home, &state_sessions, &payload);
@@ -209,10 +215,16 @@ fn quorum_approval_child_worker() {
     let repo_p = Path::new(&repo);
     let canon = agent_guard::resolve_common_repo_root(repo_p);
     let repo_sha = agent_guard::crypto::sha256_hex(canon.to_string_lossy().as_bytes());
-    let role = if reviewer.starts_with("reviewer_") {
-        agent_guard::swarm_contracts::SwarmRole::AdversarialReviewer
+    let (role, write_paths) = if reviewer.starts_with("reviewer_") {
+        (
+            agent_guard::swarm_contracts::SwarmRole::AdversarialReviewer,
+            Vec::new(),
+        )
     } else {
-        agent_guard::swarm_contracts::SwarmRole::Grunt
+        (
+            agent_guard::swarm_contracts::SwarmRole::Grunt,
+            vec![rel_path.clone()],
+        )
     };
     let cap = agent_guard::swarm_contracts::SessionCapability {
         session_id: reviewer.clone(),
@@ -222,7 +234,7 @@ fn quorum_approval_child_worker() {
         repo_sha256: repo_sha,
         plan_sha256: "0".repeat(64),
         assigned_read_paths: vec![rel_path.clone()],
-        allowed_write_paths: Vec::new(),
+        allowed_write_paths: write_paths,
         assigned_tests: Vec::new(),
         last_green_tree_oid: None,
         consecutive_test_failures: 0,

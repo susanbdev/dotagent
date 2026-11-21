@@ -880,12 +880,20 @@ pub fn record_quorum_approval_breadcrumb(
         None => (1, [0u8; 32]),
     };
     let clean_rel = target_rel_path.trim().trim_start_matches("./");
-    let doc_sha256 = if clean_rel != "*"
-        && let Ok(bytes) = fs::read(local_root.join(clean_rel))
-    {
-        sha256_digest(&bytes)
-    } else {
+    let doc_sha256 = if clean_rel == "*" {
         [0u8; 32]
+    } else {
+        let target_full = local_root.join(clean_rel);
+        let tmeta = fs::symlink_metadata(&target_full)
+            .map_err(|e| format!("quorum approval target '{clean_rel}' must exist on disk: {e}"))?;
+        if tmeta.file_type().is_symlink() || !tmeta.file_type().is_file() {
+            return Err(format!(
+                "quorum approval target '{clean_rel}' must be a regular non-symlink file"
+            ));
+        }
+        let bytes = fs::read(&target_full)
+            .map_err(|e| format!("failed reading quorum target '{clean_rel}': {e}"))?;
+        sha256_digest(&bytes)
     };
     let event = AuthenticatedEvent {
         schema_version: AUTH_EVENT_SCHEMA_V1,
@@ -928,20 +936,35 @@ pub fn count_verified_quorum_approvals(
     let canon_repo = fs::canonicalize(repo_root).unwrap_or_else(|_| repo_root.to_path_buf());
     let common_repo = crate::resolve_common_repo_root(&canon_repo);
     let expected_repo_sha = sha256_digest(common_repo.to_string_lossy().as_bytes());
+    let Ok(actor_cap) = load_session_capability(&common_repo, actor_session_id) else {
+        return 0;
+    };
+    if actor_cap.malicious_flags != 0 || actor_cap.task_id.trim().is_empty() {
+        return 0;
+    }
     let targets: Vec<&str> = if target_rel_paths.is_empty() {
         vec!["*"]
     } else {
         target_rel_paths.iter().map(String::as_str).collect()
     };
-    let actor_cap = load_session_capability(&common_repo, actor_session_id).ok();
     let mut min_verified: Option<usize> = None;
     for target in targets {
         let clean_t = target.trim().trim_start_matches("./");
-        let expected_doc = (clean_t != "*").then(|| {
-            fs::read(canon_repo.join(clean_t))
-                .map(|b| sha256_digest(&b))
-                .unwrap_or([0u8; 32])
-        });
+        let expected_doc = if clean_t == "*" {
+            [0u8; 32]
+        } else {
+            let tf = canon_repo.join(clean_t);
+            let Ok(tm) = fs::symlink_metadata(&tf) else {
+                return 0;
+            };
+            if tm.file_type().is_symlink() || !tm.file_type().is_file() {
+                return 0;
+            }
+            let Ok(bytes) = fs::read(&tf) else {
+                return 0;
+            };
+            sha256_digest(&bytes)
+        };
         let mut trails = vec![canon_repo.join(".breadcrumbs.jsonl")];
         if clean_t != "*"
             && let Ok(tp) = trail_path_for_rel_path(&canon_repo, clean_t)
@@ -969,11 +992,7 @@ pub fn count_verified_quorum_approvals(
                     || rec.event.session_id == actor_session_id
                     || rec.event.canonical_rel_path != clean_t
                     || rec.event.task_id.trim().is_empty()
-                {
-                    continue;
-                }
-                if let Some(exp_doc) = expected_doc
-                    && rec.event.doc_sha256 != exp_doc
+                    || rec.event.doc_sha256 != expected_doc
                 {
                     continue;
                 }
@@ -987,12 +1006,10 @@ pub fn count_verified_quorum_approvals(
                     continue;
                 };
                 let exp_plan = hex_decode_32(&cap.plan_sha256).unwrap_or([0u8; 32]);
-                if rec.event.task_id != cap.task_id || rec.event.plan_sha256 != exp_plan {
-                    continue;
-                }
-                if let Some(ac) = &actor_cap
-                    && !ac.task_id.trim().is_empty()
-                    && (rec.event.task_id != ac.task_id || cap.plan_sha256 != ac.plan_sha256)
+                if rec.event.task_id != cap.task_id
+                    || rec.event.plan_sha256 != exp_plan
+                    || rec.event.task_id != actor_cap.task_id
+                    || cap.plan_sha256 != actor_cap.plan_sha256
                 {
                     continue;
                 }

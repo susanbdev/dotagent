@@ -354,10 +354,10 @@ vectors = [
   { kind = "cmd", payload = "dotagent feedback triage --json" },
   { kind = "cmd", payload = "agent-guard feedback triage --min-votes 1" },
   { kind = "cmd", payload = "dotagent verify-ring0-ratchet --base HEAD --mode automated-pr" },
-  { kind = "write_path", payload = "profiles/plugins/rogue.rego" },
-  { kind = "write_path", payload = "profiles/coding-agent.toml" },
-  { kind = "write_path", payload = ".dotagent-smoke.toml" },
-  { kind = "cmd", payload = "./bin/dotagent doctor" },
-  { kind = "cmd", payload = "./bin/swarm-tool status" }
+  { kind = "cmd", payload = "./sub/dotagent feedback submit --denial-id dnl_0123456789abcdef --category missing_safe_flag" },
+  { kind = "cmd", payload = "swarm-tool --probe-landlock-child" },
+  { kind = "cmd", payload = "agent-guard --probe-landlock-child" },
+  { kind = "mcp", payload = "mcp__susanbdev__rotate_cluster_keys" },
+  { kind = "mcp", payload = "mcp__susanbdev__deploy_worker_bundle" }
 ]
 

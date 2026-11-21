@@ -47,9 +47,9 @@ pub const MCP_CAPABILITY_MANIFEST: &[McpManifestRule] = &[
         description: "Liveness and pure read-only health metadata",
     },
     McpManifestRule {
-        pattern: "get_*|list_*|read_*|search|search_*|query|query_*|inspect_*|describe_*|explain_*|verify_*|diff|diff_*|check_*|audit_*|lookup_*|dotagent_read_file|dotagent_search|dotagent_submit_friction",
+        pattern: "get_*|list_*|read_*|search|search_*|query|query_*|inspect_*|describe_*|explain_*|verify_*|diff|diff_*|check_*|audit_*|lookup_*|dotagent_read_file|dotagent_search",
         class: McpRpcClass::ReadOnly,
-        description: "Pure read-only lookup, search, verification, and write-only friction ballot RPCs",
+        description: "Pure read-only lookup, search, and verification RPCs",
     },
     McpManifestRule {
         pattern: "dotagent_submit_friction",

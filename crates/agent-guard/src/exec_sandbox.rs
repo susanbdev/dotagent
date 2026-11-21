@@ -259,19 +259,16 @@ pub fn probe_host_sandbox_mode() -> KernelSandboxMode {
     #[cfg(target_os = "linux")]
     {
         if let Ok(exe) = env::current_exe() {
-            let mut candidates = vec![exe.clone()];
-            if let Some(dir) = exe.parent() {
-                let sib = dir.join("agent-guard");
-                if sib != exe && sib.is_file() {
-                    candidates.insert(0, sib);
-                }
-                if let Some(parent_dir) = dir.parent() {
-                    let parent_sib = parent_dir.join("agent-guard");
-                    if parent_sib != exe && parent_sib.is_file() {
-                        candidates.insert(0, parent_sib);
+            let mut candidates = Vec::new();
+            for anc in exe.ancestors().skip(1).take(5) {
+                for name in ["agent-guard", "dotagent"] {
+                    let cand = anc.join(name);
+                    if cand != exe && cand.is_file() && !candidates.contains(&cand) {
+                        candidates.push(cand);
                     }
                 }
             }
+            candidates.push(exe);
             for bin in candidates {
                 if let Ok(out) = Command::new(bin).arg("--probe-landlock-child").output()
                     && out.status.success()

@@ -673,11 +673,37 @@ fn read_policy_ir_plugin_pins(
         ));
     };
     let mut out = Vec::new();
-    if let Some(crate::json::JsonValue::Object(entries)) = v.get("plugins") {
-        for (k, val) in entries {
-            if let Some(h) = val.as_str() {
-                out.push((k.clone(), h.to_string()));
+    match v.get("plugins") {
+        None => {}
+        Some(crate::json::JsonValue::Object(entries)) => {
+            for (k, val) in entries {
+                let valid_name = !k.is_empty()
+                    && !k.starts_with('.')
+                    && !k.contains('/')
+                    && !k.contains('\\')
+                    && !k.contains("..")
+                    && (k.ends_with(".rego") || k.ends_with(".toml"));
+                let Some(h) = val.as_str() else {
+                    return Err((
+                        "PLUGIN_INTEGRITY_VIOLATION",
+                        format!("Non-string plugin digest for '{k}' in policy_ir.json."),
+                    ));
+                };
+                let valid_hex = h.len() == 64 && h.bytes().all(|b| b.is_ascii_hexdigit());
+                if !valid_name || !valid_hex {
+                    return Err((
+                        "PLUGIN_INTEGRITY_VIOLATION",
+                        format!("Malformed plugin pin '{k}' in policy_ir.json."),
+                    ));
+                }
+                out.push((k.clone(), h.to_ascii_lowercase()));
             }
+        }
+        Some(_) => {
+            return Err((
+                "PLUGIN_INTEGRITY_VIOLATION",
+                "Invalid non-object 'plugins' field in policy_ir.json.".to_string(),
+            ));
         }
     }
     Ok(out)

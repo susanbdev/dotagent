@@ -188,6 +188,22 @@ fn review_regressions_sshsig_app_quorum_binding_and_repo_local_bin_blocks() {
     assert!(evaluate_shell_command("./bin/dotagent doctor", &canon, &canon, false).is_err());
     assert!(evaluate_shell_command("./bin/swarm-tool status", &canon, &canon, false).is_err());
     assert!(evaluate_shell_command("./bin/git status", &canon, &canon, false).is_err());
+    for protected in [
+        "profiles/plugins/rogue.rego",
+        "profiles/coding-agent.toml",
+        ".dotagent-smoke.toml",
+    ] {
+        assert!(
+            agent_guard::path_policy::validate_path(
+                &canon,
+                &canon,
+                protected,
+                agent_guard::path_policy::PathAccess::Write,
+            )
+            .is_err(),
+            "write to {protected} must be denied"
+        );
+    }
 }
 
 #[test]

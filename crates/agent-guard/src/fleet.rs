@@ -1640,23 +1640,71 @@ fn run_fleet_configure_github_cli(args: &[String], cwd: &Path) -> ExitCode {
         println!("{}", plan.to_json_string());
         return ExitCode::SUCCESS;
     }
-    if !verify_only {
-        if let Err((code, detail)) = crate::telemetry::verify_human_tty_telemetry_gate() {
-            eprintln!("[AGENT-GUARD HARD DENY :: {code}] {detail}");
-            return ExitCode::from(2);
-        }
-        let repo_root = crate::resolve_repo_root(cwd);
-        if let Err(ge) = crate::operator::verify_operator_sshsig_gate(
-            &repo_root,
-            "configure-github",
-            sshsig_file.as_deref(),
-        ) {
-            eprintln!("[AGENT-GUARD HARD DENY :: {}] {}", ge.code, ge.detail);
-            return ExitCode::from(2);
+    if let Err((code, detail)) = crate::telemetry::verify_human_tty_telemetry_gate() {
+        eprintln!("[AGENT-GUARD HARD DENY :: {code}] {detail}");
+        return ExitCode::from(2);
+    }
+    let repo_root = crate::resolve_repo_root(cwd);
+    if let Err(ge) = crate::operator::verify_operator_sshsig_gate(
+        &repo_root,
+        "configure-github",
+        sshsig_file.as_deref(),
+    ) {
+        eprintln!("[AGENT-GUARD HARD DENY :: {}] {}", ge.code, ge.detail);
+        return ExitCode::from(2);
+    }
+    let canon_root = fs::canonicalize(&repo_root).unwrap_or_else(|_| repo_root.clone());
+    let mut gh_candidates = vec![
+        PathBuf::from("/opt/antigravity/bin/gh"),
+        PathBuf::from("/usr/local/bin/gh"),
+        PathBuf::from("/opt/homebrew/bin/gh"),
+        PathBuf::from("/usr/bin/gh"),
+    ];
+    if let Some(path_os) = std::env::var_os("PATH") {
+        for dir in std::env::split_paths(&path_os) {
+            if dir.is_absolute() {
+                gh_candidates.push(dir.join("gh"));
+            }
         }
     }
+    let Some(gh_bin) = gh_candidates.into_iter().find(|p| {
+        p.is_absolute()
+            && !p.starts_with(&repo_root)
+            && fs::canonicalize(p).is_ok_and(|c| {
+                !c.starts_with(&canon_root) && crate::coordinator::is_trusted_executable_file(&c)
+            })
+    }) else {
+        eprintln!("[dotagent fleet configure-github] trusted absolute `gh` binary not found");
+        return ExitCode::from(2);
+    };
+    let build_gh_cmd = || -> std::process::Command {
+        let mut c = std::process::Command::new(&gh_bin);
+        c.env_clear();
+        c.env(
+            "PATH",
+            "/opt/antigravity/bin:/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin",
+        );
+        c.env("GH_PROMPT_DISABLED", "1");
+        c.env("NO_COLOR", "1");
+        for k in [
+            "HOME",
+            "GH_TOKEN",
+            "GITHUB_TOKEN",
+            "GH_CONFIG_DIR",
+            "HTTP_PROXY",
+            "HTTPS_PROXY",
+            "NO_PROXY",
+            "SSL_CERT_FILE",
+            "SSL_CERT_DIR",
+        ] {
+            if let Ok(v) = std::env::var(k) {
+                c.env(k, v);
+            }
+        }
+        c
+    };
     let gh_get = |ep: &str| -> Result<JsonValue, String> {
-        let out = std::process::Command::new("gh")
+        let out = build_gh_cmd()
             .args(["api", ep])
             .output()
             .map_err(|e| format!("gh api '{ep}' failed: {e}"))?;
@@ -1717,7 +1765,7 @@ fn run_fleet_configure_github_cli(args: &[String], cwd: &Path) -> ExitCode {
         } else {
             let gh_put = |method: &str, ep: &str, body: &str| -> Result<(), String> {
                 use std::io::Write;
-                let mut child = std::process::Command::new("gh")
+                let mut child = build_gh_cmd()
                     .args(["api", "--method", method, ep, "--input", "-"])
                     .stdin(std::process::Stdio::piped())
                     .stdout(std::process::Stdio::null())

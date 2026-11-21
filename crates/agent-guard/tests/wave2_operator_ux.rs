@@ -102,7 +102,12 @@ fn doctor_json_and_session_reset_fail_closed_gates() {
     let dotagent_bin = env!("CARGO_BIN_EXE_dotagent");
     let root = workspace_root();
 
-    let kernel_enforced = agent_guard::exec_sandbox::probe_host_sandbox_mode().is_kernel_enforced();
+    let status_probe = Command::new(dotagent_bin)
+        .arg("sandbox-status")
+        .output()
+        .expect("dotagent sandbox-status");
+    let kernel_enforced =
+        String::from_utf8_lossy(&status_probe.stdout).contains("kernel_enforced=true");
     if !kernel_enforced {
         let degraded_default = Command::new(dotagent_bin)
             .args(["doctor", "--json"])

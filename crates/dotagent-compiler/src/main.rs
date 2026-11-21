@@ -581,8 +581,37 @@ fn validate_profiles(
             &toml_json.to_json_string(),
         )?;
         let ir = parse_profile_toml_to_ir(required, &text)?;
+        for (plug_name, exp_hex) in &ir.pinned_plugins {
+            let plug_dir = profiles_dir.join("plugins");
+            let plug_path = plug_dir.join(plug_name);
+            let plug_body = read_contained_regular_file(&plug_dir, &plug_path).map_err(|e| {
+                format!(
+                    "profile '{required}' pins missing or invalid plugin 'profiles/plugins/{plug_name}': {e}"
+                )
+            })?;
+            let actual_hex = sha256_hex(plug_body.as_bytes());
+            if actual_hex != *exp_hex {
+                return Err(format!(
+                    "profile '{required}' plugin 'profiles/plugins/{plug_name}' sha256 mismatch (expected {exp_hex}, got {actual_hex})"
+                ));
+            }
+            hashes.insert(format!("profiles/plugins/{plug_name}"), actual_hex);
+        }
         profile_irs.push(ir);
         hashes.insert(format!("profiles/{required}"), sha256_hex(text.as_bytes()));
+    }
+    let plug_dir = profiles_dir.join("plugins");
+    if plug_dir.is_dir()
+        && let Ok(plug_entries) = fs::read_dir(&plug_dir)
+    {
+        for pe in plug_entries.flatten() {
+            let pn = pe.file_name().to_string_lossy().into_owned();
+            if !hashes.contains_key(&format!("profiles/plugins/{pn}")) {
+                return Err(format!(
+                    "unpinned plugin 'profiles/plugins/{pn}' must be SHA-256 pinned in profiles/*.toml"
+                ));
+            }
+        }
     }
     Ok((hashes, profile_irs))
 }

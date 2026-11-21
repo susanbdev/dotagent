@@ -42,6 +42,7 @@ pub struct ProfileIr {
     pub max_direct_discovery_calls: u64,
     pub mcp_allowed_endpoint: String,
     pub ban_stdio_npx_servers: bool,
+    pub pinned_plugins: BTreeMap<String, String>,
 }
 
 impl ProfileIr {
@@ -799,6 +800,37 @@ pub fn parse_profile_toml_to_ir(file_name: &str, raw_toml: &str) -> Result<Profi
         .and_then(JsonValue::as_bool)
         .unwrap_or(true);
 
+    let mut pinned_plugins = BTreeMap::new();
+    match ast.get("plugins") {
+        None => {}
+        Some(JsonValue::Object(entries)) => {
+            for (k, val) in entries {
+                let valid_name = !k.is_empty()
+                    && !k.starts_with('.')
+                    && !k.contains('/')
+                    && !k.contains('\\')
+                    && !k.contains("..")
+                    && (k.ends_with(".rego") || k.ends_with(".toml"));
+                let Some(hex) = val.as_str() else {
+                    return Err(format!(
+                        "profile '{file_name}' plugin '{k}' must map to a 64-hex SHA-256 string"
+                    ));
+                };
+                if !valid_name || hex.len() != 64 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+                    return Err(format!(
+                        "profile '{file_name}' has invalid plugin name or SHA-256 digest for '{k}'"
+                    ));
+                }
+                pinned_plugins.insert(k.clone(), hex.to_ascii_lowercase());
+            }
+        }
+        Some(_) => {
+            return Err(format!(
+                "profile '{file_name}' [plugins] must be a key-value table"
+            ));
+        }
+    }
+
     Ok(ProfileIr {
         file_name: file_name.to_string(),
         profile_id,
@@ -823,13 +855,20 @@ pub fn parse_profile_toml_to_ir(file_name: &str, raw_toml: &str) -> Result<Profi
         max_direct_discovery_calls,
         mcp_allowed_endpoint,
         ban_stdio_npx_servers,
+        pinned_plugins,
     })
 }
 
 /// Compiles all parsed `ProfileIr`s, `SkillIr`s, and the declarative `MCP_CAPABILITY_MANIFEST`
 /// into `dist/profiles/policy_ir.json`.
 pub fn compile_policy_bundle_ir_json(profiles: &[ProfileIr], skills: &[SkillIr]) -> String {
-    compile_policy_bundle_ir_json_with_plugins(profiles, skills, &BTreeMap::new())
+    let mut merged = BTreeMap::new();
+    for p in profiles {
+        for (k, v) in &p.pinned_plugins {
+            merged.insert(k.clone(), v.clone());
+        }
+    }
+    compile_policy_bundle_ir_json_with_plugins(profiles, skills, &merged)
 }
 
 pub fn compile_policy_bundle_ir_json_with_plugins(
