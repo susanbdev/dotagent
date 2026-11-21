@@ -1,0 +1,12 @@
+# Canonical Hardware FIDO2 SSH Commit Signers (`susanbdev/dotagent` Ring-0 Trust Anchor)
+#
+# Format (OpenSSH `allowed_signers` -- ONLY hardware-backed `sk-*` key types are accepted):
+#   <principal> namespaces="git" sk-ssh-ed25519@openssh.com <base64_pubkey>
+#   <principal> namespaces="git" sk-ecdsa-sha2-nistp256@openssh.com <base64_pubkey>
+#
+# Bootstrap One-Liner (run locally with your physical YubiKey inserted, then `git commit -S`):
+#   ssh-add -L | grep 'sk-ssh' | awk '{print "owner@susanb.dev namespaces=\"git\" " $1 " " $2}' >> scripts/allowed_hardware_signers
+#
+# Once populated with >= 1 active `sk-*` key (or when `DOTAGENT_ENFORCE_HW_SIGNERS=1` is set),
+# `scripts/verify-pr-authority.sh` fails closed (`exit 2` `RING0_HARDWARE_SIGNATURE_REQUIRED`)
+# on every Ring-0 PR unless `HEAD` is cryptographically signed by a listed hardware key.

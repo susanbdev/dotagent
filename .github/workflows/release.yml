@@ -2,6 +2,8 @@ name: Verifiable Release & SLSA Provenance
 
 on:
   push:
+    branches:
+      - "main"
     tags:
       - "v*"
 
@@ -9,9 +11,69 @@ permissions:
   contents: read
 
 jobs:
+  auto-tag-release:
+    name: auto-tag-release
+    if: startsWith(github.ref, 'refs/heads/main')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Checkout main (zero persisted credentials)
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          submodules: false
+
+      - name: Inspect Cargo.toml workspace version & check existing release tags
+        id: check_ver
+        shell: bash
+        run: |
+          set -euo pipefail
+          VER="$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml","rb"))["workspace"]["package"]["version"])')"
+          TAG="v${VER}"
+          echo "tag=${TAG}" >> "${GITHUB_OUTPUT}"
+          if git rev-parse -q --verify "refs/tags/${TAG}" >/dev/null 2>&1; then
+            echo "needs_tag=false" >> "${GITHUB_OUTPUT}"
+            echo "[auto-tag-release] Tag ${TAG} already exists; nothing to tag."
+          else
+            echo "needs_tag=true" >> "${GITHUB_OUTPUT}"
+            echo "[auto-tag-release] Detected untagged workspace version ${TAG} on main."
+          fi
+
+      - name: Notice when Promoter App is not configured for untagged version bump
+        if: steps.check_ver.outputs.needs_tag == 'true' && vars.PROMOTER_APP_ID == ''
+        run: |
+          echo "::notice::Detected new version ${{ steps.check_ver.outputs.tag }}; configure vars.PROMOTER_APP_ID or push tag ${{ steps.check_ver.outputs.tag }} to publish release."
+
+      - name: Mint scoped dotagent-promoter[bot] token for release tagging
+        id: app_token
+        if: steps.check_ver.outputs.needs_tag == 'true' && vars.PROMOTER_APP_ID != ''
+        uses: actions/create-github-app-token@f418cff399f7aef4c2f0ad47e25ca7a6abbdd6fc # v3.4.0
+        with:
+          app-id: ${{ vars.PROMOTER_APP_ID }}
+          private-key: ${{ secrets.PROMOTER_APP_PRIVATE_KEY }}
+
+      - name: Push annotated release tag via dotagent-promoter[bot]
+        if: steps.check_ver.outputs.needs_tag == 'true' && vars.PROMOTER_APP_ID != ''
+        shell: bash
+        env:
+          APP_TOKEN: ${{ steps.app_token.outputs.token }}
+          TAG: ${{ steps.check_ver.outputs.tag }}
+          REPO_FULL: ${{ github.repository }}
+          TARGET_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          export GIT_AUTHOR_NAME="dotagent-promoter[bot]"
+          export GIT_AUTHOR_EMAIL="dotagent-promoter[bot]@users.noreply.github.com"
+          export GIT_COMMITTER_NAME="dotagent-promoter[bot]"
+          export GIT_COMMITTER_EMAIL="dotagent-promoter[bot]@users.noreply.github.com"
+          git tag -a "${TAG}" -m "dotagent ${TAG}" "${TARGET_SHA}"
+          git push "https://x-access-token:${APP_TOKEN}@github.com/${REPO_FULL}.git" "refs/tags/${TAG}"
+
   verify-release-gate:
     name: Pre-Release Security & Manifest Gate
-    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     env:
       CARGO_TERM_COLOR: always
@@ -26,6 +88,17 @@ jobs:
         with:
           persist-credentials: false
           submodules: false
+
+      - name: Verify release tag matches Cargo.toml workspace version
+        shell: bash
+        run: |
+          set -euo pipefail
+          VER="$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml","rb"))["workspace"]["package"]["version"])')"
+          EXPECTED_TAG="v${VER}"
+          if [[ "${GITHUB_REF_NAME}" != "${EXPECTED_TAG}" ]]; then
+            echo "TAG_VERSION_MISMATCH: tag '${GITHUB_REF_NAME}' != Cargo.toml '${EXPECTED_TAG}'" >&2
+            exit 1
+          fi
 
       - name: Apply hardened global Git configuration
         run: cp dist/gitconfig.hardened ~/.gitconfig
@@ -65,26 +138,39 @@ jobs:
           cargo run --release --locked -p agent-guard --bin dotagent -- audit-repo .
 
   build-archives:
-    name: Build Archive (${{ matrix.target }})
+    name: Build & Smoke-Test Archive (${{ matrix.target }})
+    if: startsWith(github.ref, 'refs/tags/v')
     needs: verify-release-gate
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 25
+    timeout-minutes: 30
     strategy:
       fail-fast: true
       matrix:
         include:
-          - os: ubuntu-latest
+          - os: ubuntu-24.04
             target: x86_64-unknown-linux-musl
             use_musl_tools: "true"
+            expect_mode: landlock
+            runner_prefix: ""
+            dual_repro: "true"
           - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-musl
             use_musl_tools: "true"
-          - os: macos-latest
-            target: x86_64-apple-darwin
-            use_musl_tools: "false"
-          - os: macos-latest
+            expect_mode: landlock
+            runner_prefix: ""
+            dual_repro: "false"
+          - os: macos-15
             target: aarch64-apple-darwin
             use_musl_tools: "false"
+            expect_mode: seatbelt
+            runner_prefix: ""
+            dual_repro: "false"
+          - os: macos-15
+            target: x86_64-apple-darwin
+            use_musl_tools: "false"
+            expect_mode: seatbelt
+            runner_prefix: "arch -x86_64"
+            dual_repro: "false"
     steps:
       - name: Checkout tag (zero persisted credentials)
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -97,6 +183,13 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends musl-tools
+
+      - name: Ensure Rosetta 2 is available for Intel macOS cleanroom smoke test
+        if: matrix.target == 'x86_64-apple-darwin'
+        run: |
+          if ! arch -x86_64 /usr/bin/true >/dev/null 2>&1; then
+            sudo softwareupdate --install-rosetta --agree-to-license || true
+          fi
 
       - name: Install Rust target (${{ matrix.target }})
         run: |
@@ -113,62 +206,55 @@ jobs:
           export RUSTFLAGS="--remap-path-prefix=${GITHUB_WORKSPACE}=/dotagent --remap-path-prefix=${CARGO_DIR}=/cargo"
           cargo build --release --locked --workspace --target "${{ matrix.target }}"
 
-      - name: Package deterministic bit-for-bit reproducible release tarball
+      - name: Package deterministic release archive & run sterile clean-room smoke test
         shell: bash
         run: |
           set -euo pipefail
           TAG="${GITHUB_REF_NAME}"
           PKG="dotagent-${TAG}-${{ matrix.target }}"
-          STAGE="dist-release/${PKG}"
-          mkdir -p "${STAGE}/bin"
-          for bin in dotagent agent-guard agent-guard-sh dotagent-compiler swarm-tool dotagent-harness; do
-            cp "target/${{ matrix.target }}/release/${bin}" "${STAGE}/bin/${bin}"
-            chmod 0555 "${STAGE}/bin/${bin}"
-          done
-          cp -R dist profiles skills "${STAGE}/"
-          cp AGENTS.md README.md THREAT_MODEL.md SECURITY.md CHANGELOG.md spec.md "${STAGE}/"
-          mkdir -p release-out
-          python3 - "${STAGE}" "${PKG}" "release-out/${PKG}.tar.gz" <<'PY'
-          import gzip, os, stat, sys, tarfile
-          stage_dir, pkg_name, out_tar_gz = sys.argv[1], sys.argv[2], sys.argv[3]
-          entries = []
-          for root, dirs, files in os.walk(stage_dir, followlinks=False):
-              dirs.sort()
-              files.sort()
-              rel_root = os.path.relpath(root, os.path.dirname(stage_dir))
-              entries.append((root, rel_root, True))
-              for f in files:
-                  full = os.path.join(root, f)
-                  entries.append((full, os.path.join(rel_root, f), False))
-          entries.sort(key=lambda item: item[1])
-          with open(out_tar_gz, "wb") as raw_fh:
-              with gzip.GzipFile(filename="", mode="wb", fileobj=raw_fh, mtime=0) as gz_fh:
-                  with tarfile.open(mode="w", fileobj=gz_fh, format=tarfile.PAX_FORMAT) as tf:
-                      for full, arcname, is_dir in entries:
-                          st = os.lstat(full)
-                          if stat.S_ISLNK(st.st_mode):
-                              raise SystemExit(f"forbidden symlink in release stage: {full}")
-                          ti = tarfile.TarInfo(name=arcname.replace(os.sep, "/"))
-                          ti.uid = 0
-                          ti.gid = 0
-                          ti.uname = ""
-                          ti.gname = ""
-                          ti.mtime = 0
-                          if is_dir and stat.S_ISDIR(st.st_mode):
-                              ti.type = tarfile.DIRTYPE
-                              ti.mode = 0o555
-                              tf.addfile(ti)
-                          elif stat.S_ISREG(st.st_mode):
-                              ti.type = tarfile.REGTYPE
-                              ti.size = st.st_size
-                              ti.mode = 0o555 if (st.st_mode & 0o111) else 0o444
-                              with open(full, "rb") as src_fh:
-                                  tf.addfile(ti, src_fh)
-                          else:
-                              raise SystemExit(f"forbidden non-regular file in release stage: {full}")
-          PY
+          OUT_TAR="release-out/${PKG}.tar.gz"
+          bash scripts/package-release-archive.sh \
+            --target "${{ matrix.target }}" \
+            --tag "${TAG}" \
+            --out "${OUT_TAR}"
 
-      - name: Upload target archive artifact
+          SMOKE_ARGS=(--archive "${OUT_TAR}" --expect-mode "${{ matrix.expect_mode }}")
+          if [[ -n "${{ matrix.runner_prefix }}" ]]; then
+            SMOKE_ARGS+=(--runner-prefix "${{ matrix.runner_prefix }}")
+          fi
+          bash scripts/cleanroom-smoke-test.sh "${SMOKE_ARGS[@]}"
+
+      - name: Verify dual-directory bit-for-bit reproducibility on x86_64-unknown-linux-musl
+        if: matrix.dual_repro == 'true'
+        shell: bash
+        env:
+          LC_ALL: C
+          SOURCE_DATE_EPOCH: "1700000000"
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF_NAME}"
+          PKG="dotagent-${TAG}-${{ matrix.target }}"
+          ALT_DIR="${RUNNER_TEMP}/repro-check/deep/nested/repo"
+          mkdir -p "${ALT_DIR}"
+          tar -cf - --exclude='./.git' --exclude='./target' --exclude='./release-out' . | tar -xf - -C "${ALT_DIR}"
+          CARGO_DIR="${CARGO_HOME:-$HOME/.cargo}"
+          (
+            cd "${ALT_DIR}"
+            export RUSTFLAGS="--remap-path-prefix=${ALT_DIR}=/dotagent --remap-path-prefix=${CARGO_DIR}=/cargo"
+            cargo build --release --locked --workspace --target "${{ matrix.target }}"
+            bash scripts/package-release-archive.sh \
+              --target "${{ matrix.target }}" \
+              --tag "${TAG}" \
+              --out "${RUNNER_TEMP}/alt-${PKG}.tar.gz"
+          )
+          SHA_PRIMARY="$(sha256sum "release-out/${PKG}.tar.gz" | awk '{print $1}')"
+          SHA_ALT="$(sha256sum "${RUNNER_TEMP}/alt-${PKG}.tar.gz" | awk '{print $1}')"
+          if [[ "${SHA_PRIMARY}" != "${SHA_ALT}" ]]; then
+            echo "RELEASE_REPRODUCIBILITY_MISMATCH: ${SHA_PRIMARY} != ${SHA_ALT}" >&2
+            exit 1
+          fi
+
+      - name: Upload verified target archive artifact
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: archive-${{ matrix.target }}
@@ -177,15 +263,16 @@ jobs:
 
   publish-attested-release:
     name: SHA256SUMS, SLSA Provenance, & GitHub Release
+    if: startsWith(github.ref, 'refs/tags/v')
     needs: build-archives
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     permissions:
       contents: write
       id-token: write
       attestations: write
     steps:
-      - name: Download all target archives
+      - name: Download all smoke-tested target archives
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           path: artifacts
@@ -216,3 +303,56 @@ jobs:
             --title "dotagent ${GITHUB_REF_NAME}" \
             --generate-notes \
             --verify-tag
+
+  verify-published-release:
+    name: Post-Publish SLSA & dotagent self-verify (${{ matrix.os }})
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: publish-attested-release
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      attestations: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-musl
+          - os: macos-15
+            target: aarch64-apple-darwin
+    steps:
+      - name: Download published release archive, SHA256SUMS, & SLSA attestation and run dotagent self-verify
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO_FULL: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          VERIFY_DIR="${RUNNER_TEMP}/post-release-verify"
+          mkdir -p "${VERIFY_DIR}/unpacked"
+          cd "${VERIFY_DIR}"
+
+          PKG="dotagent-${TAG}-${TARGET}"
+          TARBALL="${PKG}.tar.gz"
+          gh release download "${TAG}" --repo "${REPO_FULL}" -p "${TARBALL}" -p "SHA256SUMS"
+
+          gh attestation verify "${TARBALL}" --repo "${REPO_FULL}" --format json > attestation-bundle.json
+          python3 - attestation-bundle.json statement.json <<'PY'
+          import base64, json, sys
+          bundles = json.load(open(sys.argv[1], "r", encoding="utf-8"))
+          env = bundles[0]["verificationResult"]["statement"] if "verificationResult" in bundles[0] and "statement" in bundles[0]["verificationResult"] else None
+          if env is None:
+              dsse = bundles[0].get("bundle", {}).get("dsseEnvelope") or bundles[0].get("dsseEnvelope")
+              env = json.loads(base64.b64decode(dsse["payload"]).decode("utf-8"))
+          with open(sys.argv[2], "w", encoding="utf-8") as out:
+              json.dump(env, out)
+          PY
+
+          tar -xzf "${TARBALL}" -C "${VERIFY_DIR}/unpacked"
+          "${VERIFY_DIR}/unpacked/${PKG}/bin/dotagent" self-verify \
+            --sums "${VERIFY_DIR}/SHA256SUMS" \
+            --subject "${VERIFY_DIR}/${TARBALL}" \
+            --provenance "${VERIFY_DIR}/statement.json"
