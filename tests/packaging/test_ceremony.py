@@ -183,6 +183,33 @@ class CeremonyIntegrationTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn('"%s"' % fx.TAG, slurp(os.path.join(web, "dotagent", "install.sh")))
 
+    def test_duplicate_baked_digest_in_installer_is_refused(self):
+        installer = os.path.join(self.release["dir"], "install.sh")
+        text = slurp(installer) + 'DOTAGENT_SHA256_LINUX_X64="%s"\n' % ("0" * 64)
+        with open(installer, "w", encoding="ascii") as handle:
+            handle.write(text)
+        sums = os.path.join(self.release["dir"], "SHA256SUMS")
+        new_hash = fx.sha256_file(installer)
+        lines = [
+            ("%s  install.sh" % new_hash) if line.endswith("  install.sh") else line
+            for line in slurp(sums).splitlines()
+        ]
+        with open(sums, "w", encoding="ascii") as handle:
+            handle.write("\n".join(lines) + "\n")
+        result = self.ceremony()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("expected exactly 1", result.stderr)
+        self.assertEqual(self.uploads(), [])
+
+    def test_sums_path_traversal_is_refused(self):
+        sums = os.path.join(self.release["dir"], "SHA256SUMS")
+        with open(sums, "a", encoding="ascii") as handle:
+            handle.write("%s  ../outside\n" % ("0" * 64))
+        result = self.ceremony()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("invalid filename", result.stderr)
+        self.assertEqual(self.uploads(), [])
+
 
 if __name__ == "__main__":
     unittest.main()

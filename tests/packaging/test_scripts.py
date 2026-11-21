@@ -65,18 +65,20 @@ class ActivateTests(unittest.TestCase):
         self.assertIn("agent-guard activate --dotagent-root", log)
 
     def test_from_prebuilt_rejects_symlinked_binary(self):
+        sums = self.write_sums()
         target = os.path.join(self.prebuilt, "bin", "swarm-tool")
         os.remove(target)
-        os.symlink("/bin/true", target)
-        result = self.run_activate("--from-prebuilt", self.prebuilt, "--prebuilt-sums", self.write_sums())
+        os.symlink(os.path.join(self.prebuilt, "bin", "dotagent"), target)
+        result = self.run_activate("--from-prebuilt", self.prebuilt, "--prebuilt-sums", sums)
         self.assertEqual(result.returncode, 2)
         self.assertIn("symlink", result.stderr)
 
     def test_from_prebuilt_rejects_symlinked_optional_harness(self):
+        sums = self.write_sums()
         target = os.path.join(self.prebuilt, "bin", "dotagent-harness")
         os.remove(target)
-        os.symlink("/bin/true", target)
-        result = self.run_activate("--from-prebuilt", self.prebuilt, "--prebuilt-sums", self.write_sums())
+        os.symlink(os.path.join(self.prebuilt, "bin", "dotagent"), target)
+        result = self.run_activate("--from-prebuilt", self.prebuilt, "--prebuilt-sums", sums)
         self.assertEqual(result.returncode, 2)
         self.assertIn("symlink", result.stderr)
 

@@ -395,7 +395,8 @@ def render_formula(version, tag, license_id, digests):
             "  end",
             "",
             "  def install",
-            "    libexec.install Dir[\"*\"]",
+            '    root = Dir["dotagent-*"].find { |p| File.directory?(p) } || "."',
+            '    libexec.install Dir["#{root}/*"]',
         ]
         + ["    bin.install_symlink libexec/\"bin/%s\"" % binary for binary in BINARIES]
         + [

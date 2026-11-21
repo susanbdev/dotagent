@@ -137,9 +137,10 @@ class InstallerTests(unittest.TestCase):
     def test_running_binary_is_replaced_atomically(self):
         os.makedirs(self.bin)
         busy = os.path.join(self.bin, "dotagent")
-        shutil.copy("/bin/sleep", busy)
+        with open(busy, "w", encoding="ascii") as handle:
+            handle.write("#!/bin/sh\ntrap 'exit 0' TERM\nsleep 30 &\nwait\n")
         os.chmod(busy, 0o555)
-        process = subprocess.Popen([busy, "30"])
+        process = subprocess.Popen([busy])
         self.addCleanup(process.wait)
         self.addCleanup(process.kill)
         time.sleep(0.2)
@@ -147,7 +148,7 @@ class InstallerTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIsNone(process.poll(), "running binary must keep running")
         with open(busy, "rb") as handle:
-            self.assertTrue(handle.read(2) == b"#!", "binary was swapped for the release copy")
+            self.assertIn(b".stub.log", handle.read(), "binary was swapped for the release copy")
         process.send_signal(signal.SIGTERM)
 
     def audit(self, members):

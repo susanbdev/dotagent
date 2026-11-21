@@ -93,10 +93,31 @@ verify_sums() {
     while IFS= read -r line; do
         want="${line%% *}"
         name="${line#*  }"
-        [[ -f "${dir}/${name}" ]] || die "SHA256SUMS lists missing file ${name}"
+        [[ -n "${name}" && "${name}" != .* && "${name}" != */* ]] || die "invalid filename in SHA256SUMS: ${name}"
+        [[ -f "${dir}/${name}" && ! -L "${dir}/${name}" ]] || die "SHA256SUMS lists missing file ${name}"
         have="$(hash_file "${dir}/${name}")"
         [[ "${have}" == "${want}" ]] || die "SHA256SUMS mismatch for ${name}"
     done < "${dir}/SHA256SUMS"
+}
+
+audit_archive() {
+    local archive="$1" prefix="$2" entry
+    while IFS= read -r entry; do
+        case "${entry}" in
+            "" | /* | *../* | */.. | ..) die "unsafe archive path: ${entry}" ;;
+            "${prefix}" | "${prefix}"/*) ;;
+            *) die "unexpected archive entry: ${entry}" ;;
+        esac
+    done < <(tar -tzf "${archive}")
+    while IFS= read -r entry; do
+        case "${entry}" in
+            -* | d*) ;;
+            *) die "archive contains disallowed entry type: ${entry}" ;;
+        esac
+        case "${entry}" in
+            *" -> "* | *" link to "*) die "archive contains link entry: ${entry}" ;;
+        esac
+    done < <(tar -tvzf "${archive}")
 }
 
 # Decides whether the .pkg is built at all. Kept separate from build_pkg: a command that runs
@@ -116,6 +137,8 @@ build_pkg() {
     arm="${work}/arm"
     intel="${work}/intel"
     mkdir -p "${arm}" "${intel}" "${work}/root/opt" "${work}/root/etc/paths.d"
+    audit_archive "${dir}/dotagent-${tag}-aarch64-apple-darwin.tar.gz" "dotagent-${tag}-aarch64-apple-darwin"
+    audit_archive "${dir}/dotagent-${tag}-x86_64-apple-darwin.tar.gz" "dotagent-${tag}-x86_64-apple-darwin"
     tar -xzf "${dir}/dotagent-${tag}-aarch64-apple-darwin.tar.gz" -C "${arm}" --no-same-owner
     tar -xzf "${dir}/dotagent-${tag}-x86_64-apple-darwin.tar.gz" -C "${intel}" --no-same-owner
     cp -R "${arm}/dotagent-${tag}-aarch64-apple-darwin" "${work}/root/opt/dotagent"
@@ -139,15 +162,23 @@ build_pkg() {
     xcrun stapler staple "${dir}/dotagent-${tag}-universal-apple-darwin.pkg"
 }
 
+exact_one_line() {
+    local file="$1" prefix="$2" count
+    count="$(grep -c "^${prefix}" "${file}" || true)"
+    [[ "${count}" -eq 1 ]] || die "expected exactly 1 ${prefix} definition in ${file##*/}, found ${count}"
+    grep "^${prefix}" "${file}"
+}
+
 # The installer is attested by CI but its bake must still agree with what we are about to sign.
 verify_installer() {
     local tag="$1" dir="$2" baked var target want have
-    baked="$(grep '^DOTAGENT_RELEASE_TAG=' "${dir}/install.sh" | head -n 1 | cut -d'"' -f2)"
+    baked="$(exact_one_line "${dir}/install.sh" 'DOTAGENT_RELEASE_TAG=' | cut -d'"' -f2)"
     [[ "${baked}" == "${tag}" ]] || die "install.sh is baked for ${baked:-nothing}, not ${tag}"
+    exact_one_line "${dir}/install.sh" 'DOTAGENT_SIGNER_LINE=' >/dev/null
     for var in LINUX_X64:x86_64-unknown-linux-musl LINUX_ARM64:aarch64-unknown-linux-musl \
         DARWIN_X64:x86_64-apple-darwin DARWIN_ARM64:aarch64-apple-darwin; do
         target="${var#*:}"
-        have="$(grep "^DOTAGENT_SHA256_${var%%:*}=" "${dir}/install.sh" | head -n 1 | cut -d'"' -f2)"
+        have="$(exact_one_line "${dir}/install.sh" "DOTAGENT_SHA256_${var%%:*}=" | cut -d'"' -f2)"
         want="$(grep -F "  dotagent-${tag}-${target}.tar.gz" "${dir}/SHA256SUMS" | head -n 1 | cut -d' ' -f1)"
         [[ -n "${have}" && "${have}" == "${want}" ]] || die "install.sh digest for ${target} differs from SHA256SUMS"
     done
@@ -155,13 +186,15 @@ verify_installer() {
 
 # Prints the release tag baked into an install.sh file (empty when absent).
 baked_tag() {
-    grep '^DOTAGENT_RELEASE_TAG=' "$1" 2>/dev/null | head -n 1 | cut -d'"' -f2
+    local count
+    count="$(grep -c '^DOTAGENT_RELEASE_TAG=' "$1" 2>/dev/null || true)"
+    [[ "${count}" -eq 1 ]] || return 0
+    grep '^DOTAGENT_RELEASE_TAG=' "$1" | cut -d'"' -f2
 }
 
 pinned_blob() {
     local line
-    line="$(grep '^DOTAGENT_SIGNER_LINE=' "$1" | head -n 1)"
-    [[ -n "${line}" ]] || die "install.sh carries no pinned signer"
+    line="$(exact_one_line "$1" 'DOTAGENT_SIGNER_LINE=')"
     printf '%s' "${line}" | tr -s " \"'" '\n' | grep -E '^AAAA' | head -n 1
 }
 

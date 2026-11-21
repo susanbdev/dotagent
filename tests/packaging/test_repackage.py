@@ -126,6 +126,7 @@ class RepackageTests(unittest.TestCase):
         for target in fx.TARGETS:
             digest = fx.sha256_file(os.path.join(self.archives, "dotagent-%s-%s.tar.gz" % (fx.TAG, target)))
             self.assertIn(digest, formula)
+        self.assertIn('Dir["dotagent-*"]', formula)
 
     def test_divergent_shared_trees_are_rejected(self):
         fx.build_archives(self.archives, skew_target="x86_64-apple-darwin")
