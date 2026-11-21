@@ -884,6 +884,16 @@ pub fn read_sudo_result_banner(req_id: &str) -> Result<String, (&'static str, St
             "[DOTAGENT SUDO-RESULT :: {valid_id}] STATUS=REJECTED_BY_HUMAN."
         ));
     }
+    if ticket.status == "executing" {
+        return Ok(format!(
+            "[DOTAGENT SUDO-RESULT :: {valid_id}] STATUS=EXECUTING_IN_HUMAN_TTY (wait for `dotagent approve` to finish)."
+        ));
+    }
+    if ticket.status == "expired" {
+        return Ok(format!(
+            "[DOTAGENT SUDO-RESULT :: {valid_id}] STATUS=EXPIRED (5-minute human approval window elapsed)."
+        ));
+    }
 
     let res_path = sudo_broker_dir().join(format!("{valid_id}.result.json"));
     let raw = fs::read_to_string(&res_path)
