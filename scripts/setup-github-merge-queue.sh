@@ -180,18 +180,29 @@ for r in "${REPOS[@]}"; do
     TAG_RS_ID="$(gh api --paginate "repos/${OWNER}/${r}/rulesets" --jq '.[] | select(.name == "dotagent-release-tags") | .id' | head -n1)"
     [[ -n "${RS_ID}" && -n "${TAG_RS_ID}" ]] || { echo "[setup-merge-queue] FAIL: missing rulesets on ${OWNER}/${r}" >&2; exit 1; }
     RS_JSON="$(gh api "repos/${OWNER}/${r}/rulesets/${RS_ID}")"
-    python3 - "${r}" "${REPO_JSON}" "${RS_JSON}" <<'PY'
+    TAG_RS_JSON="$(gh api "repos/${OWNER}/${r}/rulesets/${TAG_RS_ID}")"
+    python3 - "${r}" "${PROMOTER_APP_ID}" "${REPO_JSON}" "${RS_JSON}" "${TAG_RS_JSON}" <<'PY'
 import json, sys
-rname, repo, rs = sys.argv[1], json.loads(sys.argv[2]), json.loads(sys.argv[3])
+rname, app_id_s, repo, rs, trs = sys.argv[1], sys.argv[2], json.loads(sys.argv[3]), json.loads(sys.argv[4]), json.loads(sys.argv[5])
 assert repo.get("allow_squash_merge") is True and repo.get("allow_merge_commit") is False and repo.get("allow_rebase_merge") is False
 assert repo.get("allow_auto_merge") is True and repo.get("delete_branch_on_merge") is True
-assert rs.get("enforcement") == "active" and rs.get("bypass_actors", []) == []
+assert rs.get("enforcement") == "active" and rs.get("target") == "branch" and rs.get("bypass_actors", []) == []
 by_type = {rule["type"]: rule for rule in rs.get("rules", [])}
 for req in ("deletion", "non_fast_forward", "required_linear_history", "merge_queue", "pull_request"):
-    assert req in by_type, f"missing rule {req}"
+    assert req in by_type, f"missing branch rule {req}"
 if rname == "dotagent":
     checks = by_type["required_status_checks"]["parameters"]["required_status_checks"]
     assert len(checks) == 9 and all(c.get("integration_id") == 15368 for c in checks)
+assert trs.get("enforcement") == "active" and trs.get("target") == "tag"
+assert (trs.get("conditions", {}).get("ref_name", {}) or {}).get("include") == ["refs/tags/v*"]
+tag_rule_types = {rule["type"] for rule in trs.get("rules", [])}
+for req in ("creation", "update", "deletion", "non_fast_forward"):
+    assert req in tag_rule_types, f"missing tag rule {req}"
+t_actors = trs.get("bypass_actors", [])
+if app_id_s:
+    assert len(t_actors) == 1 and t_actors[0].get("actor_id") == int(app_id_s) and t_actors[0].get("actor_type") == "Integration"
+else:
+    assert t_actors == []
 PY
     echo "[setup-merge-queue] VERIFIED ${OWNER}/${r} (branch_ruleset=${RS_ID}, tag_ruleset=${TAG_RS_ID})"
 done

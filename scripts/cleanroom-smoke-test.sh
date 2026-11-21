@@ -28,15 +28,25 @@ case "${EXPECT_MODE}" in
 esac
 
 ARCHIVE_ABS="$(cd "$(dirname "${ARCHIVE}")" && pwd)/$(basename "${ARCHIVE}")"
-CLEAN_ROOT="${WORK_ROOT:-$(pwd)/target/cleanroom-run-$$-${RANDOM}}"
+WORK_BASE="${WORK_ROOT:-$(pwd)/target}"
+mkdir -p "${WORK_BASE}"
+WORK_BASE_ABS="$(cd "${WORK_BASE}" && pwd)"
+if [[ "${WORK_BASE_ABS}" == "/" || "${WORK_BASE_ABS}" == "${HOME:-}" ]]; then
+    echo "USAGE_ERROR: refusing dangerous --work-root '${WORK_BASE_ABS}'" >&2
+    exit 2
+fi
+CLEAN_ROOT="${WORK_BASE_ABS}/cleanroom-run-$$-${RANDOM}"
+mkdir "${CLEAN_ROOT}"
 CLEAN_HOME="${CLEAN_ROOT}/home"
 OPT_DIR="${CLEAN_ROOT}/opt"
 SAMPLE_REPO="${CLEAN_ROOT}/sample-repo"
 mkdir -p "${CLEAN_HOME}/.local/bin" "${CLEAN_HOME}/.local/run" "${OPT_DIR}" "${SAMPLE_REPO}"
 
 cleanup() {
-    chmod -R u+w "${CLEAN_ROOT}" 2>/dev/null || true
-    rm -rf "${CLEAN_ROOT}"
+    if [[ -n "${CLEAN_ROOT:-}" && "${CLEAN_ROOT}" == "${WORK_BASE_ABS}/cleanroom-run-"* ]]; then
+        chmod -R u+w "${CLEAN_ROOT}" 2>/dev/null || true
+        rm -rf "${CLEAN_ROOT}"
+    fi
 }
 trap cleanup EXIT
 

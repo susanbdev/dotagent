@@ -116,7 +116,15 @@ JSON_OUT="$(cd "${FIXTURE_REPO}" && bash "${VERIFY_SCRIPT}" --base "${BASE_SHA}"
     || fail "unexpected JSON summary for Ring-2 pass: ${JSON_OUT}"
 echo "[test-delivery-scripts] ok 3 - cmd_policy.rs + 2 unique vectors passes RING2_ALLOWLISTED (${JSON_OUT})"
 
-# Case 4: Populated allowed_hardware_signers + touching Cargo.toml without sk-* signature MUST exit 2
+# Case 4: Unsigned Ring-0 change fails closed by default even with 0 active signers, AND unsigned sk-* enrollment fails even under --bootstrap-allow-empty-signers
+git -C "${FIXTURE_REPO}" checkout -b case-evil-enroll "${BASE_SHA}" >/dev/null 2>&1
+printf 'attacker@evil.dev namespaces="git" sk-ssh-ed25519@openssh.com %s\n' "${VALID_SK_PUBKEY}" >> "${FIXTURE_REPO}/scripts/allowed_hardware_signers"
+git -C "${FIXTURE_REPO}" commit -am "evil: unsigned attacker sk-* enrollment" >/dev/null
+HEAD_EVIL_ENROLL="$(git -C "${FIXTURE_REPO}" rev-parse HEAD)"
+(cd "${FIXTURE_REPO}" && assert_exit_code 2 bash "${VERIFY_SCRIPT}" --base "${BASE_SHA}" --head "${HEAD_EVIL_ENROLL}" --bootstrap-allow-empty-signers)
+echo "[test-delivery-scripts] ok 4 - unsigned sk-* trust-anchor enrollment exits 2 even in bootstrap mode"
+
+# Case 5: Populated allowed_hardware_signers + touching Cargo.toml without sk-* signature MUST exit 2
 git -C "${FIXTURE_REPO}" checkout -b main-with-hw-signer "${BASE_SHA}" >/dev/null 2>&1
 printf 'owner@susanb.dev namespaces="git" sk-ssh-ed25519@openssh.com %s\n' "${VALID_SK_PUBKEY}" >> "${FIXTURE_REPO}/scripts/allowed_hardware_signers"
 git -C "${FIXTURE_REPO}" commit -am "chore: populate hardware FIDO2 signer" >/dev/null
@@ -127,29 +135,30 @@ echo "# ring0 edit" >> "${FIXTURE_REPO}/Cargo.toml"
 : > "${FIXTURE_REPO}/scripts/allowed_hardware_signers"
 git -C "${FIXTURE_REPO}" commit -am "evil: unsigned Cargo.toml + signer wipe" >/dev/null
 HEAD_RING0="$(git -C "${FIXTURE_REPO}" rev-parse HEAD)"
-(cd "${FIXTURE_REPO}" && assert_exit_code 2 bash "${VERIFY_SCRIPT}" --base "${HW_BASE_SHA}" --head "${HEAD_RING0}")
-echo "[test-delivery-scripts] ok 4 - touching Cargo.toml without sk-* signature exits 2"
+(cd "${FIXTURE_REPO}" && assert_exit_code 2 bash "${VERIFY_SCRIPT}" --base "${HW_BASE_SHA}" --head "${HEAD_RING0}" --bootstrap-allow-empty-signers)
+echo "[test-delivery-scripts] ok 5 - touching Cargo.toml without sk-* signature exits 2"
 
-# Case 5: Trailing-comment sk-* smuggling on software ssh-ed25519 key MUST exit 2
+# Case 6: Trailing-comment sk-* smuggling on software ssh-ed25519 key MUST exit 2
 SMUGGLED_SIGNERS="${TEST_ROOT}/smuggled_signers"
 cat > "${SMUGGLED_SIGNERS}" <<'EOF'
 owner@susanb.dev namespaces="git" ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAID000000000000000000000000000000000000000000 sk-ssh-ed25519@openssh.com
 EOF
 (cd "${FIXTURE_REPO}" && assert_exit_code 2 bash "${VERIFY_SCRIPT}" --base "${BASE_SHA}" --head "${HEAD_PASS}" --signers-file "${SMUGGLED_SIGNERS}")
-echo "[test-delivery-scripts] ok 5 - trailing-comment software ssh-ed25519 smuggling exits 2"
+echo "[test-delivery-scripts] ok 6 - trailing-comment software ssh-ed25519 smuggling exits 2"
 
-# Case 6: Empty 0-file diff is classified as Ring-0 (not auto-enqueued)
-EMPTY_JSON="$(cd "${FIXTURE_REPO}" && bash "${VERIFY_SCRIPT}" --base "${BASE_SHA}" --head "${BASE_SHA}" --json)"
+# Case 7: Empty 0-file diff fails closed by default (and is ineligible under bootstrap)
+(cd "${FIXTURE_REPO}" && assert_exit_code 2 bash "${VERIFY_SCRIPT}" --base "${BASE_SHA}" --head "${BASE_SHA}" --json)
+EMPTY_JSON="$(cd "${FIXTURE_REPO}" && bash "${VERIFY_SCRIPT}" --base "${BASE_SHA}" --head "${BASE_SHA}" --bootstrap-allow-empty-signers --json)"
 [[ "${EMPTY_JSON}" == '{"tier":"ring0","hw_signed":false,"new_corpus_vectors":0,"eligible_for_auto_enqueue":false}' ]] \
     || fail "empty diff should not be eligible_for_auto_enqueue: ${EMPTY_JSON}"
-echo "[test-delivery-scripts] ok 6 - empty diff classified ring0 with auto-enqueue disabled"
+echo "[test-delivery-scripts] ok 7 - empty diff fails closed by default and disables auto-enqueue"
 
-# Case 7: Verify setup-github-merge-queue.sh manifest & dry-run
+# Case 8: Verify setup-github-merge-queue.sh manifest & dry-run
 MANIFEST_JSON="$(bash "${SETUP_MQ_SCRIPT}" --print-app-manifest)"
 python3 -c 'import json, sys; d = json.loads(sys.argv[1]); assert d["default_permissions"]["contents"] == "write" and d["default_permissions"]["pull_requests"] == "write"' "${MANIFEST_JSON}"
 DRY_OUT="$(bash "${SETUP_MQ_SCRIPT}" --owner susanbdev --repo dotagent --promoter-app-id 123456 --dry-run)"
 [[ "${DRY_OUT}" == *"merge_queue"* && "${DRY_OUT}" == *"15368"* && "${DRY_OUT}" == *"dotagent-release-tags"* ]] \
     || fail "dry-run missing merge_queue / integration_id / tag_ruleset payload"
-echo "[test-delivery-scripts] ok 7 - setup-github-merge-queue.sh manifest & dry-run validated"
+echo "[test-delivery-scripts] ok 8 - setup-github-merge-queue.sh manifest & dry-run validated"
 
 echo "[test-delivery-scripts] ALL TESTS PASSED"

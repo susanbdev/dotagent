@@ -43,18 +43,40 @@ jobs:
           MQ_HEAD_SHA: ${{ github.event.merge_group.head_sha }}
           PUSH_BEFORE_SHA: ${{ github.event.before }}
           PUSH_HEAD_SHA: ${{ github.sha }}
+          ENFORCE_HW_VAR: ${{ vars.DOTAGENT_ENFORCE_HW_SIGNERS }}
+          BOOTSTRAP_SIGNER_VAR: ${{ vars.DOTAGENT_BOOTSTRAP_SIGNER }}
         run: |
           set -euo pipefail
+          GENESIS_PRE_GATE_SHA="0194af29450aa65d1699337ec731d1740efc00e4"
+          PINNED_GENESIS_VERIFIER_SHA256="ea34149d6b9cbee20ced65be6028a04e23672254a47b773f5935ce76b7ae943e"
+
           run_trusted_gate() {
             local base_sha="$1"
             shift
-            local gate_script="scripts/verify-pr-authority.sh"
+            local gate_script="${RUNNER_TEMP}/trusted-verify-pr-authority.sh"
             if git cat-file -e "${base_sha}:scripts/verify-pr-authority.sh" 2>/dev/null; then
-              gate_script="${RUNNER_TEMP}/trusted-verify-pr-authority.sh"
               git show "${base_sha}:scripts/verify-pr-authority.sh" > "${gate_script}"
               chmod 0700 "${gate_script}"
+            elif [[ "${base_sha}" == "${GENESIS_PRE_GATE_SHA}" ]]; then
+              ACTUAL_SHA256="$(sha256sum scripts/verify-pr-authority.sh | awk '{print $1}')"
+              if [[ "${ACTUAL_SHA256}" != "${PINNED_GENESIS_VERIFIER_SHA256}" ]]; then
+                echo "UNTRUSTED_BOOTSTRAP_VERIFIER: scripts/verify-pr-authority.sh sha256=${ACTUAL_SHA256} != pinned ${PINNED_GENESIS_VERIFIER_SHA256}" >&2
+                exit 2
+              fi
+              cp scripts/verify-pr-authority.sh "${gate_script}"
+              chmod 0700 "${gate_script}"
+            else
+              echo "MISSING_TRUSTED_VERIFIER: base commit ${base_sha} lacks scripts/verify-pr-authority.sh" >&2
+              exit 2
             fi
-            bash "${gate_script}" --base "${base_sha}" "$@"
+            local extra_args=()
+            if [[ "${ENFORCE_HW_VAR}" != "1" ]]; then
+              extra_args+=(--bootstrap-allow-empty-signers)
+            fi
+            if [[ -n "${BOOTSTRAP_SIGNER_VAR}" ]]; then
+              extra_args+=(--bootstrap-signer "${BOOTSTRAP_SIGNER_VAR}")
+            fi
+            DOTAGENT_ENFORCE_HW_SIGNERS="${ENFORCE_HW_VAR:-0}" bash "${gate_script}" --base "${base_sha}" "${extra_args[@]}" "$@"
           }
 
           case "${EVENT_NAME}" in
@@ -289,10 +311,10 @@ jobs:
           }
           forbidden = landlock_calls | dangerous_calls
 
-          spec_proc = subprocess.run(["ctr", "oci", "spec"], capture_output=True, text=True)
-          if spec_proc.returncode != 0:
-              raise SystemExit("ctr oci spec failed; refusing to fall back to permissive seccomp")
-          seccomp = json.loads(spec_proc.stdout)["linux"]["seccomp"]
+          spec_proc = subprocess.run(["ctr", "oci", "spec", "--seccomp"], capture_output=True, text=True)
+          seccomp = json.loads(spec_proc.stdout).get("linux", {}).get("seccomp") if spec_proc.returncode == 0 else None
+          if not isinstance(seccomp, dict):
+              raise SystemExit("ctr oci spec --seccomp did not emit linux.seccomp")
           assert seccomp.get("defaultAction") == "SCMP_ACT_ERRNO", f"unexpected defaultAction: {seccomp.get('defaultAction')}"
 
           cleaned_rules = []
