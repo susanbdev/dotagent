@@ -213,13 +213,30 @@ fn load_or_create_broker_key(dir: &Path) -> Result<[u8; 32], String> {
     let mut f = fs::File::open("/dev/urandom").map_err(|e| format!("open /dev/urandom: {e}"))?;
     f.read_exact(&mut k)
         .map_err(|e| format!("read /dev/urandom: {e}"))?;
-    fs::write(&key_path, k).map_err(|e| format!("write host.key: {e}"))?;
+    let mut opts = fs::OpenOptions::new();
+    opts.write(true).create_new(true);
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = fs::set_permissions(&key_path, fs::Permissions::from_mode(0o600));
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
     }
-    Ok(k)
+    match opts.open(&key_path) {
+        Ok(mut kf) => {
+            kf.write_all(&k)
+                .map_err(|e| format!("write host.key: {e}"))?;
+            Ok(k)
+        }
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+            let raw = fs::read(&key_path).map_err(|re| format!("read host.key: {re}"))?;
+            if raw.len() == 32 {
+                k.copy_from_slice(&raw);
+                Ok(k)
+            } else {
+                Err("corrupt sudo-broker host.key".to_string())
+            }
+        }
+        Err(e) => Err(format!("create host.key: {e}")),
+    }
 }
 
 fn compute_ticket_mac(key: &[u8; 32], t: &StagedSudoTicket) -> [u8; 32] {
@@ -371,17 +388,14 @@ pub fn parse_and_validate_sudo_request(
         ));
     }
 
-    // Block setuid/setgid bit creation on `chmod` / `install -m`
+    // Block setuid/setgid bit creation on `chmod` / `install` (including `--mode=4755`, `u=s`, `06755`)
     if matches!(base_bin.as_str(), "chmod" | "install") {
         for arg in &cmd_argv[1..] {
-            let lower = arg.to_ascii_lowercase();
-            if lower.contains("+s")
-                || lower.starts_with("47")
-                || lower.starts_with("27")
-                || lower.starts_with("67")
-                || lower.starts_with("047")
-                || lower.starts_with("027")
-            {
+            let mode_val = arg
+                .strip_prefix("--mode=")
+                .or_else(|| arg.strip_prefix("-m"))
+                .unwrap_or(arg.as_str());
+            if is_setuid_or_setgid_mode(mode_val) {
                 return Err((
                     "SUDO_SENSITIVE_TARGET_FORBIDDEN",
                     format!("Setting setuid/setgid mode '{arg}' via `sudo-request` is forbidden."),
@@ -422,46 +436,67 @@ pub fn parse_and_validate_sudo_request(
             ));
         }
 
-        // Pin SHA-256 of any existing local file inside `repo_root` to defeat TOCTOU swaps!
-        if !arg.starts_with('-') {
-            let candidate = if Path::new(arg).is_absolute() {
-                PathBuf::from(arg)
+        // Pin SHA-256 of any existing local file inside `repo_root` (including `--opt=path`) to defeat TOCTOU swaps!
+        let path_operand = if arg.starts_with('-') {
+            arg.split_once('=').map(|(_, v)| v)
+        } else {
+            Some(arg.as_str())
+        };
+        if let Some(op) = path_operand
+            && !op.is_empty()
+        {
+            let candidate = if Path::new(op).is_absolute() {
+                PathBuf::from(op)
             } else {
-                cwd.join(arg)
+                cwd.join(op)
             };
-            if let Ok(meta) = fs::symlink_metadata(&candidate) {
-                if meta.file_type().is_symlink() {
+            // Component-wise symlink check from `repo_root` downward when inside repo
+            let mut cur = PathBuf::new();
+            for comp in candidate.components() {
+                cur.push(comp);
+                if let Ok(m) = fs::symlink_metadata(&cur)
+                    && m.file_type().is_symlink()
+                    && (cur.starts_with(repo_root) || cur == candidate)
+                {
                     return Err((
                         "SYMLINK_ESCAPE_BLOCKED",
                         format!(
-                            "`sudo-request` refuses symlinked file operand '{}'.",
-                            candidate.display()
+                            "`sudo-request` refuses symlinked path component '{}'.",
+                            cur.display()
                         ),
                         true,
                     ));
                 }
-                if meta.file_type().is_file() {
-                    let canon_f = fs::canonicalize(&candidate).unwrap_or(candidate);
-                    if canon_f.starts_with(&canon_repo) {
-                        let bytes = fs::read(&canon_f).map_err(|e| {
-                            (
-                                "FILE_READ_ERROR",
-                                format!("Failed hashing staged file '{}': {e}", canon_f.display()),
-                                false,
-                            )
-                        })?;
-                        if bytes.len() > 262_144 {
-                            return Err((
-                                "FILE_BYTE_BUDGET_EXCEEDED",
-                                format!(
-                                    "Staged `sudo-request` file '{}' exceeds 256 KiB cap.",
-                                    canon_f.display()
-                                ),
-                                false,
-                            ));
-                        }
+            }
+            if let Ok(meta) = fs::symlink_metadata(&candidate)
+                && meta.file_type().is_file()
+            {
+                let canon_f = fs::canonicalize(&candidate).unwrap_or(candidate);
+                if canon_f.starts_with(&canon_repo) {
+                    let bytes = fs::read(&canon_f).map_err(|e| {
+                        (
+                            "FILE_READ_ERROR",
+                            format!("Failed hashing staged file '{}': {e}", canon_f.display()),
+                            false,
+                        )
+                    })?;
+                    if bytes.len() > 262_144 {
+                        return Err((
+                            "FILE_BYTE_BUDGET_EXCEEDED",
+                            format!(
+                                "Staged `sudo-request` file '{}' exceeds 256 KiB cap.",
+                                canon_f.display()
+                            ),
+                            false,
+                        ));
+                    }
+                    let abs_s = canon_f.to_string_lossy().into_owned();
+                    if !pinned_files
+                        .iter()
+                        .any(|p: &PinnedFileDigest| p.abs_path == abs_s)
+                    {
                         pinned_files.push(PinnedFileDigest {
-                            abs_path: canon_f.to_string_lossy().into_owned(),
+                            abs_path: abs_s,
                             sha256_hex: crate::crypto::sha256_hex(&bytes),
                         });
                     }
@@ -475,6 +510,24 @@ pub fn parse_and_validate_sudo_request(
         argv: cmd_argv,
         pinned_files,
     })
+}
+
+fn is_setuid_or_setgid_mode(raw: &str) -> bool {
+    let lower = raw.trim().to_ascii_lowercase();
+    if lower.is_empty() {
+        return false;
+    }
+    if lower.contains("+s") || lower.contains("=s") {
+        return true;
+    }
+    let digits = lower.trim_start_matches('0');
+    // 4-digit octal mode whose leading special-bits digit has setuid (4) or setgid (2) set
+    digits.len() == 4
+        && digits.bytes().all(|b| (b'0'..=b'7').contains(&b))
+        && matches!(
+            digits.as_bytes()[0],
+            b'2' | b'3' | b'4' | b'5' | b'6' | b'7'
+        )
 }
 
 pub fn stage_sudo_request(
@@ -587,13 +640,20 @@ pub fn load_verified_ticket_in_dir(dir: &Path, req_id: &str) -> Result<StagedSud
         .map_err(|_| format!("Unknown sudo request '{valid_id}' (no ticket found)."))?;
     let v = JsonValue::parse(&raw).map_err(|e| format!("Corrupt sudo ticket JSON: {e}"))?;
 
-    let argv: Vec<String> = v
+    let raw_argv = v
         .get("argv")
         .and_then(JsonValue::as_array)
-        .ok_or_else(|| "missing argv".to_string())?
-        .iter()
-        .filter_map(|x| x.as_str().map(String::from))
-        .collect();
+        .ok_or_else(|| "missing argv".to_string())?;
+    let mut argv: Vec<String> = Vec::with_capacity(raw_argv.len());
+    for item in raw_argv {
+        let s = item
+            .as_str()
+            .ok_or_else(|| "non-string element in argv".to_string())?;
+        argv.push(s.to_string());
+    }
+    if argv.is_empty() {
+        return Err("empty argv in sudo ticket".to_string());
+    }
     let mut pinned_files = Vec::new();
     if let Some(arr) = v.get("pinned_files").and_then(JsonValue::as_array) {
         for item in arr {
@@ -668,6 +728,12 @@ pub fn reject_sudo_ticket(req_id: &str) -> Result<(), String> {
     let dir = sudo_broker_dir();
     let key = load_or_create_broker_key(&dir)?;
     let mut ticket = load_verified_ticket_in_dir(&dir, req_id)?;
+    if ticket.status != "pending" {
+        return Err(format!(
+            "Ticket '{}' is already '{}' and cannot be rejected.",
+            ticket.req_id, ticket.status
+        ));
+    }
     ticket.status = "rejected".to_string();
     save_signed_ticket(&dir, &key, &ticket)
 }
@@ -728,6 +794,10 @@ pub fn verify_and_execute_sudo_ticket_in_dir(
             ));
         }
     }
+
+    // Claim ticket before spawning `sudo` to prevent concurrent double-execution.
+    ticket.status = "executing".to_string();
+    save_signed_ticket(dir, &key, &ticket)?;
 
     let mut cmd = if let Some(test_runner) = runner_override_for_test {
         let mut c = Command::new(test_runner);

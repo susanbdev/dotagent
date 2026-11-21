@@ -777,6 +777,18 @@ fn sudo_broker_stages_pinned_argv_blocks_shells_secrets_and_toctou_and_scrubs_ou
             "SUDO_SENSITIVE_TARGET_FORBIDDEN",
         ),
         (
+            "dotagent sudo-request -- install --mode=4755 ops/99-forward.conf /usr/local/bin/x",
+            "SUDO_SENSITIVE_TARGET_FORBIDDEN",
+        ),
+        (
+            "dotagent sudo-request -- chmod u=s /bin/cp",
+            "SUDO_SENSITIVE_TARGET_FORBIDDEN",
+        ),
+        (
+            "dotagent sudo-request -- chmod 06755 /bin/cp",
+            "SUDO_SENSITIVE_TARGET_FORBIDDEN",
+        ),
+        (
             "dotagent sudo-request -- cp ops/99-forward.conf AGENTS.md",
             "SUDO_SENSITIVE_TARGET_FORBIDDEN",
         ),
