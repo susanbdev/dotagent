@@ -1167,14 +1167,27 @@ fn configure_or_verify_repo(
                 .push("applied squash-only linear merge & auto-delete-branch settings".to_string());
 
             if is_org {
-                // Org-level selected-actions policy may lock repo-level allowed_actions (HTTP 409/422),
-                // while repo-level workflow permissions always apply.
-                let _ = gh_api_write_json(
+                // Org-level selected-actions policy may lock repo-level allowed_actions (HTTP 409/422);
+                // if the repo-level PUT is rejected, verify the effective repository policy still
+                // enforces `sha_pinning_required: true` from the organization before proceeding.
+                if let Err(put_err) = gh_api_write_json(
                     gh,
                     "PUT",
                     &format!("repos/{full_repo}/actions/permissions"),
                     &build_org_actions_permissions_payload(),
-                );
+                ) {
+                    let effective =
+                        gh_api_get_json(gh, &format!("repos/{full_repo}/actions/permissions"))?;
+                    let sha_pinned = effective
+                        .get("sha_pinning_required")
+                        .and_then(JsonValue::as_bool)
+                        .unwrap_or(false);
+                    if !sha_pinned {
+                        return Err(format!(
+                            "failed enforcing sha_pinning_required on '{full_repo}' ({put_err}) and effective repo policy has sha_pinning_required=false"
+                        ));
+                    }
+                }
             } else {
                 // Personal `User` account (`susanbeasles`): strictly enforce repo-level SHA pinning
                 // and a GitHub-owned-only selected-actions allowlist.

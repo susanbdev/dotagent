@@ -1073,6 +1073,60 @@ fn verify_corpus_prefix_and_no_duplicates(
     Ok(added)
 }
 
+fn strip_rust_line_and_block_comments(raw: &str) -> String {
+    let bytes = raw.as_bytes();
+    let mut out = String::with_capacity(raw.len());
+    let mut i = 0usize;
+    let mut in_str = false;
+    let mut esc = false;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if in_str {
+            out.push(b as char);
+            if esc {
+                esc = false;
+            } else if b == b'\\' {
+                esc = true;
+            } else if b == b'"' {
+                in_str = false;
+            }
+            i += 1;
+            continue;
+        }
+        if b == b'"' {
+            in_str = true;
+            out.push('"');
+            i += 1;
+            continue;
+        }
+        if b == b'/' && bytes.get(i + 1) == Some(&b'/') {
+            break;
+        }
+        if b == b'/' && bytes.get(i + 1) == Some(&b'*') {
+            i += 2;
+            while i + 1 < bytes.len() && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                i += 1;
+            }
+            i = (i + 2).min(bytes.len());
+            continue;
+        }
+        out.push(b as char);
+        i += 1;
+    }
+    out
+}
+
+fn extract_fn_check_target(line: &str) -> Option<String> {
+    let fn_pos = line.find("fn check_")?;
+    let after = &line[fn_pos + "fn check_".len()..];
+    let bin_tok = after.split(['_', '(']).next()?;
+    if !bin_tok.is_empty() && !matches!(bin_tok, "single" | "env" | "path" | "shell") {
+        Some(bin_tok.to_ascii_lowercase())
+    } else {
+        None
+    }
+}
+
 fn extract_modified_policy_targets(repo_root: &Path, merge_base: &str) -> BTreeSet<String> {
     let mut targets = BTreeSet::new();
     let Ok(out) = git_cmd(repo_root)
@@ -1095,28 +1149,48 @@ fn extract_modified_policy_targets(repo_root: &Path, merge_base: &str) -> BTreeS
         return targets;
     }
     let diff_text = String::from_utf8_lossy(&out.stdout);
-    for line in diff_text.lines() {
-        if line.starts_with("+++") || line.starts_with("---") || line.starts_with('+') {
-            // Never extract targets from newly added `+` lines: otherwise an autonomous edit to
-            // `check_git_args` could plant a dummy `"rm"` literal in a comment or dead binding to
-            // satisfy the corpus check with unrelated `rm` vectors.
+    let mut current_hunk_fn_target: Option<String> = None;
+    for raw_line in diff_text.lines() {
+        if raw_line.starts_with("+++") || raw_line.starts_with("---") {
             continue;
         }
-        if !(line.starts_with('-') || line.starts_with("@@")) {
-            continue;
-        }
-        // Extract `fn check_<target>_...` from `@@ ... @@ fn check_git_args(...)` hunk headers or removed base lines
-        if let Some(fn_pos) = line.find("fn check_") {
-            let after = &line[fn_pos + "fn check_".len()..];
-            if let Some(bin_tok) = after.split(['_', '(']).next()
-                && !bin_tok.is_empty()
-                && !matches!(bin_tok, "single" | "env" | "path" | "shell")
-            {
-                targets.insert(bin_tok.to_ascii_lowercase());
+        if raw_line.starts_with("@@") {
+            current_hunk_fn_target = extract_fn_check_target(raw_line);
+            if let Some(ref t) = current_hunk_fn_target {
+                targets.insert(t.clone());
             }
+            continue;
         }
-        // Extract quoted identifier tokens from removed base lines / hunk headers only
-        let mut rest = line;
+        if !(raw_line.starts_with('+') || raw_line.starts_with('-')) {
+            continue;
+        }
+        let code = strip_rust_line_and_block_comments(&raw_line[1..]);
+        if let Some(fn_target) = extract_fn_check_target(&code) {
+            current_hunk_fn_target = Some(fn_target.clone());
+            targets.insert(fn_target);
+            continue;
+        }
+        // Inside a dedicated `fn check_<bin>_*` hunk, the target is scoped strictly to `<bin>` so
+        // string literals inside that function body cannot broaden `modified_targets`.
+        if current_hunk_fn_target.is_some() {
+            continue;
+        }
+        // In top-level dispatchers (`evaluate_single_command`, `evaluate_mcp_tool`, etc.), extract
+        // targets from both removed (`-`) and added (`+`) structural declarations (excluding
+        // comments and dead `let _ = "..."` bindings).
+        if code.trim_start().starts_with("let _ =") {
+            continue;
+        }
+        let is_structural = code.contains("=>")
+            || code.contains("==")
+            || code.contains("matches!(")
+            || code.contains("eq_ignore_ascii_case(")
+            || code.contains("starts_with(")
+            || code.contains('|');
+        if !is_structural {
+            continue;
+        }
+        let mut rest = code.as_str();
         while let Some(q1) = rest.find('"') {
             rest = &rest[q1 + 1..];
             let Some(q2) = rest.find('"') else {

@@ -211,7 +211,7 @@ jobs:
           rustup toolchain install stable --profile minimal
           rustup default stable
 
-      - name: Build ratchet verifier from trusted base branch (never from PR-controlled sources)
+      - name: Enforce unconditional Ring-0 allowlist ratchet & hardware-signer verification
         env:
           BASE_REF: ${{ github.event.repository.default_branch || 'main' }}
         run: |
@@ -219,25 +219,46 @@ jobs:
           BASE_OID="$(git rev-parse --verify "origin/${BASE_REF}^{commit}")"
           TRUSTED="${RUNNER_TEMP}/trusted-base"
           git worktree add --detach "${TRUSTED}" "${BASE_OID}"
-          if git -C "${TRUSTED}" grep -q -F 'verify-ring0-ratchet' -- crates/agent-guard/src/cli.rs; then
-            SRC="${TRUSTED}"
-          else
-            echo "::warning::GENESIS: base ${BASE_OID} predates verify-ring0-ratchet; building verifier from PR head once."
-            SRC="${GITHUB_WORKSPACE}"
-          fi
           for f in .cargo/config .cargo/config.toml rust-toolchain rust-toolchain.toml; do
-            if [ -e "${SRC}/${f}" ]; then
-              echo "::error::Refusing to build verifier: ${f} present in ${SRC}"
+            if [ -e "${TRUSTED}/${f}" ] || [ -e "${GITHUB_WORKSPACE}/${f}" ]; then
+              echo "::error::Refusing to run ratchet: forbidden toolchain override ${f} present"
               exit 1
             fi
           done
-          (cd "${SRC}" && CARGO_TARGET_DIR="${RUNNER_TEMP}/trusted-target" \
-            cargo build --locked -p agent-guard --bin dotagent)
-          echo "RATCHET_BIN=${RUNNER_TEMP}/trusted-target/debug/dotagent" >> "${GITHUB_ENV}"
+          if git -C "${TRUSTED}" grep -q -F 'verify-ring0-ratchet' -- crates/agent-guard/src/cli.rs; then
+            (cd "${TRUSTED}" && CARGO_TARGET_DIR="${RUNNER_TEMP}/trusted-target" \
+              cargo build --locked -p agent-guard --bin dotagent)
+            "${RUNNER_TEMP}/trusted-target/debug/dotagent" verify-ring0-ratchet --base "origin/${BASE_REF}"
+          elif [ "${BASE_OID}" = "0194af29450aa65d1699337ec731d1740efc00e4" ]; then
+            # Self-extinguishing one-time genesis bootstrap (never compiles PR sources): verifies pinned
+            # signer keyring digest and strict corpus prefix-superset directly against TRUSTED base.
+            python3 - "${TRUSTED}" "${GITHUB_WORKSPACE}" "${BASE_OID}" <<'PY'
+          import hashlib, os, subprocess, sys, tomllib
 
-      - name: Enforce unconditional Ring-0 allowlist ratchet & hardware-signer verification
-        env:
-          BASE_REF: ${{ github.event.repository.default_branch || 'main' }}
-        run: |
-          set -euo pipefail
-          "${RATCHET_BIN}" verify-ring0-ratchet --base "origin/${BASE_REF}"
+          trusted, ws, base_oid = sys.argv[1], sys.argv[2], sys.argv[3]
+          PINNED_SIGNERS_SHA256 = "89ce5a026336a21d62959969b1552654c79709d03601d82f16fc3102d1dd7692"
+          mb = subprocess.check_output(["git", "-C", ws, "merge-base", "HEAD", base_oid], text=True).strip()
+          if mb != base_oid:
+              raise SystemExit(f"GENESIS_VIOLATION: merge-base {mb} != {base_oid}")
+          sig_path = os.path.join(ws, "config", "allowed_human_signers")
+          if os.path.islink(sig_path) or not os.path.isfile(sig_path):
+              raise SystemExit("GENESIS_VIOLATION: config/allowed_human_signers missing or symlink")
+          digest = hashlib.sha256(open(sig_path, "rb").read()).hexdigest()
+          if digest != PINNED_SIGNERS_SHA256:
+              raise SystemExit(f"GENESIS_VIOLATION: signers sha256 {digest} != {PINNED_SIGNERS_SHA256}")
+          base_vecs = tomllib.load(open(os.path.join(trusted, "tests", "bypass_corpus.toml"), "rb"))["vectors"]
+          head_vecs = tomllib.load(open(os.path.join(ws, "tests", "bypass_corpus.toml"), "rb"))["vectors"]
+          if len(head_vecs) < len(base_vecs) or head_vecs[:len(base_vecs)] != base_vecs:
+              raise SystemExit("GENESIS_VIOLATION: bypass_corpus.toml violates prefix identity against base")
+          seen = set()
+          for idx, v in enumerate(head_vecs):
+              key = (v["kind"], " ".join(v["payload"].split()))
+              if key in seen:
+                  raise SystemExit(f"GENESIS_VIOLATION: duplicate corpus vector at #{idx + 1}")
+              seen.add(key)
+          print(f"[RING0 RATCHET GENESIS OK] base={base_oid[:12]} corpus={len(head_vecs)} (+{len(head_vecs)-len(base_vecs)})")
+          PY
+          else
+            echo "::error::Trusted base ${BASE_OID} lacks verify-ring0-ratchet and is not the pinned genesis commit; failing closed."
+            exit 1
+          fi

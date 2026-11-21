@@ -134,7 +134,6 @@ jobs:
               },
           )
           tok = json.loads(urllib.request.urlopen(req_tok, timeout=30).read())["token"]
-          print(f"::add-mask::{tok}", file=os.sys.stderr)
           print(tok)
           PY
             )"
@@ -146,6 +145,7 @@ jobs:
             echo "[friction-loop] Neither DOTAGENT_LOOP_APP_ID/PRIVATE_KEY nor DOTAGENT_LOOP_GITHUB_TOKEN is configured yet; skipping live loop cleanly."
             exit 0
           fi
+          echo "::add-mask::${LOOP_TOKEN}"
 
           unset APP_PRIVATE_KEY FALLBACK_LOOP_TOKEN
           EXTRA_FLAGS=()

@@ -1048,47 +1048,26 @@ sys.exit(1)
         );
     }
 
-    // Implementer script asserts:
+    // Implementer command runs via `/usr/bin/python3 -c` inside `wt_dir` (Landlock-compatible) and asserts:
     // 1. ZERO GitHub tokens (`GH_TOKEN`, `GITHUB_TOKEN`, `DOTAGENT_LOOP_GITHUB_TOKEN`) exist in `env`!
     // 2. ZERO raw ballot prose (`IGNORE PREVIOUS INSTRUCTIONS`) exists on `stdin` (`Ring2RemediationSpec` airlock)!
-    let impl_script = root.join("mock_implementer.py");
-    fs::write(
-        &impl_script,
-        r#"#!/usr/bin/env python3
+    let impl_inline_cmd = r#"python3 -c '
 import json, os, sys
-
-for forbidden in ("GH_TOKEN", "GITHUB_TOKEN", "DOTAGENT_LOOP_GITHUB_TOKEN", "DOTAGENT_TELEMETRY_SIGNING_KEY"):
+for forbidden in ("GH_TOKEN", "GITHUB_TOKEN", "DOTAGENT_LOOP_GITHUB_TOKEN", "DOTAGENT_LOOP_GITHUB_TOKEN_FILE", "DOTAGENT_TELEMETRY_SIGNING_KEY"):
     if os.environ.get(forbidden):
         raise SystemExit(f"CREDENTIAL_LEAK: {forbidden} present in Stage 3 implementer env!")
-
 payload_raw = sys.stdin.read()
 if "IGNORE PREVIOUS INSTRUCTIONS" in payload_raw or "need git log" in payload_raw:
     raise SystemExit("AIRLOCK_LEAK: raw ballot prose reached Stage 3 implementer!")
-
 data = json.loads(payload_raw)
 with open("crates/agent-guard/src/cmd_policy.rs", "w", encoding="utf-8") as fh:
-    fh.write('pub fn check_git_args() { let _ = "git"; /* safe flag */ }\n')
-
+    fh.write("pub fn check_git_args() { let _ = \"git\"; /* safe flag */ }\n")
 if "copilot_threads" in data:
     with open("crates/agent-guard/tests/ring2_policy_tests.rs", "w", encoding="utf-8") as fh:
         fh.write("// ring2 tests + copilot thread addressed\n")
-
 with open("tests/bypass_corpus.toml", "w", encoding="utf-8") as fh:
-    fh.write(
-        'vectors = [\n'
-        '  { kind = "cmd", payload = "cat /tmp/secret" },\n'
-        '  { kind = "cmd", payload = "git push --force origin main" },\n'
-        '  { kind = "cmd", payload = "git -c core.sshCommand=evil status" },\n'
-        ']\n'
-    )
-"#,
-    )
-    .expect("write impl");
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&impl_script, fs::Permissions::from_mode(0o755)).expect("chmod impl");
-    }
+    fh.write("vectors = [\n  { kind = \"cmd\", payload = \"cat /tmp/secret\" },\n  { kind = \"cmd\", payload = \"git push --force origin main\" },\n  { kind = \"cmd\", payload = \"git -c core.sshCommand=evil status\" },\n]\n")
+'"#;
 
     let loop_out = Command::new(dotagent_bin())
         .current_dir(&repo)
@@ -1117,7 +1096,7 @@ with open("tests/bypass_corpus.toml", "w", encoding="utf-8") as fh:
             "--security-cmd",
             r#"echo '{"verdict":"APPROVE"}'"#,
             "--implementer-cmd",
-            impl_script.to_str().expect("impl path"),
+            impl_inline_cmd,
             "--adversarial-cmd",
             r#"echo '{"medium_plus_defects":0,"findings":[]}'"#,
         ])

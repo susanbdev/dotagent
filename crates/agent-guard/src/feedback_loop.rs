@@ -933,6 +933,34 @@ fn cluster_to_json(c: &AggregatedFrictionCluster) -> JsonValue {
 
 fn gh_cmd_with_token(gh: &Path, tok: Option<&ZeroizingToken>) -> Command {
     let mut cmd = Command::new(gh);
+    cmd.env_clear();
+    for safe_var in [
+        "PATH",
+        "HOME",
+        "USER",
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "NO_PROXY",
+        "SSL_CERT_FILE",
+        "SSL_CERT_DIR",
+        "GIT_SSL_CAINFO",
+        "SYSTEMROOT",
+    ] {
+        if let Ok(val) = std::env::var(safe_var) {
+            cmd.env(safe_var, val);
+        }
+    }
+    if gh != Path::new("gh") {
+        for mock_var in ["MOCK_GH_STATE", "MOCK_BARE_ORIGIN"] {
+            if let Ok(val) = std::env::var(mock_var) {
+                cmd.env(mock_var, val);
+            }
+        }
+    }
+    cmd.env("GH_HOST", "github.com")
+        .env("GH_CONFIG_DIR", "/dev/null")
+        .env("GH_PROMPT_DISABLED", "1")
+        .env("NO_COLOR", "1");
     if let Some(t) = tok {
         cmd.env("GH_TOKEN", t.as_str());
     }
@@ -1894,9 +1922,13 @@ fn resolve_sibling_agent_guard_bin() -> Result<PathBuf, String> {
     std::env::current_exe()
         .ok()
         .and_then(|p| p.parent().map(|d| d.join("agent-guard")))
-        .filter(|p| p.is_file())
+        .filter(|p| {
+            fs::symlink_metadata(p)
+                .is_ok_and(|m| m.file_type().is_file() && !m.file_type().is_symlink())
+                && crate::coordinator::is_trusted_executable_file(p)
+        })
         .ok_or_else(|| {
-            "STAGE_SANDBOX_UNAVAILABLE: sibling agent-guard binary not found; refusing unsandboxed execution"
+            "STAGE_SANDBOX_UNAVAILABLE: trusted non-symlink sibling agent-guard binary not found; refusing unsandboxed execution"
                 .to_string()
         })
 }
@@ -2810,18 +2842,29 @@ fn audit_worktree_git_config_before_push(wt_dir: &Path) -> Result<(), String> {
 }
 
 fn resolve_push_target(target_repo: &str) -> Result<String, String> {
-    for env_key in ["DOTAGENT_LOOP_PUSH_URL", "MOCK_BARE_ORIGIN"] {
-        if let Ok(v) = std::env::var(env_key) {
-            let trimmed = v.trim();
-            if !trimmed.is_empty() {
-                if trimmed.starts_with('-') {
-                    return Err(format!("invalid push URL in {env_key}"));
-                }
-                return Ok(trimmed.to_string());
+    let (owner, repo) = validate_owner_repo(target_repo)?;
+    // Only when an explicit local mock `gh` harness binary is configured (`DOTAGENT_GH_BIN`) may tests
+    // redirect `git push` to a local non-symlink bare directory (`MOCK_BARE_ORIGIN`). Remote URLs or
+    // SSH targets in `MOCK_BARE_ORIGIN` are unconditionally rejected.
+    if std::env::var("DOTAGENT_GH_BIN").is_ok_and(|s| !s.trim().is_empty())
+        && let Ok(v) = std::env::var("MOCK_BARE_ORIGIN")
+    {
+        let trimmed = v.trim();
+        if !trimmed.is_empty() {
+            let p = Path::new(trimmed);
+            let is_local_dir = p.is_absolute()
+                && !trimmed.contains("://")
+                && !trimmed.contains('@')
+                && fs::symlink_metadata(p)
+                    .is_ok_and(|m| m.file_type().is_dir() && !m.file_type().is_symlink());
+            if !is_local_dir {
+                return Err(
+                    "MOCK_BARE_ORIGIN must be an absolute non-symlink local directory".to_string(),
+                );
             }
+            return Ok(trimmed.to_string());
         }
     }
-    let (owner, repo) = validate_owner_repo(target_repo)?;
     Ok(format!("https://github.com/{owner}/{repo}.git"))
 }
 
@@ -3231,8 +3274,10 @@ fn check_copilot_structural_review_on_head(
         let state = rev.get("state").and_then(JsonValue::as_str).unwrap_or("");
         if is_verified_copilot_bot(login, utype)
             && commit_id == head_sha
-            && state != "DISMISSED"
             && let Some(rid) = rev.get("id").and_then(JsonValue::as_u64)
+            && latest_review_id_on_head
+                .as_ref()
+                .is_none_or(|(prev_id, _)| rid >= *prev_id)
         {
             latest_review_id_on_head = Some((rid, state.to_string()));
         }
@@ -3241,7 +3286,11 @@ fn check_copilot_structural_review_on_head(
     let Some((review_id, state)) = latest_review_id_on_head else {
         return Ok((false, false));
     };
-    if state == "CHANGES_REQUESTED" {
+    if state.eq_ignore_ascii_case("DISMISSED") {
+        // A dismissed review invalidates prior approvals on this head SHA; wait for a fresh review.
+        return Ok((false, false));
+    }
+    if state.eq_ignore_ascii_case("CHANGES_REQUESTED") {
         return Ok((true, false));
     }
 

@@ -52,27 +52,59 @@ jobs:
           BASE_OID="$(git rev-parse --verify "origin/${BASE_REF}^{commit}")"
           TRUSTED="${RUNNER_TEMP}/trusted-base"
           git worktree add --detach "${TRUSTED}" "${BASE_OID}"
-          if git -C "${TRUSTED}" grep -q -F 'verify-ring0-ratchet' -- crates/agent-guard/src/cli.rs; then
-            SRC="${TRUSTED}"
-          else
-            echo "::warning::GENESIS: base ${BASE_OID} predates verify-ring0-ratchet; building verifier from PR head once."
-            SRC="${GITHUB_WORKSPACE}"
-          fi
           for f in .cargo/config .cargo/config.toml rust-toolchain rust-toolchain.toml; do
-            if [ -e "${SRC}/${f}" ]; then
-              echo "::error::Refusing to build verifier: ${f} present in ${SRC}"
+            if [ -e "${TRUSTED}/${f}" ] || [ -e "${GITHUB_WORKSPACE}/${f}" ]; then
+              echo "::error::Refusing to run ratchet: forbidden toolchain override ${f} present"
               exit 1
             fi
           done
-          (cd "${SRC}" && CARGO_TARGET_DIR="${RUNNER_TEMP}/trusted-target" \
-            cargo build --locked -p agent-guard --bin dotagent)
-          BASE_HAS_SIGNERS="false"
-          if git cat-file -e "${BASE_OID}:config/allowed_human_signers" 2>/dev/null; then
-            BASE_HAS_SIGNERS="true"
+          if git -C "${TRUSTED}" grep -q -F 'verify-ring0-ratchet' -- crates/agent-guard/src/cli.rs; then
+            (cd "${TRUSTED}" && CARGO_TARGET_DIR="${RUNNER_TEMP}/trusted-target" \
+              cargo build --locked -p agent-guard --bin dotagent)
+            "${RUNNER_TEMP}/trusted-target/debug/dotagent" verify-ring0-ratchet \
+              --base "origin/${BASE_REF}" --json > "${RUNNER_TEMP}/ratchet_report.json"
+          elif [ "${BASE_OID}" = "0194af29450aa65d1699337ec731d1740efc00e4" ]; then
+            # Self-extinguishing one-time genesis bootstrap (never compiles PR sources): verifies pinned
+            # signer keyring digest and strict corpus prefix-superset directly against TRUSTED base.
+            python3 - "${TRUSTED}" "${GITHUB_WORKSPACE}" "${BASE_OID}" "${RUNNER_TEMP}/ratchet_report.json" <<'PY'
+          import hashlib, json, os, subprocess, sys, tomllib
+
+          trusted, ws, base_oid, out_json = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+          PINNED_SIGNERS_SHA256 = "89ce5a026336a21d62959969b1552654c79709d03601d82f16fc3102d1dd7692"
+          mb = subprocess.check_output(["git", "-C", ws, "merge-base", "HEAD", base_oid], text=True).strip()
+          if mb != base_oid:
+              raise SystemExit(f"GENESIS_VIOLATION: merge-base {mb} != {base_oid}")
+          sig_path = os.path.join(ws, "config", "allowed_human_signers")
+          if os.path.islink(sig_path) or not os.path.isfile(sig_path):
+              raise SystemExit("GENESIS_VIOLATION: config/allowed_human_signers missing or symlink")
+          digest = hashlib.sha256(open(sig_path, "rb").read()).hexdigest()
+          if digest != PINNED_SIGNERS_SHA256:
+              raise SystemExit(f"GENESIS_VIOLATION: signers sha256 {digest} != {PINNED_SIGNERS_SHA256}")
+          base_vecs = tomllib.load(open(os.path.join(trusted, "tests", "bypass_corpus.toml"), "rb"))["vectors"]
+          head_vecs = tomllib.load(open(os.path.join(ws, "tests", "bypass_corpus.toml"), "rb"))["vectors"]
+          if len(head_vecs) < len(base_vecs) or head_vecs[:len(base_vecs)] != base_vecs:
+              raise SystemExit("GENESIS_VIOLATION: bypass_corpus.toml violates prefix identity against base")
+          seen = set()
+          for idx, v in enumerate(head_vecs):
+              key = (v["kind"], " ".join(v["payload"].split()))
+              if key in seen:
+                  raise SystemExit(f"GENESIS_VIOLATION: duplicate corpus vector at #{idx + 1}")
+              seen.add(key)
+          with open(out_json, "w", encoding="utf-8") as fh:
+              json.dump({
+                  "base_ref": f"origin/{os.environ['BASE_REF']}",
+                  "merge_base": base_oid,
+                  "human_hardware_signed": False,
+                  "enforce_ring0_paths": False,
+                  "base_corpus_count": len(base_vecs),
+                  "head_corpus_count": len(head_vecs),
+                  "added_corpus_vectors": len(head_vecs) - len(base_vecs),
+              }, fh)
+          PY
+          else
+            echo "::error::Trusted base ${BASE_OID} lacks verify-ring0-ratchet and is not the pinned genesis commit; failing closed."
+            exit 1
           fi
-          echo "base_has_signers=${BASE_HAS_SIGNERS}" >> "${GITHUB_OUTPUT}"
-          "${RUNNER_TEMP}/trusted-target/debug/dotagent" verify-ring0-ratchet \
-            --base "origin/${BASE_REF}" --json > "${RUNNER_TEMP}/ratchet_report.json"
 
       # Runs no cargo / repository code; only stdlib Python + gh against the GitHub API.
       - name: Post Ring-0 & Copilot Gate commit status
@@ -83,7 +115,6 @@ jobs:
           PR_NUMBER: ${{ github.event.pull_request.number }}
           PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           RATCHET_OUTCOME: ${{ steps.ratchet.outcome }}
-          BASE_HAS_SIGNERS: ${{ steps.ratchet.outputs.base_has_signers }}
         run: |
           set -euo pipefail
           python3 - "${RUNNER_TEMP}/ratchet_report.json" <<'PY'
@@ -116,9 +147,7 @@ jobs:
                   set_status("failure", "Ring-0 Constitutional Ratchet failed")
                   return 1
               with open(sys.argv[1], "r", encoding="utf-8") as fh:
-                  ratchet = json.load(fh)
-              base_has_signers = os.environ.get("BASE_HAS_SIGNERS") == "true"
-              hw_signed = bool(ratchet.get("human_hardware_signed")) and base_has_signers
+                  _ratchet = json.load(fh)
 
               gql = (
                   "query($owner:String!,$name:String!,$pr:Int!){"
@@ -144,16 +173,22 @@ jobs:
 
               pages = gh_json(["api", "--paginate", "--slurp", f"repos/{repo}/pulls/{pr_num}/reviews"]) or []
               reviews = [r for p in pages for r in (p if isinstance(p, list) else [p])]
+              # Track the newest Copilot review on head_sha including DISMISSED so a subsequent
+              # dismissal invalidates any earlier clean review on the same commit.
               latest_copilot = None
               for rev in reviews:
                   u = rev.get("user") or {}
                   is_copilot = u.get("login", "") == COPILOT and str(u.get("type", "")).lower() == "bot"
-                  if is_copilot and rev.get("commit_id") == head_sha and rev.get("state") != "DISMISSED":
-                      latest_copilot = rev
+                  if is_copilot and rev.get("commit_id") == head_sha:
+                      if latest_copilot is None or int(rev.get("id", 0)) >= int(latest_copilot.get("id", 0)):
+                          latest_copilot = rev
 
               if latest_copilot is not None:
                   rid = latest_copilot["id"]
-                  rstate = latest_copilot.get("state", "")
+                  rstate = str(latest_copilot.get("state", "")).upper()
+                  if rstate == "DISMISSED":
+                      set_status("pending", "Latest Copilot review on head was dismissed; awaiting fresh review")
+                      return 0
                   cpages = gh_json(["api", "--paginate", "--slurp", f"repos/{repo}/pulls/{pr_num}/reviews/{rid}/comments"]) or []
                   inline_comments = sum(len(p) if isinstance(p, list) else 1 for p in cpages)
                   if rstate == "CHANGES_REQUESTED" or inline_comments > 0:
@@ -170,10 +205,8 @@ jobs:
                   set_status("success", "Ring-0 ratchet + Copilot 0-comment review verified")
                   return 0
 
-              if hw_signed and unresolved == 0:
-                  set_status("success", "Verified hardware-signed human commit (0 unresolved threads)")
-                  return 0
-
+              # Copilot review is required unconditionally on every PR (hardware signatures govern
+              # only Ring-0 path eligibility in verify-ring0-ratchet, never review bypass).
               set_status("pending", "Waiting for copilot-pull-request-reviewer[bot] review on head commit")
               return 0
 

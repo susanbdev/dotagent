@@ -141,7 +141,7 @@ impl SessionLedger {
 
     pub fn new(repo_root: &Path, session_id: &str) -> Self {
         let clean_sid = sanitize_session_id(session_id);
-        let root_session_id = resolve_default_root_session_id(&clean_sid);
+        let root_session_id = clean_sid.clone();
         let session_key_hash = compute_session_key_hash(repo_root, session_id);
         let turn_nonce = generate_turn_nonce(repo_root, session_id, 0);
         Self {
