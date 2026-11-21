@@ -789,7 +789,37 @@ fn collect_working_and_commit_diff(
             continue;
         }
         let s = std::str::from_utf8(raw_u).map_err(|_| "non-UTF-8 untracked path".to_string())?;
-        all_paths.insert(normalize_repo_rel_path(s)?);
+        let u_norm = normalize_repo_rel_path(s)?;
+        if forbidden_mode.is_none() {
+            let full_u = repo_root.join(&u_norm);
+            match fs::symlink_metadata(&full_u) {
+                Ok(meta) => {
+                    if meta.file_type().is_symlink() || !meta.file_type().is_file() {
+                        forbidden_mode = Some(format!(
+                            "RING0_RATCHET_VIOLATION: untracked path '{u_norm}' is a symlink or non-regular file"
+                        ));
+                    } else {
+                        #[cfg(unix)]
+                        {
+                            use std::os::unix::fs::PermissionsExt;
+                            let mode = meta.permissions().mode();
+                            if (mode & 0o111) != 0 {
+                                forbidden_mode = Some(format!(
+                                    "RING0_RATCHET_VIOLATION: untracked file '{u_norm}' has executable mode {:o} (autonomous Ring-2 edits only permit regular 100644 files)",
+                                    mode & 0o777
+                                ));
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    forbidden_mode = Some(format!(
+                        "RING0_RATCHET_VIOLATION: cannot stat untracked path '{u_norm}': {e}"
+                    ));
+                }
+            }
+        }
+        all_paths.insert(u_norm);
     }
 
     // 3. Check working-tree cleanliness (`git status --porcelain=v1 -z -uall`)

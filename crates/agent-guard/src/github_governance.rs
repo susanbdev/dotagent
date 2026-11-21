@@ -947,7 +947,8 @@ fn discover_required_checks(
     if validate_url_safe_branch(default_branch).is_err() {
         return Vec::new();
     }
-    let endpoint = format!("repos/{full_repo}/commits/{default_branch}/check-runs");
+    let encoded_branch = default_branch.replace('/', "%2F");
+    let endpoint = format!("repos/{full_repo}/commits/{encoded_branch}/check-runs");
     let Ok(v) = gh_api_get_json(gh, &endpoint) else {
         return Vec::new();
     };

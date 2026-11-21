@@ -429,6 +429,42 @@ pub(crate) fn verify_operator_not_in_agent_sandbox(cmd_label: &str) -> Result<()
     Ok(())
 }
 
+fn trusted_git_cmd(cwd: &Path) -> Result<std::process::Command, String> {
+    let git_bin = [
+        "/usr/bin/git",
+        "/opt/homebrew/bin/git",
+        "/usr/local/bin/git",
+    ]
+    .into_iter()
+    .map(Path::new)
+    .find(|p| crate::coordinator::is_trusted_executable_file(p))
+    .ok_or_else(|| {
+        "no trusted system git executable found in /usr/bin, /opt/homebrew/bin, or /usr/local/bin"
+            .to_string()
+    })?;
+    let mut cmd = std::process::Command::new(git_bin);
+    cmd.current_dir(cwd)
+        .env_remove("GIT_EXTERNAL_DIFF")
+        .env_remove("GIT_DIFF_OPTS")
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_INDEX_FILE")
+        .env_remove("GIT_OBJECT_DIRECTORY")
+        .env_remove("GIT_ALTERNATE_OBJECT_DIRECTORIES")
+        .env_remove("GIT_COMMON_DIR")
+        .env_remove("GIT_CONFIG_PARAMETERS")
+        .env_remove("GIT_CONFIG_GLOBAL")
+        .env_remove("GIT_CONFIG_SYSTEM")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_CONFIG_COUNT", "2")
+        .env("GIT_CONFIG_KEY_0", "core.hooksPath")
+        .env("GIT_CONFIG_VALUE_0", "/dev/null")
+        .env("GIT_CONFIG_KEY_1", "core.fsmonitor")
+        .env("GIT_CONFIG_VALUE_1", "false");
+    Ok(cmd)
+}
+
 fn verify_bundle_rollout_provenance(bundle_root: &Path) -> Result<(), String> {
     use std::process::Command;
     if let Err(errs) = audit_repository(bundle_root) {
@@ -437,8 +473,7 @@ fn verify_bundle_rollout_provenance(bundle_root: &Path) -> Result<(), String> {
             errs.join("; ")
         ));
     }
-    let st = Command::new("git")
-        .current_dir(bundle_root)
+    let st = trusted_git_cmd(bundle_root)?
         .args(["status", "--porcelain=v1", "-z", "-uall"])
         .output()
         .map_err(|e| format!("git status on bundle failed: {e}"))?;
@@ -448,8 +483,7 @@ fn verify_bundle_rollout_provenance(bundle_root: &Path) -> Result<(), String> {
                 .to_string(),
         );
     }
-    let head_out = Command::new("git")
-        .current_dir(bundle_root)
+    let head_out = trusted_git_cmd(bundle_root)?
         .args(["rev-parse", "--verify", "HEAD"])
         .output()
         .map_err(|e| format!("git rev-parse HEAD failed: {e}"))?;
@@ -464,10 +498,8 @@ fn verify_bundle_rollout_provenance(bundle_root: &Path) -> Result<(), String> {
     let signers_ok = fs::symlink_metadata(&signers_path)
         .is_ok_and(|m| m.file_type().is_file() && !m.file_type().is_symlink());
     if signers_ok
-        && let Ok(tags_out) = Command::new("git")
-            .current_dir(bundle_root)
-            .args(["tag", "--points-at", "HEAD"])
-            .output()
+        && let Ok(mut tag_cmd) = trusted_git_cmd(bundle_root)
+        && let Ok(tags_out) = tag_cmd.args(["tag", "--points-at", "HEAD"]).output()
         && tags_out.status.success()
     {
         for tag in String::from_utf8_lossy(&tags_out.stdout)
@@ -475,30 +507,24 @@ fn verify_bundle_rollout_provenance(bundle_root: &Path) -> Result<(), String> {
             .map(str::trim)
             .filter(|s| !s.is_empty() && !s.starts_with('-'))
         {
-            let is_ssh_signed = Command::new("git")
-                .current_dir(bundle_root)
-                .args(["cat-file", "tag", tag])
-                .output()
-                .is_ok_and(|o| {
+            let is_ssh_signed = trusted_git_cmd(bundle_root).is_ok_and(|mut c| {
+                c.args(["cat-file", "tag", tag]).output().is_ok_and(|o| {
                     o.status.success()
                         && String::from_utf8_lossy(&o.stdout)
                             .contains("-----BEGIN SSH SIGNATURE-----")
-                });
+                })
+            });
             if !is_ssh_signed {
                 continue;
             }
-            if Command::new("git")
-                .current_dir(bundle_root)
-                .env("GIT_CONFIG_NOSYSTEM", "1")
-                .env("GIT_CONFIG_COUNT", "2")
-                .env("GIT_CONFIG_KEY_0", "gpg.ssh.allowedSignersFile")
-                .env("GIT_CONFIG_VALUE_0", &signers_path)
-                .env("GIT_CONFIG_KEY_1", "core.hooksPath")
-                .env("GIT_CONFIG_VALUE_1", "/dev/null")
-                .args(["verify-tag", "--end-of-options", tag])
-                .output()
-                .is_ok_and(|o| o.status.success())
-            {
+            if trusted_git_cmd(bundle_root).is_ok_and(|mut c| {
+                c.env("GIT_CONFIG_COUNT", "3")
+                    .env("GIT_CONFIG_KEY_2", "gpg.ssh.allowedSignersFile")
+                    .env("GIT_CONFIG_VALUE_2", &signers_path)
+                    .args(["verify-tag", "--end-of-options", tag])
+                    .output()
+                    .is_ok_and(|o| o.status.success())
+            }) {
                 return Ok(());
             }
         }

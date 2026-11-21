@@ -1612,7 +1612,38 @@ pub fn submit_friction_ballot(
     submit_friction_ballot_with_sink(repo_root, req, EmitSink::CliStdout)
 }
 
-pub fn load_verified_ballots(_repo_root: &Path) -> Result<Vec<SignedBallotRecord>, String> {
+pub fn compute_repo_id_prefix(repo_root: &Path) -> Result<String, String> {
+    let meta = fs::symlink_metadata(repo_root).map_err(|e| {
+        format!(
+            "INVALID_BALLOT_REPO_ROOT: cannot stat '{}': {e}",
+            repo_root.display()
+        )
+    })?;
+    if meta.file_type().is_symlink() || !meta.file_type().is_dir() {
+        return Err(format!(
+            "INVALID_BALLOT_REPO_ROOT: '{}' must be a non-symlink directory",
+            repo_root.display()
+        ));
+    }
+    let canon = fs::canonicalize(repo_root)
+        .map_err(|e| format!("failed canonicalizing '{}': {e}", repo_root.display()))?;
+    let common_repo = crate::resolve_common_repo_root(&canon);
+    let full_hash = sha256_hex(common_repo.to_string_lossy().as_bytes());
+    Ok(full_hash[..24].to_string())
+}
+
+pub fn load_verified_ballots_for_repo(repo_root: &Path) -> Result<Vec<SignedBallotRecord>, String> {
+    let expected_repo_id = compute_repo_id_prefix(repo_root)?;
+    let all = load_verified_ballots(repo_root)?;
+    Ok(all
+        .into_iter()
+        .filter(|rec| rec.repo_id == expected_repo_id)
+        .collect())
+}
+
+pub fn load_verified_ballots(repo_root: &Path) -> Result<Vec<SignedBallotRecord>, String> {
+    let expected_repo_id = compute_repo_id_prefix(repo_root)?;
+    let isolate_to_single_repo = repo_root.join(".dotagent-repo-isolated").is_file();
     let dir = feedback_state_dir()?;
     let fb_key = load_or_init_global_feedback_key()?;
     let mut verified = Vec::new();
@@ -1669,6 +1700,9 @@ pub fn load_verified_ballots(_repo_root: &Path) -> Result<Vec<SignedBallotRecord
                     rec.ballot_id,
                     idx + 1
                 ));
+            }
+            if isolate_to_single_repo && rec.repo_id != expected_repo_id {
+                continue;
             }
             verified.push(rec);
         }

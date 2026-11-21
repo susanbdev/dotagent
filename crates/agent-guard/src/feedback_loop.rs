@@ -43,7 +43,7 @@ use crate::feedback::{
     AGENTPI_EVENT_SCHEMA, AGENTPI_STDOUT_PREFIX, AggregatedFrictionCluster,
     aggregate_verified_clusters, clean_single_line_ascii, compute_cluster_key,
     current_host_spool_id, feedback_state_dir, is_ring0_constitutional_code, is_valid_cluster_key,
-    load_verified_ballots,
+    load_verified_ballots, load_verified_ballots_for_repo,
 };
 use crate::github_governance::{DOTAGENT_REQUIRED_CHECKS, validate_github_ident};
 use crate::json::JsonValue;
@@ -1052,13 +1052,21 @@ pub fn run_feedback_sync_github_cli(args: &[String], cwd: &Path) -> ExitCode {
         }
     }
 
-    if let Err(e) = validate_owner_repo(&target_repo) {
-        eprintln!("[dotagent feedback sync-github] HARD DENY: {e}");
-        return ExitCode::from(2);
-    }
+    let (_, target_repo_short) = match validate_owner_repo(&target_repo) {
+        Ok(pair) => pair,
+        Err(e) => {
+            eprintln!("[dotagent feedback sync-github] HARD DENY: {e}");
+            return ExitCode::from(2);
+        }
+    };
 
     let repo_root = resolve_repo_root(cwd);
-    let all_ballots = match load_verified_ballots(&repo_root) {
+    let ballot_res = if target_repo_short.eq_ignore_ascii_case("dotagent") {
+        load_verified_ballots(&repo_root)
+    } else {
+        load_verified_ballots_for_repo(&repo_root)
+    };
+    let all_ballots = match ballot_res {
         Ok(b) => b,
         Err(e) => {
             eprintln!("[dotagent feedback sync-github] HARD DENY: {e}");
@@ -2889,7 +2897,7 @@ fn commit_and_push_worktree(
         .map_err(|e| format!("git status failed: {e}"))?;
     if !String::from_utf8_lossy(&status.stdout).trim().is_empty() {
         let commit = hardened_git_cmd(wt_dir)
-            .args(["commit", "--no-verify", "-m", msg])
+            .args(["commit", "-m", msg])
             .output()
             .map_err(|e| format!("git commit failed: {e}"))?;
         if !commit.status.success() {
@@ -2945,13 +2953,7 @@ fn commit_and_push_worktree(
         push_cmd.env("GIT_CONFIG_COUNT", "3");
     }
     let push = push_cmd
-        .args([
-            "push",
-            "--no-verify",
-            "--end-of-options",
-            &push_target,
-            &refspec,
-        ])
+        .args(["push", "--end-of-options", &push_target, &refspec])
         .output()
         .map_err(|e| format!("git push failed: {e}"))?;
     if !push.status.success() {

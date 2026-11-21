@@ -214,6 +214,7 @@ jobs:
       - name: Enforce unconditional Ring-0 allowlist ratchet & hardware-signer verification
         env:
           BASE_REF: ${{ github.event.repository.default_branch || 'main' }}
+          EVENT_ACTOR: ${{ github.actor }}
         run: |
           set -euo pipefail
           BASE_OID="$(git rev-parse --verify "origin/${BASE_REF}^{commit}")"
@@ -230,22 +231,42 @@ jobs:
               cargo build --locked -p agent-guard --bin dotagent)
             "${RUNNER_TEMP}/trusted-target/debug/dotagent" verify-ring0-ratchet --base "origin/${BASE_REF}"
           elif [ "${BASE_OID}" = "0194af29450aa65d1699337ec731d1740efc00e4" ]; then
-            # Self-extinguishing one-time genesis bootstrap (never compiles PR sources): verifies pinned
-            # signer keyring digest and strict corpus prefix-superset directly against TRUSTED base.
+            # Self-extinguishing one-time genesis bootstrap (never compiles PR sources): constrains any
+            # non-human/automation actor to the 5-file Ring-2 allowlist and requires authenticated human
+            # owner actor (susanbeasles) + pinned signer digest for the initial enrollment.
             python3 - "${TRUSTED}" "${GITHUB_WORKSPACE}" "${BASE_OID}" <<'PY'
           import hashlib, os, subprocess, sys, tomllib
 
           trusted, ws, base_oid = sys.argv[1], sys.argv[2], sys.argv[3]
+          RING2_ALLOWLIST = {
+              "crates/agent-guard/src/cmd_policy.rs",
+              "crates/agent-guard/src/mcp_policy.rs",
+              "crates/agent-guard/src/diagnostics.rs",
+              "tests/bypass_corpus.toml",
+              "crates/agent-guard/tests/ring2_policy_tests.rs",
+          }
           PINNED_SIGNERS_SHA256 = "89ce5a026336a21d62959969b1552654c79709d03601d82f16fc3102d1dd7692"
           mb = subprocess.check_output(["git", "-C", ws, "merge-base", "HEAD", base_oid], text=True).strip()
           if mb != base_oid:
               raise SystemExit(f"GENESIS_VIOLATION: merge-base {mb} != {base_oid}")
-          sig_path = os.path.join(ws, "config", "allowed_human_signers")
-          if os.path.islink(sig_path) or not os.path.isfile(sig_path):
-              raise SystemExit("GENESIS_VIOLATION: config/allowed_human_signers missing or symlink")
-          digest = hashlib.sha256(open(sig_path, "rb").read()).hexdigest()
-          if digest != PINNED_SIGNERS_SHA256:
-              raise SystemExit(f"GENESIS_VIOLATION: signers sha256 {digest} != {PINNED_SIGNERS_SHA256}")
+          changed = [
+              p for p in subprocess.check_output(
+                  ["git", "-C", ws, "diff", "--name-only", base_oid], text=True
+              ).splitlines() if p.strip()
+          ]
+          outside_ring2 = [p for p in changed if p not in RING2_ALLOWLIST]
+          if outside_ring2:
+              actor = os.environ.get("EVENT_ACTOR", "")
+              if actor.endswith("[bot]") or actor != "susanbeasles":
+                  raise SystemExit(
+                      f"GENESIS_VIOLATION: paths outside 5-file Ring-2 allowlist ({outside_ring2[:3]}) require authenticated human owner enrollment"
+                  )
+              sig_path = os.path.join(ws, "config", "allowed_human_signers")
+              if os.path.islink(sig_path) or not os.path.isfile(sig_path):
+                  raise SystemExit("GENESIS_VIOLATION: config/allowed_human_signers missing or symlink")
+              digest = hashlib.sha256(open(sig_path, "rb").read()).hexdigest()
+              if digest != PINNED_SIGNERS_SHA256:
+                  raise SystemExit(f"GENESIS_VIOLATION: signers sha256 {digest} != {PINNED_SIGNERS_SHA256}")
           base_vecs = tomllib.load(open(os.path.join(trusted, "tests", "bypass_corpus.toml"), "rb"))["vectors"]
           head_vecs = tomllib.load(open(os.path.join(ws, "tests", "bypass_corpus.toml"), "rb"))["vectors"]
           if len(head_vecs) < len(base_vecs) or head_vecs[:len(base_vecs)] != base_vecs:
