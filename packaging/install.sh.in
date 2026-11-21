@@ -230,15 +230,18 @@ dotagent_seal_tree() {
 
 dotagent_swap_dir() {
     local fresh="$1" final="$2" old
+    chmod 0755 "${fresh}"
     if [[ -e "${final}" || -L "${final}" ]]; then
         old="${final}.old.$$"
         chmod -R u+rwX "${final}" 2>/dev/null || true
         mv "${final}" "${old}"
         mv "${fresh}" "${final}"
+        chmod 0555 "${final}"
         chmod -R u+rwX "${old}" 2>/dev/null || true
         rm -rf "${old}"
     else
         mv "${fresh}" "${final}"
+        chmod 0555 "${final}"
     fi
 }
 
