@@ -1633,19 +1633,11 @@ pub fn compute_repo_id_prefix(repo_root: &Path) -> Result<String, String> {
 }
 
 pub fn load_verified_ballots_for_repo(repo_root: &Path) -> Result<Vec<SignedBallotRecord>, String> {
-    let expected_repo_id = compute_repo_id_prefix(repo_root)?;
-    let all = load_verified_ballots(repo_root)?;
-    Ok(all
-        .into_iter()
-        .filter(|rec| rec.repo_id == expected_repo_id)
-        .collect())
+    load_verified_ballots(repo_root)
 }
 
 pub fn load_verified_ballots(repo_root: &Path) -> Result<Vec<SignedBallotRecord>, String> {
     let expected_repo_id = compute_repo_id_prefix(repo_root)?;
-    let is_telemetry_hub = fs::symlink_metadata(repo_root.join("config/telemetry_verify_keys.pub"))
-        .is_ok_and(|m| m.file_type().is_file() && !m.file_type().is_symlink())
-        && !repo_root.join(".dotagent-repo-isolated").is_file();
     let dir = feedback_state_dir()?;
     let fb_key = load_or_init_global_feedback_key()?;
     let mut verified = Vec::new();
@@ -1703,7 +1695,7 @@ pub fn load_verified_ballots(repo_root: &Path) -> Result<Vec<SignedBallotRecord>
                     idx + 1
                 ));
             }
-            if !is_telemetry_hub && rec.repo_id != expected_repo_id {
+            if rec.repo_id != expected_repo_id {
                 continue;
             }
             verified.push(rec);

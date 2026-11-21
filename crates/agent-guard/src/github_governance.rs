@@ -38,6 +38,8 @@ pub const DOTAGENT_REQUIRED_CHECKS: &[&str] = &[
     "Security Kernel & Harness (ubuntu-latest)",
     "Security Kernel & Harness (macos-latest)",
     "Supply-Chain Advisory & License Gate (cargo-deny)",
+    "Container Cleanroom Matrix",
+    "Dual-Directory Reproducibility Proof",
     "Kani Bounded Model Checking Proofs",
     "MSRV 1.88.0 Compatibility Gate",
     "Ring-0 Constitutional Ratchet",
@@ -1306,7 +1308,7 @@ mod tests {
             .iter()
             .map(|s| (*s).to_string())
             .collect();
-        assert_eq!(checks.len(), 7);
+        assert_eq!(checks.len(), 9);
         let payload = build_main_ruleset_payload(&checks, true);
         let s = payload.to_json_string();
         assert!(s.contains(RULESET_NAME));
@@ -1319,7 +1321,7 @@ mod tests {
         let empty_fb = build_main_ruleset_payload(&[], false).to_json_string();
         assert!(empty_fb.contains("\"required_approving_review_count\":1"));
         // CI checks without any review gate still require a human approval.
-        let ci_only = build_main_ruleset_payload(&checks[..6], false).to_json_string();
+        let ci_only = build_main_ruleset_payload(&checks[..8], false).to_json_string();
         assert!(ci_only.contains("\"required_approving_review_count\":1"));
         // The native Copilot rule alone never lowers the human approval floor.
         let copilot_only = build_main_ruleset_payload(&[], true).to_json_string();

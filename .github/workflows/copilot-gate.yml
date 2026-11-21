@@ -6,18 +6,17 @@ on:
   pull_request_review:
     types: [submitted, dismissed]
 
-permissions:
-  contents: read
-  pull-requests: read
-  statuses: write
+permissions: {}
 
 concurrency:
   group: copilot-gate-${{ github.event.pull_request.number }}
   cancel-in-progress: true
 
 jobs:
-  copilot-and-ratchet-gate:
-    name: Evaluate Ring-0 & Copilot Gate Status
+  ring0-ratchet:
+    name: Verify Ring-0 from trusted base
+    permissions:
+      contents: read
     # Decoy-PR defense: commit statuses are per-SHA, so a PR aimed at a scratch branch must never
     # mint a green gate status that a second PR (same head SHA) into the default branch inherits.
     # Runs strictly from the trusted default-branch workflow via pull_request_target / pull_request_review.
@@ -46,6 +45,7 @@ jobs:
         id: ratchet
         env:
           BASE_REF: ${{ github.event.repository.default_branch }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
           PR_AUTHOR: ${{ github.event.pull_request.user.login }}
           PR_AUTHOR_TYPE: ${{ github.event.pull_request.user.type }}
@@ -54,6 +54,7 @@ jobs:
           EVENT_ACTOR: ${{ github.actor }}
         run: |
           set -euo pipefail
+          test "$(git rev-parse --verify HEAD^{commit})" = "${PR_HEAD_SHA}"
           BASE_OID="$(git rev-parse --verify "origin/${BASE_REF}^{commit}")"
           TRUSTED="${RUNNER_TEMP}/trusted-base"
           git worktree add --detach "${TRUSTED}" "${BASE_OID}"
@@ -145,15 +146,24 @@ jobs:
             exit 1
           fi
 
+  copilot-and-ratchet-gate:
+    name: Evaluate Ring-0 & Copilot Gate Status
+    needs: ring0-ratchet
+    if: always() && github.event.pull_request.base.ref == github.event.repository.default_branch
+    permissions:
+      pull-requests: read
+      statuses: write
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
       # Runs no cargo / repository code; only stdlib Python + gh against the GitHub API.
       - name: Post Ring-0 & Copilot Gate commit status
-        if: always()
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO_FULL: ${{ github.repository }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
           PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-          RATCHET_OUTCOME: ${{ steps.ratchet.outcome }}
+          RATCHET_OUTCOME: ${{ needs.ring0-ratchet.result }}
         run: |
           set -euo pipefail
           python3 - <<'PY'
@@ -235,8 +245,7 @@ jobs:
                       )
                       return 1
                   if unresolved > 0:
-                      # Clean head review but stale threads remain: stay pending; resolving the
-                      # threads re-triggers this workflow via pull_request_review_thread.
+                      # Re-evaluate through the trusted gate after remaining threads are resolved.
                       set_status("pending", f"Copilot clean on head; {unresolved} unresolved thread(s) remain")
                       return 0
                   set_status("success", "Ring-0 ratchet + Copilot 0-comment review verified")

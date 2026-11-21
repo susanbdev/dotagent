@@ -1436,9 +1436,15 @@ const CONSTITUTIONAL_CODE_GUARDED_FILES: &[&str] = &[
 ];
 
 fn count_constitutional_codes(raw: &str) -> Vec<usize> {
+    let tokens = crate::qa_suspects::rust_source_tokens(raw);
     crate::feedback::RING0_CONSTITUTIONAL_CODES
         .iter()
-        .map(|code| raw.matches(code).count())
+        .map(|code| {
+            tokens
+                .iter()
+                .map(|token| token.text.matches(code).count())
+                .sum()
+        })
         .collect()
 }
 
@@ -2023,6 +2029,18 @@ pub fn run_verify_ring0_ratchet_cli(args: &[String], cwd: &Path) -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn constitutional_code_counts_ignore_comments() {
+        let source = r#"
+            // FORBIDDEN_DIRECTORY_ACCESS
+            /* Outer comment /* FORBIDDEN_DIRECTORY_ACCESS */ end */
+            const CODE: &str = "FORBIDDEN_DIRECTORY_ACCESS";
+        "#;
+        let counts = count_constitutional_codes(source);
+        assert_eq!(counts[0], 1);
+        assert!(counts[1..].iter().all(|count| *count == 0));
+    }
 
     #[test]
     fn enforces_strict_five_file_ring2_allowlist_and_corpus_prefix_identity() {

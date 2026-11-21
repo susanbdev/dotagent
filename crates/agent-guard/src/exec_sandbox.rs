@@ -678,34 +678,16 @@ pub fn run_exec_sandbox_cli(args: &[String], default_cwd: &Path) -> ExitCode {
     // Pre-launch the out-of-sandbox Vault Coordinator daemon BEFORE `restrict_self()` so
     // `swarm-tool` or `dotagent feedback submit` can communicate via `ipc/coord.sock`
     // while `vault/hmac.key` and `feedback/` stay 100% kernel-inaccessible (`EACCES`)!
-    if opts.invokes_swarm_tool || has_swarm_session || opts.invokes_feedback_submit {
-        let _ = crate::coordinator::ensure_coordinator_daemon(&common_repo);
-        if let Ok(sdir) = crate::breadcrumbs::swarm_state_dir(&common_repo) {
-            for sub in ["ipc", "sessions", "spools", "ledger"] {
-                let p = sdir.join(sub);
-                let _ = fs::create_dir_all(&p);
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::PermissionsExt;
-                    let _ = fs::set_permissions(&p, fs::Permissions::from_mode(0o700));
-                }
-            }
+    let needs_swarm_state = opts.invokes_swarm_tool || has_swarm_session;
+    if needs_swarm_state || opts.invokes_feedback_submit {
+        if let Err(e) = initialize_swarm_sandbox_state(&common_repo, needs_swarm_state) {
+            eprintln!("[AGENT-GUARD HARD DENY :: INVALID_SWARM_STATE] {e}");
+            return ExitCode::from(2);
         }
-        let _ = crate::breadcrumbs::swarm_locks_dir();
-    } else if opts.invokes_feedback_submit {
         let _ = crate::coordinator::ensure_coordinator_daemon(&common_repo);
-        if let Ok(sdir) = crate::breadcrumbs::swarm_state_dir(&common_repo) {
-            let p = sdir.join("ipc");
-            let _ = fs::create_dir_all(&p);
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                let _ = fs::set_permissions(&p, fs::Permissions::from_mode(0o700));
-            }
-        }
     }
     if opts.invokes_swarm_tool {
-        precreate_swarm_tool_sandbox_targets(&repo_root, &shell_script);
+        precreate_swarm_tool_sandbox_targets(&repo_root);
     }
 
     // Mint `AGENT_GUARD_IPC_WORKER_TOKEN` STRICTLY for atomic `dotagent feedback submit`
@@ -1286,20 +1268,99 @@ pub(crate) fn is_atomic_feedback_submit_command(script: &str) -> bool {
     true
 }
 
-fn precreate_swarm_tool_sandbox_targets(repo_root: &Path, _shell_script: &str) {
-    let canon_repo = fs::canonicalize(repo_root).unwrap_or_else(|_| repo_root.to_path_buf());
-    if let Ok(sdir) = crate::breadcrumbs::swarm_state_dir(&canon_repo) {
-        for sub in ["ipc", "sessions", "spools", "ledger"] {
-            let p = sdir.join(sub);
-            let _ = fs::create_dir_all(&p);
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                let _ = fs::set_permissions(&p, fs::Permissions::from_mode(0o700));
-            }
+fn initialize_swarm_sandbox_state(
+    common_repo: &Path,
+    needs_swarm_state: bool,
+) -> Result<(), String> {
+    let root = crate::traversal_ledger::state_root_dir();
+    if let Some(parent) = root.parent() {
+        let ancestors: Vec<_> = parent.ancestors().collect();
+        for ancestor in ancestors
+            .into_iter()
+            .rev()
+            .filter(|p| !p.as_os_str().is_empty())
+        {
+            ensure_sandbox_state_directory(ancestor, false)?;
         }
     }
-    let _ = crate::breadcrumbs::swarm_locks_dir();
+    ensure_sandbox_state_directory(&root, true)?;
+    let swarm_root = root.join("swarm");
+    ensure_sandbox_state_directory(&swarm_root, true)?;
+    let repo_hash = crate::crypto::sha256_hex(common_repo.to_string_lossy().as_bytes());
+    let repo_state = swarm_root.join(&repo_hash[..24]);
+    ensure_sandbox_state_directory(&repo_state, true)?;
+    ensure_sandbox_state_directory(&repo_state.join("ipc"), true)?;
+    if needs_swarm_state {
+        for child in ["sessions", "spools", "ledger"] {
+            ensure_sandbox_state_directory(&repo_state.join(child), true)?;
+        }
+        ensure_sandbox_state_directory(&root.join("locks"), true)?;
+    }
+    Ok(())
+}
+
+fn ensure_sandbox_state_directory(path: &Path, private: bool) -> Result<(), String> {
+    let err = |reason| {
+        format!(
+            "invalid sandbox state directory '{}': {reason}",
+            path.display()
+        )
+    };
+    let meta = match fs::symlink_metadata(path) {
+        Ok(meta) => meta,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            let mut builder = fs::DirBuilder::new();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::DirBuilderExt;
+                builder.mode(0o700);
+            }
+            match builder.create(path) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(e) => return Err(err(e.to_string())),
+            }
+            fs::symlink_metadata(path).map_err(|e| err(e.to_string()))?
+        }
+        Err(e) => return Err(err(e.to_string())),
+    };
+    if !meta.is_dir() {
+        return Err(err("expected a regular non-symlink directory".to_string()));
+    }
+    #[cfg(unix)]
+    if private {
+        use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+
+        let nofollow = crate::traversal_ledger::O_NOFOLLOW_FLAG;
+        if nofollow == 0 {
+            return Err(err("no-follow directory opening is unavailable".to_string()));
+        }
+        let nonblock = if cfg!(target_os = "macos") {
+            0x4
+        } else {
+            0o4000
+        };
+        let dir = fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(nofollow | nonblock)
+            .open(path)
+            .map_err(|e| err(e.to_string()))?;
+        let opened = dir.metadata().map_err(|e| err(e.to_string()))?;
+        if !opened.is_dir() || meta.dev() != opened.dev() || meta.ino() != opened.ino() {
+            return Err(err("directory changed while opening".to_string()));
+        }
+        if opened.permissions().mode() & 0o777 != 0o700 {
+            dir.set_permissions(fs::Permissions::from_mode(0o700))
+                .map_err(|e| err(e.to_string()))?;
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = private;
+    Ok(())
+}
+
+fn precreate_swarm_tool_sandbox_targets(repo_root: &Path) {
+    let canon_repo = fs::canonicalize(repo_root).unwrap_or_else(|_| repo_root.to_path_buf());
     let _ = crate::breadcrumbs::ensure_git_info_exclude(&canon_repo);
 
     // Pre-open `.breadcrumbs.jsonl` before Landlock `restrict_self()` (which deliberately withholds
@@ -2078,6 +2139,76 @@ fn prepare_capability_write_paths(
 }
 
 #[cfg(target_os = "linux")]
+fn open_trusted_toolchain_entry(
+    path: &Path,
+    home: &Path,
+    repo: &Path,
+    state: &Path,
+    directory: bool,
+) -> Option<fs::File> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+
+    let before = fs::symlink_metadata(path).ok()?;
+    if if directory {
+        !before.is_dir()
+    } else {
+        !before.is_file()
+    } {
+        return None;
+    }
+    let canonical = fs::canonicalize(path).ok()?;
+    if canonical != path
+        || home.starts_with(&canonical)
+        || repo.starts_with(&canonical)
+        || canonical.starts_with(repo)
+        || state.starts_with(&canonical)
+        || canonical.starts_with(state)
+        || [
+            "/tmp",
+            "/var/tmp",
+            "/dev",
+            "/run/user",
+            "/proc",
+            "/sys",
+            "/etc",
+        ]
+        .iter()
+        .any(|root| canonical.starts_with(root))
+        || canonical.ancestors().any(|ancestor| {
+            ancestor.ends_with(".config/gh")
+                || ancestor.ends_with(".local/state/agent-guard")
+                || ancestor
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_none_or(|name| {
+                        matches!(
+                            name.to_ascii_lowercase().as_str(),
+                            ".ssh" | ".aws" | ".gnupg" | ".git"
+                        ) || is_secret_or_forbidden_root_entry(name)
+                    })
+                    && ancestor.parent().is_some()
+        })
+    {
+        return None;
+    }
+    let nofollow = crate::traversal_ledger::O_NOFOLLOW_FLAG;
+    if nofollow == 0 {
+        return None;
+    }
+    const O_PATH: i32 = 0o10_000_000;
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(nofollow | O_PATH)
+        .open(&canonical)
+        .ok()?;
+    let opened = file.metadata().ok()?;
+    (before.dev() == opened.dev()
+        && before.ino() == opened.ino()
+        && (directory && opened.is_dir() || !directory && opened.is_file() && opened.nlink() == 1))
+        .then_some(file)
+}
+
+#[cfg(target_os = "linux")]
 fn apply_linux_landlock(
     repo_root: &Path,
     ephemeral_tmp: Option<&Path>,
@@ -2200,33 +2331,47 @@ fn apply_linux_landlock(
         }
     }
 
-    // 3. User-space toolchain directories (Rustup, Cargo, NVM/Volta/fnm) WITHOUT exposing ~/.ssh, ~/.aws, ~/.local/state/agent-guard
+    // Toolchain environment paths receive rules only for verified, pinned file descriptors.
+    let mut toolchain_rules = Vec::new();
     if let Some(ref home) = home_opt {
-        let rustup = env::var_os("RUSTUP_HOME")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| home.join(".rustup"));
-        if rustup.exists() {
-            add_path(&rustup, ro_access);
-        }
-        let cargo_home = env::var_os("CARGO_HOME")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| home.join(".cargo"));
-        if cargo_home.exists() {
-            let cargo_bin = cargo_home.join("bin");
-            if cargo_bin.exists() {
-                add_path(&cargo_bin, ro_access);
+        if let Ok(canonical_home) = fs::canonicalize(home) {
+            let state_base = crate::traversal_ledger::state_base_dir();
+            let state = if state_base.ends_with("sessions") {
+                state_base.parent().unwrap_or(&state_base)
+            } else {
+                &state_base
+            };
+            let state = fs::canonicalize(state).unwrap_or_else(|_| state.to_path_buf());
+            let vetted = |path: &Path, is_dir: bool| {
+                open_trusted_toolchain_entry(path, &canonical_home, &canon_repo, &state, is_dir)
+            };
+            let rustup = env::var_os("RUSTUP_HOME")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| home.join(".rustup"));
+            if let Some(rustup) = vetted(&rustup, true) {
+                toolchain_rules.push(PathBeneath::new(rustup, ro_access));
             }
-            for sub in ["registry", "git", ".package-cache", ".package-cache-mutate"] {
-                let sp = cargo_home.join(sub);
-                if sp.exists() {
-                    add_path(
-                        &sp,
-                        if opts.writes_allowed {
-                            rw_access
-                        } else {
-                            ro_access
-                        },
-                    );
+            let cargo_home = env::var_os("CARGO_HOME")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| home.join(".cargo"));
+            if vetted(&cargo_home, true).is_some() {
+                if let Some(bin) = vetted(&cargo_home.join("bin"), true) {
+                    toolchain_rules.push(PathBeneath::new(bin, ro_access));
+                }
+                let cache_access = if opts.writes_allowed {
+                    rw_access
+                } else {
+                    ro_access
+                };
+                for (name, is_dir) in [
+                    ("registry", true),
+                    ("git", true),
+                    (".package-cache", false),
+                    (".package-cache-mutate", false),
+                ] {
+                    if let Some(cache) = vetted(&cargo_home.join(name), is_dir) {
+                        toolchain_rules.push(PathBeneath::new(cache, cache_access));
+                    }
                 }
             }
         }
@@ -2530,6 +2675,7 @@ fn apply_linux_landlock(
 
     match created
         .add_rules(rules)
+        .and_then(|r| r.add_rules(toolchain_rules.into_iter().map(Ok)))
         .and_then(|r| r.add_rules(capability_rules))
         .and_then(|r| r.restrict_self())
     {
@@ -2850,6 +2996,41 @@ mod tests {
     use super::drain_stream_bounded;
     use std::io::Cursor;
 
+    #[cfg(any(
+        target_os = "macos",
+        all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        )
+    ))]
+    #[test]
+    fn sandbox_state_directory_requires_a_real_directory() -> std::io::Result<()> {
+        use super::ensure_sandbox_state_directory;
+        use std::fs;
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let nonce = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
+        let fixture = std::env::temp_dir().join(format!(
+            "dotagent-state-dir-{}-{}",
+            std::process::id(),
+            nonce.as_nanos()
+        ));
+        fs::create_dir(&fixture)?;
+        let real = fixture.join("real");
+        let alias = fixture.join("alias");
+        let created = ensure_sandbox_state_directory(&real, true);
+        symlink(&real, &alias)?;
+        let rejected = ensure_sandbox_state_directory(&alias, true);
+        let permissions = fs::metadata(&real)?.permissions().mode() & 0o777;
+        fs::remove_dir_all(&fixture)?;
+
+        assert!(created.is_ok(), "{created:?}");
+        assert_eq!(permissions, 0o700);
+        assert!(rejected.is_err(), "symlinked directory must be refused");
+        Ok(())
+    }
+
     #[test]
     fn checkpoint_session_requires_explicit_identity_and_accepts_exact_ambient_match() {
         use super::checkpoint_session_id;
@@ -2909,6 +3090,50 @@ mod tests {
         assert!(text.ends_with("TAIL_MARKER\n"));
         assert!(text.contains("exec-sandbox drained"));
         assert!(drained.len() < 36_000);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn toolchain_entries_require_regular_paths_outside_protected_roots() {
+        use super::open_trusted_toolchain_entry;
+        use std::fs;
+        use std::os::unix::fs::symlink;
+        use std::path::PathBuf;
+
+        struct Scratch(PathBuf);
+        impl Drop for Scratch {
+            fn drop(&mut self) {
+                let _ = fs::remove_dir_all(&self.0);
+            }
+        }
+
+        let root = std::env::current_dir()
+            .expect("cwd")
+            .join(format!("toolchain-policy-{}", std::process::id()));
+        fs::create_dir(&root).expect("new scratch directory");
+        let scratch = Scratch(root);
+        let home = scratch.0.join("home");
+        let repo = scratch.0.join("repo");
+        let state = home.join(".local/state/agent-guard");
+        let cargo = home.join(".cargo");
+        let private = home.join(".ssh");
+        let registry = cargo.join("registry");
+        let lock = cargo.join(".package-cache");
+        for dir in [&state, &repo, &registry, &private] {
+            fs::create_dir_all(dir).expect("directory fixture");
+        }
+        fs::write(&lock, "").expect("Cargo cache lock");
+        let alias = cargo.join("alias");
+        symlink(&registry, &alias).expect("directory symlink fixture");
+
+        let open =
+            |path, directory| open_trusted_toolchain_entry(path, &home, &repo, &state, directory);
+        assert!(open(&registry, true).is_some());
+        assert!(open(&lock, false).is_some());
+        assert!(open(&lock, true).is_none());
+        for dir in [&home, &repo, &state, &private, &alias] {
+            assert!(open(dir, true).is_none());
+        }
     }
 
     #[cfg(target_os = "linux")]

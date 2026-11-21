@@ -7,6 +7,7 @@
 //! and indirect wrappers (`sh -c`, `bash -c`, `eval`, `env`, `xargs`), and enforces
 //! zero-trust path, depth<=2, git-hook/config, package-script, and anti-confused-deputy rules.
 
+use std::collections::BTreeSet;
 use std::path::Path;
 
 use crate::path_policy::{PathAccess, check_forbidden_zones_lexical, validate_path};
@@ -2345,34 +2346,10 @@ fn check_cargo_command(
     repo_root: &Path,
     cwd: &Path,
 ) -> Result<(), CommandViolation> {
-    // Inspect `.cargo/config.toml` and `.cargo/config` (no-symlink, bounded, key-only) for RCE traps!
-    for rel in [".cargo/config.toml", ".cargo/config"] {
-        if let Some(keys) = read_bounded_nonsymlink_config_keys(repo_root, rel)? {
-            for bad in [
-                "rustc-wrapper",
-                "rustc_wrapper",
-                "workspace-wrapper",
-                "linker",
-                "runner",
-                "[alias]",
-                "rustc",
-            ] {
-                if keys
-                    .iter()
-                    .any(|k| k == bad || (bad != "rustc" && k.contains(bad)))
-                {
-                    return Err(CommandViolation {
-                        code: "CARGO_CONFIG_EXEC_TRAP",
-                        detail: format!(
-                            "Repository '{rel}' contains dangerous execution directive matching `{bad}` — refusing `cargo` invocation."
-                        ),
-                        halt_session: true,
-                    });
-                }
-            }
-        }
-    }
-
+    let canonical_repo =
+        std::fs::canonicalize(repo_root).unwrap_or_else(|_| repo_root.to_path_buf());
+    let canonical_cwd = std::fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
+    let mut config_roots = BTreeSet::from([canonical_repo.clone(), canonical_cwd]);
     let mut sub = "";
     let mut i = 0usize;
     while i < args.len() {
@@ -2386,8 +2363,13 @@ fn check_cargo_command(
                 halt_session: true,
             });
         }
-        if a == "--manifest-path" || a == "-C" {
-            let Some(p) = args.get(i + 1) else {
+        let directory_value = a
+            .strip_prefix("-C")
+            .filter(|value| !value.is_empty())
+            .map(|value| value.strip_prefix('=').unwrap_or(value));
+        let path_option = a.strip_prefix("--manifest-path=").or(directory_value);
+        if a == "--manifest-path" || a == "-C" || path_option.is_some() {
+            let Some(p) = path_option.or_else(|| args.get(i + 1).map(String::as_str)) else {
                 return Err(CommandViolation {
                     code: "MALFORMED_CARGO_COMMAND",
                     detail: format!("`cargo {a}` missing path argument."),
@@ -2395,22 +2377,19 @@ fn check_cargo_command(
                 });
             };
             reject_shell_glob_in_operand("cargo", p)?;
-            validate_path(repo_root, cwd, p, PathAccess::Read).map_err(|pv| CommandViolation {
-                code: pv.code,
-                detail: pv.detail,
-                halt_session: pv.is_poisoned_zone,
-            })?;
-            i += 2;
-            continue;
-        }
-        if let Some(p) = a.strip_prefix("--manifest-path=") {
-            reject_shell_glob_in_operand("cargo", p)?;
-            validate_path(repo_root, cwd, p, PathAccess::Read).map_err(|pv| CommandViolation {
-                code: pv.code,
-                detail: pv.detail,
-                halt_session: pv.is_poisoned_zone,
-            })?;
-            i += 1;
+            let path = validate_path(repo_root, cwd, p, PathAccess::Read)
+                .map_err(|pv| CommandViolation {
+                    code: pv.code,
+                    detail: pv.detail,
+                    halt_session: pv.is_poisoned_zone,
+                })?
+                .canonical_or_norm;
+            if a == "-C" || directory_value.is_some() {
+                config_roots.insert(path);
+            } else if let Some(parent) = path.parent() {
+                config_roots.insert(parent.to_path_buf());
+            }
+            i += if path_option.is_some() { 1 } else { 2 };
             continue;
         }
         if a == "--target-dir" {
@@ -2464,7 +2443,68 @@ fn check_cargo_command(
             halt_session: false,
         });
     }
+
+    let mut checked = BTreeSet::new();
+    for root in &config_roots {
+        for dir in root
+            .ancestors()
+            .take_while(|dir| dir.starts_with(&canonical_repo))
+        {
+            if !checked.insert(dir) {
+                break;
+            }
+            for rel in [".cargo/config.toml", ".cargo/config"] {
+                if let Some(keys) = read_bounded_nonsymlink_config_keys(dir, rel)?
+                    && let Some(directive) = cargo_config_traps(&keys).next()
+                {
+                    return Err(CommandViolation {
+                        code: "CARGO_CONFIG_EXEC_TRAP",
+                        detail: format!(
+                            "Cargo config '{}' contains dangerous execution directive '{directive}'.",
+                            dir.join(rel).display()
+                        ),
+                        halt_session: true,
+                    });
+                }
+            }
+        }
+    }
     Ok(())
+}
+
+fn cargo_config_traps(keys: &[String]) -> impl Iterator<Item = &'static str> + '_ {
+    [
+        "rustc-wrapper",
+        "rustc_wrapper",
+        "workspace-wrapper",
+        "linker",
+        "runner",
+        "alias",
+        "env",
+        "target",
+        "rustflags",
+        "rustdocflags",
+        "credential-provider",
+        "rustc",
+    ]
+    .into_iter()
+    .filter(|directive| {
+        keys.iter().any(|key| {
+            let table = key.starts_with('[');
+            let mut parts = key
+                .trim_matches(['[', ']'])
+                .split('.')
+                .map(|part| part.trim().trim_matches(['\'', '"']));
+            let first = parts.next().unwrap_or_default();
+            match *directive {
+                "alias" | "env" | "target" => {
+                    first == *directive && (table || parts.next().is_some())
+                }
+                "rustc" => first == *directive || parts.any(|part| part == *directive),
+                _ => key.contains(*directive),
+            }
+        })
+    })
 }
 
 /// Reads a config file inside `base_dir` up to 16 KiB without following symlinks on any path
@@ -2677,21 +2717,10 @@ pub fn inspect_repo_build_config_traps(repo_root: &Path) -> Vec<String> {
         match read_bounded_nonsymlink_config_keys(repo_root, rel) {
             Err(cv) => findings.push(format!("{}: {}", cv.code, cv.detail)),
             Ok(Some(keys)) => {
-                for bad in [
-                    "rustc-wrapper",
-                    "rustc_wrapper",
-                    "workspace-wrapper",
-                    "linker",
-                    "runner",
-                    "[alias]",
-                    "rustc",
-                ] {
-                    if keys
-                        .iter()
-                        .any(|k| k == bad || (bad != "rustc" && k.contains(bad)))
-                    {
-                        findings.push(format!("CARGO_CONFIG_EXEC_TRAP: '{rel}' contains `{bad}`"));
-                    }
+                for directive in cargo_config_traps(&keys) {
+                    findings.push(format!(
+                        "CARGO_CONFIG_EXEC_TRAP: '{rel}' contains '{directive}'"
+                    ));
                 }
             }
             Ok(None) => {}
@@ -5560,7 +5589,52 @@ pub const fn scan_shell_brace_and_quote_bytes(bytes: &[u8]) -> Result<usize, She
 
 #[cfg(test)]
 mod tests {
-    use super::evaluate_shell_command;
+    use super::{check_cargo_command, evaluate_shell_command};
+
+    #[test]
+    fn cargo_checks_cwd_and_manifest_ancestors() {
+        use std::fs;
+        use std::path::PathBuf;
+
+        struct Scratch(PathBuf);
+        impl Drop for Scratch {
+            fn drop(&mut self) {
+                let _ = fs::remove_dir_all(&self.0);
+            }
+        }
+
+        let root = std::env::current_dir()
+            .expect("cwd")
+            .join(format!("cargo-config-policy-{}", std::process::id()));
+        fs::create_dir(&root).expect("new scratch directory");
+        let scratch = Scratch(root);
+        let repo = &scratch.0;
+        let nested = repo.join("apps/service");
+        fs::create_dir_all(&nested).expect("service directory");
+        fs::create_dir(repo.join("apps/.cargo")).expect("config directory");
+        fs::write(repo.join("apps/.cargo/config.toml"), "[ env ]\n").expect("config fixture");
+        fs::write(nested.join("Cargo.toml"), "[workspace]\n").expect("manifest fixture");
+        for (args, cwd) in [
+            (vec!["check"], nested.as_path()),
+            (
+                vec!["check", "--manifest-path", "apps/service/Cargo.toml"],
+                repo.as_path(),
+            ),
+            (
+                vec!["check", "--manifest-path=apps/service/Cargo.toml"],
+                repo.as_path(),
+            ),
+            (vec!["-C", "apps/service", "check"], repo.as_path()),
+            (vec!["-Capps/service", "check"], repo.as_path()),
+        ] {
+            let args: Vec<_> = args.into_iter().map(str::to_string).collect();
+            let violation =
+                check_cargo_command(&args, repo, cwd).expect_err("config must be checked");
+            assert_eq!(violation.code, "CARGO_CONFIG_EXEC_TRAP");
+            assert!(violation.detail.contains("'env'"));
+        }
+        assert!(check_cargo_command(&["check".to_string()], repo, repo).is_ok());
+    }
 
     #[test]
     fn defeats_quote_splitting_and_subshell_and_git_hook_bypasses() {

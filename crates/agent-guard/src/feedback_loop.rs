@@ -13,8 +13,8 @@
 //! 2. **Cryptographic Queue Rehydration & Swarm Quorum (`run-loop`)**: Ignores issue bodies and
 //!    unsigned/untrusted comments; verifies `dotagent:sync-sig:v2` signatures against
 //!    `config/telemetry_verify_keys.pub` (plus optional `DOTAGENT_TELEMETRY_VERIFY_KEY`), requiring
-//!    `>= 3` unique root-session votes across `>= 2` `(repo_id, utc_day)` buckets (or explicit
-//!    operator label `dotagent-approved-triage`) and enforcing a 2-strike circuit breaker per
+//!    `>= 3` unique root-session votes across `>= 2` `(repo_id, utc_day)` buckets and enforcing a
+//!    2-strike circuit breaker per
 //!    `(cluster_key, main_tree_hash)` (`friction-escalated-human`).
 //! 3. **Credential & Prompt Airlock (`Command::env_clear()`)**: GitHub token stays exclusively in
 //!    parent Rust process memory. Stage 1-4 subprocesses run with `Command::env_clear()`. Raw
@@ -43,7 +43,7 @@ use crate::feedback::{
     AGENTPI_EVENT_SCHEMA, AGENTPI_STDOUT_PREFIX, AggregatedFrictionCluster,
     aggregate_verified_clusters, clean_single_line_ascii, compute_cluster_key,
     current_host_spool_id, feedback_state_dir, is_ring0_constitutional_code, is_valid_cluster_key,
-    load_verified_ballots, load_verified_ballots_for_repo,
+    load_verified_ballots,
 };
 use crate::github_governance::{DOTAGENT_REQUIRED_CHECKS, validate_github_ident};
 use crate::json::JsonValue;
@@ -147,60 +147,52 @@ pub fn verify_feedback_operator_or_ci_loop(cmd_label: &str) -> Result<(), String
     Ok(())
 }
 
-fn is_safe_executable_file(p: &Path) -> bool {
-    if !p.is_absolute() {
-        return false;
-    }
-    let Ok(meta) = fs::symlink_metadata(p) else {
-        return false;
-    };
-    if !meta.file_type().is_file() || meta.file_type().is_symlink() {
-        return false;
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mode = meta.permissions().mode();
-        if (mode & 0o111) == 0 || (mode & 0o022) != 0 {
-            return false;
+const TRUSTED_EXEC_PATH: &str =
+    "/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin:/opt/antigravity/bin";
+
+fn trusted_command_path(candidates: &[&str]) -> Option<PathBuf> {
+    candidates.iter().find_map(|candidate| {
+        let path = Path::new(candidate);
+        if !crate::coordinator::has_trusted_executable_ancestors(path) {
+            return None;
         }
-    }
-    true
+        let canonical = fs::canonicalize(path).ok()?;
+        if !crate::coordinator::is_trusted_executable_file(&canonical) {
+            return None;
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if fs::metadata(&canonical).ok()?.permissions().mode() & 0o111 == 0 {
+                return None;
+            }
+        }
+        Some(canonical)
+    })
 }
 
+fn trusted_git_bin() -> Option<PathBuf> {
+    trusted_command_path(&[
+        "/usr/bin/git",
+        "/bin/git",
+        "/usr/local/bin/git",
+        "/opt/homebrew/bin/git",
+    ])
+}
+
+/// Returns an approved GitHub CLI path or an empty path when no candidate passes validation.
 pub fn resolve_gh_bin() -> PathBuf {
-    if std::env::var("MOCK_GH_STATE").is_ok_and(|s| !s.trim().is_empty())
-        && let Ok(custom) = std::env::var("DOTAGENT_GH_BIN")
-    {
-        let trimmed = custom.trim();
-        let p = Path::new(trimmed);
-        if is_safe_executable_file(p) {
-            return p.to_path_buf();
-        }
+    #[cfg(test)]
+    if let Some(path) = std::env::var_os("DOTAGENT_FEEDBACK_TEST_GH") {
+        return PathBuf::from(path);
     }
-    for sys_gh in [
-        "/opt/antigravity/bin/gh",
+    trusted_command_path(&[
         "/usr/bin/gh",
         "/usr/local/bin/gh",
         "/opt/homebrew/bin/gh",
-    ] {
-        let p = Path::new(sys_gh);
-        if is_safe_executable_file(p) {
-            return p.to_path_buf();
-        }
-    }
-    if let Ok(path_var) = std::env::var("PATH") {
-        for dir in std::env::split_paths(&path_var) {
-            if !dir.is_absolute() {
-                continue;
-            }
-            let cand = dir.join("gh");
-            if is_safe_executable_file(&cand) {
-                return cand;
-            }
-        }
-    }
-    PathBuf::from("/usr/bin/gh")
+        "/opt/antigravity/bin/gh",
+    ])
+    .unwrap_or_default()
 }
 
 pub fn validate_owner_repo(full_repo: &str) -> Result<(String, String), String> {
@@ -218,36 +210,48 @@ pub fn validate_owner_repo(full_repo: &str) -> Result<(String, String), String> 
     Ok((owner.to_string(), repo.to_string()))
 }
 
-fn verify_checkout_matches_target_repo(repo_root: &Path, target_repo: &str) -> Result<(), String> {
-    let (owner, repo_short) = validate_owner_repo(target_repo)?;
-    let expected_slug = format!("{owner}/{repo_short}").to_ascii_lowercase();
-    if let Ok(out) = hardened_git_cmd(repo_root)
-        .args(["remote", "get-url", "origin"])
-        .output()
-        && out.status.success()
+fn github_origin_identity(url: &str) -> Option<(String, String)> {
+    if url
+        .bytes()
+        .any(|byte| byte.is_ascii_whitespace() || byte.is_ascii_control())
     {
-        let raw_url = String::from_utf8_lossy(&out.stdout)
-            .trim()
-            .to_ascii_lowercase();
-        let trimmed = raw_url
-            .trim_end_matches('/')
-            .trim_end_matches(".git")
-            .to_string();
-        if trimmed.contains("github.com") {
-            if !trimmed.ends_with(&format!("/{expected_slug}"))
-                && !trimmed.ends_with(&format!(":{expected_slug}"))
-            {
-                return Err(format!(
-                    "SYNC_REPO_MISMATCH: checkout origin '{raw_url}' does not match requested --repo '{target_repo}'"
-                ));
-            }
-            return Ok(());
-        }
+        return None;
     }
-    let dir_name = repo_root.file_name().and_then(|n| n.to_str()).unwrap_or("");
-    if !dir_name.eq_ignore_ascii_case(&repo_short) {
+    let url = url.trim_end_matches('/').to_ascii_lowercase();
+    let authority = url
+        .strip_prefix("https://github.com/")
+        .or_else(|| url.strip_prefix("ssh://git@github.com/"))
+        .or_else(|| url.strip_prefix("git@github.com:"))?;
+    let slug = authority.strip_suffix(".git").unwrap_or(authority);
+    validate_owner_repo(slug).ok()
+}
+
+fn verify_checkout_matches_target_repo(repo_root: &Path, target_repo: &str) -> Result<(), String> {
+    let (owner, name) = validate_owner_repo(target_repo)?;
+    let out = hardened_git_cmd(repo_root)
+        .args([
+            "config",
+            "--no-includes",
+            "--local",
+            "--null",
+            "--get-all",
+            "remote.origin.url",
+        ])
+        .output()
+        .map_err(|e| {
+            format!("SYNC_REPO_MISMATCH: unable to read checkout origin with trusted Git: {e}")
+        })?;
+    if !out.status.success() {
+        return Err("SYNC_REPO_MISMATCH: checkout must have a GitHub origin".to_string());
+    }
+    let raw = std::str::from_utf8(&out.stdout)
+        .map_err(|_| "SYNC_REPO_MISMATCH: checkout origin is invalid".to_string())?;
+    let origin = raw.strip_suffix('\0').and_then(github_origin_identity);
+    if !origin.is_some_and(|(actual_owner, actual_name)| {
+        actual_owner.eq_ignore_ascii_case(&owner) && actual_name.eq_ignore_ascii_case(&name)
+    }) {
         return Err(format!(
-            "SYNC_REPO_MISMATCH: checkout directory '{dir_name}' does not match requested --repo '{target_repo}'"
+            "SYNC_REPO_MISMATCH: checkout must have one verified GitHub origin matching '{target_repo}'"
         ));
     }
     Ok(())
@@ -1015,9 +1019,8 @@ fn cluster_to_json(c: &AggregatedFrictionCluster) -> JsonValue {
 
 fn gh_cmd_with_token(gh: &Path, tok: Option<&ZeroizingToken>) -> Command {
     let mut cmd = Command::new(gh);
-    cmd.env_clear();
+    cmd.env_clear().env("PATH", TRUSTED_EXEC_PATH);
     for safe_var in [
-        "PATH",
         "HOME",
         "USER",
         "HTTP_PROXY",
@@ -1032,11 +1035,10 @@ fn gh_cmd_with_token(gh: &Path, tok: Option<&ZeroizingToken>) -> Command {
             cmd.env(safe_var, val);
         }
     }
-    if gh != Path::new("gh") {
-        for mock_var in ["MOCK_GH_STATE", "MOCK_BARE_ORIGIN"] {
-            if let Ok(val) = std::env::var(mock_var) {
-                cmd.env(mock_var, val);
-            }
+    #[cfg(test)]
+    for mock_var in ["MOCK_GH_STATE", "MOCK_BARE_ORIGIN"] {
+        if let Ok(val) = std::env::var(mock_var) {
+            cmd.env(mock_var, val);
         }
     }
     cmd.env("GH_HOST", "github.com")
@@ -1144,15 +1146,7 @@ pub fn run_feedback_sync_github_cli(args: &[String], cwd: &Path) -> ExitCode {
         eprintln!("[dotagent feedback sync-github] HARD DENY: {e}");
         return ExitCode::from(2);
     }
-    let all_ballots = match if target_repo
-        .rsplit('/')
-        .next()
-        .is_some_and(|s| s.eq_ignore_ascii_case("dotagent"))
-    {
-        load_verified_ballots(&repo_root)
-    } else {
-        load_verified_ballots_for_repo(&repo_root)
-    } {
+    let all_ballots = match load_verified_ballots(&repo_root) {
         Ok(b) => b,
         Err(e) => {
             eprintln!("[dotagent feedback sync-github] HARD DENY: {e}");
@@ -1231,6 +1225,10 @@ pub fn run_feedback_sync_github_cli(args: &[String], cwd: &Path) -> ExitCode {
     }
 
     let gh = resolve_gh_bin();
+    if gh.as_os_str().is_empty() {
+        eprintln!("[dotagent feedback sync-github] trusted GitHub CLI unavailable");
+        return ExitCode::from(2);
+    }
     let tok = ZeroizingToken::from_env_and_scrub();
     if let Err(e) = ensure_friction_labels(&gh, tok.as_ref(), &target_repo) {
         eprintln!("[dotagent feedback sync-github] label setup failed: {e}");
@@ -1656,6 +1654,10 @@ pub fn run_feedback_loop_cli(args: &[String], cwd: &Path) -> ExitCode {
     };
 
     let repo_root = resolve_repo_root(cwd);
+    if let Err(e) = verify_checkout_matches_target_repo(&repo_root, &cfg.target_repo) {
+        eprintln!("[dotagent feedback run-loop] HARD DENY: {e}");
+        return ExitCode::from(2);
+    }
     let gh_tok = ZeroizingToken::from_env_and_scrub();
     // Scrub GitHub credentials from current process env so NO child process can ever inherit them even accidentally!
     // (Parent passes `gh_tok` explicitly only to `gh_cmd_with_token`.)
@@ -1677,7 +1679,6 @@ pub fn run_feedback_loop_cli(args: &[String], cwd: &Path) -> ExitCode {
 #[derive(Debug)]
 struct RehydratedIssueItem {
     issue_number: u64,
-    operator_override_triage: bool,
     failed_attempts_on_main: usize,
     cluster: AggregatedFrictionCluster,
 }
@@ -1775,7 +1776,6 @@ fn rehydrate_cryptographic_queue(
             continue;
         };
         let mut skip_issue = false;
-        let mut operator_override = false;
         if let Some(lbls) = iss.get("labels").and_then(JsonValue::as_array) {
             for l in lbls {
                 let lname = l.get("name").and_then(JsonValue::as_str).unwrap_or("");
@@ -1784,9 +1784,6 @@ fn rehydrate_cryptographic_queue(
                     "wontfix-constitutional" | "friction-escalated-human" | "automated-pr-open"
                 ) {
                     skip_issue = true;
-                }
-                if lname == "dotagent-approved-triage" {
-                    operator_override = true;
                 }
             }
         }
@@ -1894,7 +1891,6 @@ fn rehydrate_cryptographic_queue(
             .is_some_and(is_ring0_constitutional_code);
         items.push(RehydratedIssueItem {
             issue_number: num,
-            operator_override_triage: operator_override,
             failed_attempts_on_main,
             cluster: AggregatedFrictionCluster {
                 cluster_key: target_ck,
@@ -1949,19 +1945,22 @@ fn generate_csprng_nonce_hex() -> String {
 /// Builds a `git` invocation with dangerous environment overrides stripped and hooks, attributes,
 /// and fsmonitor disabled via `GIT_CONFIG_*` environment variables (never `git -c`).
 fn hardened_git_cmd(cwd: &Path) -> Command {
-    let mut cmd = Command::new("git");
+    let mut cmd = Command::new(trusted_git_bin().unwrap_or_default());
     cmd.current_dir(cwd)
-        .env_remove("GIT_EXTERNAL_DIFF")
-        .env_remove("GIT_DIFF_OPTS")
-        .env_remove("GIT_DIR")
-        .env_remove("GIT_WORK_TREE")
-        .env_remove("GIT_INDEX_FILE")
-        .env_remove("GIT_OBJECT_DIRECTORY")
-        .env_remove("GIT_ALTERNATE_OBJECT_DIRECTORIES")
-        .env_remove("GIT_COMMON_DIR")
-        .env_remove("GIT_CONFIG_PARAMETERS")
-        .env_remove("GIT_CONFIG_GLOBAL")
-        .env_remove("GIT_CONFIG_SYSTEM")
+        .env_clear()
+        .env("PATH", TRUSTED_EXEC_PATH);
+    for key in [
+        "HOME",
+        "GIT_AUTHOR_NAME",
+        "GIT_AUTHOR_EMAIL",
+        "GIT_COMMITTER_NAME",
+        "GIT_COMMITTER_EMAIL",
+    ] {
+        if let Some(value) = std::env::var_os(key) {
+            cmd.env(key, value);
+        }
+    }
+    cmd.env("GIT_CONFIG_GLOBAL", "/dev/null")
         .env("GIT_CONFIG_NOSYSTEM", "1")
         .env("GIT_TERMINAL_PROMPT", "0")
         .env("GIT_CONFIG_COUNT", "3")
@@ -2013,6 +2012,10 @@ fn build_airlocked_command(program: &Path, cwd: &Path, include_llm_keys: bool) -
 }
 
 fn resolve_sibling_agent_guard_bin() -> Result<PathBuf, String> {
+    #[cfg(test)]
+    if let Some(path) = std::env::var_os("DOTAGENT_FEEDBACK_TEST_GUARD") {
+        return Ok(PathBuf::from(path));
+    }
     std::env::current_exe()
         .ok()
         .and_then(|p| p.parent().map(|d| d.join("agent-guard")))
@@ -2140,6 +2143,9 @@ fn execute_autonomous_loop(
     tok: Option<&ZeroizingToken>,
 ) -> Result<usize, String> {
     let gh = resolve_gh_bin();
+    if gh.as_os_str().is_empty() {
+        return Err("trusted GitHub CLI unavailable".to_string());
+    }
     if !cfg.dry_run {
         let _ = ensure_friction_labels(&gh, tok, &cfg.target_repo);
     }
@@ -2152,9 +2158,8 @@ fn execute_autonomous_loop(
             break;
         }
 
-        let meets_quorum = item.operator_override_triage
-            || (item.cluster.unique_votes >= cfg.min_votes
-                && item.cluster.distinct_repo_day_buckets >= cfg.min_buckets);
+        let meets_quorum = item.cluster.unique_votes >= cfg.min_votes
+            && item.cluster.distinct_repo_day_buckets >= cfg.min_buckets;
         if !meets_quorum {
             continue;
         }
@@ -2846,6 +2851,7 @@ fn run_worktree_verification(wt_dir: &Path, base_ref: &str) -> Result<(), String
     audit_worktree_prebuild_traps(wt_dir)?;
     verify_ring0_ratchet(wt_dir, base_ref, true)?;
 
+    #[cfg(test)]
     if let Ok(custom_verify) = std::env::var("DOTAGENT_LOOP_VERIFY_CMD")
         && !custom_verify.trim().is_empty()
     {
@@ -2885,24 +2891,48 @@ fn run_worktree_verification(wt_dir: &Path, base_ref: &str) -> Result<(), String
 /// extraheader token, or execute arbitrary helper binaries if a sandboxed stage tampered with
 /// `.git/config`.
 fn audit_worktree_git_config_before_push(wt_dir: &Path) -> Result<(), String> {
+    let worktree_config = hardened_git_cmd(wt_dir)
+        .args([
+            "config",
+            "--no-includes",
+            "--local",
+            "--type=bool",
+            "--get",
+            "extensions.worktreeConfig",
+        ])
+        .output()
+        .map_err(|e| format!("could not determine Git worktree config scope: {e}"))?;
+    let worktree_config_enabled = match (
+        worktree_config.status.code(),
+        worktree_config.stdout.as_slice(),
+    ) {
+        (Some(0), b"true\n") => true,
+        (Some(0), b"false\n") => false,
+        (Some(1), b"") if worktree_config.stderr.is_empty() => false,
+        _ => return Err("could not determine Git worktree config scope".to_string()),
+    };
     for scope_flag in ["--local", "--worktree"] {
-        let Ok(out) = hardened_git_cmd(wt_dir)
-            .args(["config", "--list", scope_flag])
-            .output()
-        else {
-            continue;
-        };
-        if !out.status.success() {
+        if scope_flag == "--worktree" && !worktree_config_enabled {
             continue;
         }
-        let text = String::from_utf8_lossy(&out.stdout);
-        for line in text.lines() {
-            let key = line
-                .split_once('=')
-                .map(|(k, _)| k)
-                .unwrap_or(line)
-                .trim()
-                .to_ascii_lowercase();
+        let out = hardened_git_cmd(wt_dir)
+            .args([
+                "config",
+                "--no-includes",
+                "--null",
+                "--name-only",
+                "--list",
+                scope_flag,
+            ])
+            .output()
+            .map_err(|e| format!("could not audit Git config ({scope_flag}): {e}"))?;
+        if !out.status.success() {
+            return Err(format!("could not audit Git config ({scope_flag})"));
+        }
+        let text = std::str::from_utf8(&out.stdout)
+            .map_err(|_| format!("invalid Git config names ({scope_flag})"))?;
+        for raw_key in text.split_terminator('\0') {
+            let key = raw_key.to_ascii_lowercase();
             let forbidden = key.starts_with("http.")
                 || key.starts_with("url.")
                 || key.starts_with("credential.")
@@ -2937,12 +2967,8 @@ fn audit_worktree_git_config_before_push(wt_dir: &Path) -> Result<(), String> {
 
 fn resolve_push_target(target_repo: &str) -> Result<String, String> {
     let (owner, repo) = validate_owner_repo(target_repo)?;
-    // Only when an explicit local mock `gh` harness binary is configured (`DOTAGENT_GH_BIN`) may tests
-    // redirect `git push` to a local non-symlink bare directory (`MOCK_BARE_ORIGIN`). Remote URLs or
-    // SSH targets in `MOCK_BARE_ORIGIN` are unconditionally rejected.
-    if std::env::var("DOTAGENT_GH_BIN").is_ok_and(|s| !s.trim().is_empty())
-        && let Ok(v) = std::env::var("MOCK_BARE_ORIGIN")
-    {
+    #[cfg(test)]
+    if let Ok(v) = std::env::var("MOCK_BARE_ORIGIN") {
         let trimmed = v.trim();
         if !trimmed.is_empty() {
             let p = Path::new(trimmed);
@@ -2999,10 +3025,13 @@ fn commit_and_push_worktree(
     // `git push` runs in a cleared environment against an explicit destination URL (never trusting
     // a mutable `remote.origin.url`): hooks/fsmonitor/credential helpers are disabled and the token
     // is supplied only as a scoped `http.https://github.com/.extraheader` via GIT_CONFIG_* env.
-    let mut push_cmd = Command::new("git");
-    push_cmd.current_dir(wt_dir).env_clear();
+    let git = trusted_git_bin().ok_or_else(|| "trusted Git executable unavailable".to_string())?;
+    let mut push_cmd = Command::new(git);
+    push_cmd
+        .current_dir(wt_dir)
+        .env_clear()
+        .env("PATH", TRUSTED_EXEC_PATH);
     for safe_var in [
-        "PATH",
         "HOME",
         "USER",
         "HTTP_PROXY",
@@ -3017,6 +3046,7 @@ fn commit_and_push_worktree(
         }
     }
     push_cmd
+        .env("GIT_ALLOW_PROTOCOL", "https")
         .env("GIT_TERMINAL_PROMPT", "0")
         .env("GIT_CONFIG_NOSYSTEM", "1")
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
@@ -3026,6 +3056,10 @@ fn commit_and_push_worktree(
         .env("GIT_CONFIG_VALUE_1", "false")
         .env("GIT_CONFIG_KEY_2", "credential.helper")
         .env("GIT_CONFIG_VALUE_2", "");
+    #[cfg(test)]
+    if Path::new(&push_target).is_absolute() {
+        push_cmd.env("GIT_ALLOW_PROTOCOL", "file");
+    }
     if let Some(t) = tok {
         let basic = base64_std_encode(format!("x-access-token:{}", t.as_str()).as_bytes());
         push_cmd
@@ -3652,6 +3686,50 @@ fn cleanup_worktree(repo_root: &Path, canon_parent: &Path, wt_dir: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore = "separate process entry point for the feedback integration fixture"]
+    fn feedback_cli_fixture_driver() {
+        let raw = std::env::var("DOTAGENT_FEEDBACK_TEST_CLI_ARGS").expect("fixture arguments");
+        let json = JsonValue::parse(&raw).expect("valid fixture arguments");
+        let args: Vec<_> = json
+            .as_array()
+            .expect("fixture argument array")
+            .iter()
+            .map(|arg| arg.as_str().expect("fixture argument string").to_string())
+            .collect();
+        let cwd = std::env::current_dir().expect("fixture checkout");
+        let exit = match args.split_first() {
+            Some((command, args)) if command == "sync-github" => {
+                run_feedback_sync_github_cli(args, &cwd)
+            }
+            Some((command, args)) if command == "run-loop" => run_feedback_loop_cli(args, &cwd),
+            _ => panic!("unknown fixture command"),
+        };
+        assert_eq!(exit, ExitCode::SUCCESS);
+    }
+
+    #[test]
+    fn github_origin_identity_requires_a_supported_github_authority() {
+        for url in [
+            "https://github.com/Owner/Repo.git",
+            "ssh://git@github.com/Owner/Repo",
+            "git@github.com:Owner/Repo.git",
+        ] {
+            assert_eq!(
+                github_origin_identity(url),
+                Some(("owner".into(), "repo".into()))
+            );
+        }
+        for url in [
+            "http://github.com/Owner/Repo",
+            "https://example.com/Owner/Repo",
+            "https://github.com/Owner/Repo/issues",
+            "/work/Repo",
+        ] {
+            assert_eq!(github_origin_identity(url), None);
+        }
+    }
 
     #[test]
     fn abuse_neighbors_must_target_the_relaxed_tool() {
