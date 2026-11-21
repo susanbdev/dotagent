@@ -10,31 +10,43 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   auto-tag-release:
     name: auto-tag-release
-    if: startsWith(github.ref, 'refs/heads/main')
+    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
       - name: Checkout main (zero persisted credentials)
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
           persist-credentials: false
           submodules: false
 
-      - name: Inspect Cargo.toml workspace version & check existing release tags
+      - name: Validate SemVer Cargo.toml version & check remote release tags
         id: check_ver
         shell: bash
         run: |
           set -euo pipefail
-          VER="$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml","rb"))["workspace"]["package"]["version"])')"
+          VER="$(python3 - <<'PY'
+          import re, sys, tomllib
+          ver = tomllib.load(open("Cargo.toml", "rb"))["workspace"]["package"]["version"]
+          if not isinstance(ver, str) or not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?", ver):
+              sys.stderr.write(f"INVALID_SEMVER: '{ver}'\n")
+              sys.exit(1)
+          print(ver)
+          PY
+          )"
           TAG="v${VER}"
           echo "tag=${TAG}" >> "${GITHUB_OUTPUT}"
-          if git rev-parse -q --verify "refs/tags/${TAG}" >/dev/null 2>&1; then
+          if git ls-remote --exit-code --tags origin "refs/tags/${TAG}" >/dev/null 2>&1; then
             echo "needs_tag=false" >> "${GITHUB_OUTPUT}"
-            echo "[auto-tag-release] Tag ${TAG} already exists; nothing to tag."
+            echo "[auto-tag-release] Remote tag ${TAG} already exists; nothing to tag."
           else
             echo "needs_tag=true" >> "${GITHUB_OUTPUT}"
             echo "[auto-tag-release] Detected untagged workspace version ${TAG} on main."
@@ -42,33 +54,45 @@ jobs:
 
       - name: Notice when Promoter App is not configured for untagged version bump
         if: steps.check_ver.outputs.needs_tag == 'true' && vars.PROMOTER_APP_ID == ''
+        env:
+          RELEASE_TAG: ${{ steps.check_ver.outputs.tag }}
         run: |
-          echo "::notice::Detected new version ${{ steps.check_ver.outputs.tag }}; configure vars.PROMOTER_APP_ID or push tag ${{ steps.check_ver.outputs.tag }} to publish release."
+          echo "::notice::Detected new version ${RELEASE_TAG}; configure vars.PROMOTER_APP_ID or push tag ${RELEASE_TAG} to publish release."
 
-      - name: Mint scoped dotagent-promoter[bot] token for release tagging
+      - name: Mint least-privilege repo-scoped dotagent-promoter[bot] token
         id: app_token
         if: steps.check_ver.outputs.needs_tag == 'true' && vars.PROMOTER_APP_ID != ''
         uses: actions/create-github-app-token@f418cff399f7aef4c2f0ad47e25ca7a6abbdd6fc # v3.4.0
         with:
           app-id: ${{ vars.PROMOTER_APP_ID }}
           private-key: ${{ secrets.PROMOTER_APP_PRIVATE_KEY }}
+          repositories: ${{ github.event.repository.name }}
+          permission-contents: write
 
-      - name: Push annotated release tag via dotagent-promoter[bot]
+      - name: Atomically create annotated release tag via GitHub API (zero token in argv)
         if: steps.check_ver.outputs.needs_tag == 'true' && vars.PROMOTER_APP_ID != ''
         shell: bash
         env:
-          APP_TOKEN: ${{ steps.app_token.outputs.token }}
+          GH_TOKEN: ${{ steps.app_token.outputs.token }}
           TAG: ${{ steps.check_ver.outputs.tag }}
           REPO_FULL: ${{ github.repository }}
           TARGET_SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
-          export GIT_AUTHOR_NAME="dotagent-promoter[bot]"
-          export GIT_AUTHOR_EMAIL="dotagent-promoter[bot]@users.noreply.github.com"
-          export GIT_COMMITTER_NAME="dotagent-promoter[bot]"
-          export GIT_COMMITTER_EMAIL="dotagent-promoter[bot]@users.noreply.github.com"
-          git tag -a "${TAG}" -m "dotagent ${TAG}" "${TARGET_SHA}"
-          git push "https://x-access-token:${APP_TOKEN}@github.com/${REPO_FULL}.git" "refs/tags/${TAG}"
+          if gh api "repos/${REPO_FULL}/git/ref/tags/${TAG}" >/dev/null 2>&1; then
+            echo "[auto-tag-release] Tag ${TAG} already created concurrently; skipping."
+            exit 0
+          fi
+          TAG_OBJ_SHA="$(gh api --method POST "repos/${REPO_FULL}/git/tags" \
+            -f tag="${TAG}" \
+            -f message="dotagent ${TAG}" \
+            -f object="${TARGET_SHA}" \
+            -f type="commit" \
+            --jq '.sha')"
+          gh api --method POST "repos/${REPO_FULL}/git/refs" \
+            -f ref="refs/tags/${TAG}" \
+            -f sha="${TAG_OBJ_SHA}" >/dev/null
+          echo "[auto-tag-release] Pushed annotated tag ${TAG} -> ${TARGET_SHA}"
 
   verify-release-gate:
     name: Pre-Release Security & Manifest Gate
@@ -81,19 +105,27 @@ jobs:
       GIT_AUTHOR_NAME: "dotagent-release"
       GIT_AUTHOR_EMAIL: "release@dotagent.local"
       GIT_COMMITTER_NAME: "dotagent-release"
-      GIT_COMMITTER_EMAIL: "release@dotagent.local"
+      GIT_COMMITTER_EMAIL: "dotagent-release"
     steps:
-      - name: Checkout tag (zero persisted credentials)
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Checkout tag & main ancestry (zero persisted credentials)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          fetch-depth: 0
           persist-credentials: false
           submodules: false
 
-      - name: Verify release tag matches Cargo.toml workspace version
+      - name: Verify release tag matches Cargo.toml SemVer & descends from origin/main
         shell: bash
+        env:
+          TAG_SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
-          VER="$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml","rb"))["workspace"]["package"]["version"])')"
+          git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main
+          if ! git merge-base --is-ancestor "${TAG_SHA}" refs/remotes/origin/main; then
+            echo "UNMERGED_RELEASE_TAG_FORBIDDEN: ${TAG_SHA} is not an ancestor of origin/main" >&2
+            exit 1
+          fi
+          VER="$(python3 -c 'import re,sys,tomllib; v=tomllib.load(open("Cargo.toml","rb"))["workspace"]["package"]["version"]; assert re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?", v); print(v)')"
           EXPECTED_TAG="v${VER}"
           if [[ "${GITHUB_REF_NAME}" != "${EXPECTED_TAG}" ]]; then
             echo "TAG_VERSION_MISMATCH: tag '${GITHUB_REF_NAME}' != Cargo.toml '${EXPECTED_TAG}'" >&2
@@ -173,7 +205,7 @@ jobs:
             dual_repro: "false"
     steps:
       - name: Checkout tag (zero persisted credentials)
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
           submodules: false
@@ -184,43 +216,51 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends musl-tools
 
-      - name: Ensure Rosetta 2 is available for Intel macOS cleanroom smoke test
+      - name: Ensure Rosetta 2 is functional for Intel macOS cleanroom smoke test
         if: matrix.target == 'x86_64-apple-darwin'
         run: |
           if ! arch -x86_64 /usr/bin/true >/dev/null 2>&1; then
-            sudo softwareupdate --install-rosetta --agree-to-license || true
+            sudo softwareupdate --install-rosetta --agree-to-license
           fi
+          arch -x86_64 /usr/bin/true
 
       - name: Install Rust target (${{ matrix.target }})
+        env:
+          MATRIX_TARGET: ${{ matrix.target }}
         run: |
           rustup toolchain install stable --profile minimal
           rustup default stable
-          rustup target add "${{ matrix.target }}"
+          rustup target add "${MATRIX_TARGET}"
 
       - name: Build locked release workspace binaries with deterministic path remapping
         env:
           LC_ALL: C
           SOURCE_DATE_EPOCH: "1700000000"
+          MATRIX_TARGET: ${{ matrix.target }}
         run: |
           CARGO_DIR="${CARGO_HOME:-$HOME/.cargo}"
           export RUSTFLAGS="--remap-path-prefix=${GITHUB_WORKSPACE}=/dotagent --remap-path-prefix=${CARGO_DIR}=/cargo"
-          cargo build --release --locked --workspace --target "${{ matrix.target }}"
+          cargo build --release --locked --workspace --target "${MATRIX_TARGET}"
 
       - name: Package deterministic release archive & run sterile clean-room smoke test
         shell: bash
+        env:
+          MATRIX_TARGET: ${{ matrix.target }}
+          MATRIX_EXPECT_MODE: ${{ matrix.expect_mode }}
+          MATRIX_RUNNER_PREFIX: ${{ matrix.runner_prefix }}
         run: |
           set -euo pipefail
           TAG="${GITHUB_REF_NAME}"
-          PKG="dotagent-${TAG}-${{ matrix.target }}"
+          PKG="dotagent-${TAG}-${MATRIX_TARGET}"
           OUT_TAR="release-out/${PKG}.tar.gz"
           bash scripts/package-release-archive.sh \
-            --target "${{ matrix.target }}" \
+            --target "${MATRIX_TARGET}" \
             --tag "${TAG}" \
             --out "${OUT_TAR}"
 
-          SMOKE_ARGS=(--archive "${OUT_TAR}" --expect-mode "${{ matrix.expect_mode }}")
-          if [[ -n "${{ matrix.runner_prefix }}" ]]; then
-            SMOKE_ARGS+=(--runner-prefix "${{ matrix.runner_prefix }}")
+          SMOKE_ARGS=(--archive "${OUT_TAR}" --expect-mode "${MATRIX_EXPECT_MODE}")
+          if [[ -n "${MATRIX_RUNNER_PREFIX}" ]]; then
+            SMOKE_ARGS+=(--runner-prefix "${MATRIX_RUNNER_PREFIX}")
           fi
           bash scripts/cleanroom-smoke-test.sh "${SMOKE_ARGS[@]}"
 
@@ -230,10 +270,11 @@ jobs:
         env:
           LC_ALL: C
           SOURCE_DATE_EPOCH: "1700000000"
+          MATRIX_TARGET: ${{ matrix.target }}
         run: |
           set -euo pipefail
           TAG="${GITHUB_REF_NAME}"
-          PKG="dotagent-${TAG}-${{ matrix.target }}"
+          PKG="dotagent-${TAG}-${MATRIX_TARGET}"
           ALT_DIR="${RUNNER_TEMP}/repro-check/deep/nested/repo"
           mkdir -p "${ALT_DIR}"
           tar -cf - --exclude='./.git' --exclude='./target' --exclude='./release-out' . | tar -xf - -C "${ALT_DIR}"
@@ -241,9 +282,9 @@ jobs:
           (
             cd "${ALT_DIR}"
             export RUSTFLAGS="--remap-path-prefix=${ALT_DIR}=/dotagent --remap-path-prefix=${CARGO_DIR}=/cargo"
-            cargo build --release --locked --workspace --target "${{ matrix.target }}"
+            cargo build --release --locked --workspace --target "${MATRIX_TARGET}"
             bash scripts/package-release-archive.sh \
-              --target "${{ matrix.target }}" \
+              --target "${MATRIX_TARGET}" \
               --tag "${TAG}" \
               --out "${RUNNER_TEMP}/alt-${PKG}.tar.gz"
           )
@@ -255,7 +296,7 @@ jobs:
           fi
 
       - name: Upload verified target archive artifact
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: archive-${{ matrix.target }}
           path: release-out/*.tar.gz
@@ -272,8 +313,23 @@ jobs:
       id-token: write
       attestations: write
     steps:
+      - name: Re-verify main branch ancestry prior to release publication
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          submodules: false
+
+      - name: Assert tagged commit is merged on origin/main
+        env:
+          TAG_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main
+          git merge-base --is-ancestor "${TAG_SHA}" refs/remotes/origin/main
+
       - name: Download all smoke-tested target archives
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           path: artifacts
           merge-multiple: true
@@ -286,7 +342,7 @@ jobs:
           cat SHA256SUMS
 
       - name: Generate SLSA build provenance attestation
-        uses: actions/attest-build-provenance@c074443f1aee8d4aeeae555aebba3282517eb71b # v2
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-path: |
             artifacts/dotagent-*.tar.gz
@@ -318,41 +374,63 @@ jobs:
       matrix:
         include:
           - os: ubuntu-24.04
-            target: x86_64-unknown-linux-musl
+            native_target: x86_64-unknown-linux-musl
           - os: macos-15
-            target: aarch64-apple-darwin
+            native_target: aarch64-apple-darwin
     steps:
-      - name: Download published release archive, SHA256SUMS, & SLSA attestation and run dotagent self-verify
+      - name: Verify SLSA attestations on all published assets & run dotagent self-verify
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
           REPO_FULL: ${{ github.repository }}
           TAG: ${{ github.ref_name }}
-          TARGET: ${{ matrix.target }}
+          NATIVE_TARGET: ${{ matrix.native_target }}
+          SIGNER_WF: ${{ github.repository }}/.github/workflows/release.yml
         run: |
           set -euo pipefail
           VERIFY_DIR="${RUNNER_TEMP}/post-release-verify"
           mkdir -p "${VERIFY_DIR}/unpacked"
           cd "${VERIFY_DIR}"
 
-          PKG="dotagent-${TAG}-${TARGET}"
-          TARBALL="${PKG}.tar.gz"
-          gh release download "${TAG}" --repo "${REPO_FULL}" -p "${TARBALL}" -p "SHA256SUMS"
+          gh release download "${TAG}" --repo "${REPO_FULL}" -p "dotagent-${TAG}-*.tar.gz" -p "SHA256SUMS"
+          gh attestation verify "SHA256SUMS" --repo "${REPO_FULL}" --signer-workflow "${SIGNER_WF}" >/dev/null
 
-          gh attestation verify "${TARBALL}" --repo "${REPO_FULL}" --format json > attestation-bundle.json
-          python3 - attestation-bundle.json statement.json <<'PY'
+          ALL_TARGETS=(
+            x86_64-unknown-linux-musl
+            aarch64-unknown-linux-musl
+            aarch64-apple-darwin
+            x86_64-apple-darwin
+          )
+          for t in "${ALL_TARGETS[@]}"; do
+            f="dotagent-${TAG}-${t}.tar.gz"
+            [[ -f "${f}" ]] || { echo "MISSING_RELEASE_ASSET: ${f}" >&2; exit 1; }
+            gh attestation verify "${f}" --repo "${REPO_FULL}" --signer-workflow "${SIGNER_WF}" --format json > "attestation-${t}.json"
+          done
+
+          shasum -a 256 -c SHA256SUMS
+
+          NATIVE_PKG="dotagent-${TAG}-${NATIVE_TARGET}"
+          tar -xzf "${NATIVE_PKG}.tar.gz" -C "${VERIFY_DIR}/unpacked"
+          DOTAGENT_BIN="${VERIFY_DIR}/unpacked/${NATIVE_PKG}/bin/dotagent"
+
+          for t in "${ALL_TARGETS[@]}"; do
+            f="dotagent-${TAG}-${t}.tar.gz"
+            python3 - "attestation-${t}.json" "statement-${t}.json" <<'PY'
           import base64, json, sys
           bundles = json.load(open(sys.argv[1], "r", encoding="utf-8"))
-          env = bundles[0]["verificationResult"]["statement"] if "verificationResult" in bundles[0] and "statement" in bundles[0]["verificationResult"] else None
-          if env is None:
-              dsse = bundles[0].get("bundle", {}).get("dsseEnvelope") or bundles[0].get("dsseEnvelope")
-              env = json.loads(base64.b64decode(dsse["payload"]).decode("utf-8"))
+          assert isinstance(bundles, list) and len(bundles) >= 1 and isinstance(bundles[0], dict), "invalid attestation bundle"
+          b0 = bundles[0]
+          stmt = (b0.get("verificationResult") or {}).get("statement")
+          if not isinstance(stmt, dict):
+              dsse = (b0.get("bundle") or {}).get("dsseEnvelope") or b0.get("dsseEnvelope")
+              assert isinstance(dsse, dict) and isinstance(dsse.get("payload"), str), "missing dsseEnvelope payload"
+              stmt = json.loads(base64.b64decode(dsse["payload"]).decode("utf-8"))
+          assert isinstance(stmt, dict) and isinstance(stmt.get("subject"), list), "invalid SLSA statement"
           with open(sys.argv[2], "w", encoding="utf-8") as out:
-              json.dump(env, out)
+              json.dump(stmt, out)
           PY
-
-          tar -xzf "${TARBALL}" -C "${VERIFY_DIR}/unpacked"
-          "${VERIFY_DIR}/unpacked/${PKG}/bin/dotagent" self-verify \
-            --sums "${VERIFY_DIR}/SHA256SUMS" \
-            --subject "${VERIFY_DIR}/${TARBALL}" \
-            --provenance "${VERIFY_DIR}/statement.json"
+            "${DOTAGENT_BIN}" self-verify \
+              --sums "${VERIFY_DIR}/SHA256SUMS" \
+              --subject "${VERIFY_DIR}/${f}" \
+              --provenance "${VERIFY_DIR}/statement-${t}.json"
+          done

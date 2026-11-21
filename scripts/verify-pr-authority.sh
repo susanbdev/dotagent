@@ -1,16 +1,11 @@
 #!/usr/bin/env bash
 # Deterministic PR Authority & Ring-0 Hardware-Signature Gate (`susanbdev/dotagent`)
-# Distinguishes allowlisted Ring-2 PRs (with monotonic `bypass_corpus.toml` ratchet)
+# Distinguishes allowlisted Ring-2 PRs (with unique monotonic `bypass_corpus.toml` ratchet)
 # from Ring-0 protected changes requiring an OpenSSH hardware FIDO2 (`sk-*`) commit signature.
 
 set -euo pipefail
 
-BASE_REF=""
-HEAD_REF="HEAD"
-SIGNERS_FILE=""
-ALLOW_MQ_PARENTS="false"
-JSON_ONLY="false"
-
+BASE_REF=""; HEAD_REF="HEAD"; SIGNERS_FILE=""; ALLOW_MQ_PARENTS="false"; JSON_ONLY="false"
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --base) BASE_REF="${2:-}"; shift 2 ;;
@@ -18,17 +13,11 @@ while [[ $# -gt 0 ]]; do
         --signers-file) SIGNERS_FILE="${2:-}"; shift 2 ;;
         --allow-merge-queue-parents) ALLOW_MQ_PARENTS="true"; shift ;;
         --json) JSON_ONLY="true"; shift ;;
-        *)
-            echo "USAGE_ERROR: unknown argument '$1'" >&2
-            exit 2
-            ;;
+        *) echo "USAGE_ERROR: unknown argument '$1'" >&2; exit 2 ;;
     esac
 done
 
-if [[ -z "${BASE_REF}" || -z "${HEAD_REF}" ]]; then
-    echo "USAGE_ERROR: --base <git_ref> and --head <git_ref> are required" >&2
-    exit 2
-fi
+[[ -n "${BASE_REF}" && -n "${HEAD_REF}" ]] || { echo "USAGE_ERROR: --base and --head required" >&2; exit 2; }
 git rev-parse --verify "${BASE_REF}^{commit}" >/dev/null 2>&1 || { echo "INVALID_GIT_REF: ${BASE_REF}" >&2; exit 2; }
 git rev-parse --verify "${HEAD_REF}^{commit}" >/dev/null 2>&1 || { echo "INVALID_GIT_REF: ${HEAD_REF}" >&2; exit 2; }
 
@@ -36,112 +25,86 @@ WORK_DIR="$(pwd)/target/.authority-verify-$$-${RANDOM}"
 mkdir -p "${WORK_DIR}"
 trap 'rm -rf "${WORK_DIR}"' EXIT
 
-RAW_SIGNERS="${WORK_DIR}/raw_signers"
-CLEAN_SIGNERS="${WORK_DIR}/clean_signers"
+RAW_SIGNERS="${WORK_DIR}/raw_signers"; CLEAN_SIGNERS="${WORK_DIR}/clean_signers"
 if [[ -n "${SIGNERS_FILE}" ]]; then
-    [[ -f "${SIGNERS_FILE}" ]] || { echo "SIGNERS_FILE_MISSING: '${SIGNERS_FILE}'" >&2; exit 2; }
+    [[ -f "${SIGNERS_FILE}" && ! -L "${SIGNERS_FILE}" ]] || { echo "SIGNERS_FILE_INVALID: '${SIGNERS_FILE}'" >&2; exit 2; }
     cp "${SIGNERS_FILE}" "${RAW_SIGNERS}"
 elif git cat-file -e "${BASE_REF}:scripts/allowed_hardware_signers" 2>/dev/null; then
     git show "${BASE_REF}:scripts/allowed_hardware_signers" > "${RAW_SIGNERS}"
-elif [[ -f "scripts/allowed_hardware_signers" ]]; then
-    cp "scripts/allowed_hardware_signers" "${RAW_SIGNERS}"
 else
     : > "${RAW_SIGNERS}"
 fi
 
-ACTIVE_HW_SIGNERS="$(python3 - "${RAW_SIGNERS}" "${CLEAN_SIGNERS}" <<'PY'
-import sys
-raw_path, clean_path = sys.argv[1], sys.argv[2]
-allowed = {"sk-ssh-ed25519@openssh.com", "sk-ecdsa-sha2-nistp256@openssh.com"}
-valid = []
-with open(raw_path, "r", encoding="utf-8") as fh:
-    for lineno, raw in enumerate(fh, 1):
-        line = raw.strip()
-        if not line or line.startswith("#"):
-            continue
-        parts = line.split()
-        has_ns = any(p.startswith("namespaces=") and "git" in p for p in parts[1:-2])
-        if len(parts) < 4 or not has_ns or not any(p in allowed for p in parts):
-            sys.stderr.write(f"NON_HARDWARE_SIGNER_FORBIDDEN: invalid signer on line {lineno}\n")
-            sys.exit(2)
-        valid.append(line + "\n")
-with open(clean_path, "w", encoding="utf-8") as out:
-    out.writelines(valid)
-print(len(valid))
-PY
-)"
+RESULT_JSON="$(python3 - "${BASE_REF}" "${HEAD_REF}" "${RAW_SIGNERS}" "${CLEAN_SIGNERS}" "${WORK_DIR}" "${ALLOW_MQ_PARENTS}" "${DOTAGENT_ENFORCE_HW_SIGNERS:-0}" <<'PY'
+import base64, json, os, re, subprocess, sys, tomllib
 
-verify_commit_hw_sig() {
-    local commit_ref="$1"
-    [[ "${ACTIVE_HW_SIGNERS}" -gt 0 ]] || return 1
-    git -c gpg.format=ssh -c "gpg.ssh.allowedSignersFile=${CLEAN_SIGNERS}" verify-commit "${commit_ref}" >/dev/null 2>&1 || return 1
-    python3 - "${commit_ref}" "${CLEAN_SIGNERS}" "${WORK_DIR}" <<'PY'
-import os, subprocess, sys
-commit_ref, signers, work_dir = sys.argv[1:4]
-raw = subprocess.check_output(["git", "cat-file", "commit", commit_ref])
-hdr, sep, body = raw.partition(b"\n\n")
-if not sep:
-    sys.exit(1)
-sig_lines, kept, in_sig = [], [], False
-for line in hdr.split(b"\n"):
-    if line.startswith(b"gpgsig "):
-        in_sig = True
-        sig_lines.append(line[7:])
-    elif in_sig and line.startswith(b" "):
-        sig_lines.append(line[1:])
-    else:
-        in_sig = False
-        kept.append(line)
-sig_text = b"\n".join(sig_lines) + b"\n"
-if b"-----BEGIN SSH SIGNATURE-----" not in sig_text:
-    sys.exit(1)
-sig_path, payload_path = os.path.join(work_dir, "head.sig"), os.path.join(work_dir, "head.payload")
-open(sig_path, "wb").write(sig_text)
-open(payload_path, "wb").write(b"\n".join(kept) + b"\n\n" + body)
-principals = subprocess.check_output(
-    ["ssh-keygen", "-Y", "find-principals", "-f", signers, "-s", sig_path], stderr=subprocess.DEVNULL
-).decode("utf-8", errors="replace").strip().splitlines()
-if not principals:
-    sys.exit(1)
-with open(payload_path, "rb") as pf:
-    subprocess.check_call(
-        ["ssh-keygen", "-Y", "verify", "-f", signers, "-I", principals[0].strip(), "-n", "git", "-s", sig_path],
-        stdin=pf, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-    )
-PY
-}
+base_ref, head_ref, raw_signers, clean_signers, work_dir, allow_mq_s, enforce_s = sys.argv[1:8]
+allow_mq, enforce_hw = (allow_mq_s == "true"), (enforce_s == "1")
+allowed_kt = {"sk-ssh-ed25519@openssh.com", "sk-ecdsa-sha2-nistp256@openssh.com"}
+principal_re = re.compile(r"^[A-Za-z0-9._+-]+@[A-Za-z0-9.-]+$")
+# Spec Ring-2 allowlist permits only top-level harness .rs tests; nested or non-.rs paths escalate to Ring-0
+harness_rs_re = re.compile(r"^crates/dotagent-harness/tests/[A-Za-z0-9_.-]+\.rs$")
 
-TIER="ring2"
-POLICY_MODIFIED="false"
-while IFS= read -r path; do
-    [[ -z "${path}" ]] && continue
-    case "${path}" in
-        crates/agent-guard/src/diagnostics.rs|tests/bypass_corpus.toml) ;;
-        crates/agent-guard/src/cmd_policy.rs|crates/agent-guard/src/mcp_policy.rs) POLICY_MODIFIED="true" ;;
-        crates/dotagent-harness/tests/*) [[ "${path}" == *".."* ]] && TIER="ring0" ;;
-        *) TIER="ring0" ;;
-    esac
-done < <(git diff --name-only "${BASE_REF}...${HEAD_REF}")
+def die(msg: str):
+    sys.stderr.write(msg + "\n"); sys.exit(2)
 
-HW_SIGNED="false"
-if verify_commit_hw_sig "${HEAD_REF}"; then
-    HW_SIGNED="true"
-elif [[ "${ALLOW_MQ_PARENTS}" == "true" ]] && git rev-parse --verify -q "${HEAD_REF}^2" >/dev/null 2>&1; then
-    MQ_OK="true"; MQ_COUNT=0
-    while IFS= read -r msha; do
-        [[ -z "${msha}" ]] && continue
-        MQ_COUNT=$((MQ_COUNT + 1))
-        verify_commit_hw_sig "${msha}^2" || { MQ_OK="false"; break; }
-    done < <(git rev-list --first-parent --merges "${BASE_REF}..${HEAD_REF}")
-    [[ "${MQ_COUNT}" -gt 0 && "${MQ_OK}" == "true" ]] && HW_SIGNED="true"
-fi
+valid_signers = []
+for lineno, raw in enumerate(open(raw_signers, "r", encoding="utf-8"), 1):
+    line = raw.strip()
+    if not line or line.startswith("#"):
+        continue
+    parts = line.split()
+    if len(parts) != 4:
+        die(f"NON_HARDWARE_SIGNER_FORBIDDEN: line {lineno} must have exactly 4 tokens")
+    principal, opts, key_type, pubkey_b64 = parts
+    if not principal_re.fullmatch(principal) or opts != 'namespaces="git"' or key_type not in allowed_kt:
+        die(f"NON_HARDWARE_SIGNER_FORBIDDEN: line {lineno} failed principal/namespace/sk-* validation")
+    try:
+        blob = base64.b64decode(pubkey_b64, validate=True)
+        klen = int.from_bytes(blob[:4], "big") if len(blob) >= 4 else -1
+        wire_kt = blob[4 : 4 + klen].decode("ascii") if 0 < klen <= len(blob) - 4 else ""
+    except Exception:
+        wire_kt = ""
+    if wire_kt != key_type:
+        die(f"NON_HARDWARE_SIGNER_FORBIDDEN: line {lineno} wire key type '{wire_kt}' != '{key_type}'")
+    valid_signers.append(f'{principal} namespaces="git" {key_type} {pubkey_b64}\n')
 
-NEW_CORPUS_VECTORS="$(python3 - "${BASE_REF}" "${HEAD_REF}" "${HW_SIGNED}" "${POLICY_MODIFIED}" <<'PY'
-from collections import Counter
-import json, subprocess, sys, tomllib
+open(clean_signers, "w", encoding="utf-8").writelines(valid_signers)
+active_hw = len(valid_signers)
 
-base_ref, head_ref, hw_s, pol_s = sys.argv[1:5]
-hw_signed, policy_mod = (hw_s == "true"), (pol_s == "true")
+def verify_commit_hw_sig(commit_ref: str) -> bool:
+    if active_hw == 0:
+        return False
+    gv = subprocess.run(["git", "-c", "gpg.format=ssh", "-c", f"gpg.ssh.allowedSignersFile={clean_signers}", "verify-commit", commit_ref], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    if gv.returncode != 0:
+        return False
+    hdr, sep, body = subprocess.check_output(["git", "cat-file", "commit", commit_ref]).partition(b"\n\n")
+    if not sep:
+        return False
+    sig_lines, kept, in_sig, sig_headers = [], [], False, 0
+    for line in hdr.split(b"\n"):
+        if line.startswith(b"gpgsig-"):
+            return False
+        if line.startswith(b"gpgsig "):
+            sig_headers += 1; in_sig = True; sig_lines.append(line[7:])
+        elif in_sig and line.startswith(b" "):
+            sig_lines.append(line[1:])
+        else:
+            in_sig = False; kept.append(line)
+    sig_text = b"\n".join(sig_lines) + b"\n"
+    if sig_headers != 1 or b"-----BEGIN SSH SIGNATURE-----" not in sig_text:
+        return False
+    sig_path, payload_path = os.path.join(work_dir, "head.sig"), os.path.join(work_dir, "head.payload")
+    open(sig_path, "wb").write(sig_text); open(payload_path, "wb").write(b"\n".join(kept) + b"\n\n" + body)
+    fp = subprocess.run(["ssh-keygen", "-Y", "find-principals", "-f", clean_signers, "-s", sig_path], capture_output=True)
+    if fp.returncode != 0:
+        return False
+    for princ in fp.stdout.decode("utf-8", errors="replace").splitlines():
+        if princ.strip():
+            with open(payload_path, "rb") as pf:
+                if subprocess.run(["ssh-keygen", "-Y", "verify", "-f", clean_signers, "-I", princ.strip(), "-n", "git", "-s", sig_path], stdin=pf, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0:
+                    return True
+    return False
 
 def load_vecs(ref: str):
     p = subprocess.run(["git", "show", f"{ref}:tests/bypass_corpus.toml"], capture_output=True)
@@ -150,49 +113,103 @@ def load_vecs(ref: str):
     try:
         doc = tomllib.loads(p.stdout.decode("utf-8"))
     except Exception as exc:
-        sys.stderr.write(f"CORPUS_PARSE_ERROR: {ref}:tests/bypass_corpus.toml: {exc}\n")
-        sys.exit(2)
+        die(f"CORPUS_PARSE_ERROR: {ref}:tests/bypass_corpus.toml: {exc}")
     vecs = doc.get("vectors", doc.get("cases"))
-    if not isinstance(vecs, list) or any(not isinstance(v, dict) for v in vecs):
-        sys.stderr.write(f"CORPUS_SCHEMA_ERROR: {ref}:tests/bypass_corpus.toml\n")
-        sys.exit(2)
+    if not set(doc.keys()) <= {"vectors", "cases"} or not isinstance(vecs, list) or any(not isinstance(v, dict) for v in vecs):
+        die(f"CORPUS_SCHEMA_ERROR: {ref}:tests/bypass_corpus.toml")
     return vecs
 
-base_v, head_v = load_vecs(base_ref), load_vecs(head_ref)
-if base_v is not None and head_v is None:
-    if not hw_signed:
-        sys.stderr.write("CORPUS_RATCHET_VIOLATION: tests/bypass_corpus.toml deleted\n")
-        sys.exit(2)
-    print(0); sys.exit(0)
+def vec_identity(v: dict) -> str:
+    if "kind" in v or "payload" in v:
+        k, pl = v.get("kind"), v.get("payload")
+        if k not in {"cmd", "read_path", "write_path", "glob", "content"} or not isinstance(pl, str) or not pl.strip():
+            die(f"CORPUS_SCHEMA_ERROR: invalid kind/payload in {v}")
+        return f"kp:{k}:{pl}"
+    cmd = v.get("command")
+    if not isinstance(cmd, str) or not cmd.strip():
+        die(f"CORPUS_SCHEMA_ERROR: missing payload/command in {v}")
+    return f"cmd:{cmd}"
 
-bc = Counter(json.dumps(v, sort_keys=True, separators=(",", ":")) for v in (base_v or []))
-hc = Counter(json.dumps(v, sort_keys=True, separators=(",", ":")) for v in (head_v or []))
-for canon, cnt in bc.items():
-    if hc[canon] < cnt and not hw_signed:
-        sys.stderr.write(f"CORPUS_RATCHET_VIOLATION: vector deleted or weakened: {canon}\n")
-        sys.exit(2)
+def evaluate_range(b_ref: str, h_ref: str):
+    mb_p = subprocess.run(["git", "merge-base", "--", b_ref, h_ref], capture_output=True, text=True)
+    mb = mb_p.stdout.strip() if mb_p.returncode == 0 else ""
+    if not mb:
+        die(f"NO_MERGE_BASE: {b_ref} and {h_ref}")
+    parts = subprocess.check_output(["git", "-c", "core.quotePath=false", "diff", "--raw", "-z", "--no-renames", "--end-of-options", mb, h_ref]).split(b"\0")
+    tier, policy_mod, file_count, idx = "ring2", False, 0, 0
+    while idx + 1 < len(parts) and parts[idx]:
+        meta = parts[idx].decode("utf-8", errors="replace").lstrip(":").split()
+        path = parts[idx + 1].decode("utf-8", errors="replace")
+        idx += 2; file_count += 1
+        if len(meta) < 2 or meta[0] not in {"000000", "100644"} or meta[1] not in {"000000", "100644"}:
+            tier = "ring0"
+        if path in {"crates/agent-guard/src/diagnostics.rs", "tests/bypass_corpus.toml"} or harness_rs_re.fullmatch(path):
+            pass
+        elif path in {"crates/agent-guard/src/cmd_policy.rs", "crates/agent-guard/src/mcp_policy.rs"}:
+            policy_mod = True
+        else:
+            tier = "ring0"
+    if file_count == 0:
+        tier = "ring0"
+    hw_ok = verify_commit_hw_sig(h_ref)
+    base_v, head_v = load_vecs(mb), load_vecs(h_ref)
+    if base_v is not None and head_v is None:
+        if not hw_ok:
+            die("CORPUS_RATCHET_VIOLATION: tests/bypass_corpus.toml deleted")
+        return tier, hw_ok, 0
+    base_canons = {json.dumps(v, sort_keys=True, separators=(",", ":")) for v in (base_v or [])}
+    base_idents = {vec_identity(v) for v in (base_v or [])}
+    head_canons, seen_idents, seen_ids, new_deny = set(), set(), set(), 0
+    for v in (head_v or []):
+        exp, act, vid = v.get("expected_code", 2), v.get("action", "deny"), v.get("id")
+        if type(exp) is not int or not isinstance(act, str):
+            die(f"CORPUS_SCHEMA_ERROR: invalid expected_code/action in {v}")
+        ident = vec_identity(v)
+        if (ident in seen_idents or (vid is not None and vid in seen_ids)) and not hw_ok:
+            die(f"CORPUS_DUPLICATE_VECTOR_FORBIDDEN: duplicate vector or id '{ident}'")
+        seen_idents.add(ident)
+        if vid is not None:
+            seen_ids.add(vid)
+        head_canons.add(json.dumps(v, sort_keys=True, separators=(",", ":")))
+        if ident not in base_idents and exp == 2 and act.lower() == "deny":
+            new_deny += 1
+    for bc in base_canons:
+        if bc not in head_canons and not hw_ok:
+            die(f"CORPUS_RATCHET_VIOLATION: vector deleted or weakened: {bc}")
+    if policy_mod and not hw_ok and new_deny < 2:
+        die(f"CORPUS_RATCHET_VIOLATION: cmd/mcp policy edit requires >= 2 unique new deny vectors (got {new_deny})")
+    return tier, hw_ok, new_deny
 
-new_deny = sum(
-    cnt for canon, cnt in (hc - bc).items()
-    if json.loads(canon).get("expected_code", 2) == 2 and str(json.loads(canon).get("action", "deny")).lower() == "deny"
-)
-if policy_mod and not hw_signed and new_deny < 2:
-    sys.stderr.write(f"CORPUS_RATCHET_VIOLATION: cmd/mcp policy edit requires >= 2 new deny vectors (got {new_deny})\n")
-    sys.exit(2)
-print(new_deny)
+if allow_mq and subprocess.run(["git", "rev-parse", "--verify", "-q", f"{head_ref}^2"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0:
+    fp_commits = subprocess.check_output(["git", "rev-list", "--first-parent", f"{base_ref}..{head_ref}"], text=True).splitlines()
+    if not fp_commits:
+        die("MQ_EMPTY_RANGE: empty merge_group commit range")
+    agg_tier, agg_hw, agg_new, agg_elig = "ring2", True, 0, True
+    for msha in fp_commits:
+        parents = subprocess.check_output(["git", "rev-list", "--parents", "-n", "1", msha], text=True).strip().split()[1:]
+        if len(parents) != 2:
+            die(f"MQ_NON_TWO_PARENT_COMMIT: {msha} has {len(parents)} parents")
+        t, hw, nd = evaluate_range(parents[0], parents[1])
+        agg_new += nd
+        if t == "ring0":
+            agg_tier = "ring0"
+            if not hw:
+                agg_hw, agg_elig = False, False
+                if active_hw > 0 or enforce_hw:
+                    die(f"RING0_HARDWARE_SIGNATURE_REQUIRED: queue entry {parents[1]} missing valid sk-* signature")
+        else:
+            agg_hw = agg_hw and hw
+    print(json.dumps({"tier": agg_tier, "hw_signed": agg_hw, "new_corpus_vectors": agg_new, "eligible_for_auto_enqueue": agg_elig}, separators=(",", ":")))
+else:
+    tier, hw_ok, new_deny = evaluate_range(base_ref, head_ref)
+    elig = not (tier == "ring0" and not hw_ok)
+    if not elig:
+        if active_hw > 0 or enforce_hw:
+            die("RING0_HARDWARE_SIGNATURE_REQUIRED: Ring-0 paths modified without valid sk-* hardware commit signature")
+        sys.stderr.write("[verify-pr-authority] BOOTSTRAP_NOTICE: Ring-0 paths modified with 0 active sk-* signers; auto-enqueue disabled\n")
+    print(json.dumps({"tier": tier, "hw_signed": hw_ok, "new_corpus_vectors": new_deny, "eligible_for_auto_enqueue": elig}, separators=(",", ":")))
 PY
 )"
 
-ELIGIBLE="true"
-if [[ "${TIER}" == "ring0" && "${HW_SIGNED}" != "true" ]]; then
-    ELIGIBLE="false"
-    if [[ "${ACTIVE_HW_SIGNERS}" -gt 0 || "${DOTAGENT_ENFORCE_HW_SIGNERS:-0}" == "1" ]]; then
-        echo "RING0_HARDWARE_SIGNATURE_REQUIRED: Ring-0 paths modified without valid sk-* hardware commit signature" >&2
-        exit 2
-    fi
-    echo "[verify-pr-authority] BOOTSTRAP_NOTICE: Ring-0 paths modified with 0 active sk-* signers; auto-enqueue disabled" >&2
-fi
-
-SUMMARY="$(printf '{"tier":"%s","hw_signed":%s,"new_corpus_vectors":%d,"eligible_for_auto_enqueue":%s}' "${TIER}" "${HW_SIGNED}" "${NEW_CORPUS_VECTORS}" "${ELIGIBLE}")"
-[[ "${JSON_ONLY}" == "true" ]] || echo "[verify-pr-authority] PASS: ${SUMMARY}" >&2
-printf '%s\n' "${SUMMARY}"
+[[ "${JSON_ONLY}" == "true" ]] || echo "[verify-pr-authority] PASS: ${RESULT_JSON}" >&2
+printf '%s\n' "${RESULT_JSON}"

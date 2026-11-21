@@ -4,6 +4,7 @@ on:
   push:
     branches: ["main"]
   pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
   merge_group:
 
 permissions:
@@ -16,7 +17,7 @@ jobs:
     timeout-minutes: 10
     steps:
       - name: Checkout full repository history (zero persisted credentials)
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
           persist-credentials: false
@@ -33,6 +34,8 @@ jobs:
       - name: Verify Ring-0 hardware SSHSIG authority & monotonic bypass_corpus.toml ratchet
         shell: bash
         env:
+          GH_TOKEN: ${{ github.token }}
+          REPO_FULL: ${{ github.repository }}
           EVENT_NAME: ${{ github.event_name }}
           PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
           PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
@@ -42,21 +45,57 @@ jobs:
           PUSH_HEAD_SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
+          run_trusted_gate() {
+            local base_sha="$1"
+            shift
+            local gate_script="scripts/verify-pr-authority.sh"
+            if git cat-file -e "${base_sha}:scripts/verify-pr-authority.sh" 2>/dev/null; then
+              gate_script="${RUNNER_TEMP}/trusted-verify-pr-authority.sh"
+              git show "${base_sha}:scripts/verify-pr-authority.sh" > "${gate_script}"
+              chmod 0700 "${gate_script}"
+            fi
+            bash "${gate_script}" --base "${base_sha}" "$@"
+          }
+
           case "${EVENT_NAME}" in
             pull_request)
-              bash scripts/verify-pr-authority.sh --base "${PR_BASE_SHA}" --head "${PR_HEAD_SHA}" --json
+              run_trusted_gate "${PR_BASE_SHA}" --head "${PR_HEAD_SHA}" --json
               ;;
             merge_group)
-              bash scripts/verify-pr-authority.sh --base "${MQ_BASE_SHA}" --head "${MQ_HEAD_SHA}" --allow-merge-queue-parents --json
+              run_trusted_gate "${MQ_BASE_SHA}" --head "${MQ_HEAD_SHA}" --allow-merge-queue-parents --json
               ;;
             push)
               if [[ "${PUSH_BEFORE_SHA}" != "0000000000000000000000000000000000000000" ]] \
                  && git cat-file -e "${PUSH_BEFORE_SHA}^{commit}" 2>/dev/null; then
-                COMMITTER_EMAIL="$(git log -1 --format='%ce' "${PUSH_HEAD_SHA}")"
-                if [[ "${COMMITTER_EMAIL}" == "noreply@github.com" ]]; then
-                  echo "[authority-gate] Merge-Queue squash commit verified via prior pull_request + merge_group gates"
+                COMMIT_META="$(gh api "repos/${REPO_FULL}/commits/${PUSH_HEAD_SHA}")"
+                PULLS_META="$(gh api "repos/${REPO_FULL}/commits/${PUSH_HEAD_SHA}/pulls")"
+                MQ_PR_INFO="$(python3 - "${COMMIT_META}" "${PULLS_META}" <<'PY'
+          import json, sys
+          c, prs = json.loads(sys.argv[1]), json.loads(sys.argv[2])
+          verified = (c.get("commit", {}).get("verification") or {}).get("verified") is True
+          committer = (c.get("committer") or {}).get("login")
+          if verified and committer == "web-flow" and isinstance(prs, list):
+              merged = [p for p in prs if p.get("merged_at") and (p.get("base") or {}).get("ref") == "main"]
+              if len(merged) == 1:
+                  num = merged[0]["number"]
+                  hsha = (merged[0].get("head") or {}).get("sha", "")
+                  if isinstance(num, int) and len(hsha) == 40:
+                      print(f"{num}:{hsha}")
+                      sys.exit(0)
+          print("")
+          PY
+                )"
+                if [[ -n "${MQ_PR_INFO}" ]]; then
+                  PR_NUM="${MQ_PR_INFO%%:*}"
+                  PR_ORIG_SHA="${MQ_PR_INFO#*:}"
+                  git fetch --no-tags origin "+refs/pull/${PR_NUM}/head:refs/remotes/origin/mq-pr-${PR_NUM}"
+                  if [[ "$(git rev-parse "${PR_ORIG_SHA}^{tree}")" == "$(git rev-parse "${PUSH_HEAD_SHA}^{tree}")" ]]; then
+                    run_trusted_gate "${PUSH_BEFORE_SHA}" --head "${PR_ORIG_SHA}" --json
+                  else
+                    run_trusted_gate "${PUSH_BEFORE_SHA}" --head "${PUSH_HEAD_SHA}" --json
+                  fi
                 else
-                  bash scripts/verify-pr-authority.sh --base "${PUSH_BEFORE_SHA}" --head "${PUSH_HEAD_SHA}" --json
+                  run_trusted_gate "${PUSH_BEFORE_SHA}" --head "${PUSH_HEAD_SHA}" --json
                 fi
               fi
               ;;
@@ -73,7 +112,7 @@ jobs:
           - os: ubuntu-24.04-arm
             expect_mode: landlock
           - os: ubuntu-22.04
-            expect_mode: ""
+            expect_mode: landlock-any
           - os: macos-15
             expect_mode: seatbelt
     runs-on: ${{ matrix.os }}
@@ -87,7 +126,7 @@ jobs:
       GIT_COMMITTER_EMAIL: "ci@dotagent.local"
     steps:
       - name: Checkout repository (zero persisted credentials)
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
           submodules: false
@@ -101,7 +140,7 @@ jobs:
           rustup default stable
 
       - name: Cache Cargo workspace build artifacts
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: target
           key: ${{ matrix.os }}-${{ runner.arch }}-cargo-stable-${{ hashFiles('Cargo.lock', 'Cargo.toml') }}
@@ -119,6 +158,8 @@ jobs:
 
       - name: Build release binaries, verify bundles, repo audit, StopReceipt, microbench, & sterile cleanroom tarball
         shell: bash
+        env:
+          MATRIX_EXPECT_MODE: ${{ matrix.expect_mode }}
         run: |
           set -euo pipefail
           cargo build --release --locked --workspace
@@ -143,8 +184,8 @@ jobs:
           done
           ARCHIVE_PATH="${RUNNER_TEMP}/dotagent-v0.0.0-ci-${HOST_TRIPLE}.tar.gz"
           bash scripts/package-release-archive.sh --target "${HOST_TRIPLE}" --tag "v0.0.0-ci" --out "${ARCHIVE_PATH}"
-          if [[ -n "${{ matrix.expect_mode }}" ]]; then
-            bash scripts/cleanroom-smoke-test.sh --archive "${ARCHIVE_PATH}" --expect-mode "${{ matrix.expect_mode }}"
+          if [[ -n "${MATRIX_EXPECT_MODE}" ]]; then
+            bash scripts/cleanroom-smoke-test.sh --archive "${ARCHIVE_PATH}" --expect-mode "${MATRIX_EXPECT_MODE}"
           else
             bash scripts/cleanroom-smoke-test.sh --archive "${ARCHIVE_PATH}"
           fi
@@ -160,7 +201,7 @@ jobs:
       CARGO_TERM_COLOR: always
     steps:
       - name: Checkout repository (zero persisted credentials)
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
           submodules: false
@@ -174,7 +215,7 @@ jobs:
           rustup target add x86_64-unknown-linux-musl
 
       - name: Cache musl Cargo artifacts
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: target
           key: ${{ runner.os }}-musl-cleanroom-${{ hashFiles('Cargo.lock', 'Cargo.toml') }}
@@ -200,12 +241,13 @@ jobs:
 
           docker build -t dotagent-ci-debian - <<'DOCKERFILE'
           FROM debian:12-slim
-          RUN apt-get update && apt-get install -y --no-install-recommends bash git ca-certificates && rm -rf /var/lib/apt/lists/*
+          RUN apt-get update && apt-get install -y --no-install-recommends bash git python3 ca-certificates && rm -rf /var/lib/apt/lists/*
           USER 65532:65532
           DOCKERFILE
 
           COMMON_DOCKER_ARGS=(
             --rm
+            --network=none
             --cap-drop=ALL
             --security-opt=no-new-privileges
             --read-only
@@ -217,28 +259,71 @@ jobs:
 
           echo "=== [1/3] alpine:3.21 pure musl locked-down cleanroom ==="
           docker run "${COMMON_DOCKER_ARGS[@]}" dotagent-ci-alpine \
-            bash /usr/local/bin/cleanroom-smoke-test.sh --archive /archive/dotagent.tar.gz --work-root /work/run
+            bash /usr/local/bin/cleanroom-smoke-test.sh \
+              --archive /archive/dotagent.tar.gz \
+              --expect-mode landlock \
+              --work-root /work/run
 
           echo "=== [2/3] debian:12-slim minimal glibc locked-down cleanroom ==="
           docker run "${COMMON_DOCKER_ARGS[@]}" dotagent-ci-debian \
-            bash /usr/local/bin/cleanroom-smoke-test.sh --archive /archive/dotagent.tar.gz --work-root /work/run
+            bash /usr/local/bin/cleanroom-smoke-test.sh \
+              --archive /archive/dotagent.tar.gz \
+              --expect-mode landlock \
+              --work-root /work/run
 
-          echo "=== [3/3] unprivileged seccomp-only (Landlock-blocked) fail-closed cleanroom ==="
+          echo "=== [3/3] unprivileged seccomp-only (default restrictive OCI allowlist + Landlock denied) ==="
           SECCOMP_NO_LL="${RUNNER_TEMP}/seccomp-no-landlock.json"
-          cat > "${SECCOMP_NO_LL}" <<'JSON'
-          {
-            "defaultAction": "SCMP_ACT_ALLOW",
-            "syscalls": [
-              {
-                "names": ["landlock_create_ruleset", "landlock_add_rule", "landlock_restrict_self"],
-                "action": "SCMP_ACT_ERRNO",
-                "errnoRet": 38
-              }
-            ]
+          python3 - "${SECCOMP_NO_LL}" <<'PY'
+          import json, subprocess, sys
+
+          out_path = sys.argv[1]
+          landlock_calls = {"landlock_create_ruleset", "landlock_add_rule", "landlock_restrict_self"}
+          dangerous_calls = {
+              "acct", "add_key", "bpf", "clock_adjtime", "clock_settime", "delete_module",
+              "finit_module", "init_module", "ioperm", "iopl", "kcmp", "kexec_file_load",
+              "kexec_load", "keyctl", "lookup_dcookie", "mount", "move_mount", "nfsservctl",
+              "open_by_handle_at", "open_tree", "perf_event_open", "pivot_root",
+              "process_vm_readv", "process_vm_writev", "ptrace", "quotactl", "reboot",
+              "request_key", "setns", "settimeofday", "swapoff", "swapon", "syslog",
+              "umount2", "unshare", "uselib", "userfaultfd", "vmsplice",
           }
-          JSON
+          forbidden = landlock_calls | dangerous_calls
+
+          spec_proc = subprocess.run(["ctr", "oci", "spec"], capture_output=True, text=True)
+          if spec_proc.returncode != 0:
+              raise SystemExit("ctr oci spec failed; refusing to fall back to permissive seccomp")
+          seccomp = json.loads(spec_proc.stdout)["linux"]["seccomp"]
+          assert seccomp.get("defaultAction") == "SCMP_ACT_ERRNO", f"unexpected defaultAction: {seccomp.get('defaultAction')}"
+
+          cleaned_rules = []
+          for rule in seccomp.get("syscalls", []):
+              if rule.get("action") == "SCMP_ACT_ALLOW":
+                  names = [n for n in rule.get("names", []) if n not in forbidden]
+                  if names:
+                      r = dict(rule)
+                      r["names"] = names
+                      cleaned_rules.append(r)
+              else:
+                  cleaned_rules.append(rule)
+
+          cleaned_rules.append({"names": sorted(ps := {"prctl", "seccomp"}), "action": "SCMP_ACT_ALLOW"})
+          cleaned_rules.insert(0, {
+              "names": sorted(landlock_calls),
+              "action": "SCMP_ACT_ERRNO",
+              "errnoRet": 38,
+          })
+          seccomp["syscalls"] = cleaned_rules
+
+          for rule in seccomp["syscalls"]:
+              if rule.get("action") == "SCMP_ACT_ALLOW":
+                  overlap = forbidden.intersection(rule.get("names", []))
+                  assert not overlap, f"forbidden syscalls remained allowed: {overlap}"
+
+          with open(out_path, "w", encoding="utf-8") as fh:
+              json.dump(seccomp, fh)
+          PY
+
           docker run "${COMMON_DOCKER_ARGS[@]}" \
-            --security-opt seccomp=default \
             --security-opt "seccomp=${SECCOMP_NO_LL}" \
             dotagent-ci-debian \
             bash /usr/local/bin/cleanroom-smoke-test.sh \
@@ -254,7 +339,7 @@ jobs:
       CARGO_TERM_COLOR: always
     steps:
       - name: Checkout repository (zero persisted credentials)
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
           submodules: false
@@ -338,7 +423,7 @@ jobs:
       CARGO_TERM_COLOR: always
     steps:
       - name: Checkout repository (zero persisted credentials)
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
           submodules: false
@@ -349,7 +434,7 @@ jobs:
           rustup default stable
 
       - name: Cache Kani 0.68.0 verifier & CBMC bundle
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cargo/bin/kani
@@ -391,7 +476,7 @@ jobs:
       GIT_CONFIG_NOSYSTEM: "1"
     steps:
       - name: Checkout repository (zero persisted credentials)
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
           submodules: false
@@ -400,7 +485,7 @@ jobs:
         run: rustup toolchain install 1.88.0 --profile minimal
 
       - name: Cache MSRV 1.88.0 check artifacts
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: target
           key: ${{ runner.os }}-cargo-msrv-1-88-${{ hashFiles('Cargo.lock', 'Cargo.toml') }}
@@ -420,6 +505,9 @@ jobs:
       - reproducibility-and-supply-chain
       - kani-formal-proofs
       - msrv-1-88-gate
+    concurrency:
+      group: promoter-pr-${{ github.event.pull_request.number }}
+      cancel-in-progress: false
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
@@ -428,40 +516,59 @@ jobs:
         run: |
           echo "::notice::vars.PROMOTER_APP_ID is not configured yet; skipping dotagent-promoter[bot] auto-enqueue."
 
-      - name: Checkout PR history for authority eligibility verification
+      - name: Checkout trusted base branch ONLY (never untrusted PR working tree)
         if: vars.PROMOTER_APP_ID != ''
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ github.event.pull_request.base.ref }}
           fetch-depth: 0
           persist-credentials: false
           submodules: false
 
-      - name: Mint scoped dotagent-promoter[bot] installation token
-        id: app_token
+      - name: Verify PR authority using trusted base-branch gate before minting App token
+        id: precheck
         if: vars.PROMOTER_APP_ID != ''
+        shell: bash
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          BASE_REF_NAME: ${{ github.event.pull_request.base.ref }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          if [[ ! -f "scripts/verify-pr-authority.sh" ]]; then
+            echo "::notice::scripts/verify-pr-authority.sh is not yet on ${BASE_REF_NAME}; skipping auto-enqueue."
+            echo "eligible=false" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+          git fetch --no-tags origin "+refs/heads/${BASE_REF_NAME}:refs/remotes/origin/${BASE_REF_NAME}" "+refs/pull/${PR_NUMBER}/head:refs/remotes/origin/pr-${PR_NUMBER}"
+          AUTH_JSON="$(bash scripts/verify-pr-authority.sh --base "refs/remotes/origin/${BASE_REF_NAME}" --head "${HEAD_SHA}" --json)"
+          ELIGIBLE="$(python3 -c 'import json,sys; print("true" if json.loads(sys.argv[1]).get("eligible_for_auto_enqueue") else "false")' "${AUTH_JSON}")"
+          echo "eligible=${ELIGIBLE}" >> "${GITHUB_OUTPUT}"
+          if [[ "${ELIGIBLE}" != "true" ]]; then
+            echo "::notice::PR #${PR_NUMBER} is not eligible for automatic Merge Queue enqueue (${AUTH_JSON})."
+          fi
+
+      - name: Mint least-privilege repo-scoped dotagent-promoter[bot] token
+        id: app_token
+        if: vars.PROMOTER_APP_ID != '' && steps.precheck.outputs.eligible == 'true'
         uses: actions/create-github-app-token@f418cff399f7aef4c2f0ad47e25ca7a6abbdd6fc # v3.4.0
         with:
           app-id: ${{ vars.PROMOTER_APP_ID }}
           private-key: ${{ secrets.PROMOTER_APP_PRIVATE_KEY }}
+          repositories: ${{ github.event.repository.name }}
+          permission-contents: write
+          permission-pull-requests: write
 
-      - name: Verify zero unresolved review threads & enqueue PR into GitHub Merge Queue
-        if: vars.PROMOTER_APP_ID != ''
+      - name: Atomically verify review threads, approve exact commitOID, & enqueue into Merge Queue
+        if: vars.PROMOTER_APP_ID != '' && steps.precheck.outputs.eligible == 'true'
         shell: bash
         env:
           GH_TOKEN: ${{ steps.app_token.outputs.token }}
           REPO_FULL: ${{ github.repository }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
           set -euo pipefail
-          AUTH_JSON="$(bash scripts/verify-pr-authority.sh --base "${BASE_SHA}" --head "${HEAD_SHA}" --json)"
-          ELIGIBLE="$(python3 -c 'import json,sys; print("true" if json.loads(sys.argv[1]).get("eligible_for_auto_enqueue") else "false")' "${AUTH_JSON}")"
-          if [[ "${ELIGIBLE}" != "true" ]]; then
-            echo "::notice::PR #${PR_NUMBER} is not eligible for automatic Merge Queue enqueue (${AUTH_JSON})."
-            exit 0
-          fi
-
           OWNER="${REPO_FULL%%/*}"
           REPO="${REPO_FULL##*/}"
           GQL_JSON="$(gh api graphql \
@@ -472,23 +579,18 @@ jobs:
               query($owner: String!, $name: String!, $pr: Int!) {
                 repository(owner: $owner, name: $name) {
                   pullRequest(number: $pr) {
+                    id
                     headRefOid
                     isDraft
+                    reviewDecision
                     reviewThreads(first: 100) {
-                      pageInfo {
-                        hasNextPage
-                      }
-                      nodes {
-                        isResolved
-                      }
+                      pageInfo { hasNextPage }
+                      nodes { isResolved }
                     }
-                    reviews(last: 20) {
+                    reviews(last: 100, states: [APPROVED]) {
                       nodes {
-                        state
-                        body
-                        commit {
-                          oid
-                        }
+                        author { login }
+                        commit { oid }
                       }
                     }
                   }
@@ -496,38 +598,57 @@ jobs:
               }
             ')"
 
-          STATE_INFO="$(python3 - "${GQL_JSON}" "${HEAD_SHA}" <<'PY'
+          DECISION="$(python3 - "${GQL_JSON}" "${HEAD_SHA}" <<'PY'
           import json, sys
           data, expected_sha = json.loads(sys.argv[1]), sys.argv[2]
           pr = data["data"]["repository"]["pullRequest"]
           if pr["isDraft"] or pr["headRefOid"] != expected_sha:
-              print("stale")
+              print("skip:stale")
+              sys.exit(0)
+          if pr.get("reviewDecision") == "CHANGES_REQUESTED":
+              print("skip:changes_requested")
               sys.exit(0)
           threads = pr["reviewThreads"]
           if threads["pageInfo"]["hasNextPage"]:
-              print("unresolved:overflow")
+              print("skip:threads_overflow")
               sys.exit(0)
           unresolved = sum(1 for t in threads["nodes"] if not t["isResolved"])
           if unresolved != 0:
-              print(f"unresolved:{unresolved}")
+              print(f"skip:unresolved_{unresolved}")
               sys.exit(0)
           already = any(
-              r.get("state") == "APPROVED"
+              ((r.get("author") or {}).get("login") in {"dotagent-promoter", "dotagent-promoter[bot]"})
               and (r.get("commit") or {}).get("oid") == expected_sha
-              and "[PROMOTER]" in (r.get("body") or "")
               for r in pr["reviews"]["nodes"]
           )
-          print("ready:approved" if already else "ready:needs_review")
+          action = "approved" if already else "needs_review"
+          print(f"{action}:{pr['id']}")
           PY
           )"
 
-          if [[ "${STATE_INFO}" != ready:* ]]; then
-            echo "::notice::Skipping auto-enqueue for PR #${PR_NUMBER}: state=${STATE_INFO}"
+          if [[ "${DECISION}" == skip:* ]]; then
+            echo "::notice::Skipping auto-enqueue for PR #${PR_NUMBER}: ${DECISION}"
             exit 0
           fi
 
-          if [[ "${STATE_INFO}" == "ready:needs_review" ]]; then
-            gh pr review "${PR_NUMBER}" --repo "${REPO_FULL}" --approve \
-              --body "[PROMOTER] All 6 OS/Container/Formal/Authority gates verified on ${HEAD_SHA}"
+          ACTION="${DECISION%%:*}"
+          PR_NODE_ID="${DECISION#*:}"
+          if [[ "${ACTION}" == "needs_review" ]]; then
+            gh api graphql \
+              -f prId="${PR_NODE_ID}" \
+              -f headOid="${HEAD_SHA}" \
+              -f body="[PROMOTER] All 6 OS/Container/Formal/Authority gates verified on ${HEAD_SHA}" \
+              -f query='
+                mutation($prId: ID!, $headOid: GitObjectID!, $body: String!) {
+                  addPullRequestReview(input: {
+                    pullRequestId: $prId,
+                    commitOID: $headOid,
+                    event: APPROVE,
+                    body: $body
+                  }) {
+                    pullRequestReview { id }
+                  }
+                }
+              ' >/dev/null
           fi
           gh pr merge "${PR_NUMBER}" --repo "${REPO_FULL}" --auto --squash --match-head-commit "${HEAD_SHA}"

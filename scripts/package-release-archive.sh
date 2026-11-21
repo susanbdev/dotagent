@@ -27,12 +27,14 @@ if [[ -z "${TARGET}" || -z "${TAG}" || -z "${OUT_ARCHIVE}" ]]; then
     echo "USAGE_ERROR: --target <triple>, --tag <ver>, and --out <path.tar.gz> are required" >&2
     exit 2
 fi
+[[ "${TARGET}" =~ ^[A-Za-z0-9._-]+$ ]] || { echo "USAGE_ERROR: invalid --target '${TARGET}'" >&2; exit 2; }
+[[ "${TAG}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]] || { echo "USAGE_ERROR: invalid --tag '${TAG}'" >&2; exit 2; }
 
 BIN_SRC_DIR="${REPO_ROOT}/target/${TARGET}/release"
 BINS=(dotagent agent-guard agent-guard-sh dotagent-compiler swarm-tool dotagent-harness)
 for bin in "${BINS[@]}"; do
-    if [[ ! -f "${BIN_SRC_DIR}/${bin}" ]]; then
-        echo "MISSING_RELEASE_BINARY: expected '${BIN_SRC_DIR}/${bin}'" >&2
+    if [[ ! -f "${BIN_SRC_DIR}/${bin}" || -L "${BIN_SRC_DIR}/${bin}" ]]; then
+        echo "MISSING_RELEASE_BINARY: expected regular file '${BIN_SRC_DIR}/${bin}'" >&2
         exit 2
     fi
 done
@@ -52,7 +54,7 @@ for bin in "${BINS[@]}"; do
     chmod 0555 "${STAGE_DIR}/bin/${bin}"
 done
 
-cp -R "${REPO_ROOT}/dist" "${REPO_ROOT}/dist-verify" "${REPO_ROOT}/profiles" "${REPO_ROOT}/skills" "${STAGE_DIR}/"
+cp -RP "${REPO_ROOT}/dist" "${REPO_ROOT}/dist-verify" "${REPO_ROOT}/profiles" "${REPO_ROOT}/skills" "${STAGE_DIR}/"
 for doc in AGENTS.md README.md THREAT_MODEL.md SECURITY.md CHANGELOG.md spec.md; do
     cp "${REPO_ROOT}/${doc}" "${STAGE_DIR}/${doc}"
 done
@@ -69,6 +71,10 @@ for root, dirs, files in os.walk(stage_dir, followlinks=False):
     files.sort()
     rel_root = os.path.relpath(root, base_parent)
     entries.append((root, rel_root, True))
+    for dname in dirs:
+        dfull = os.path.join(root, dname)
+        if os.path.islink(dfull):
+            raise SystemExit(f"FORBIDDEN_SYMLINK_IN_STAGE: {dfull}")
     for fname in files:
         full = os.path.join(root, fname)
         entries.append((full, os.path.join(rel_root, fname), False))
