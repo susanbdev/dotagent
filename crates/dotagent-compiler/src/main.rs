@@ -5,9 +5,11 @@
 
 use std::collections::BTreeMap;
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
+use agent_guard::budget_guard::MAX_PLUGIN_FILE_BYTES;
 use agent_guard::crypto::sha256_hex;
 use agent_guard::json::JsonValue;
 use agent_guard::unicode_guard::{ScanMode, scan_unicode};
@@ -286,6 +288,14 @@ fn ensure_no_symlink_components_under(root: &Path, target: &Path) -> Result<Path
 }
 
 fn read_contained_regular_file(base_dir: &Path, target: &Path) -> Result<String, String> {
+    read_contained_regular_file_with_limit(base_dir, target, None)
+}
+
+fn read_contained_regular_file_with_limit(
+    base_dir: &Path,
+    target: &Path,
+    max_bytes: Option<u64>,
+) -> Result<String, String> {
     let canon_base = ensure_no_symlink_components_under(base_dir, target)?;
     let meta = fs::symlink_metadata(target)
         .map_err(|e| format!("cannot stat '{}': {e}", target.display()))?;
@@ -304,7 +314,20 @@ fn read_contained_regular_file(base_dir: &Path, target: &Path) -> Result<String,
             canon_base.display()
         ));
     }
-    fs::read_to_string(&canon_file).map_err(|e| format!("cannot read '{}': {e}", target.display()))
+    let read_error = |e| format!("cannot read '{}': {e}", target.display());
+    let Some(max_bytes) = max_bytes else {
+        return fs::read_to_string(&canon_file).map_err(read_error);
+    };
+    let mut body = String::new();
+    fs::File::open(&canon_file)
+        .map_err(read_error)?
+        .take(max_bytes + 1)
+        .read_to_string(&mut body)
+        .map_err(read_error)?;
+    if body.len() as u64 > max_bytes {
+        return Err(format!("'{}' exceeds {max_bytes} bytes", target.display()));
+    }
+    Ok(body)
 }
 
 fn validate_and_lock_skills(repo_root: &Path) -> Result<(String, Vec<SkillIr>), String> {
@@ -588,11 +611,21 @@ fn validate_profiles(
         for (plug_name, exp_hex) in &ir.pinned_plugins {
             let plug_dir = profiles_dir.join("plugins");
             let plug_path = plug_dir.join(plug_name);
-            let plug_body = read_contained_regular_file(&plug_dir, &plug_path).map_err(|e| {
+            let plug_body = read_contained_regular_file_with_limit(
+                &plug_dir,
+                &plug_path,
+                Some(MAX_PLUGIN_FILE_BYTES),
+            )
+            .map_err(|e| {
                 format!(
                     "profile '{required}' pins missing or invalid plugin 'profiles/plugins/{plug_name}': {e}"
                 )
             })?;
+            if !plug_body.is_ascii() || plug_body.as_bytes().contains(&0) {
+                return Err(format!(
+                    "profile '{required}' plugin 'profiles/plugins/{plug_name}' must be 7-bit ASCII without NUL bytes"
+                ));
+            }
             let actual_hex = sha256_hex(plug_body.as_bytes());
             if actual_hex != *exp_hex {
                 return Err(format!(

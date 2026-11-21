@@ -771,11 +771,6 @@ pub fn run_exec_sandbox_cli(args: &[String], default_cwd: &Path) -> ExitCode {
         if post_digest != Some(expected_digest) {
             let restored_ok = pre_git_cfg_bytes.as_deref().is_some_and(|orig_bytes| {
                 restore_git_config_atomic(&git_cfg_path, orig_bytes, pre_git_cfg_mode).is_ok()
-                    && fs::symlink_metadata(&git_cfg_path)
-                        .ok()
-                        .filter(|m| !m.file_type().is_symlink() && m.file_type().is_file())
-                        .and_then(|_| fs::read(&git_cfg_path).ok())
-                        .is_some_and(|b| sha256_bytes(&b) == expected_digest)
             });
             if !restored_ok {
                 let mut ledger = crate::traversal_ledger::SessionLedger::load_or_create(
@@ -838,7 +833,7 @@ fn restore_git_config_atomic(
     orig_bytes: &[u8],
     orig_mode: u32,
 ) -> Result<(), String> {
-    use std::io::Write as _;
+    use std::io::{Seek as _, Write as _};
     let parent = git_cfg_path
         .parent()
         .ok_or_else(|| "missing .git parent".to_string())?;
@@ -869,28 +864,63 @@ fn restore_git_config_atomic(
         ".config.dotagent-restore.{}.{nanos}.tmp",
         std::process::id()
     ));
-    let mut f = fs::OpenOptions::new()
-        .create_new(true)
-        .write(true)
-        .open(&tmp)
-        .map_err(|e| e.to_string())?;
-    if let Err(e) = f.write_all(orig_bytes).and_then(|()| f.sync_all()) {
-        let _ = fs::remove_file(&tmp);
-        return Err(e.to_string());
-    }
-    drop(f);
+    let mut options = fs::OpenOptions::new();
+    options.create_new(true).read(true).write(true);
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = fs::set_permissions(&tmp, fs::Permissions::from_mode(orig_mode & 0o777));
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
     }
     #[cfg(not(unix))]
     let _ = orig_mode;
-    if let Err(e) = fs::rename(&tmp, git_cfg_path) {
+
+    let mut f = options.open(&tmp).map_err(|e| e.to_string())?;
+    let restore = (|| -> Result<(), String> {
+        f.write_all(orig_bytes).map_err(|e| e.to_string())?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            f.set_permissions(fs::Permissions::from_mode(orig_mode & 0o777))
+                .map_err(|e| e.to_string())?;
+        }
+        f.sync_all().map_err(|e| e.to_string())?;
+        fs::rename(&tmp, git_cfg_path).map_err(|e| e.to_string())?;
+
+        // Landlock grants ReadFile to the original inode. Verify replacement bytes
+        // through the open staging handle because reopening the new path may be denied.
+        f.rewind().map_err(|e| e.to_string())?;
+        let mut restored_bytes = Vec::with_capacity(orig_bytes.len());
+        (&mut f)
+            .take(orig_bytes.len() as u64 + 1)
+            .read_to_end(&mut restored_bytes)
+            .map_err(|e| e.to_string())?;
+        if restored_bytes != orig_bytes {
+            return Err("restored .git/config bytes differ from snapshot".to_string());
+        }
+        let installed = fs::symlink_metadata(git_cfg_path).map_err(|e| e.to_string())?;
+        if !installed.is_file() {
+            return Err("restored .git/config is not a regular file".to_string());
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let staged = f.metadata().map_err(|e| e.to_string())?;
+            if (installed.dev(), installed.ino()) != (staged.dev(), staged.ino())
+                || installed.mode() & 0o777 != orig_mode & 0o777
+            {
+                return Err("restored .git/config identity or mode changed".to_string());
+            }
+        }
+        #[cfg(not(unix))]
+        if fs::read(git_cfg_path).map_err(|e| e.to_string())? != orig_bytes {
+            return Err("restored .git/config path differs from snapshot".to_string());
+        }
+        Ok(())
+    })();
+    if restore.is_err() {
         let _ = fs::remove_file(&tmp);
-        return Err(e.to_string());
     }
-    Ok(())
+    restore
 }
 
 fn exit_code_from_status(status: std::process::ExitStatus) -> ExitCode {

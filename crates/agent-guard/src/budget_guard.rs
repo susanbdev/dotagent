@@ -9,7 +9,7 @@
 //! - Repetitive token stuffing & cumulative per-turn context exhaustion
 
 use std::fs::File;
-use std::io::Read;
+use std::io::{ErrorKind, Read};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::UNIX_EPOCH;
@@ -651,8 +651,15 @@ fn read_policy_ir_plugin_pins(
     repo_root: &Path,
 ) -> Result<Vec<(String, String)>, (&'static str, String)> {
     let ir_path = repo_root.join("dist/profiles/policy_ir.json");
-    let Ok(meta) = std::fs::symlink_metadata(&ir_path) else {
-        return Ok(Vec::new());
+    let meta = match std::fs::symlink_metadata(&ir_path) {
+        Ok(meta) => meta,
+        Err(e) if e.kind() == ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => {
+            return Err((
+                "PLUGIN_INTEGRITY_VIOLATION",
+                format!("Cannot inspect 'dist/profiles/policy_ir.json': {e}"),
+            ));
+        }
     };
     if meta.file_type().is_symlink() || !meta.file_type().is_file() || meta.len() > 262_144 {
         return Err((
@@ -711,9 +718,11 @@ fn read_policy_ir_plugin_pins(
 
 pub fn repo_has_configured_plugins(repo_root: &Path, profile: &RuntimeProfile) -> bool {
     !profile.pinned_plugins.is_empty()
-        || std::fs::symlink_metadata(repo_root.join("profiles/plugins")).is_ok()
-        || read_policy_ir_plugin_pins(repo_root).is_ok_and(|p| !p.is_empty())
-        || read_policy_ir_plugin_pins(repo_root).is_err()
+        || !matches!(
+            std::fs::symlink_metadata(repo_root.join("profiles/plugins")),
+            Err(e) if e.kind() == ErrorKind::NotFound
+        )
+        || !read_policy_ir_plugin_pins(repo_root).is_ok_and(|pins| pins.is_empty())
 }
 
 pub fn load_verified_profile_plugins(
@@ -731,16 +740,16 @@ pub fn load_verified_profile_plugins(
         pins.entry(k).or_insert(h);
     }
     let dir = repo_root.join("profiles/plugins");
-    let dir_exists = std::fs::symlink_metadata(&dir).is_ok();
-    if pins.is_empty() && !dir_exists {
-        return Ok(Vec::new());
-    }
-    let dir_meta = std::fs::symlink_metadata(&dir).map_err(|_| {
-        (
-            "PLUGIN_INTEGRITY_VIOLATION",
-            "Pinned 'profiles/plugins/' directory missing.".to_string(),
-        )
-    })?;
+    let dir_meta = match std::fs::symlink_metadata(&dir) {
+        Ok(meta) => meta,
+        Err(e) if pins.is_empty() && e.kind() == ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => {
+            return Err((
+                "PLUGIN_INTEGRITY_VIOLATION",
+                format!("Cannot inspect 'profiles/plugins': {e}"),
+            ));
+        }
+    };
     if dir_meta.file_type().is_symlink() || !dir_meta.is_dir() {
         return Err((
             "PLUGIN_INTEGRITY_VIOLATION",

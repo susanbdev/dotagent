@@ -45,6 +45,12 @@ fn parse_str_array(raw: &str) -> Result<Vec<String>, String> {
         .collect()
 }
 
+fn parse_smoke_bool(key: &str, value: &str) -> Result<bool, String> {
+    value
+        .parse::<bool>()
+        .map_err(|_| format!("SMOKE_CONFIG_INVALID: '{key}' must be a TOML boolean"))
+}
+
 fn extract_wrangler_main(cfg_name: &str, text: &str) -> Result<String, String> {
     if cfg_name.ends_with(".toml") {
         let stripped = strip_code_comments_preserve_lines(text, true);
@@ -141,8 +147,12 @@ pub fn verify_repo_smoke_gate(repo_root: &Path) -> Result<SmokeGateReport, Strin
                 match (k.trim(), v.trim()) {
                     ("required_artifacts", val) => req_artifacts = parse_str_array(val)?,
                     ("allowed_facade_globs", val) => exempt = parse_str_array(val)?,
-                    ("scan_facade_tokens", val) => scan_facade = val == "true",
-                    ("wrangler_auto_detect", val) => detect_wrangler = val == "true",
+                    (key @ "scan_facade_tokens", val) => {
+                        scan_facade = parse_smoke_bool(key, val)?;
+                    }
+                    (key @ "wrangler_auto_detect", val) => {
+                        detect_wrangler = parse_smoke_bool(key, val)?;
+                    }
                     (other, _) => {
                         return Err(format!("SMOKE_CONFIG_INVALID: unknown key '{other}'"));
                     }
@@ -159,7 +169,13 @@ pub fn verify_repo_smoke_gate(repo_root: &Path) -> Result<SmokeGateReport, Strin
 
     let mut verified = BTreeMap::new();
     for rel in &req_artifacts {
-        verify_smoke_artifact(&canon, rel, ".dotagent-smoke.toml", &mut verified)?;
+        verify_smoke_artifact(
+            &canon,
+            rel,
+            ".dotagent-smoke.toml",
+            &mut verified,
+            std::io::sink(),
+        )?;
     }
 
     if detect_wrangler {
@@ -187,18 +203,19 @@ pub fn verify_repo_smoke_gate(repo_root: &Path) -> Result<SmokeGateReport, Strin
             let text = fs::read_to_string(&p)
                 .map_err(|e| format!("SMOKE_CONFIG_INVALID: cannot read '{cfg_name}': {e}"))?;
             let main_rel = extract_wrangler_main(&cfg_name, &text)?;
-            let main_full = verify_smoke_artifact(&canon, &main_rel, &cfg_name, &mut verified)?;
+            let mut shim_bytes = Vec::new();
+            verify_smoke_artifact(&canon, &main_rel, &cfg_name, &mut verified, &mut shim_bytes)?;
             let pdir = Path::new(main_rel.trim_start_matches("./"))
                 .parent()
                 .map(|d| d.to_string_lossy().into_owned())
                 .unwrap_or_default();
             for w in collect_wasm_refs(&text, "") {
-                verify_smoke_artifact(&canon, &w, &cfg_name, &mut verified)?;
+                verify_smoke_artifact(&canon, &w, &cfg_name, &mut verified, std::io::sink())?;
             }
-            let shim = fs::read_to_string(&main_full)
+            let shim = String::from_utf8(shim_bytes)
                 .map_err(|e| format!("SMOKE_ARTIFACT_MISSING: cannot read '{main_rel}': {e}"))?;
             for w in collect_wasm_refs(&shim, &pdir) {
-                verify_smoke_artifact(&canon, &w, &main_rel, &mut verified)?;
+                verify_smoke_artifact(&canon, &w, &main_rel, &mut verified, std::io::sink())?;
             }
         }
     }
@@ -251,4 +268,20 @@ pub fn verify_repo_smoke_gate(repo_root: &Path) -> Result<SmokeGateReport, Strin
         smoke_gate_digest: hex_encode(&hasher.finalize()),
         verified_artifacts: verified,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_smoke_bool;
+
+    #[test]
+    fn smoke_config_booleans_require_toml_literals() {
+        for key in ["scan_facade_tokens", "wrangler_auto_detect"] {
+            assert_eq!(parse_smoke_bool(key, "true"), Ok(true));
+            assert_eq!(parse_smoke_bool(key, "false"), Ok(false));
+            for value in ["yes", "1", "\"false\"", "False", ""] {
+                assert!(parse_smoke_bool(key, value).is_err());
+            }
+        }
+    }
 }

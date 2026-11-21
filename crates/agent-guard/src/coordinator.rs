@@ -298,6 +298,28 @@ pub fn ping_coordinator(repo_root: &Path) -> bool {
     }
 }
 
+pub(crate) fn has_trusted_executable_ancestors(path: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        for ancestor in path.ancestors().skip(1) {
+            if ancestor.as_os_str().is_empty() {
+                continue;
+            }
+            let Ok(metadata) = fs::symlink_metadata(ancestor) else {
+                return false;
+            };
+            if metadata.is_dir() && (metadata.permissions().mode() & 0o022) != 0 {
+                return false;
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+    true
+}
+
 pub fn is_trusted_executable_file(path: &Path) -> bool {
     let Ok(meta) = fs::symlink_metadata(path) else {
         return false;
@@ -315,16 +337,8 @@ pub fn is_trusted_executable_file(path: &Path) -> bool {
         }
         // Check every pre-canonicalization directory component so symlinked parent components
         // inside a group- or world-writable directory cannot redirect to another binary.
-        for anc in path.ancestors().skip(1) {
-            if anc.as_os_str().is_empty() {
-                continue;
-            }
-            let Ok(ameta) = fs::symlink_metadata(anc) else {
-                return false;
-            };
-            if ameta.file_type().is_dir() && (ameta.permissions().mode() & 0o022) != 0 {
-                return false;
-            }
+        if !has_trusted_executable_ancestors(path) {
+            return false;
         }
         let Ok(canon) = fs::canonicalize(path) else {
             return false;

@@ -950,14 +950,16 @@ fn check_single_command(
                     if let Some(found) = hit {
                         let canon_found = std::fs::canonicalize(&found).ok();
                         if in_ws
-                            || canon_found
-                                .as_ref()
-                                .is_some_and(|c| c.starts_with(&canonical_root))
+                            || canon_found.as_ref().is_none_or(|c| {
+                                c.starts_with(&canonical_root)
+                                    || !crate::coordinator::is_trusted_executable_file(c)
+                            })
+                            || !crate::coordinator::has_trusted_executable_ancestors(&found)
                         {
                             return Err(CommandViolation {
                                 code: "SELF_TAMPERING_BLOCKED",
                                 detail: format!(
-                                    "Workspace-local or relative `PATH` shadow binary `{}` is forbidden for `{bin}`.",
+                                    "Workspace-local, relative, or untrusted `PATH` binary `{}` is forbidden for `{bin}`.",
                                     found.display()
                                 ),
                                 halt_session: true,

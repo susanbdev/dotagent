@@ -553,29 +553,31 @@ pub(crate) fn verify_smoke_artifact(
     rel: &str,
     hint: &str,
     out: &mut std::collections::BTreeMap<String, String>,
-) -> Result<PathBuf, String> {
-    use std::io::Read as _;
+    mut contents: impl Write,
+) -> Result<(), String> {
+    const MAX_ARTIFACT_BYTES: u64 = 268_435_456;
     let (full, norm) = clean_smoke_rel_nonsymlink(canon, rel)?;
+    let io_error = |e| format!("SMOKE_ARTIFACT_MISSING: '{norm}' ({hint}): {e}");
     let meta = fs::symlink_metadata(&full)
         .map_err(|_| format!("SMOKE_ARTIFACT_MISSING: '{norm}' ({hint}) missing"))?;
-    if meta.file_type().is_symlink()
-        || !meta.file_type().is_file()
-        || meta.len() == 0
-        || meta.len() > 268_435_456
-    {
+    if !meta.is_file() || !(1..=MAX_ARTIFACT_BYTES).contains(&meta.len()) {
         return Err(format!(
             "SMOKE_ARTIFACT_MISSING: '{norm}' ({hint}) empty, oversized, or non-regular"
         ));
     }
-    let mut f =
-        fs::File::open(&full).map_err(|e| format!("SMOKE_ARTIFACT_MISSING: '{norm}': {e}"))?;
+    let mut file = open_smoke_artifact_nofollow(&full).map_err(io_error)?;
+    let opened = file.metadata().map_err(io_error)?;
+    if !opened.is_file() || !same_smoke_artifact(&meta, &opened) {
+        return Err(format!(
+            "SMOKE_ARTIFACT_MISSING: '{norm}' ({hint}) changed while opening"
+        ));
+    }
+    let mut reader = (&mut file).take(opened.len() + 1);
     let mut head = Vec::with_capacity(8);
     let mut hasher = Sha256::new();
     let mut buf = [0u8; 65_536];
     loop {
-        let n = f
-            .read(&mut buf)
-            .map_err(|e| format!("SMOKE_ARTIFACT_MISSING: '{norm}': {e}"))?;
+        let n = reader.read(&mut buf).map_err(io_error)?;
         if n == 0 {
             break;
         }
@@ -584,6 +586,12 @@ pub(crate) fn verify_smoke_artifact(
             head.extend_from_slice(&buf[..take]);
         }
         hasher.update(&buf[..n]);
+        contents.write_all(&buf[..n]).map_err(io_error)?;
+    }
+    if reader.limit() != 1 || !same_smoke_artifact(&opened, &file.metadata().map_err(io_error)?) {
+        return Err(format!(
+            "SMOKE_ARTIFACT_MISSING: '{norm}' ({hint}) changed while reading"
+        ));
     }
     if norm.ends_with(".wasm") && head.as_slice() != b"\0asm\x01\0\0\0" {
         return Err(format!(
@@ -591,7 +599,50 @@ pub(crate) fn verify_smoke_artifact(
         ));
     }
     out.insert(norm, crate::crypto::hex_encode(&hasher.finalize()));
-    Ok(full)
+    Ok(())
+}
+
+#[cfg(unix)]
+fn open_smoke_artifact_nofollow(path: &Path) -> std::io::Result<File> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let nofollow = crate::traversal_ledger::O_NOFOLLOW_FLAG;
+    if nofollow == 0 {
+        return Err(std::io::ErrorKind::Unsupported.into());
+    }
+    // A replacement FIFO must not block the open before the descriptor can be checked.
+    let nonblock = if cfg!(target_os = "macos") {
+        0x4
+    } else {
+        0o4000
+    };
+    fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(nofollow | nonblock)
+        .open(path)
+}
+
+#[cfg(not(unix))]
+fn open_smoke_artifact_nofollow(_path: &Path) -> std::io::Result<File> {
+    Err(std::io::ErrorKind::Unsupported.into())
+}
+
+#[cfg(unix)]
+fn same_smoke_artifact(before: &fs::Metadata, after: &fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+
+    before.dev() == after.dev()
+        && before.ino() == after.ino()
+        && before.size() == after.size()
+        && before.mtime() == after.mtime()
+        && before.mtime_nsec() == after.mtime_nsec()
+        && before.ctime() == after.ctime()
+        && before.ctime_nsec() == after.ctime_nsec()
+}
+
+#[cfg(not(unix))]
+fn same_smoke_artifact(_before: &fs::Metadata, _after: &fs::Metadata) -> bool {
+    false
 }
 
 pub(crate) fn recent_or_dirty_repo_paths(canon_repo: &Path) -> Result<Vec<String>, String> {
