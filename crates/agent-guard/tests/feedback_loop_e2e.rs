@@ -751,6 +751,8 @@ fn signed_append_only_queue_credential_airlock_post_fix_copilot_and_two_strike_b
     assert!(
         Command::new("git")
             .current_dir(&repo)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
             .args(["push", "-u", "origin", "main"])
             .status()
             .expect("push")
