@@ -101,6 +101,7 @@ const SCRUBBED_ENV_VARS: &[&str] = &[
     "AGENT_GUARD_ALLOW_INTERPRETER",
     "AGENT_GUARD_ALLOW_DEPUTY",
     "AGENT_GUARD_INTERNAL_SBX_TOKEN",
+    "DOTAGENT_RECEIPT_SEED_HEX",
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -513,7 +514,7 @@ pub fn run_exec_sandbox_cli(args: &[String], default_cwd: &Path) -> ExitCode {
         return ExitCode::from(2);
     }
     if opts.deny_net
-        && require_kernel
+        && (require_kernel || mode.is_kernel_enforced())
         && let Err(seccomp_err) = net_filter_res
     {
         eprintln!(
@@ -1277,6 +1278,12 @@ fn apply_linux_landlock(
                 }
             }
         }
+        let home_gitconfig = home.join(".gitconfig");
+        if fs::symlink_metadata(&home_gitconfig)
+            .is_ok_and(|m| m.file_type().is_file() && !m.file_type().is_symlink())
+        {
+            add_path(&home_gitconfig, file_ro_access);
+        }
         for ro_tool in [
             ".nvm",
             ".volta",
@@ -1577,7 +1584,7 @@ fn render_macos_seatbelt_profile(
     }
     if !home_s.is_empty() {
         p.push_str(&format!(
-            "(deny file-read* file-write* (subpath \"{home_s}/.ssh\") (subpath \"{home_s}/.aws\") (subpath \"{home_s}/.gnupg\") (subpath \"{home_s}/.config/gh\") (subpath \"{home_s}/Library/Keychains\") (subpath \"{home_s}/.local/state/agent-guard\"))\n"
+            "(deny file-read* file-write* (subpath \"{home_s}/.ssh\") (subpath \"{home_s}/.aws\") (subpath \"{home_s}/.gnupg\") (subpath \"{home_s}/.config/gh\") (subpath \"{home_s}/Library/Keychains\"))\n(deny file-read-data file-write* (subpath \"{home_s}/.local/state/agent-guard\"))\n"
         ));
     }
     let active_state_base = crate::traversal_ledger::state_base_dir();
@@ -1585,7 +1592,7 @@ fn render_macos_seatbelt_profile(
     let sb_s = escape_sbpl_literal(&canon_state_base.to_string_lossy());
     if !sb_s.is_empty() {
         p.push_str(&format!(
-            "(deny file-read* file-write* (subpath \"{sb_s}\"))\n"
+            "(deny file-read-data file-write* (subpath \"{sb_s}\"))\n"
         ));
     }
     if opts.invokes_swarm_tool {

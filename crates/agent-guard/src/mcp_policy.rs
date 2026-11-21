@@ -100,8 +100,35 @@ const READONLY_PREFIXES: &[&str] = &[
 
 const WORKSPACE_WRITE_EXACT: &[&str] = &["dotagent_edit_file"];
 
+/// Splits an MCP method name on both non-alphanumeric delimiters and camelCase boundaries
+/// (`get_and_deleteAll` -> `["get", "and", "delete", "all"]`, `read_deleteFile` -> `["read", "delete", "file"]`).
+fn split_identifier_subtokens(raw: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut cur = String::new();
+    let mut prev_lower_or_digit = false;
+    for ch in raw.trim().chars() {
+        if !ch.is_ascii_alphanumeric() {
+            if !cur.is_empty() {
+                tokens.push(std::mem::take(&mut cur));
+            }
+            prev_lower_or_digit = false;
+            continue;
+        }
+        if ch.is_ascii_uppercase() && prev_lower_or_digit && !cur.is_empty() {
+            tokens.push(std::mem::take(&mut cur));
+        }
+        cur.push(ch.to_ascii_lowercase());
+        prev_lower_or_digit = ch.is_ascii_lowercase() || ch.is_ascii_digit();
+    }
+    if !cur.is_empty() {
+        tokens.push(cur);
+    }
+    tokens
+}
+
 /// Deterministically classifies an `mcp__susanbdev__<sub_method>` or `mcp-gateway` tool name.
-/// Unknown or compound (`get_and_delete`) methods fail closed as `McpRpcClass::ExternalMutation`.
+/// Unknown or compound (`get_and_delete`, `get_and_deleteAll`, `read_deleteFile`) methods fail
+/// closed as `McpRpcClass::ExternalMutation`.
 pub fn classify_mcp_sub_method(sub_method: &str) -> McpRpcClass {
     let lower = sub_method.trim().to_ascii_lowercase();
     if lower.is_empty() {
@@ -112,13 +139,13 @@ pub fn classify_mcp_sub_method(sub_method: &str) -> McpRpcClass {
         return McpRpcClass::WorkspaceWrite;
     }
 
-    // Compound smuggling guard: if ANY token in the method identifier is a mutating verb
-    // (e.g., `get_and_delete_repo`, `read_then_push`), fail closed to `ExternalMutation`!
-    let has_mutating_segment = lower
-        .split(|c: char| !c.is_ascii_alphanumeric())
-        .filter(|seg| !seg.is_empty())
-        .any(|seg| MUTATING_TOKENS.contains(&seg));
-    if has_mutating_segment {
+    // Compound & camelCase smuggling guard: if ANY subtoken in the method identifier is a mutating
+    // verb (e.g., `get_and_delete_repo`, `get_and_deleteAll`, `read_deleteFile`), fail closed!
+    let subtokens = split_identifier_subtokens(sub_method);
+    if subtokens
+        .iter()
+        .any(|seg| MUTATING_TOKENS.contains(&seg.as_str()))
+    {
         return McpRpcClass::ExternalMutation;
     }
 
@@ -154,11 +181,11 @@ pub fn authorize_mcp_rpc_invocation(
                     false,
                 ));
             }
-            if session_tainted && full_tool_name.to_ascii_lowercase().starts_with("mcp__") {
+            if session_tainted {
                 return Err((
                     "TAINTED_EXTERNAL_MUTATION_BLOCKED",
                     format!(
-                        "Tainted session cannot invoke remote workspace-write MCP tool '{full_tool_name}' (confused-deputy prevention)."
+                        "Tainted session cannot invoke workspace-write MCP tool '{full_tool_name}' (confused-deputy prevention)."
                     ),
                     true,
                 ));
@@ -215,11 +242,14 @@ mod tests {
             classify_mcp_sub_method("update_issue"),
             McpRpcClass::ExternalMutation
         );
-        // Compound verb smuggling (`get_*` prefix + `delete` segment) -> ExternalMutation!
-        assert_eq!(
-            classify_mcp_sub_method("get_and_delete_pr"),
-            McpRpcClass::ExternalMutation
-        );
+        // Compound & camelCase verb smuggling (`get_*` / `read_*` prefix + mutating verb) -> ExternalMutation!
+        for smuggled in ["get_and_delete_pr", "get_and_deleteAll", "read_deleteFile"] {
+            assert_eq!(
+                classify_mcp_sub_method(smuggled),
+                McpRpcClass::ExternalMutation,
+                "failed on {smuggled}"
+            );
+        }
         // Unknown method -> fail-closed ExternalMutation!
         assert_eq!(
             classify_mcp_sub_method("reconfigure_mesh_fabric"),
@@ -251,7 +281,18 @@ mod tests {
         .expect_err("must block");
         assert_eq!(err_ro.0, "PROFILE_WRITE_TOOLS_DISABLED");
 
-        // Remote write_file and merge_pr blocked under tainted coding-agent session with halt=true
+        // Local dotagent_edit_file AND remote mutating RPCs blocked under tainted session with halt=true
+        let err_local_taint = authorize_mcp_rpc_invocation(
+            "dotagent_edit_file",
+            "dotagent_edit_file",
+            false,
+            true,
+            "coding-agent",
+        )
+        .expect_err("must block tainted local edit");
+        assert_eq!(err_local_taint.0, "TAINTED_EXTERNAL_MUTATION_BLOCKED");
+        assert!(err_local_taint.2);
+
         for method in [
             "merge_pr",
             "write_file",

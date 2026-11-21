@@ -274,6 +274,17 @@ pub fn load_or_init_ed25519_signing_key(repo_root: &Path) -> Result<ZeroizingKey
         );
     }
 
+    if let Ok(explicit_seed) = std::env::var("DOTAGENT_RECEIPT_SEED_HEX") {
+        let trimmed = explicit_seed.trim();
+        if !trimmed.is_empty() {
+            let mut seed = hex_decode_32(trimmed)
+                .map_err(|e| format!("invalid DOTAGENT_RECEIPT_SEED_HEX: {e}"))?;
+            let zk = ZeroizingKey::new(seed);
+            crate::crypto::zeroize_slice(&mut seed);
+            return Ok(zk);
+        }
+    }
+
     let lock_path = swarm_locks_dir()?.join("stop_receipt_ed25519_vault.lock");
     let _guard = ExclusiveFileLockGuard::acquire(&lock_path)?;
 
@@ -636,6 +647,12 @@ pub fn issue_verified_stop_receipt(
             ledger.halt_reason.as_deref().unwrap_or("halted")
         ));
     }
+    if ledger.tainted {
+        return Err(format!(
+            "STOP_RECEIPT_LEDGER_TAINTED: session '{sid}' is tainted by untrusted provenance ({})",
+            ledger.taint_reason.as_deref().unwrap_or("tainted")
+        ));
+    }
 
     let epoch_id = crate::coordinator::current_hmac_epoch_id(&canon).unwrap_or(1);
     let (repo_id, head_commit_oid, work_tree_oid, bundle_manifest_sha256) =
@@ -682,13 +699,13 @@ pub fn issue_verified_stop_receipt(
     Ok((receipt, out_path))
 }
 
-/// CLI: `dotagent verify-receipt <receipt.json> [--pubkey <hex|path>] [--repo <dir>] [--repo-id <id>] [--require-untainted]`
+/// CLI: `dotagent verify-receipt <receipt.json> [--pubkey <hex|path>] [--repo <dir>] [--repo-id <id>] [--require-untainted | --allow-tainted]`
 pub fn run_verify_receipt_cli(args: &[String], cwd: &Path) -> ExitCode {
     let mut receipt_arg: Option<PathBuf> = None;
     let mut pubkey_arg: Option<String> = None;
     let mut repo_arg: Option<PathBuf> = None;
     let mut repo_id_override: Option<String> = None;
-    let mut require_untainted = false;
+    let mut require_untainted = true;
 
     let mut i = 0usize;
     while i < args.len() {
@@ -719,6 +736,10 @@ pub fn run_verify_receipt_cli(args: &[String], cwd: &Path) -> ExitCode {
             }
             "--require-untainted" => {
                 require_untainted = true;
+                i += 1;
+            }
+            "--allow-tainted" => {
+                require_untainted = false;
                 i += 1;
             }
             other if !other.starts_with('-') && receipt_arg.is_none() => {

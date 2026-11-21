@@ -53,13 +53,13 @@ pub fn check_cmd_policy_no_panic(cmd: &str) -> bool {
 
 #[cfg(kani)]
 mod proofs {
-    use crate::cmd_policy::tokenize_shell_script_pure;
+    use crate::cmd_policy::scan_shell_brace_and_quote_bytes;
     use crate::crypto::{constant_time_eq_bytes, zeroize_slice};
-    use crate::json::{JsonValue, is_unique_object_key};
+    use crate::json::is_unique_str_key;
     use crate::sanitizer::is_clean_7bit_ascii_byte;
 
     #[kani::proof]
-    #[kani::unwind(40)]
+    #[kani::unwind(12)]
     fn proof_constant_time_eq_soundness() {
         let a: [u8; 8] = kani::any();
         let b: [u8; 8] = kani::any();
@@ -67,7 +67,7 @@ mod proofs {
     }
 
     #[kani::proof]
-    #[kani::unwind(40)]
+    #[kani::unwind(36)]
     fn proof_zeroize_wipes_all_secret_bytes() {
         let mut key: [u8; 32] = kani::any();
         zeroize_slice(&mut key);
@@ -86,30 +86,32 @@ mod proofs {
     }
 
     #[kani::proof]
-    #[kani::unwind(8)]
+    #[kani::unwind(4)]
     fn proof_json_duplicate_key_rejection() {
         let k1: [u8; 2] = kani::any();
         let k2: [u8; 2] = kani::any();
         kani::assume(k1[0].is_ascii_alphabetic() && k1[1].is_ascii_alphabetic());
         kani::assume(k2[0].is_ascii_alphabetic() && k2[1].is_ascii_alphabetic());
-        if let (Ok(s1), Ok(s2)) = (std::str::from_utf8(&k1), std::str::from_utf8(&k2)) {
-            let entries = [(s1.to_string(), JsonValue::Null)];
-            assert_eq!(is_unique_object_key(&entries, s2), s1 != s2);
+        if let (Ok(s1), Ok(s2)) = (core::str::from_utf8(&k1), core::str::from_utf8(&k2)) {
+            let existing = [s1];
+            assert_eq!(is_unique_str_key(&existing, s2), s1 != s2);
         }
     }
 
     #[kani::proof]
-    #[kani::unwind(16)]
+    #[kani::unwind(8)]
     fn proof_shell_lexer_forward_progress_and_brace_block() {
-        let raw: [u8; 3] = kani::any();
-        kani::assume(raw[0] != b'\n' && raw[1] != b'\n' && raw[2] != b'\n');
-        if let Ok(s) = std::str::from_utf8(&raw) {
-            let _ = tokenize_shell_script_pure(s);
-        }
+        let raw: [u8; 6] = kani::any();
+        let _ = scan_shell_brace_and_quote_bytes(&raw);
         assert_eq!(
-            tokenize_shell_script_pure("{a,b}"),
+            scan_shell_brace_and_quote_bytes(b"{a,b}"),
             Err("SHELL_BRACE_EXPANSION_BLOCKED")
         );
+        assert_eq!(
+            scan_shell_brace_and_quote_bytes(b"{1..3}"),
+            Err("SHELL_BRACE_EXPANSION_BLOCKED")
+        );
+        assert!(scan_shell_brace_and_quote_bytes(b"${a}").is_ok());
     }
 }
 

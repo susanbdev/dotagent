@@ -319,6 +319,15 @@ fn commit_registry_with_lock(
         ACTIVE_SLOT_HMAC_DOMAIN,
         &payload,
     )?;
+    let verify_guard = ExclusiveFileLockGuard::acquire(path)?;
+    let persisted = load_registry_unlocked(repo_root, path)?;
+    drop(verify_guard);
+    if persisted.revision < reg.revision {
+        return Err(
+            "ACTIVE_SESSIONS_COMMIT_FAILED: coordinator did not persist updated active_sessions.json revision"
+                .to_string(),
+        );
+    }
     Ok(())
 }
 

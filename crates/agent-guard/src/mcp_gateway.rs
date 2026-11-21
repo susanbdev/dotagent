@@ -470,6 +470,13 @@ pub fn handle_mcp_jsonrpc_message(raw_json: &str, cwd: &Path) -> Option<JsonValu
     };
 
     let id_opt = req.get("id").cloned();
+    if req.get("jsonrpc").and_then(JsonValue::as_str) != Some("2.0") {
+        return Some(jsonrpc_error(
+            id_opt.unwrap_or(JsonValue::Null),
+            -32600,
+            "Invalid Request: jsonrpc version must equal '2.0'",
+        ));
+    }
     let Some(method) = req.get("method").and_then(JsonValue::as_str) else {
         return id_opt.map(|id| jsonrpc_error(id, -32600, "Invalid Request: missing method"));
     };
@@ -793,11 +800,12 @@ fn dispatch_mediated_tool_call(tool_name: &str, args: &JsonValue, cwd: &Path) ->
                 Ok(v) => v,
                 Err(pv) => return mcp_tool_error(pv.code, &pv.detail),
             };
-            if let Some(parent) = valid.canonical_or_norm.parent() {
-                let _ = fs::create_dir_all(parent);
-            }
-            if let Err(e) = fs::write(&valid.canonical_or_norm, new_content.as_bytes()) {
-                return mcp_tool_error("WRITE_IO_ERROR", &format!("failed writing file: {e}"));
+            if let Err(err_msg) = write_workspace_file_nonsymlink_atomic(
+                &repo_root,
+                &valid.canonical_or_norm,
+                new_content.as_bytes(),
+            ) {
+                return mcp_tool_error("WRITE_IO_ERROR", &err_msg);
             }
             if let Decision::Deny { code, reason, .. } = handle_post_edit(path_str, cwd) {
                 return mcp_tool_error(code, &reason);
@@ -1099,6 +1107,90 @@ fn mcp_tool_error(code: &str, detail: &str) -> JsonValue {
         ),
         ("isError".to_string(), JsonValue::Bool(true)),
     ])
+}
+
+fn write_workspace_file_nonsymlink_atomic(
+    repo_root: &Path,
+    dst: &Path,
+    bytes: &[u8],
+) -> Result<(), String> {
+    static EDIT_NONCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    let canon_repo = fs::canonicalize(repo_root).unwrap_or_else(|_| repo_root.to_path_buf());
+    let rel = dst
+        .strip_prefix(&canon_repo)
+        .map_err(|_| "destination path escapes canonical repository root".to_string())?;
+
+    let mut cur = canon_repo;
+    if let Some(rel_parent) = rel.parent() {
+        for comp in rel_parent.components() {
+            let std::path::Component::Normal(seg) = comp else {
+                return Err("disallowed path component in destination".to_string());
+            };
+            cur.push(seg);
+            match fs::symlink_metadata(&cur) {
+                Ok(meta) => {
+                    if meta.file_type().is_symlink() {
+                        return Err(format!(
+                            "SYMLINK_ESCAPE_BLOCKED: ancestor directory '{}' is a symlink",
+                            cur.display()
+                        ));
+                    }
+                    if !meta.file_type().is_dir() {
+                        return Err(format!("ancestor '{}' is not a directory", cur.display()));
+                    }
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    fs::create_dir(&cur).map_err(|ce| {
+                        format!("failed creating directory '{}': {ce}", cur.display())
+                    })?;
+                }
+                Err(e) => {
+                    return Err(format!("failed statting '{}': {e}", cur.display()));
+                }
+            }
+        }
+    }
+
+    if let Ok(meta) = fs::symlink_metadata(dst)
+        && meta.file_type().is_symlink()
+    {
+        return Err(format!(
+            "SYMLINK_ESCAPE_BLOCKED: destination '{}' is a symlink",
+            dst.display()
+        ));
+    }
+
+    let seq = EDIT_NONCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let fname = dst
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("edit.tmp");
+    let tmp_path = cur.join(format!(".{fname}.mcp_tmp.{}.{seq}", std::process::id()));
+    let mut f = fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&tmp_path)
+        .map_err(|e| format!("failed creating atomic temp file: {e}"))?;
+    if let Err(e) = f.write_all(bytes).and_then(|()| f.sync_all()) {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(format!("failed writing temp file: {e}"));
+    }
+    drop(f);
+
+    if let Ok(meta) = fs::symlink_metadata(dst)
+        && meta.file_type().is_symlink()
+    {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(format!(
+            "SYMLINK_ESCAPE_BLOCKED: destination '{}' became a symlink during write",
+            dst.display()
+        ));
+    }
+    if let Err(e) = fs::rename(&tmp_path, dst) {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(format!("failed renaming atomic temp file: {e}"));
+    }
+    Ok(())
 }
 
 fn jsonrpc_ok(id: JsonValue, result: JsonValue) -> JsonValue {

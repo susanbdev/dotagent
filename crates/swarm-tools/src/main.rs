@@ -168,10 +168,28 @@ fn run_dag_cli(repo_root: &Path, cwd: &Path, args: &[String]) -> Result<(), Stri
         allow_amend,
         ..swarm_tools::WaveSupervisorConfig::default()
     };
-    if let Some(ms) = flag_val(args, "--task-timeout-ms").and_then(|s| s.parse::<u64>().ok()) {
+    if let Some(raw_ms) = flag_val(args, "--task-timeout-ms") {
+        let ms = raw_ms
+            .parse::<u64>()
+            .ok()
+            .filter(|&v| v > 0)
+            .ok_or_else(|| {
+                format!(
+                    "INVALID_CLI_ARGUMENT: `--task-timeout-ms` requires a positive integer, got '{raw_ms}'"
+                )
+            })?;
         cfg.task_timeout_ms = ms;
     }
-    if let Some(toks) = flag_val(args, "--max-task-tokens").and_then(|s| s.parse::<usize>().ok()) {
+    if let Some(raw_toks) = flag_val(args, "--max-task-tokens") {
+        let toks = raw_toks
+            .parse::<usize>()
+            .ok()
+            .filter(|&v| v > 0)
+            .ok_or_else(|| {
+                format!(
+                    "INVALID_CLI_ARGUMENT: `--max-task-tokens` requires a positive integer, got '{raw_toks}'"
+                )
+            })?;
         cfg.max_task_tokens = toks;
     }
 

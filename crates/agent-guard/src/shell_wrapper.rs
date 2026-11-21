@@ -382,9 +382,15 @@ fn execute_inside_sandbox(cmd_str: &str, cwd: &Path) -> ExitCode {
             }
         }
     } else {
-        if std::env::var("AGENT_GUARD_REQUIRE_KERNEL").as_deref() == Ok("1") {
+        let repo_root = crate::resolve_repo_root(cwd);
+        let needs_strict_kernel = match crate::budget_guard::load_active_profile(&repo_root) {
+            Ok(prof) => prof.network_access_none || !prof.enable_write_tools,
+            Err(_) => true,
+        };
+        if std::env::var("AGENT_GUARD_REQUIRE_KERNEL").as_deref() == Ok("1") || needs_strict_kernel
+        {
             eprintln!(
-                "[agent-guard-sh HARD DENY :: SANDBOX_BINARY_UNAVAILABLE] Trusted agent-guard binary not found for kernel exec-sandbox."
+                "[agent-guard-sh HARD DENY :: SANDBOX_BINARY_UNAVAILABLE] Trusted agent-guard binary is required to enforce kernel VFS/network isolation for the active profile."
             );
             return ExitCode::from(2);
         }
@@ -423,6 +429,7 @@ fn execute_inside_sandbox(cmd_str: &str, cwd: &Path) -> ExitCode {
             "GIT_TEMPLATE_DIR",
             "GIT_CONFIG_PARAMETERS",
             "AGENT_GUARD_COORDINATOR_SOCK",
+            "DOTAGENT_RECEIPT_SEED_HEX",
         ] {
             fb_cmd.env_remove(var);
         }

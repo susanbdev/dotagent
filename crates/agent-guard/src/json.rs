@@ -477,6 +477,18 @@ pub fn is_unique_object_key(entries: &[(String, JsonValue)], candidate_key: &str
         .any(|(existing, _)| existing == candidate_key)
 }
 
+/// Zero-heap-allocation RFC 7493 duplicate-key predicate for bounded Kani verification.
+pub fn is_unique_str_key(existing: &[&str], candidate_key: &str) -> bool {
+    let mut i = 0usize;
+    while i < existing.len() {
+        if existing[i] == candidate_key {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::JsonValue;

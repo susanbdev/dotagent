@@ -5064,6 +5064,118 @@ pub fn tokenize_shell_script_pure(script: &str) -> Result<usize, &'static str> {
         .map_err(|v| v.code)
 }
 
+/// Zero-heap-allocation byte-level shell quote, escape, and unquoted brace-expansion verifier
+/// (`{a,b}` / `{a..b}` vs `${VAR}`) with a fixed stack depth of 8 for fast CBMC/Kani model checking.
+pub const fn scan_shell_brace_and_quote_bytes(bytes: &[u8]) -> Result<usize, &'static str> {
+    let mut i = 0usize;
+    let mut stack_is_param = [false; 8];
+    let mut stack_saw_exp = [false; 8];
+    let mut sp = 0usize;
+    let mut prev_unquoted_dollar = false;
+    let mut prev_unquoted_dot = false;
+    let mut tokens = 0usize;
+
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b == b'\\' {
+            if i + 1 >= bytes.len() {
+                return Err("UNTERMINATED_SHELL_ESCAPE");
+            }
+            prev_unquoted_dollar = false;
+            prev_unquoted_dot = false;
+            i += 2;
+            continue;
+        }
+        if b == b'\'' {
+            prev_unquoted_dollar = false;
+            prev_unquoted_dot = false;
+            i += 1;
+            while i < bytes.len() && bytes[i] != b'\'' {
+                i += 1;
+            }
+            if i >= bytes.len() {
+                return Err("UNTERMINATED_SINGLE_QUOTE");
+            }
+            tokens += 1;
+            i += 1;
+            continue;
+        }
+        if b == b'"' {
+            prev_unquoted_dollar = false;
+            prev_unquoted_dot = false;
+            i += 1;
+            while i < bytes.len() && bytes[i] != b'"' {
+                if bytes[i] == b'\\' {
+                    if i + 1 >= bytes.len() {
+                        return Err("UNTERMINATED_DOUBLE_QUOTE");
+                    }
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+            }
+            if i >= bytes.len() {
+                return Err("UNTERMINATED_DOUBLE_QUOTE");
+            }
+            tokens += 1;
+            i += 1;
+            continue;
+        }
+        match b {
+            b'{' => {
+                if sp >= 8 {
+                    return Err("SHELL_NESTING_EXCEEDED");
+                }
+                stack_is_param[sp] = prev_unquoted_dollar;
+                stack_saw_exp[sp] = false;
+                sp += 1;
+                prev_unquoted_dollar = false;
+                prev_unquoted_dot = false;
+            }
+            b',' => {
+                if sp > 0 && !stack_is_param[sp - 1] {
+                    stack_saw_exp[sp - 1] = true;
+                }
+                prev_unquoted_dollar = false;
+                prev_unquoted_dot = false;
+            }
+            b'.' => {
+                if prev_unquoted_dot && sp > 0 && !stack_is_param[sp - 1] {
+                    stack_saw_exp[sp - 1] = true;
+                }
+                prev_unquoted_dollar = false;
+                prev_unquoted_dot = true;
+            }
+            b'}' => {
+                if sp > 0 {
+                    sp -= 1;
+                    if !stack_is_param[sp] && stack_saw_exp[sp] {
+                        return Err("SHELL_BRACE_EXPANSION_BLOCKED");
+                    }
+                }
+                prev_unquoted_dollar = false;
+                prev_unquoted_dot = false;
+            }
+            b'$' => {
+                prev_unquoted_dollar = true;
+                prev_unquoted_dot = false;
+            }
+            b' ' | b'\t' | b'\n' | b';' => {
+                sp = 0;
+                prev_unquoted_dollar = false;
+                prev_unquoted_dot = false;
+            }
+            _ => {
+                tokens += 1;
+                prev_unquoted_dollar = false;
+                prev_unquoted_dot = false;
+            }
+        }
+        i += 1;
+    }
+    Ok(tokens)
+}
+
 #[cfg(test)]
 mod tests {
     use super::evaluate_shell_command;

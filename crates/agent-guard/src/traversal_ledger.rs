@@ -1120,7 +1120,12 @@ pub fn append_audit_jsonl(
 }
 
 pub fn compute_session_key_hash(repo_root: &Path, raw_session_id: &str) -> String {
-    let repo_bytes = repo_root.to_string_lossy();
+    let effective_repo = if repo_root.join(".git").is_file() {
+        crate::resolve_common_repo_root(repo_root)
+    } else {
+        repo_root.to_path_buf()
+    };
+    let repo_bytes = effective_repo.to_string_lossy();
     let framed = format!(
         "v2:{}:{}:{}:{}",
         repo_bytes.len(),
