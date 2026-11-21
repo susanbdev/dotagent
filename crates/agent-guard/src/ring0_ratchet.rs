@@ -1699,9 +1699,32 @@ pub fn extract_tag_ssh_signature(raw_tag: &[u8]) -> Option<(Vec<u8>, String)> {
     Some((unsigned_payload, sig_pem))
 }
 
+fn first_ssh_string(encoded: &[u8]) -> Option<&[u8]> {
+    let (length, data) = encoded.split_at_checked(4)?;
+    let length = u32::from_be_bytes(length.try_into().ok()?);
+    data.get(..usize::try_from(length).ok()?)
+}
+
+fn release_signature_uses_fido2_key(sig_pem: &str) -> Option<bool> {
+    let body = sig_pem
+        .trim()
+        .strip_prefix("-----BEGIN SSH SIGNATURE-----")?
+        .strip_suffix("-----END SSH SIGNATURE-----")?;
+    if body.len() > 32_768 {
+        return None;
+    }
+    let decoded = crate::crypto::base64_decode_clean(body, 16_384).ok()?;
+    let public_key = first_ssh_string(decoded.strip_prefix(b"SSHSIG\x00\x00\x00\x01")?)?;
+    let algorithm = first_ssh_string(public_key)?;
+    Some(matches!(
+        algorithm,
+        b"sk-ssh-ed25519@openssh.com" | b"sk-ecdsa-sha2-nistp256@openssh.com"
+    ))
+}
+
 /// Cryptographically verifies an annotated `v*` release tag against `<base_ref>:config/allowed_human_signers`
-/// (`ssh-keygen -Y verify -n git`). When `require_fido2_sk_key` is `true`, non-`sk-*` software SSH keys
-/// in the signer file are rejected so production release tags require a hardware FIDO2 authenticator.
+/// (`ssh-keygen -Y verify -n git`). Production release verification also requires the public key
+/// embedded in the verified SSH signature to use a FIDO2 algorithm.
 pub fn verify_release_tag_signature(
     repo_root: &Path,
     tag_name: &str,
@@ -1761,6 +1784,14 @@ pub fn verify_release_tag_signature(
             "UNSIGNED_RELEASE_TAG_FORBIDDEN: annotated tag '{clean_tag}' lacks an embedded OpenSSH signature"
         ));
     };
+    let hardware_fido2_signer = release_signature_uses_fido2_key(&sig_pem).ok_or_else(|| {
+        format!("INVALID_RELEASE_TAG_SIGNATURE: malformed OpenSSH signature on tag '{clean_tag}'")
+    })?;
+    if require_fido2_sk_key && !hardware_fido2_signer {
+        return Err(format!(
+            "MISSING_HARDWARE_RELEASE_SIGNERS: tag '{clean_tag}' signature does not use a FIDO2 key"
+        ));
+    }
 
     let signers_spec = format!("{base_commit}:config/allowed_human_signers");
     let signers_out = git_cmd(repo_root)
@@ -1772,31 +1803,6 @@ pub fn verify_release_tag_signature(
             "MISSING_RELEASE_SIGNERS: '{signers_spec}' not found on base branch"
         ));
     }
-    let raw_signers = String::from_utf8_lossy(&signers_out.stdout);
-    let mut filtered_lines = Vec::new();
-    let mut any_fido2 = false;
-    for line in raw_signers.lines() {
-        let t = line.trim();
-        if t.is_empty() || t.starts_with('#') {
-            continue;
-        }
-        let is_sk = t.contains("sk-ssh-ed25519@openssh.com")
-            || t.contains("sk-ecdsa-sha2-nistp256@openssh.com");
-        if require_fido2_sk_key && !is_sk {
-            continue;
-        }
-        if is_sk {
-            any_fido2 = true;
-        }
-        filtered_lines.push(format!("{t}\n"));
-    }
-    if filtered_lines.is_empty() {
-        return Err(
-            "MISSING_HARDWARE_RELEASE_SIGNERS: no eligible FIDO2 sk-* signers enrolled in config/allowed_human_signers"
-                .to_string(),
-        );
-    }
-    let signers_content = filtered_lines.concat();
 
     let scratch = crate::traversal_ledger::state_root_dir().join("ratchet-verify");
     ensure_nonsymlink_state_dir(&scratch)?;
@@ -1823,7 +1829,7 @@ pub fn verify_release_tag_signature(
     };
 
     let verify_res = (|| -> Result<String, String> {
-        write_private(&signers_path, signers_content.as_bytes())?;
+        write_private(&signers_path, &signers_out.stdout)?;
         write_private(&sig_path, sig_pem.as_bytes())?;
 
         let find_out = Command::new("ssh-keygen")
@@ -1882,7 +1888,7 @@ pub fn verify_release_tag_signature(
         tag: clean_tag.to_string(),
         target_commit,
         signer_principal,
-        hardware_fido2_signer: any_fido2,
+        hardware_fido2_signer,
     })
 }
 

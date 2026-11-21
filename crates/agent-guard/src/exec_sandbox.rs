@@ -259,13 +259,16 @@ pub fn probe_host_sandbox_mode() -> KernelSandboxMode {
     #[cfg(target_os = "linux")]
     {
         if let Ok(exe) = env::current_exe() {
-            let mut candidates = vec![exe.clone()];
-            if let Some(dir) = exe.parent() {
-                let sib = dir.join("agent-guard");
-                if sib != exe && sib.is_file() {
-                    candidates.insert(0, sib);
+            let mut candidates = Vec::new();
+            for anc in exe.ancestors().skip(1).take(5) {
+                for name in ["agent-guard", "dotagent"] {
+                    let cand = anc.join(name);
+                    if cand != exe && cand.is_file() && !candidates.contains(&cand) {
+                        candidates.push(cand);
+                    }
                 }
             }
+            candidates.push(exe);
             for bin in candidates {
                 if let Ok(out) = Command::new(bin).arg("--probe-landlock-child").output()
                     && out.status.success()
@@ -552,19 +555,62 @@ pub fn run_exec_sandbox_cli(args: &[String], default_cwd: &Path) -> ExitCode {
         .unwrap_or_else(|| "default".to_string());
     let has_swarm_session = effective_session_id.starts_with("swm_");
 
-    // Snapshot `.git/config` digest prior to vetted `git` writes so any `.git` lockfile access
-    // granted for `git add` / `git commit` can never tamper with `.git/config` unnoticed.
+    // Snapshot `.git/config` bytes (<= 256 KiB) and SHA-256 digest prior to execution so any
+    // `.git` lockfile access (or non-Landlock fallback execution) can never tamper with `.git/config`.
+    const MAX_GIT_CFG_SNAPSHOT_BYTES: usize = 262_144;
     let git_cfg_path = common_repo.join(".git/config");
-    let pre_git_cfg_digest = if opts.invokes_git && opts.writes_allowed {
-        fs::read(&git_cfg_path).ok().map(|b| sha256_bytes(&b))
+    let has_git_dir = common_repo.join(".git").is_dir();
+    let (pre_git_cfg_existed, pre_git_cfg_digest, pre_git_cfg_bytes, pre_git_cfg_mode) = if opts
+        .writes_allowed
+        && has_git_dir
+    {
+        match fs::symlink_metadata(&git_cfg_path) {
+            Ok(m) => {
+                if m.file_type().is_symlink()
+                    || !m.file_type().is_file()
+                    || m.len() > MAX_GIT_CFG_SNAPSHOT_BYTES as u64
+                {
+                    eprintln!(
+                        "[AGENT-GUARD HARD DENY :: GIT_CONFIG_UNSAFE] .git/config is a symlink, non-regular, or exceeds {MAX_GIT_CFG_SNAPSHOT_BYTES} bytes"
+                    );
+                    return ExitCode::from(2);
+                }
+                #[cfg(unix)]
+                let mode_bits = {
+                    use std::os::unix::fs::PermissionsExt;
+                    m.permissions().mode() & 0o777
+                };
+                #[cfg(not(unix))]
+                let mode_bits = 0o644u32;
+                match fs::read(&git_cfg_path) {
+                    Ok(bytes) if bytes.len() <= MAX_GIT_CFG_SNAPSHOT_BYTES => {
+                        let digest = sha256_bytes(&bytes);
+                        (true, Some(digest), Some(bytes), mode_bits)
+                    }
+                    _ => {
+                        eprintln!(
+                            "[AGENT-GUARD HARD DENY :: GIT_CONFIG_UNSAFE] failed reading .git/config prior to sandbox execution"
+                        );
+                        return ExitCode::from(2);
+                    }
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => (false, None, None, 0o644),
+            Err(e) => {
+                eprintln!(
+                    "[AGENT-GUARD HARD DENY :: GIT_CONFIG_UNSAFE] cannot stat .git/config: {e}"
+                );
+                return ExitCode::from(2);
+            }
+        }
     } else {
-        None
+        (false, None, None, 0o644)
     };
 
     // Pre-launch the out-of-sandbox Vault Coordinator daemon BEFORE `restrict_self()` so
-    // `swarm-tool` (atomic or inside a `swm_*` worker stage) can authenticate via `ipc/coord.sock`
-    // while `vault/hmac.key` stays 100% kernel-inaccessible (`EACCES`) inside Landlock/Seatbelt!
-    if opts.invokes_swarm_tool || has_swarm_session {
+    // `swarm-tool` or `dotagent feedback submit` can communicate via `ipc/coord.sock`
+    // while `vault/hmac.key` and `feedback/` stay 100% kernel-inaccessible (`EACCES`)!
+    if opts.invokes_swarm_tool || has_swarm_session || opts.invokes_feedback_submit {
         let _ = crate::coordinator::ensure_coordinator_daemon(&common_repo);
         if let Ok(sdir) = crate::breadcrumbs::swarm_state_dir(&common_repo) {
             for sub in ["ipc", "sessions", "spools", "ledger"] {
@@ -763,16 +809,164 @@ pub fn run_exec_sandbox_cli(args: &[String], default_cwd: &Path) -> ExitCode {
     };
 
     if let Some(expected_digest) = pre_git_cfg_digest {
-        let post_digest = fs::read(&git_cfg_path).ok().map(|b| sha256_bytes(&b));
+        let post_digest = fs::symlink_metadata(&git_cfg_path)
+            .ok()
+            .filter(|m| !m.file_type().is_symlink() && m.file_type().is_file())
+            .and_then(|_| fs::read(&git_cfg_path).ok())
+            .map(|b| sha256_bytes(&b));
         if post_digest != Some(expected_digest) {
+            let restored_ok = pre_git_cfg_bytes.as_deref().is_some_and(|orig_bytes| {
+                restore_git_config_atomic(&git_cfg_path, orig_bytes, pre_git_cfg_mode).is_ok()
+            });
+            if !restored_ok {
+                let mut ledger = crate::traversal_ledger::SessionLedger::load_or_create(
+                    &common_repo,
+                    &effective_session_id,
+                );
+                ledger.trip_circuit_breaker(
+                    "GIT_CONFIG_RESTORE_FAILED: .git/config tampered and atomic restore failed"
+                        .to_string(),
+                );
+                let _ = ledger.save_locked(&common_repo);
+                eprintln!(
+                    "[AGENT-GUARD HARD DENY :: GIT_CONFIG_RESTORE_FAILED] .git/config changed during sandbox execution and atomic restore failed; session halted!"
+                );
+                return ExitCode::from(2);
+            }
             eprintln!(
-                "[AGENT-GUARD HARD DENY :: GIT_CONFIG_TAMPERED] .git/config changed during git execution!"
+                "[AGENT-GUARD HARD DENY :: GIT_CONFIG_TAMPERED] .git/config changed during sandbox execution; atomically restored!"
             );
             return ExitCode::from(2);
         }
+    } else if opts.writes_allowed
+        && has_git_dir
+        && !pre_git_cfg_existed
+        && fs::symlink_metadata(&git_cfg_path).is_ok()
+    {
+        if let Ok(meta) = fs::symlink_metadata(&git_cfg_path) {
+            if meta.file_type().is_dir() && !meta.file_type().is_symlink() {
+                let _ = fs::remove_dir_all(&git_cfg_path);
+            } else {
+                let _ = fs::remove_file(&git_cfg_path);
+            }
+        }
+        if fs::symlink_metadata(&git_cfg_path).is_ok() {
+            let mut ledger = crate::traversal_ledger::SessionLedger::load_or_create(
+                &common_repo,
+                &effective_session_id,
+            );
+            ledger.trip_circuit_breaker(
+                "GIT_CONFIG_RESTORE_FAILED: unauthorized .git/config could not be removed"
+                    .to_string(),
+            );
+            let _ = ledger.save_locked(&common_repo);
+            eprintln!(
+                "[AGENT-GUARD HARD DENY :: GIT_CONFIG_RESTORE_FAILED] unauthorized .git/config created and removal failed; session halted!"
+            );
+            return ExitCode::from(2);
+        }
+        eprintln!(
+            "[AGENT-GUARD HARD DENY :: GIT_CONFIG_TAMPERED] unauthorized .git/config created during sandbox execution!"
+        );
+        return ExitCode::from(2);
     }
 
     exit_code
+}
+
+fn restore_git_config_atomic(
+    git_cfg_path: &Path,
+    orig_bytes: &[u8],
+    orig_mode: u32,
+) -> Result<(), String> {
+    use std::io::{Seek as _, Write as _};
+    let parent = git_cfg_path
+        .parent()
+        .ok_or_else(|| "missing .git parent".to_string())?;
+    let pmeta = fs::symlink_metadata(parent).map_err(|e| e.to_string())?;
+    if pmeta.file_type().is_symlink() || !pmeta.file_type().is_dir() {
+        return Err(".git parent is symlink or non-directory".to_string());
+    }
+    if let Ok(meta) = fs::symlink_metadata(git_cfg_path) {
+        if meta.file_type().is_symlink() {
+            let _ = fs::remove_file(git_cfg_path);
+        } else if meta.file_type().is_dir() {
+            let _ = fs::remove_dir_all(git_cfg_path);
+        }
+    }
+    let objs_dir = parent.join("objects");
+    let staging_dir = if fs::symlink_metadata(&objs_dir)
+        .is_ok_and(|m| !m.file_type().is_symlink() && m.file_type().is_dir())
+    {
+        objs_dir.as_path()
+    } else {
+        parent
+    };
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let tmp = staging_dir.join(format!(
+        ".config.dotagent-restore.{}.{nanos}.tmp",
+        std::process::id()
+    ));
+    let mut options = fs::OpenOptions::new();
+    options.create_new(true).read(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    #[cfg(not(unix))]
+    let _ = orig_mode;
+
+    let mut f = options.open(&tmp).map_err(|e| e.to_string())?;
+    let restore = (|| -> Result<(), String> {
+        f.write_all(orig_bytes).map_err(|e| e.to_string())?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            f.set_permissions(fs::Permissions::from_mode(orig_mode & 0o777))
+                .map_err(|e| e.to_string())?;
+        }
+        f.sync_all().map_err(|e| e.to_string())?;
+        fs::rename(&tmp, git_cfg_path).map_err(|e| e.to_string())?;
+
+        // Landlock grants ReadFile to the original inode. Verify replacement bytes
+        // through the open staging handle because reopening the new path may be denied.
+        f.rewind().map_err(|e| e.to_string())?;
+        let mut restored_bytes = Vec::with_capacity(orig_bytes.len());
+        (&mut f)
+            .take(orig_bytes.len() as u64 + 1)
+            .read_to_end(&mut restored_bytes)
+            .map_err(|e| e.to_string())?;
+        if restored_bytes != orig_bytes {
+            return Err("restored .git/config bytes differ from snapshot".to_string());
+        }
+        let installed = fs::symlink_metadata(git_cfg_path).map_err(|e| e.to_string())?;
+        if !installed.is_file() {
+            return Err("restored .git/config is not a regular file".to_string());
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let staged = f.metadata().map_err(|e| e.to_string())?;
+            if (installed.dev(), installed.ino()) != (staged.dev(), staged.ino())
+                || installed.mode() & 0o777 != orig_mode & 0o777
+            {
+                return Err("restored .git/config identity or mode changed".to_string());
+            }
+        }
+        #[cfg(not(unix))]
+        if fs::read(git_cfg_path).map_err(|e| e.to_string())? != orig_bytes {
+            return Err("restored .git/config path differs from snapshot".to_string());
+        }
+        Ok(())
+    })();
+    if restore.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    restore
 }
 
 fn exit_code_from_status(status: std::process::ExitStatus) -> ExitCode {
@@ -1137,6 +1331,24 @@ fn build_child_command(
     cmd.env("PAGER", "cat");
     cmd.env("GIT_PAGER", "cat");
 
+    let canon_ws = fs::canonicalize(repo_root).unwrap_or_else(|_| repo_root.to_path_buf());
+    if let Some(os_path) = env::var_os("PATH") {
+        let filtered: Vec<PathBuf> = env::split_paths(&os_path)
+            .filter(|d| {
+                !d.as_os_str().is_empty()
+                    && d.is_absolute()
+                    && !d.starts_with(repo_root)
+                    && !d.starts_with(cwd)
+                    && !fs::canonicalize(d).is_ok_and(|c| c.starts_with(&canon_ws))
+            })
+            .collect();
+        if filtered.is_empty() {
+            cmd.env("PATH", "/usr/local/bin:/usr/bin:/bin");
+        } else if let Ok(joined) = env::join_paths(filtered) {
+            cmd.env("PATH", joined);
+        }
+    }
+
     if let Some(tmp) = ephemeral_tmp {
         cmd.env("TMPDIR", tmp);
         cmd.env("TEMP", tmp);
@@ -1215,6 +1427,190 @@ fn is_secret_or_forbidden_root_entry(name: &str) -> bool {
         )
 }
 
+#[cfg(target_os = "linux")]
+fn is_secret_or_forbidden_entry(
+    name: &str,
+    depth: usize,
+    full_path: &Path,
+    verified_dist_files: &[PathBuf],
+) -> bool {
+    if depth > 0 && verified_dist_files.iter().any(|p| p == full_path) {
+        return false;
+    }
+    (depth > 0 && name.eq_ignore_ascii_case("agents.md")) || is_secret_or_forbidden_root_entry(name)
+}
+
+#[cfg(target_os = "linux")]
+fn collect_verified_dist_authority_files(canon_repo: &Path) -> Vec<PathBuf> {
+    let manifest = canon_repo.join("dist-verify/manifest.sha256");
+    let Ok(raw) = fs::read_to_string(&manifest) else {
+        return Vec::new();
+    };
+    let root_agents_hex = fs::read(canon_repo.join("AGENTS.md"))
+        .ok()
+        .map(|b| crate::crypto::sha256_hex(&b));
+    let mut out = Vec::new();
+    for line in raw.lines() {
+        let Some((hash, rel)) = line.split_once("  ") else {
+            continue;
+        };
+        let (h, r) = (hash.trim(), rel.trim());
+        if h.len() != 64 || !matches!(r, "dist/AGENTS.md" | "dist/gemini/GEMINI.md") {
+            continue;
+        }
+        let full = canon_repo.join(r);
+        let Ok(bytes) = fs::read(&full) else {
+            continue;
+        };
+        let actual = crate::crypto::sha256_hex(&bytes);
+        let valid = actual == h
+            && match r {
+                "dist/AGENTS.md" => root_agents_hex.as_deref() == Some(actual.as_str()),
+                "dist/gemini/GEMINI.md" => actual == crate::CANONICAL_DIST_GEMINI_SHA256,
+                _ => false,
+            };
+        if valid {
+            out.push(full);
+        }
+    }
+    out
+}
+
+#[cfg(target_os = "linux")]
+fn is_heavy_cargo_build_subdir(canon_repo: &Path, dir: &Path, depth: usize) -> bool {
+    if depth < 2 || !dir.starts_with(canon_repo.join("target")) {
+        return false;
+    }
+    dir.file_name().and_then(|s| s.to_str()).is_some_and(|n| {
+        matches!(
+            n,
+            "deps" | "incremental" | "build" | ".fingerprint" | "examples"
+        )
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn dir_has_forbidden_descendant(
+    dir: &Path,
+    depth: usize,
+    max_depth: usize,
+    scan_budget: &mut usize,
+    canon_repo: &Path,
+    verified_dist: &[PathBuf],
+) -> bool {
+    if is_heavy_cargo_build_subdir(canon_repo, dir, depth) {
+        return false;
+    }
+    if depth > max_depth || *scan_budget == 0 {
+        return true;
+    }
+    *scan_budget -= 1;
+    let Ok(entries) = fs::read_dir(dir) else {
+        return true;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let path = entry.path();
+        if is_secret_or_forbidden_entry(&name, depth, &path, verified_dist) {
+            return true;
+        }
+        let Ok(meta) = fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if !meta.file_type().is_symlink()
+            && meta.file_type().is_dir()
+            && dir_has_forbidden_descendant(
+                &path,
+                depth + 1,
+                max_depth,
+                scan_budget,
+                canon_repo,
+                verified_dist,
+            )
+        {
+            return true;
+        }
+    }
+    false
+}
+
+#[cfg(target_os = "linux")]
+#[allow(clippy::too_many_arguments)]
+fn add_filtered_repo_tree(
+    dir: &Path,
+    depth: usize,
+    max_depth: usize,
+    writes_allowed: bool,
+    canon_repo: &Path,
+    verified_dist: &[PathBuf],
+    ro_access: landlock::BitFlags<landlock::AccessFs>,
+    rw_access: landlock::BitFlags<landlock::AccessFs>,
+    rules: &mut Vec<Result<landlock::PathBeneath<landlock::PathFd>, landlock::RulesetError>>,
+) {
+    use landlock::{AccessFs, BitFlags};
+    let mut scan_budget = 4_096usize;
+    if !dir_has_forbidden_descendant(
+        dir,
+        depth,
+        max_depth,
+        &mut scan_budget,
+        canon_repo,
+        verified_dist,
+    ) {
+        let acc = if writes_allowed { rw_access } else { ro_access };
+        rules.extend(landlock::path_beneath_rules([dir], acc));
+        return;
+    }
+    let dirty_dir_access = if writes_allowed {
+        AccessFs::ReadDir | AccessFs::MakeReg | AccessFs::MakeDir
+    } else {
+        BitFlags::from(AccessFs::ReadDir)
+    };
+    rules.extend(landlock::path_beneath_rules([dir], dirty_dir_access));
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let path = entry.path();
+        let Ok(meta) = fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if meta.file_type().is_symlink()
+            || is_secret_or_forbidden_entry(&name, depth, &path, verified_dist)
+        {
+            continue;
+        }
+        if meta.file_type().is_dir() {
+            if depth < max_depth {
+                add_filtered_repo_tree(
+                    &path,
+                    depth + 1,
+                    max_depth,
+                    writes_allowed,
+                    canon_repo,
+                    verified_dist,
+                    ro_access,
+                    rw_access,
+                    rules,
+                );
+            } else {
+                rules.extend(landlock::path_beneath_rules(
+                    [&path],
+                    BitFlags::from(AccessFs::ReadDir),
+                ));
+            }
+        } else {
+            let f_acc = if writes_allowed {
+                AccessFs::ReadFile | AccessFs::WriteFile | AccessFs::Truncate
+            } else {
+                BitFlags::from(AccessFs::ReadFile)
+            };
+            rules.extend(landlock::path_beneath_rules([&path], f_acc));
+        }
+    }
+}
+
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn is_swarm_mutable_root_artifact(name: &str) -> bool {
     let lower = name.to_ascii_lowercase();
@@ -1231,6 +1627,8 @@ fn is_immutable_control_root_entry(name: &str) -> bool {
         lower.as_str(),
         "agents.md"
             | "review.md"
+            | "profiles"
+            | ".dotagent-smoke.toml"
             | ".claude"
             | ".codex"
             | ".cursor"
@@ -1829,10 +2227,10 @@ fn apply_linux_landlock(
         }
     }
 
-    // 5. Granular `repo_root` rules:
+    // 5. Granular `repo_root` rules with depth-3 recursive secret exclusion:
     //    - `repo_root` itself gets `ReadDir` ONLY so unlisted/secret root files (`.env*`) cannot be read
     //      and immutable root control files (`AGENTS.md`) cannot be overwritten or unlinked!
-    add_path(&canon_repo, dir_list_access);
+    rules.extend(landlock::path_beneath_rules([&canon_repo], dir_list_access));
 
     let capability_rules = capability_write_paths
         .into_iter()
@@ -1869,6 +2267,8 @@ fn apply_linux_landlock(
         }
     }
 
+    let verified_dist = collect_verified_dist_authority_files(&canon_repo);
+
     if let Ok(entries) = fs::read_dir(&canon_repo) {
         for entry in entries.flatten() {
             let name_os = entry.file_name();
@@ -1881,7 +2281,7 @@ fn apply_linux_landlock(
                 continue;
             }
 
-            if is_secret_or_forbidden_root_entry(&name) {
+            if is_secret_or_forbidden_entry(&name, 0, &entry_path, &verified_dist) {
                 // OMITTED: 0 kernel access (`EACCES` on open/read/write)!
                 continue;
             }
@@ -1889,19 +2289,26 @@ fn apply_linux_landlock(
             if name == ".git" {
                 if meta.file_type().is_dir() {
                     if opts.invokes_git && repo_writes_allowed {
+                        for gsub in ["objects", "refs", "logs"] {
+                            let gp = entry_path.join(gsub);
+                            if !gp.exists() {
+                                let _ = fs::create_dir_all(&gp);
+                            }
+                        }
                         // Vetted atomic `git` commands (`git add`, `git commit`, `git checkout -b`)
                         // require `.git/index.lock` and `.git/HEAD.lock` creation/rename inside `.git/`;
                         // `cmd_policy` blocks `git config`/`remote`/`hook`/`-c`, `GIT_CONFIG_COUNT`
-                        // overrides `.git/config`, and `run_exec_sandbox_cli` verifies `.git/config` SHA-256!
-                        add_path(
-                            &entry_path,
+                        // overrides `.git/config`, and `run_exec_sandbox_cli` atomically restores
+                        // `pre_git_cfg_bytes` via temp+rename on any `.git/config` digest drift!
+                        rules.extend(landlock::path_beneath_rules(
+                            [&entry_path],
                             AccessFs::ReadDir
                                 | AccessFs::MakeReg
                                 | AccessFs::RemoveFile
                                 | AccessFs::Refer,
-                        );
+                        ));
                     } else {
-                        add_path(&entry_path, dir_list_access);
+                        rules.extend(landlock::path_beneath_rules([&entry_path], dir_list_access));
                     }
                     if let Ok(git_entries) = fs::read_dir(&entry_path) {
                         for ge in git_entries.flatten() {
@@ -1911,11 +2318,13 @@ fn apply_linux_landlock(
                                 continue; // 0 access to .git/hooks
                             }
                             if gname.eq_ignore_ascii_case("config") {
-                                add_path(&gpath, file_ro_access); // Read-only .git/config
+                                rules
+                                    .extend(landlock::path_beneath_rules([&gpath], file_ro_access));
                                 continue;
                             }
                             let g_access = if (opts.invokes_git && repo_writes_allowed)
-                                || ((opts.invokes_swarm_tool || has_swarm_session)
+                                || (capability_write_paths.is_none()
+                                    && (opts.invokes_swarm_tool || has_swarm_session)
                                     && gname.eq_ignore_ascii_case("info"))
                             {
                                 rw_access
@@ -1924,50 +2333,57 @@ fn apply_linux_landlock(
                             } else {
                                 file_ro_access
                             };
-                            add_path(&gpath, g_access);
+                            rules.extend(landlock::path_beneath_rules([&gpath], g_access));
                         }
                     }
                 } else {
-                    add_path(&entry_path, file_ro_access);
+                    rules.extend(landlock::path_beneath_rules([&entry_path], file_ro_access));
                 }
                 continue;
             }
 
             if is_swarm_mutable_root_artifact(&name) {
-                if opts.invokes_swarm_tool
+                let sw_acc = if opts.invokes_swarm_tool
                     || (has_swarm_session && !name.eq_ignore_ascii_case("PLAN.lock.json"))
                 {
-                    add_path(
-                        &entry_path,
-                        AccessFs::ReadFile | AccessFs::WriteFile | AccessFs::Truncate,
-                    );
+                    AccessFs::ReadFile | AccessFs::WriteFile | AccessFs::Truncate
                 } else {
-                    add_path(&entry_path, file_ro_access);
-                }
+                    file_ro_access
+                };
+                rules.extend(landlock::path_beneath_rules([&entry_path], sw_acc));
                 continue;
             }
 
             if is_immutable_control_root_entry(&name) {
-                if meta.file_type().is_dir() {
-                    add_path(&entry_path, ro_access);
+                let ctl_acc = if meta.file_type().is_dir() {
+                    ro_access
                 } else {
-                    add_path(&entry_path, file_ro_access);
-                }
+                    file_ro_access
+                };
+                rules.extend(landlock::path_beneath_rules([&entry_path], ctl_acc));
                 continue;
             }
 
-            let normal_access = if repo_writes_allowed {
-                if meta.file_type().is_dir() {
-                    rw_access
-                } else {
-                    AccessFs::ReadFile | AccessFs::WriteFile | AccessFs::Truncate
-                }
-            } else if meta.file_type().is_dir() {
-                ro_access
+            if meta.file_type().is_dir() {
+                add_filtered_repo_tree(
+                    &entry_path,
+                    1,
+                    24,
+                    repo_writes_allowed,
+                    &canon_repo,
+                    &verified_dist,
+                    ro_access,
+                    rw_access,
+                    &mut rules,
+                );
             } else {
-                file_ro_access
-            };
-            add_path(&entry_path, normal_access);
+                let f_acc = if repo_writes_allowed {
+                    AccessFs::ReadFile | AccessFs::WriteFile | AccessFs::Truncate
+                } else {
+                    file_ro_access
+                };
+                rules.extend(landlock::path_beneath_rules([&entry_path], f_acc));
+            }
         }
     }
 
@@ -2033,7 +2449,7 @@ fn render_macos_seatbelt_profile(
     }
     if !home_s.is_empty() {
         p.push_str(&format!(
-            "(deny file-read* file-write* (subpath \"{home_s}/.ssh\") (subpath \"{home_s}/.aws\") (subpath \"{home_s}/.gnupg\") (subpath \"{home_s}/.config/gh\") (subpath \"{home_s}/Library/Keychains\") (subpath \"{home_s}/.local/state/agent-guard\"))\n"
+            "(deny file-read* file-write* (subpath \"{home_s}/.ssh\") (subpath \"{home_s}/.aws\") (subpath \"{home_s}/.gnupg\") (subpath \"{home_s}/.config/gh\") (subpath \"{home_s}/.config/dotagent\") (subpath \"{home_s}/Library/Keychains\") (subpath \"{home_s}/.local/state/agent-guard\"))\n"
         ));
     }
     let raw_state_base = crate::traversal_ledger::state_base_dir();
@@ -2159,6 +2575,27 @@ fn render_macos_seatbelt_profile(
             "(deny file-write* (literal \"{repo_s}/PLAN.lock.json\") (literal \"{repo_s}/WORK_LEDGER.jsonl\") (literal \"{repo_s}/.breadcrumbs.jsonl\"))\n"
         ));
     } else {
+        if opts.invokes_feedback_submit
+            && let Ok(raw_sdir) = crate::breadcrumbs::swarm_state_dir(&canon_repo)
+        {
+            if !sb_s.is_empty() {
+                p.push_str(&format!(
+                    "(allow file-read-metadata (subpath \"{sb_s}\"))\n"
+                ));
+            }
+            let sdir = fs::canonicalize(&raw_sdir).unwrap_or(raw_sdir);
+            let ipc_path = sdir.join("ipc");
+            let canon_ipc = fs::canonicalize(&ipc_path).unwrap_or(ipc_path);
+            let ip = escape_sbpl_literal(&canon_ipc.to_string_lossy());
+            p.push_str(&format!(
+                "(allow file-read* file-write* (subpath \"{ip}\"))\n"
+            ));
+            if opts.deny_net {
+                p.push_str(&format!(
+                    "(allow network-outbound (remote unix-socket (subpath \"{ip}\")))\n"
+                ));
+            }
+        }
         p.push_str(&format!(
             "(deny file-write* (literal \"{repo_s}/PLAN.lock.json\") (literal \"{repo_s}/WORK_LEDGER.jsonl\") (literal \"{repo_s}/.breadcrumbs.jsonl\"))\n"
         ));
@@ -2207,7 +2644,7 @@ fn render_macos_seatbelt_profile(
         "(deny file-read* file-write* (regex #\"/\\.env($|\\.)\") (regex #\"\\.(pem|key|p12|pfx)$\") (regex #\"/audit\\.jsonl$\") (subpath \"{repo_s}/.git/hooks\") (subpath \"{repo_s}/node_modules\") (subpath \"{repo_s}/.venv\") (subpath \"{repo_s}/vendor\"))\n"
     ));
     p.push_str(&format!(
-        "(deny file-write* (literal \"{repo_s}/AGENTS.md\") (literal \"{repo_s}/.git/config\") (subpath \"{repo_s}/.guard\") (subpath \"{repo_s}/.claude\") (subpath \"{repo_s}/.codex\") (subpath \"{repo_s}/.cursor\") (subpath \"{repo_s}/.github\") (subpath \"{repo_s}/.cargo\") (literal \"{repo_s}/.gitattributes\") (literal \"{repo_s}/.npmrc\"))\n"
+        "(deny file-write* (literal \"{repo_s}/AGENTS.md\") (literal \"{repo_s}/.dotagent-smoke.toml\") (literal \"{repo_s}/.git/config\") (subpath \"{repo_s}/profiles\") (subpath \"{repo_s}/.guard\") (subpath \"{repo_s}/.claude\") (subpath \"{repo_s}/.codex\") (subpath \"{repo_s}/.cursor\") (subpath \"{repo_s}/.github\") (subpath \"{repo_s}/.cargo\") (literal \"{repo_s}/.gitattributes\") (literal \"{repo_s}/.npmrc\"))\n"
     ));
     p
 }
@@ -2229,5 +2666,73 @@ mod tests {
         assert!(text.ends_with("TAIL_MARKER\n"));
         assert!(text.contains("exec-sandbox drained"));
         assert!(drained.len() < 36_000);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn depth3_landlock_tree_detects_nested_secrets_while_keeping_clean_siblings_fast() {
+        use super::{dir_has_forbidden_descendant, is_secret_or_forbidden_entry};
+        use std::fs;
+        use std::path::{Path, PathBuf};
+
+        let ws = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(Path::parent)
+            .expect("ws")
+            .join("target/test-workspaces/landlock-tree-unit");
+        let _ = fs::remove_dir_all(&ws);
+        fs::create_dir_all(ws.join("apps/web/src")).expect("web/src");
+        fs::create_dir_all(ws.join("apps/api")).expect("api");
+        let dotenv = format!("{}{}", ".", "env");
+        let env_path = ws.join("apps/web").join(&dotenv);
+        fs::write(&env_path, "PORT=1\n").expect("env");
+        fs::write(ws.join("apps/web/src/main.ts"), "export {};\n").expect("main.ts");
+        fs::write(ws.join("apps/api/lib.ts"), "export {};\n").expect("lib.ts");
+
+        assert!(is_secret_or_forbidden_entry(&dotenv, 2, &env_path, &[]));
+        assert!(is_secret_or_forbidden_entry(
+            "AGENTS.md",
+            1,
+            &ws.join("apps/AGENTS.md"),
+            &[]
+        ));
+        assert!(!is_secret_or_forbidden_entry(
+            "AGENTS.md",
+            0,
+            &ws.join("AGENTS.md"),
+            &[]
+        ));
+        assert!(dir_has_forbidden_descendant(
+            &ws.join("apps"),
+            1,
+            24,
+            &mut 4096,
+            &ws,
+            &[]
+        ));
+        assert!(dir_has_forbidden_descendant(
+            &ws.join("apps/web"),
+            2,
+            24,
+            &mut 4096,
+            &ws,
+            &[]
+        ));
+        assert!(!dir_has_forbidden_descendant(
+            &ws.join("apps/web/src"),
+            3,
+            24,
+            &mut 4096,
+            &ws,
+            &[]
+        ));
+        assert!(!dir_has_forbidden_descendant(
+            &ws.join("apps/api"),
+            2,
+            24,
+            &mut 4096,
+            &ws,
+            &[]
+        ));
     }
 }

@@ -51,6 +51,7 @@ jobs:
           PR_AUTHOR_TYPE: ${{ github.event.pull_request.user.type }}
           PR_AUTHOR_ASSOC: ${{ github.event.pull_request.author_association }}
           PR_HEAD_REF: ${{ github.event.pull_request.head.ref }}
+          EVENT_ACTOR: ${{ github.actor }}
         run: |
           set -euo pipefail
           BASE_OID="$(git rev-parse --verify "origin/${BASE_REF}^{commit}")"

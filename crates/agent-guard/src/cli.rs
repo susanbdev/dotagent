@@ -868,6 +868,11 @@ fn run_on_stop(args: &[String], cwd: &Path) -> ExitCode {
         return ExitCode::from(2);
     }
 
+    if let Err(smoke_err) = crate::smoke_gate::verify_repo_smoke_gate(&repo_root) {
+        eprintln!("[AGENT-GUARD ON-STOP FAIL] {smoke_err}");
+        return ExitCode::from(2);
+    }
+
     if std::env::var("AGENT_GUARD_IN_SANDBOX").as_deref() != Ok("1")
         && std::env::var("AGENT_GUARD_WORKER_LOCK").as_deref() != Ok("1")
     {

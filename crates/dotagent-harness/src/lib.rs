@@ -246,8 +246,8 @@ fn find_built_binary(workspace_root: &Path, name: &str) -> Option<PathBuf> {
 }
 
 fn build_workspace_bins(workspace_root: &Path) -> Result<(), String> {
-    let status = Command::new("cargo")
-        .arg("build")
+    let mut cmd = Command::new("cargo");
+    cmd.arg("build")
         .arg("-q")
         .arg("-p")
         .arg("agent-guard")
@@ -256,7 +256,11 @@ fn build_workspace_bins(workspace_root: &Path) -> Result<(), String> {
         .arg("-p")
         .arg("swarm-tools")
         .arg("--manifest-path")
-        .arg(workspace_root.join("Cargo.toml"))
+        .arg(workspace_root.join("Cargo.toml"));
+    if !cfg!(debug_assertions) {
+        cmd.arg("--release");
+    }
+    let status = cmd
         .status()
         .map_err(|e| format!("failed running cargo build for workspace binaries: {e}"))?;
     if !status.success() {

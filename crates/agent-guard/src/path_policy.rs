@@ -44,6 +44,34 @@ pub struct ValidatedPath {
     pub is_root_authority: bool,
 }
 
+pub fn glob_match_path(pat: &str, path: &str) -> bool {
+    let p = pat.trim().trim_start_matches("./").as_bytes();
+    let s = path.trim_start_matches("./").as_bytes();
+    let (mut pi, mut si, mut star_p, mut star_s, mut cross) = (0, 0, None, 0, false);
+    while si < s.len() {
+        if pi + 1 < p.len() && p[pi] == b'*' && p[pi + 1] == b'*' {
+            while pi < p.len() && p[pi] == b'*' {
+                pi += 1;
+            }
+            (star_p, star_s, cross) = (Some(pi), si, true);
+        } else if pi < p.len() && p[pi] == b'*' {
+            (pi, star_p, star_s, cross) = (pi + 1, Some(pi + 1), si, false);
+        } else if pi < p.len() && (p[pi] == s[si] || (p[pi] == b'?' && s[si] != b'/')) {
+            (pi, si) = (pi + 1, si + 1);
+        } else if let Some(sp) = star_p
+            && (cross || s[star_s] != b'/')
+        {
+            (star_s, si, pi) = (star_s + 1, star_s + 1, sp);
+        } else {
+            return false;
+        }
+    }
+    while pi < p.len() && p[pi] == b'*' {
+        pi += 1;
+    }
+    pi == p.len()
+}
+
 pub fn effective_max_walk_depth_for_repo(repo_root: &Path) -> usize {
     if crate::operator::has_active_elevated_lease(repo_root) {
         return crate::swarm_contracts::INVESTIGATOR_MAX_WALK_DEPTH;
@@ -1074,6 +1102,7 @@ fn check_immutable_control_plane(repo_rel: &str) -> Result<(), PathViolation> {
         ".github/",
         ".cargo/",
         ".yarn/",
+        "profiles/",
     ];
     for p in protected_prefixes {
         if lower == p.trim_end_matches('/')
@@ -1094,6 +1123,7 @@ fn check_immutable_control_plane(repo_rel: &str) -> Result<(), PathViolation> {
         "agents.md"
             | "review.md"
             | ".agent-policy.json"
+            | ".dotagent-smoke.toml"
             | ".gitconfig"
             | ".gitattributes"
             | ".envrc"
@@ -1103,6 +1133,7 @@ fn check_immutable_control_plane(repo_rel: &str) -> Result<(), PathViolation> {
     ) || matches!(
         file_name,
         ".gitattributes"
+            | ".dotagent-smoke.toml"
             | ".envrc"
             | ".npmrc"
             | ".yarnrc"

@@ -87,6 +87,7 @@ const READONLY_EXACT_METHODS: &[&str] = &[
     "dotagent_read_file",
     "dotagent_search",
     "dotagent_status",
+    "dotagent_submit_friction",
 ];
 
 const FEEDBACK_TELEMETRY_EXACT: &[&str] = &["dotagent_submit_friction"];

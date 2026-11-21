@@ -4,12 +4,13 @@ version = 4
 
 [[package]]
 name = "agent-guard"
-version = "2.0.0"
+version = "2.1.0"
 dependencies = [
  "crc32fast",
  "ed25519-dalek",
  "hmac",
  "landlock",
+ "regorus",
  "seccompiler",
  "sha2",
 ]
@@ -167,7 +168,7 @@ dependencies = [
 
 [[package]]
 name = "dotagent-compiler"
-version = "2.0.0"
+version = "2.1.0"
 dependencies = [
  "agent-guard",
  "regorus",
@@ -175,7 +176,7 @@ dependencies = [
 
 [[package]]
 name = "dotagent-harness"
-version = "2.0.0"
+version = "2.1.0"
 dependencies = [
  "agent-guard",
 ]
@@ -624,7 +625,7 @@ checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
 
 [[package]]
 name = "swarm-tools"
-version = "2.0.0"
+version = "2.1.0"
 dependencies = [
  "agent-guard",
 ]

@@ -1,4 +1,4 @@
-# `susanbdev/dotagent` -- Agent Guardrails, Skills & Multi-Harness Bundle Specification (`v2.0.0`)
+# `susanbdev/dotagent` -- Agent Guardrails, Skills & Multi-Harness Bundle Specification (`v2.1.0`)
 
 `susanbdev/dotagent` compiles the static `agent-guard` security kernel (`< 1.5 ms` cold CLI start, `< 150 us` warm `coord.sock` RPC), `dotagent` operator/fleet CLI, `agent-guard-sh` mediating wrapper shell, `swarm-tool` multi-worktree DAG supervisor, token-bounded `SKILL.md` modules, and reproducible Policy-IR harness configuration trees for `.claude/`, `.codex/`, `.cursor/`, Gemini CLI, Antigravity, and `prim-dotagent` (`/opt/dotagent`).
 
@@ -37,7 +37,7 @@ Every skill, hook, and configuration compiled from this repository **MUST** upho
 
 ---
 
-## 2. Repository Architecture (`v2.0.0`)
+## 2. Repository Architecture (`v2.1.0`)
 
 ```text
 dotagent/
@@ -62,6 +62,11 @@ dotagent/
 |   |       +-- feedback_loop.rs    # Deduplicated GitHub Issue sync & 6-stage constitutional improvement/merge loop
 |   |       +-- ring0_ratchet.rs    # Mechanical Ring-0 path immutability & monotonic `bypass_corpus.toml` ratchet
 |   |       +-- telemetry.rs        # Human-TTY-only `telemetry <summary|top-denies|rotate|export-otlp>`
+|   |       +-- feedback.rs         # Contained friction ballot kernel & one-way `[AGENTPI_EVENT]` tap
+|   |       +-- plugin_lattice.rs   # Zero-exposure monotonic `PreToolUse` `Rego` + `.toml` quorum lattice
+|   |       +-- ring0_ratchet.rs    # Default-deny `automated-pr` allowlist & `bypass_corpus.toml` ratchet
+|   |       +-- smoke_gate.rs       # Anti-facade `on-stop` smoke gate (`wrangler`, `.wasm`, stub markers)
+|   |       +-- sshsig_touch.rs     # Pure-Rust FIDO2 `sk-ssh-ed25519@openssh.com` `SSHSIG` `UP==1` verifier
 |   |       +-- stop_receipt.rs     # Asymmetric Ed25519 `StopReceipt` attestation & `verify-receipt`
 |   |       +-- mcp_gateway.rs      # Local JSON-RPC 2.0 mediating MCP proxy with PKCE S256 & Ed25519 DPoP
 |   |       +-- mcp_policy.rs       # Declarative Per-RPC MCP Capability Manifest (fail-closed ExternalMutation)
