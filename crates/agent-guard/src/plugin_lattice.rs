@@ -27,14 +27,18 @@ pub enum VerdictLevel {
 
 impl VerdictLevel {
     pub const fn from_u8(v: u8) -> Option<Self> {
-        match v {
-            0 => Some(Self::Allow),
-            1 => Some(Self::EmitSignal),
-            2 => Some(Self::RequireVoteQuorum),
-            3 => Some(Self::RequireHumanTouch),
-            4 => Some(Self::Deny),
-            5 => Some(Self::HaltSession),
-            _ => None,
+        const ALL: [VerdictLevel; 6] = [
+            VerdictLevel::Allow,
+            VerdictLevel::EmitSignal,
+            VerdictLevel::RequireVoteQuorum,
+            VerdictLevel::RequireHumanTouch,
+            VerdictLevel::Deny,
+            VerdictLevel::HaltSession,
+        ];
+        if (v as usize) < ALL.len() {
+            Some(ALL[v as usize])
+        } else {
+            None
         }
     }
 
@@ -85,11 +89,17 @@ impl HookSnapshot {
         let kb = |k: &str, v: bool| (k.to_string(), JsonValue::Bool(v));
         let ku = |k: &str, v: u64| (k.to_string(), JsonValue::Uint(v));
         let arr = |k: &str, xs: &[String]| {
-            (
-                k.to_string(),
-                JsonValue::Array(xs.iter().cloned().map(JsonValue::Str).collect()),
-            )
+            let v = xs.iter().cloned().map(JsonValue::Str).collect();
+            (k.to_string(), JsonValue::Array(v))
         };
+        let (steps, d60) = (
+            u64::from(self.step_count),
+            u64::from(self.recent_denial_count_60s),
+        );
+        let (banom, qapp) = (
+            u64::from(self.ballot_anomaly_count),
+            self.active_quorum_approvals as u64,
+        );
         JsonValue::Object(vec![
             kv("phase", &self.phase),
             kv("repo_id", &self.repo_id),
@@ -100,16 +110,10 @@ impl HookSnapshot {
             arr("cmd_args_sanitized", &self.cmd_args_sanitized),
             arr("target_rel_paths", &self.target_rel_paths),
             kb("tainted", self.tainted),
-            ku("step_count", u64::from(self.step_count)),
-            ku(
-                "recent_denial_count_60s",
-                u64::from(self.recent_denial_count_60s),
-            ),
-            ku("ballot_anomaly_count", u64::from(self.ballot_anomaly_count)),
-            ku(
-                "active_quorum_approvals",
-                self.active_quorum_approvals as u64,
-            ),
+            ku("step_count", steps),
+            ku("recent_denial_count_60s", d60),
+            ku("ballot_anomaly_count", banom),
+            ku("active_quorum_approvals", qapp),
         ])
     }
 }
