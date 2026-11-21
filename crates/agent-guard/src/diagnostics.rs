@@ -55,6 +55,10 @@ pub enum GuardCode {
     SessionResetDeniedInSandbox,
     AmbiguousToolParamAlias,
     UnrecognizedHmacDomainDenied,
+    Ring0RatchetViolation,
+    FeedbackOperatorOnly,
+    InvalidFeedbackBallot,
+    FeedbackRateLimitExceeded,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -464,6 +468,42 @@ const CATALOG: &[CodeExplanation] = &[
         summary: "`coord.sock` rejected an unknown or unpermitted HMAC domain over IPC.",
         rationale: "Restricts vault HMAC signing and verification strictly to length-prefixed, explicitly allowlisted Swarm v2 record domains.",
         remediation: "Use the official `swarm-tool` role subcommands rather than raw `coord.sock` RPC frames.",
+    },
+    CodeExplanation {
+        variant: GuardCode::Ring0RatchetViolation,
+        code: "RING0_RATCHET_VIOLATION",
+        severity: "HARD_DENY",
+        category: "feedback",
+        summary: "Automated friction PR attempted to modify a Ring-0 constitutional file or weaken the bypass corpus.",
+        rationale: "Autonomous self-improvement loops may only evolve Ring-2 ergonomics/flags/diagnostics and must strictly preserve all Ring-0 files (`AGENTS.md`, `THREAT_MODEL.md`, workflows, Rego, sandbox/Kani primitives) plus monotonically expand `tests/bypass_corpus.toml`.",
+        remediation: "Revert any Ring-0 file edits, keep all pre-existing bypass corpus vectors intact, and append at least 2 adversarial abuse vectors when changing `cmd_policy.rs` or `mcp_policy.rs`.",
+    },
+    CodeExplanation {
+        variant: GuardCode::FeedbackOperatorOnly,
+        code: "FEEDBACK_OPERATOR_ONLY",
+        severity: "HARD_DENY",
+        category: "feedback",
+        summary: "Privileged `dotagent feedback` queue/loop subcommand was invoked from an AI agent or sandbox.",
+        rationale: "Agents may submit friction ballots (`dotagent feedback submit`), but queue inspection, GitHub issue syncing, triage, and autonomous merge loops are restricted to operator/CI contexts.",
+        remediation: "Use `dotagent feedback submit` as an agent, or run `sync-github` / `run-loop` from an operator terminal or authorized CI workflow.",
+    },
+    CodeExplanation {
+        variant: GuardCode::InvalidFeedbackBallot,
+        code: "INVALID_FEEDBACK_BALLOT",
+        severity: "HARD_DENY",
+        category: "feedback",
+        summary: "Friction ballot failed schema, category, denial_id format, or ASCII validation.",
+        rationale: "Prevents prompt-injection payloads, shell metacharacters, or malformed fields from entering the feedback spool.",
+        remediation: "Pass `--denial-id <dnl_hex>` from the guard denial message, a valid `--category`, and optional `--reason-code <token>`.",
+    },
+    CodeExplanation {
+        variant: GuardCode::FeedbackRateLimitExceeded,
+        code: "FEEDBACK_RATE_LIMIT_EXCEEDED",
+        severity: "HARD_DENY",
+        category: "feedback",
+        summary: "Session exceeded the per-session friction ballot submission ceiling (> 8 submissions; disk writes halted).",
+        rationale: "Prevents runaway retry loops or compromised subagents from exhausting disk space under ~/.local/state/agent-guard/feedback.",
+        remediation: "Stop submitting duplicate friction ballots in a loop and proceed with a compliant alternative or report the block to the user.",
     },
 ];
 

@@ -710,7 +710,9 @@ pub fn check_forbidden_zones_lexical(
             || (seg_lower == "agent-guard"
                 && (next_seg.eq_ignore_ascii_case("swarm")
                     || next_seg.eq_ignore_ascii_case("sessions")
-                    || next_seg.eq_ignore_ascii_case("vault")))
+                    || next_seg.eq_ignore_ascii_case("vault")
+                    || next_seg.eq_ignore_ascii_case("feedback")
+                    || next_seg.eq_ignore_ascii_case("daemon")))
             || (seg_lower == "swarm"
                 && (next_seg.eq_ignore_ascii_case("vault")
                     || next_seg.eq_ignore_ascii_case("sessions")
@@ -719,9 +721,13 @@ pub fn check_forbidden_zones_lexical(
                     || next_seg.eq_ignore_ascii_case("locks")))
             || seg_lower == "hmac.key"
             || seg_lower == "coord.sock"
+            || seg_lower == "hook.sock"
             || seg_lower.ends_with(".spool")
             || seg_lower.ends_with(".spool.quarantine")
             || seg_lower == "audit.jsonl"
+            || seg_lower == "ballots.jsonl"
+            || seg_lower == "quarantine.jsonl"
+            || seg_lower == "agentpi_events.jsonl"
         {
             return Err(PathViolation {
                 code: "FORBIDDEN_GUARD_STATE_PATH",
@@ -737,6 +743,11 @@ pub fn check_forbidden_zones_lexical(
     let active_state = crate::traversal_ledger::state_base_dir();
     if active_state.is_absolute() {
         let mut protected_roots = vec![active_state.clone()];
+        if active_state.file_name().is_some_and(|n| n == "sessions")
+            && let Some(state_parent) = active_state.parent()
+        {
+            protected_roots.push(state_parent.to_path_buf());
+        }
         let mut anc = active_state.parent();
         while let Some(p) = anc {
             if let Some(name) = p.file_name().and_then(|s| s.to_str())

@@ -55,7 +55,11 @@ dotagent/
 |   |       +-- lib.rs              # Multi-harness lifecycle coordinator & repository auditor
 |   |       +-- cli.rs              # Shared CLI router (`pre-tool`, `post-tool`, `on-stop`, `mcp-gateway`, `fleet`)
 |   |       +-- operator.rs         # `activate`, `deactivate`, `doctor`, & TTY-gated `session-reset`
-|   |       +-- fleet.rs            # Polyrepo `fleet <audit|doctor|sync|build-image>` & SLSA `self-verify`
+|   |       +-- fleet.rs            # Polyrepo `fleet <audit|doctor|sync|build-image|configure-github>` & SLSA `self-verify`
+|   |       +-- github_governance.rs # Idempotent GitHub Org/Account Actions, squash-merge, ruleset & label provisioner
+|   |       +-- feedback.rs         # HMAC-signed agent friction ballots, per-agent loop risk counters & `[AGENTPI_EVENT]` stream
+|   |       +-- feedback_loop.rs    # Deduplicated GitHub Issue sync & 6-stage constitutional improvement/merge loop
+|   |       +-- ring0_ratchet.rs    # Mechanical Ring-0 path immutability & monotonic `bypass_corpus.toml` ratchet
 |   |       +-- telemetry.rs        # Human-TTY-only `telemetry <summary|top-denies|rotate|export-otlp>`
 |   |       +-- stop_receipt.rs     # Asymmetric Ed25519 `StopReceipt` attestation & `verify-receipt`
 |   |       +-- mcp_gateway.rs      # Local JSON-RPC 2.0 mediating MCP proxy with PKCE S256 & Ed25519 DPoP

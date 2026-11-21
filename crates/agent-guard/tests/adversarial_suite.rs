@@ -110,8 +110,8 @@ fn blocks_entire_250_plus_bypass_corpus_at_100_percent() {
     let vectors = load_bypass_corpus();
     assert_eq!(
         vectors.len(),
-        315,
-        "Expected exact 315 adversarial bypass vectors, got {}",
+        327,
+        "Expected exact 327 adversarial bypass vectors, got {}",
         vectors.len()
     );
 
@@ -153,6 +153,7 @@ fn blocks_entire_250_plus_bypass_corpus_at_100_percent() {
                     .is_some();
                 uni_bad || inj_bad
             }
+            "mcp" => agent_guard::ring0_ratchet::mcp_corpus_vector_blocked(&vec_item.payload),
             other => panic!("unknown corpus kind '{other}'"),
         };
 

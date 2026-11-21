@@ -1210,7 +1210,7 @@ exclude_slash_tmp = true
 inherit = "all"
 ignore_default_excludes = false
 exclude = ["AWS_*", "GITHUB_*", "GH_*", "ANTHROPIC_*", "OPENAI_*", "GEMINI_*", "*_TOKEN", "*_SECRET", "*_KEY", "AGENT_GUARD_ALLOW_*"]
-include_only = ["PATH", "HOME", "USER", "LOGNAME", "SHELL", "LANG", "LC_*", "TERM", "CARGO_HOME", "RUSTUP_HOME", "XDG_RUNTIME_DIR", "GIT_CONFIG_GLOBAL", "GIT_CONFIG_NOSYSTEM", "AGENT_GUARD_PROFILE", "AGENT_GUARD_ROLE", "AGENT_GUARD_SESSION_ID", "AGENT_GUARD_STATE_DIR", "AGENT_GUARD_COORDINATOR_SOCK", "AGENT_GUARD_HOT_COORD"]
+include_only = ["PATH", "HOME", "USER", "LOGNAME", "SHELL", "LANG", "LC_*", "TERM", "CARGO_HOME", "RUSTUP_HOME", "XDG_RUNTIME_DIR", "GIT_CONFIG_GLOBAL", "GIT_CONFIG_NOSYSTEM", "AGENT_GUARD_PROFILE", "AGENT_GUARD_ROLE", "AGENT_GUARD_SESSION_ID", "AGENT_GUARD_ROOT_SESSION_ID", "AGENT_GUARD_STATE_DIR", "AGENT_GUARD_COORDINATOR_SOCK", "AGENT_GUARD_HOT_COORD"]
 
 [mcp_servers.susanbdev]
 url = {escaped_url}
@@ -1250,6 +1250,14 @@ pub fn render_antigravity_harness_json_from_ir(coding: &ProfileIr) -> String {
             JsonValue::Array(vec![
                 JsonValue::Str("dotagent".to_string()),
                 JsonValue::Str("verify-receipt".to_string()),
+            ]),
+        ),
+        (
+            "feedbackSubmit".to_string(),
+            JsonValue::Array(vec![
+                JsonValue::Str("dotagent".to_string()),
+                JsonValue::Str("feedback".to_string()),
+                JsonValue::Str("submit".to_string()),
             ]),
         ),
         (
@@ -1624,7 +1632,16 @@ fn rego_value_to_plain_string(v: &RegoValue) -> String {
 pub fn verify_executable_spec_sync(repo_root: &Path) -> Result<(), String> {
     let spec_path = repo_root.join("spec.md");
     let cargo_path = repo_root.join("Cargo.toml");
-    if !spec_path.is_file() || !cargo_path.is_file() {
+    let Ok(spec_meta) = fs::symlink_metadata(&spec_path) else {
+        return Ok(());
+    };
+    let Ok(cargo_meta) = fs::symlink_metadata(&cargo_path) else {
+        return Ok(());
+    };
+    if spec_meta.file_type().is_symlink() || cargo_meta.file_type().is_symlink() {
+        return Err("SPEC_DRIFT_DETECTED: spec.md and Cargo.toml must not be symlinks".to_string());
+    }
+    if !spec_meta.file_type().is_file() || !cargo_meta.file_type().is_file() {
         return Ok(());
     }
 
@@ -1645,7 +1662,9 @@ pub fn verify_executable_spec_sync(repo_root: &Path) -> Result<(), String> {
     for line in cargo_text.lines() {
         let trimmed = line.trim().trim_matches(',').trim_matches('"');
         if let Some(crate_name) = trimmed.strip_prefix("crates/") {
-            if !spec_text.contains(crate_name) {
+            let tree_tok = format!("+-- {crate_name}/");
+            let path_tok = format!("crates/{crate_name}");
+            if !spec_text.contains(&tree_tok) && !spec_text.contains(&path_tok) {
                 return Err(format!(
                     "SPEC_DRIFT_DETECTED: workspace crate '{crate_name}' in Cargo.toml is missing from spec.md"
                 ));
@@ -1655,32 +1674,57 @@ pub fn verify_executable_spec_sync(repo_root: &Path) -> Result<(), String> {
 
     // 3. Verify every `.rs` module in `crates/agent-guard/src/` and `crates/agent-guard/src/bin/` is documented in `spec.md`
     let guard_src = repo_root.join("crates/agent-guard/src");
-    if guard_src.is_dir() {
+    if fs::symlink_metadata(&guard_src).is_ok_and(|m| !m.file_type().is_symlink() && m.is_dir()) {
         let entries = fs::read_dir(&guard_src)
             .map_err(|e| format!("failed reading '{}': {e}", guard_src.display()))?;
         for entry in entries.flatten() {
             let p = entry.path();
-            if p.is_file()
+            let ft = entry
+                .file_type()
+                .map_err(|e| format!("cannot stat '{}': {e}", p.display()))?;
+            if ft.is_symlink() {
+                return Err(format!(
+                    "SPEC_DRIFT_DETECTED: symlink '{}' forbidden in crates/agent-guard/src",
+                    p.display()
+                ));
+            }
+            if ft.is_file()
                 && p.extension().is_some_and(|e| e == "rs")
                 && let Some(fname) = p.file_name().and_then(|n| n.to_str())
-                && !spec_text.contains(fname)
             {
-                return Err(format!(
-                    "SPEC_DRIFT_DETECTED: kernel module 'crates/agent-guard/src/{fname}' is undocumented in spec.md"
-                ));
+                let tree_tok = format!("+-- {fname} ");
+                let tree_eol = format!("+-- {fname}\n");
+                let path_tok = format!("src/{fname}");
+                if !spec_text.contains(&tree_tok)
+                    && !spec_text.contains(&tree_eol)
+                    && !spec_text.contains(&path_tok)
+                {
+                    return Err(format!(
+                        "SPEC_DRIFT_DETECTED: kernel module 'crates/agent-guard/src/{fname}' is undocumented in spec.md"
+                    ));
+                }
             }
         }
     }
     let guard_bin = guard_src.join("bin");
-    if guard_bin.is_dir() {
+    if fs::symlink_metadata(&guard_bin).is_ok_and(|m| !m.file_type().is_symlink() && m.is_dir()) {
         let entries = fs::read_dir(&guard_bin)
             .map_err(|e| format!("failed reading '{}': {e}", guard_bin.display()))?;
         for entry in entries.flatten() {
             let p = entry.path();
-            if p.is_file()
+            let ft = entry
+                .file_type()
+                .map_err(|e| format!("cannot stat '{}': {e}", p.display()))?;
+            if ft.is_symlink() {
+                return Err(format!(
+                    "SPEC_DRIFT_DETECTED: symlink '{}' forbidden in crates/agent-guard/src/bin",
+                    p.display()
+                ));
+            }
+            if ft.is_file()
                 && p.extension().is_some_and(|e| e == "rs")
                 && let Some(fname) = p.file_name().and_then(|n| n.to_str())
-                && !spec_text.contains(fname)
+                && !spec_text.contains(&format!("bin/{fname}"))
             {
                 return Err(format!(
                     "SPEC_DRIFT_DETECTED: binary target 'crates/agent-guard/src/bin/{fname}' is undocumented in spec.md"
@@ -1689,11 +1733,18 @@ pub fn verify_executable_spec_sync(repo_root: &Path) -> Result<(), String> {
         }
     }
 
-    // 4. Verify any explicit `crates/<crate>/src/<mod>.rs` path mentioned in `spec.md` or `THREAT_MODEL.md` exists on disk!
+    // 4. Verify any explicit `crates/<crate>/src/<mod>.rs` path mentioned in `spec.md` or `THREAT_MODEL.md` exists on disk as a non-symlink regular file!
     let mut docs_to_check = vec![("spec.md", spec_text)];
     let tm_path = repo_root.join("THREAT_MODEL.md");
-    if let Ok(tm_text) = fs::read_to_string(&tm_path) {
-        docs_to_check.push(("THREAT_MODEL.md", tm_text));
+    if let Ok(tm_meta) = fs::symlink_metadata(&tm_path) {
+        if tm_meta.file_type().is_symlink() {
+            return Err("SPEC_DRIFT_DETECTED: THREAT_MODEL.md must not be a symlink".to_string());
+        }
+        if tm_meta.file_type().is_file()
+            && let Ok(tm_text) = fs::read_to_string(&tm_path)
+        {
+            docs_to_check.push(("THREAT_MODEL.md", tm_text));
+        }
     }
 
     for (doc_label, body) in &docs_to_check {
@@ -1709,9 +1760,11 @@ pub fn verify_executable_spec_sync(repo_root: &Path) -> Result<(), String> {
                 && seen.insert(clean)
             {
                 let candidate = repo_root.join(clean);
-                if !candidate.is_file() {
+                let ok_regular = fs::symlink_metadata(&candidate)
+                    .is_ok_and(|m| !m.file_type().is_symlink() && m.file_type().is_file());
+                if !ok_regular {
                     return Err(format!(
-                        "SPEC_DRIFT_DETECTED: {doc_label} references non-existent Rust file '{clean}'"
+                        "SPEC_DRIFT_DETECTED: {doc_label} references missing or symlinked Rust file '{clean}'"
                     ));
                 }
             }

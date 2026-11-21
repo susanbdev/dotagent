@@ -17,7 +17,7 @@
 //!    - Keyed by `SHA-256(canonical_repo_root || ":" || session_id)`.
 //!    - Stored under `~/.local/state/agent-guard/sessions` (`0700`), never `/tmp` or `~/.cache`.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -33,6 +33,8 @@ use crate::crypto::sha256_hex;
 use crate::json::JsonValue;
 
 pub const MAX_REFERENCE_LEVEL: u8 = 2;
+pub const MAX_RECENT_DENIALS: usize = 32;
+pub const MAX_RECENT_TRACES: usize = 16;
 
 pub type HotLedgerCache = Mutex<BTreeMap<String, (u128, u64, u64, SessionLedger)>>;
 
@@ -59,10 +61,20 @@ pub struct TraversalNode {
     pub was_read: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecentDenialRecord {
+    pub denial_id: String,
+    pub code: String,
+    pub target_bin_or_tool: String,
+    pub canonical_shape: String,
+    pub ts_unix: u64,
+}
+
 #[derive(Debug, Clone)]
 pub struct SessionLedger {
     pub repo_root: String,
     pub session_id: String,
+    pub root_session_id: String,
     pub session_key_hash: String,
     pub turn_nonce: String,
     pub compaction_epoch: usize,
@@ -74,9 +86,50 @@ pub struct SessionLedger {
     pub file_reads: usize,
     pub tool_calls: usize,
     pub nodes: BTreeMap<String, TraversalNode>,
+    pub last_tool_trace_id: Option<String>,
+    pub recent_traces: VecDeque<(String, String)>,
+    pub recent_denials: VecDeque<RecentDenialRecord>,
+    pub ballot_submissions: u32,
+    pub ballot_counts_by_cluster: BTreeMap<String, u32>,
+    pub mcp_readonly_feedback_calls: u32,
+}
+
+pub(crate) fn resolve_default_root_session_id(clean_sid: &str) -> String {
+    for var in [
+        "AGENT_GUARD_ROOT_SESSION_ID",
+        "AGENT_GUARD_PARENT_SESSION_ID",
+    ] {
+        if let Ok(raw) = std::env::var(var) {
+            let trimmed = raw.trim();
+            if !trimmed.is_empty() {
+                let s = sanitize_session_id(trimmed);
+                if !s.is_empty() && s != "default" {
+                    return s;
+                }
+            }
+        }
+    }
+    clean_sid.to_string()
 }
 
 impl SessionLedger {
+    pub fn apply_root_session_override(&mut self, caller_root_sid: Option<&str>) {
+        if self.root_session_id != self.session_id {
+            return;
+        }
+        if let Some(raw) = caller_root_sid {
+            let s = sanitize_session_id(raw.trim());
+            if !s.is_empty() && s != "default" {
+                self.root_session_id = s;
+                return;
+            }
+        }
+        let env_resolved = resolve_default_root_session_id(&self.session_id);
+        if env_resolved != self.session_id {
+            self.root_session_id = env_resolved;
+        }
+    }
+
     /// Acquires an exclusive per-session file lock so concurrent parallel tool hooks
     /// (`pre-tool`, `post-tool`, `pre-compact`, `user-prompt`) serialize state transitions
     /// without lost updates or clobbered circuit-breaker flags.
@@ -88,11 +141,13 @@ impl SessionLedger {
 
     pub fn new(repo_root: &Path, session_id: &str) -> Self {
         let clean_sid = sanitize_session_id(session_id);
+        let root_session_id = resolve_default_root_session_id(&clean_sid);
         let session_key_hash = compute_session_key_hash(repo_root, session_id);
         let turn_nonce = generate_turn_nonce(repo_root, session_id, 0);
         Self {
             repo_root: repo_root.to_string_lossy().into_owned(),
             session_id: clean_sid,
+            root_session_id,
             session_key_hash,
             turn_nonce,
             compaction_epoch: 0,
@@ -104,6 +159,12 @@ impl SessionLedger {
             file_reads: 0,
             tool_calls: 0,
             nodes: BTreeMap::new(),
+            last_tool_trace_id: None,
+            recent_traces: VecDeque::new(),
+            recent_denials: VecDeque::new(),
+            ballot_submissions: 0,
+            ballot_counts_by_cluster: BTreeMap::new(),
+            mcp_readonly_feedback_calls: 0,
         }
     }
 
@@ -272,8 +333,21 @@ impl SessionLedger {
 
     pub fn reset_for_new_user_prompt(repo_root: &Path, session_id: &str) -> Result<Self, String> {
         let _lock = Self::acquire_lock(repo_root, session_id);
-        let fresh = Self::new(repo_root, session_id);
+        let mut fresh = Self::new(repo_root, session_id);
         let path = ledger_file_path_for_hash(&fresh.session_key_hash);
+        if let Ok(Some(raw)) = read_nonsymlink_state_file(&path)
+            && let Some(prev) = Self::from_json(&raw)
+            && (prev.session_key_hash.is_empty() || prev.session_key_hash == fresh.session_key_hash)
+        {
+            if !prev.root_session_id.is_empty() {
+                fresh.root_session_id = prev.root_session_id;
+            }
+            fresh.last_tool_trace_id = prev.last_tool_trace_id;
+            fresh.recent_denials = prev.recent_denials;
+            fresh.ballot_submissions = prev.ballot_submissions;
+            fresh.ballot_counts_by_cluster = prev.ballot_counts_by_cluster;
+            fresh.mcp_readonly_feedback_calls = prev.mcp_readonly_feedback_calls;
+        }
         let serialized = fresh.to_json();
         atomic_write_nonsymlink_state_file(&path, serialized.as_bytes())?;
         Ok(fresh)
@@ -533,6 +607,121 @@ impl SessionLedger {
         self.register_outgoing_pointers(&source_key, targets);
     }
 
+    pub fn record_denial(
+        &mut self,
+        code: &str,
+        tool_name: &str,
+        shape: &str,
+        ts_unix: u64,
+    ) -> String {
+        static DENIAL_SEQ: AtomicU64 = AtomicU64::new(0);
+        let norm_code = code.trim().to_ascii_uppercase();
+        if norm_code.is_empty() {
+            return String::new();
+        }
+        let target_bin_or_tool = extract_target_bin_or_tool(tool_name, shape);
+        let (canonical_shape, _) = crate::feedback::scrub_high_entropy_and_secrets(shape, 120);
+        let seq = DENIAL_SEQ.fetch_add(1, Ordering::Relaxed);
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let id_seed = format!(
+            "dotagent:denial:v2:{}:{}:{}:{}:{}:{}:{}",
+            self.session_key_hash,
+            self.tool_calls,
+            self.recent_denials.len(),
+            seq,
+            nanos,
+            norm_code,
+            canonical_shape
+        );
+        let denial_id = format!("dnl_{}", &sha256_hex(id_seed.as_bytes())[..16]);
+
+        while self.recent_denials.len() >= MAX_RECENT_DENIALS {
+            self.recent_denials.pop_front();
+        }
+        self.recent_denials.push_back(RecentDenialRecord {
+            denial_id: denial_id.clone(),
+            code: norm_code,
+            target_bin_or_tool,
+            canonical_shape,
+            ts_unix,
+        });
+        denial_id
+    }
+
+    pub fn record_allowed_tool_trace(&mut self, tool_name: &str) -> String {
+        static TRACE_SEQ: AtomicU64 = AtomicU64::new(0);
+        let seq = TRACE_SEQ.fetch_add(1, Ordering::Relaxed);
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let norm_tool = if tool_name.trim().is_empty() {
+            "tool"
+        } else {
+            tool_name.trim()
+        };
+        let seed = format!(
+            "dotagent:trace:v2:{}:{}:{}:{}:{}",
+            self.session_key_hash, self.tool_calls, seq, nanos, norm_tool
+        );
+        let trace_id = format!("trc_{}", &sha256_hex(seed.as_bytes())[..16]);
+        self.last_tool_trace_id = Some(trace_id.clone());
+        while self.recent_traces.len() >= MAX_RECENT_TRACES {
+            self.recent_traces.pop_front();
+        }
+        self.recent_traces
+            .push_back((trace_id.clone(), norm_tool.to_string()));
+        trace_id
+    }
+
+    pub fn lookup_trace_by_id(&self, trace_id: &str) -> Option<&str> {
+        let trimmed = trace_id.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+        if let Some((_, tname)) = self
+            .recent_traces
+            .iter()
+            .rev()
+            .find(|(tid, _)| tid == trimmed)
+        {
+            return Some(tname.as_str());
+        }
+        if self.last_tool_trace_id.as_deref() == Some(trimmed) {
+            return Some("tool");
+        }
+        None
+    }
+
+    pub fn lookup_denial_by_id(&self, denial_id: &str) -> Option<&RecentDenialRecord> {
+        let trimmed = denial_id.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+        self.recent_denials
+            .iter()
+            .rev()
+            .find(|d| d.denial_id == trimmed)
+    }
+
+    pub fn has_recent_denial(&self, code: &str) -> bool {
+        let norm = code.trim().to_ascii_uppercase();
+        !norm.is_empty() && self.recent_denials.iter().any(|d| d.code == norm)
+    }
+
+    pub fn record_ballot_submission(&mut self, cluster_key: &str) -> (u32, u32) {
+        self.ballot_submissions = self.ballot_submissions.saturating_add(1);
+        let entry = self
+            .ballot_counts_by_cluster
+            .entry(cluster_key.to_string())
+            .or_insert(0);
+        *entry = entry.saturating_add(1);
+        (*entry, self.ballot_submissions)
+    }
+
     fn to_json(&self) -> String {
         let mut nodes_entries = Vec::with_capacity(self.nodes.len());
         for (k, v) in &self.nodes {
@@ -546,6 +735,43 @@ impl SessionLedger {
             ));
         }
 
+        let denials_arr: Vec<JsonValue> = self
+            .recent_denials
+            .iter()
+            .map(|d| {
+                JsonValue::Object(vec![
+                    ("denial_id".to_string(), JsonValue::Str(d.denial_id.clone())),
+                    ("code".to_string(), JsonValue::Str(d.code.clone())),
+                    (
+                        "target_bin_or_tool".to_string(),
+                        JsonValue::Str(d.target_bin_or_tool.clone()),
+                    ),
+                    (
+                        "canonical_shape".to_string(),
+                        JsonValue::Str(d.canonical_shape.clone()),
+                    ),
+                    ("ts_unix".to_string(), JsonValue::Uint(d.ts_unix)),
+                ])
+            })
+            .collect();
+
+        let traces_arr: Vec<JsonValue> = self
+            .recent_traces
+            .iter()
+            .map(|(tid, tname)| {
+                JsonValue::Object(vec![
+                    ("trace_id".to_string(), JsonValue::Str(tid.clone())),
+                    ("tool_name".to_string(), JsonValue::Str(tname.clone())),
+                ])
+            })
+            .collect();
+
+        let cluster_entries: Vec<(String, JsonValue)> = self
+            .ballot_counts_by_cluster
+            .iter()
+            .map(|(k, v)| (k.clone(), JsonValue::Uint(u64::from(*v))))
+            .collect();
+
         let obj = JsonValue::Object(vec![
             (
                 "repo_root".to_string(),
@@ -554,6 +780,10 @@ impl SessionLedger {
             (
                 "session_id".to_string(),
                 JsonValue::Str(self.session_id.clone()),
+            ),
+            (
+                "root_session_id".to_string(),
+                JsonValue::Str(self.root_session_id.clone()),
             ),
             (
                 "session_key_hash".to_string(),
@@ -596,6 +826,27 @@ impl SessionLedger {
                 JsonValue::Number(self.tool_calls as f64),
             ),
             ("nodes".to_string(), JsonValue::Object(nodes_entries)),
+            (
+                "last_tool_trace_id".to_string(),
+                match &self.last_tool_trace_id {
+                    Some(t) => JsonValue::Str(t.clone()),
+                    None => JsonValue::Null,
+                },
+            ),
+            ("recent_traces".to_string(), JsonValue::Array(traces_arr)),
+            ("recent_denials".to_string(), JsonValue::Array(denials_arr)),
+            (
+                "ballot_submissions".to_string(),
+                JsonValue::Uint(u64::from(self.ballot_submissions)),
+            ),
+            (
+                "ballot_counts_by_cluster".to_string(),
+                JsonValue::Object(cluster_entries),
+            ),
+            (
+                "mcp_readonly_feedback_calls".to_string(),
+                JsonValue::Uint(u64::from(self.mcp_readonly_feedback_calls)),
+            ),
         ]);
 
         obj.to_json_string()
@@ -605,6 +856,12 @@ impl SessionLedger {
         let v = JsonValue::parse(raw).ok()?;
         let repo_root = v.get("repo_root")?.as_str()?.to_string();
         let session_id = v.get("session_id")?.as_str()?.to_string();
+        let root_session_id = v
+            .get("root_session_id")
+            .and_then(JsonValue::as_str)
+            .map(sanitize_session_id)
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| resolve_default_root_session_id(&session_id));
         let session_key_hash = v
             .get("session_key_hash")
             .and_then(JsonValue::as_str)
@@ -653,9 +910,80 @@ impl SessionLedger {
             }
         }
 
+        let last_tool_trace_id = v
+            .get("last_tool_trace_id")
+            .and_then(JsonValue::as_str)
+            .map(String::from);
+
+        let mut recent_traces = VecDeque::new();
+        if let Some(arr) = v.get("recent_traces").and_then(JsonValue::as_array) {
+            for item in arr.iter().take(MAX_RECENT_TRACES) {
+                if let (Some(tid), Some(tname)) = (
+                    item.get("trace_id").and_then(JsonValue::as_str),
+                    item.get("tool_name").and_then(JsonValue::as_str),
+                ) {
+                    recent_traces.push_back((tid.to_string(), tname.to_string()));
+                }
+            }
+        }
+
+        let mut recent_denials = VecDeque::new();
+        if let Some(arr) = v.get("recent_denials").and_then(JsonValue::as_array) {
+            for item in arr.iter().take(MAX_RECENT_DENIALS) {
+                let code_opt = item.get("code").and_then(JsonValue::as_str);
+                let did_opt = item.get("denial_id").and_then(JsonValue::as_str);
+                let tgt_opt = item
+                    .get("target_bin_or_tool")
+                    .or_else(|| item.get("tool_name"))
+                    .and_then(JsonValue::as_str);
+                let shape_opt = item
+                    .get("canonical_shape")
+                    .or_else(|| item.get("normalized_shape"))
+                    .and_then(JsonValue::as_str);
+                if let (Some(c), Some(tgt), Some(sh)) = (code_opt, tgt_opt, shape_opt) {
+                    let ts = item.get("ts_unix").and_then(JsonValue::as_u64).unwrap_or(0);
+                    let did = did_opt.map(String::from).unwrap_or_else(|| {
+                        format!(
+                            "dnl_{}",
+                            &sha256_hex(format!("{session_id}:{c}:{sh}:{ts}").as_bytes())[..16]
+                        )
+                    });
+                    recent_denials.push_back(RecentDenialRecord {
+                        denial_id: did,
+                        code: c.to_string(),
+                        target_bin_or_tool: tgt.to_string(),
+                        canonical_shape: sh.to_string(),
+                        ts_unix: ts,
+                    });
+                }
+            }
+        }
+        let ballot_submissions = v
+            .get("ballot_submissions")
+            .and_then(JsonValue::as_u64)
+            .and_then(|n| u32::try_from(n).ok())
+            .unwrap_or(0);
+        let mut ballot_counts_by_cluster = BTreeMap::new();
+        if let Some(entries) = v
+            .get("ballot_counts_by_cluster")
+            .and_then(JsonValue::as_object)
+        {
+            for (k, cnt_val) in entries {
+                if let Some(cnt) = cnt_val.as_u64().and_then(|n| u32::try_from(n).ok()) {
+                    ballot_counts_by_cluster.insert(k.clone(), cnt);
+                }
+            }
+        }
+        let mcp_readonly_feedback_calls = v
+            .get("mcp_readonly_feedback_calls")
+            .and_then(JsonValue::as_u64)
+            .and_then(|n| u32::try_from(n).ok())
+            .unwrap_or(0);
+
         Some(Self {
             repo_root,
             session_id,
+            root_session_id,
             session_key_hash,
             turn_nonce,
             compaction_epoch,
@@ -667,7 +995,55 @@ impl SessionLedger {
             file_reads,
             tool_calls,
             nodes,
+            last_tool_trace_id,
+            recent_traces,
+            recent_denials,
+            ballot_submissions,
+            ballot_counts_by_cluster,
+            mcp_readonly_feedback_calls,
         })
+    }
+}
+
+pub(crate) fn extract_target_bin_or_tool(tool_name: &str, shape: &str) -> String {
+    let lower_tool = tool_name.trim().to_ascii_lowercase();
+    if matches!(
+        lower_tool.as_str(),
+        "" | "bash" | "sh" | "run_command" | "run_terminal_cmd" | "shell" | "execute_command"
+    ) {
+        for raw_tok in shape.split_whitespace() {
+            let trimmed = raw_tok.trim_matches(|c: char| {
+                matches!(c, '"' | '\'' | '(' | ')' | '{' | '}' | ';' | '|')
+            });
+            if trimmed.is_empty() {
+                continue;
+            }
+            if trimmed.contains('=') && !trimmed.starts_with('-') {
+                continue;
+            }
+            if matches!(trimmed, "env" | "command" | "nohup" | "time") {
+                continue;
+            }
+            let base = trimmed.rsplit('/').next().unwrap_or(trimmed);
+            let clean: String = base
+                .chars()
+                .filter(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-')
+                .take(48)
+                .collect();
+            if !clean.is_empty() {
+                return clean.to_ascii_lowercase();
+            }
+        }
+    }
+    let clean: String = lower_tool
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-')
+        .take(48)
+        .collect();
+    if clean.is_empty() {
+        "guard".to_string()
+    } else {
+        clean
     }
 }
 
@@ -825,6 +1201,19 @@ pub fn state_base_dir() -> PathBuf {
     PathBuf::from(".agent-guard-state")
 }
 
+/// Guard state root: the parent of `.../sessions` for the default layout, or the
+/// `AGENT_GUARD_STATE_DIR` override itself. Every auxiliary state tree (feedback spools, vaults,
+/// ratchet scratch) MUST live under this root so it inherits sandbox self-blindness.
+pub(crate) fn state_root_dir() -> PathBuf {
+    let base = state_base_dir();
+    if base.file_name().is_some_and(|n| n == "sessions")
+        && let Some(parent) = base.parent()
+    {
+        return parent.to_path_buf();
+    }
+    base
+}
+
 pub fn audit_log_path() -> PathBuf {
     let base = state_base_dir();
     if base.file_name().is_some_and(|n| n == "sessions") {
@@ -836,13 +1225,21 @@ pub fn audit_log_path() -> PathBuf {
 }
 
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-const O_NOFOLLOW_FLAG: i32 = 0o400000;
+pub(crate) const O_NOFOLLOW_FLAG: i32 = 0o400000;
 #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
-const O_NOFOLLOW_FLAG: i32 = 0o100000;
+pub(crate) const O_NOFOLLOW_FLAG: i32 = 0o100000;
 #[cfg(target_os = "macos")]
-const O_NOFOLLOW_FLAG: i32 = 0x0100;
+pub(crate) const O_NOFOLLOW_FLAG: i32 = 0x0100;
+#[cfg(not(any(
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ),
+    target_os = "macos"
+)))]
+pub(crate) const O_NOFOLLOW_FLAG: i32 = 0;
 
-fn ensure_nonsymlink_state_dir(dir: &Path) -> Result<(), String> {
+pub(crate) fn ensure_nonsymlink_state_dir(dir: &Path) -> Result<(), String> {
     if let Ok(meta) = fs::symlink_metadata(dir) {
         if meta.file_type().is_symlink() {
             return Err(format!("state directory '{}' is a symlink", dir.display()));
@@ -1067,7 +1464,7 @@ pub fn append_audit_jsonl(
         ("tool".to_string(), JsonValue::Str(tool.to_string())),
         ("code".to_string(), JsonValue::Str(code.to_string())),
         ("halted".to_string(), JsonValue::Bool(halted)),
-        ("detail".to_string(), JsonValue::Str(ascii_detail)),
+        ("detail".to_string(), JsonValue::Str(ascii_detail.clone())),
     ]);
 
     let _audit_lock = ExclusiveFileLockGuard::acquire(&path);
@@ -1117,6 +1514,86 @@ pub fn append_audit_jsonl(
     if let Some(mut file) = file_opt {
         let _ = writeln!(file, "{}", record.to_json_string());
     }
+
+    crate::feedback::record_guard_denial_agentpi_signal(
+        repo_root,
+        &session_hash[..16],
+        tool,
+        code,
+        &ascii_detail,
+        halted,
+        ts_secs,
+    );
+}
+
+/// Host/coordinator-only check verifying whether `(repo_root, session_id)` actually experienced
+/// `expected_code` in `audit.jsonl` (never exposed to agents; preserves `GUARD_SELF_BLINDNESS`).
+pub fn audit_log_has_session_denial(
+    repo_root: &Path,
+    session_id: &str,
+    expected_code: &str,
+) -> bool {
+    use std::io::{Seek, SeekFrom};
+    let norm_code = expected_code.trim().to_ascii_uppercase();
+    if norm_code.is_empty() {
+        return false;
+    }
+    let path = audit_log_path();
+    let Ok(meta) = fs::symlink_metadata(&path) else {
+        return false;
+    };
+    if meta.file_type().is_symlink() || !meta.file_type().is_file() {
+        return false;
+    }
+    let mut opts = OpenOptions::new();
+    opts.read(true);
+    #[cfg(any(
+        all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ),
+        target_os = "macos"
+    ))]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.custom_flags(O_NOFOLLOW_FLAG);
+    }
+    let Ok(mut file) = opts.open(&path) else {
+        return false;
+    };
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let Ok(fm) = file.metadata() else {
+            return false;
+        };
+        if fm.dev() != meta.dev() || fm.ino() != meta.ino() {
+            return false;
+        }
+    }
+    if meta.len() > 262_144 {
+        let _ = file.seek(SeekFrom::End(-262_144));
+    }
+    let mut buf = Vec::new();
+    if file.take(262_144).read_to_end(&mut buf).is_err() {
+        return false;
+    }
+    let raw = String::from_utf8_lossy(&buf);
+    let expected_hash = compute_session_key_hash(repo_root, session_id);
+    let prefix = &expected_hash[..16];
+    for line in raw.lines().rev().take(512) {
+        if let Ok(v) = JsonValue::parse(line) {
+            let sh = v
+                .get("session_hash")
+                .and_then(JsonValue::as_str)
+                .unwrap_or("");
+            let c = v.get("code").and_then(JsonValue::as_str).unwrap_or("");
+            if sh == prefix && c.eq_ignore_ascii_case(&norm_code) {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 pub fn compute_session_key_hash(repo_root: &Path, raw_session_id: &str) -> String {

@@ -2,7 +2,7 @@ name: Zero-Trust Guardrail CI
 
 on:
   push:
-    branches: ["main", "feat/**"]
+    branches: ["main", "feat/**", "auto/**"]
   pull_request:
 
 permissions:
@@ -151,7 +151,11 @@ jobs:
             cargo-kani setup --use-local-bundle "${BUNDLE}"
             rm -f "${BUNDLE}"
           else
-            rustup toolchain install "$(cat "${HOME}/.kani/kani-0.68.0/rust-toolchain-version")" --profile minimal || cargo-kani setup
+            TC_VER="$(tr -d ' \r\n' < "${HOME}/.kani/kani-0.68.0/rust-toolchain-version")"
+            case "${TC_VER}" in
+              *[!0-9A-Za-z._-]*|"") cargo-kani setup ;;
+              *) rustup toolchain install "${TC_VER}" --profile minimal || cargo-kani setup ;;
+            esac
           fi
           cargo kani -p agent-guard
 
@@ -183,4 +187,57 @@ jobs:
       - name: Check entire workspace against Rust 1.88.0
         run: cargo +1.88.0 check --workspace --all-targets --locked
 
+  ring0-constitutional-ratchet:
+    name: Ring-0 Constitutional Ratchet
+    # Direct pushes to main are blocked by the org ruleset (PR-only); the ratchet is enforced on
+    # every pull request and every non-main branch push against origin/main.
+    if: github.event_name == 'pull_request' || github.ref != 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      CARGO_TERM_COLOR: always
+      GIT_CONFIG_NOSYSTEM: "1"
+    steps:
+      - name: Checkout PR head (full history for merge-base & hardware-key verification)
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+          submodules: false
+          fetch-depth: 0
 
+      - name: Install stable Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      - name: Build ratchet verifier from trusted base branch (never from PR-controlled sources)
+        env:
+          BASE_REF: ${{ github.event.repository.default_branch || 'main' }}
+        run: |
+          set -euo pipefail
+          BASE_OID="$(git rev-parse --verify "origin/${BASE_REF}^{commit}")"
+          TRUSTED="${RUNNER_TEMP}/trusted-base"
+          git worktree add --detach "${TRUSTED}" "${BASE_OID}"
+          if git -C "${TRUSTED}" grep -q -F 'verify-ring0-ratchet' -- crates/agent-guard/src/cli.rs; then
+            SRC="${TRUSTED}"
+          else
+            echo "::warning::GENESIS: base ${BASE_OID} predates verify-ring0-ratchet; building verifier from PR head once."
+            SRC="${GITHUB_WORKSPACE}"
+          fi
+          for f in .cargo/config .cargo/config.toml rust-toolchain rust-toolchain.toml; do
+            if [ -e "${SRC}/${f}" ]; then
+              echo "::error::Refusing to build verifier: ${f} present in ${SRC}"
+              exit 1
+            fi
+          done
+          (cd "${SRC}" && CARGO_TARGET_DIR="${RUNNER_TEMP}/trusted-target" \
+            cargo build --locked -p agent-guard --bin dotagent)
+          echo "RATCHET_BIN=${RUNNER_TEMP}/trusted-target/debug/dotagent" >> "${GITHUB_ENV}"
+
+      - name: Enforce unconditional Ring-0 allowlist ratchet & hardware-signer verification
+        env:
+          BASE_REF: ${{ github.event.repository.default_branch || 'main' }}
+        run: |
+          set -euo pipefail
+          "${RATCHET_BIN}" verify-ring0-ratchet --base "origin/${BASE_REF}"

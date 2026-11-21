@@ -724,24 +724,28 @@ fn run_policy_gate_on_artifact(
 }
 
 fn write_file_contained(repo_root: &Path, path: &Path, content: &str) -> Result<(), String> {
+    use std::io::Write;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
+
     let canon_repo = ensure_no_symlink_components_under(repo_root, path)?;
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .map_err(|e| format!("cannot create '{}': {e}", parent.display()))?;
-        let canon_parent = fs::canonicalize(parent)
-            .map_err(|e| format!("cannot canonicalize '{}': {e}", parent.display()))?;
-        if !canon_parent.starts_with(&canon_repo) {
-            return Err(format!(
-                "parent '{}' escaped repository root '{}'",
-                canon_parent.display(),
-                canon_repo.display()
-            ));
-        }
+    let parent = path
+        .parent()
+        .ok_or_else(|| format!("target '{}' has no parent directory", path.display()))?;
+    fs::create_dir_all(parent).map_err(|e| format!("cannot create '{}': {e}", parent.display()))?;
+    let canon_parent = fs::canonicalize(parent)
+        .map_err(|e| format!("cannot canonicalize '{}': {e}", parent.display()))?;
+    if !canon_parent.starts_with(&canon_repo) {
+        return Err(format!(
+            "parent '{}' escaped repository root '{}'",
+            canon_parent.display(),
+            canon_repo.display()
+        ));
     }
     if let Ok(meta) = fs::symlink_metadata(path) {
-        if meta.file_type().is_symlink() {
+        if meta.file_type().is_symlink() || meta.file_type().is_dir() {
             return Err(format!(
-                "refusing to overwrite symlink destination '{}'",
+                "refusing to overwrite symlink or directory destination '{}'",
                 path.display()
             ));
         }
@@ -750,8 +754,39 @@ fn write_file_contained(repo_root: &Path, path: &Path, content: &str) -> Result<
             return Ok(());
         }
     }
-    fs::write(path, content.as_bytes())
-        .map_err(|e| format!("cannot write '{}': {e}", path.display()))
+
+    let leaf = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("artifact");
+    let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+    let tmp_path = canon_parent.join(format!(".{leaf}.dotagent-tmp.{}.{seq}", std::process::id()));
+    let write_res = (|| -> Result<(), String> {
+        let mut f = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp_path)
+            .map_err(|e| format!("cannot create temp file '{}': {e}", tmp_path.display()))?;
+        f.write_all(content.as_bytes())
+            .map_err(|e| format!("cannot write temp file '{}': {e}", tmp_path.display()))?;
+        f.sync_all()
+            .map_err(|e| format!("cannot sync temp file '{}': {e}", tmp_path.display()))?;
+        drop(f);
+        if let Ok(meta) = fs::symlink_metadata(path)
+            && (meta.file_type().is_symlink() || meta.file_type().is_dir())
+        {
+            return Err(format!(
+                "refusing to rename over symlink or directory '{}'",
+                path.display()
+            ));
+        }
+        fs::rename(&tmp_path, path)
+            .map_err(|e| format!("cannot atomically replace '{}': {e}", path.display()))
+    })();
+    if write_res.is_err() {
+        let _ = fs::remove_file(&tmp_path);
+    }
+    write_res
 }
 
 fn repo_harness_copy_path(repo_root: &Path, rel_path: &str) -> Option<PathBuf> {
@@ -904,6 +939,7 @@ fn render_canonical_agents_md() -> String {
 - **Immutable Build & Filter Configs**: Modifying `.cargo/config*`, `.yarnrc*`, `.npmrc`, `rust-toolchain*`, `.envrc`, or `.gitattributes` is hard-blocked; `agent-guard` audits these files for `rustc-wrapper`/`linker`/`runner`/`yarnPath` traps prior to execution.
 - **Non-Destructive Git & Zero Confused Deputy**: Never run `git commit --amend`, `git rebase`, `git reset --hard`, `git clean`, `git push --force*`, `curl`, `wget`, `nc`, `ssh`, `npx`, `npm install` without `--ignore-scripts`, or autonomous external mutations (`git push`, `gh pr create/merge/comment`, `gdocs`/`gdrive` writes) unless explicitly instructed by the human user in `__USER_REQ_TAG__`.
 - **Guard Denials Are Final**: If `agent-guard` exits with code `2` (`HARD DENY`), **STOP IMMEDIATELY**. Never attempt to bypass, re-encode, or switch tools around a block.
+- **Structured Friction & False-Positive Reporting**: Never retry a blocked command in a loop. If a legitimate workflow hits an avoidable false-positive block, missing safe CLI flag, or tool friction, reference the emitted `[denial_id: dnl_<hex>]` once via `dotagent feedback submit --denial-id <id> --category <false_positive_block|missing_safe_flag|pagination_or_budget_friction|unclear_remediation|adapter_or_workflow_bug> [--reason-code <token>]` (or MCP `dotagent_submit_friction`), then pivot to a compliant alternative or report the block to the user.
 "#
     .replace(
         "__SPOTLIGHT_OPEN__",
@@ -1217,6 +1253,7 @@ These rules bind every session across Antigravity / Gemini and take absolute pre
    - Keep context windows tiny: read bounded slices (`<= 150` lines, `24 KiB` raw cap, `16k` step token cap); skip lockfiles and minified bundles; cap `git log -n 20`. **Compact immediately after accomplishing each discrete step** rather than carrying multi-feature history; isolate broad exploration inside read-only subagents (`<= 200` ASCII tokens).
    - Do not cross between sibling repositories unless explicitly requested by the user.
    - Git hooks and attributes are disabled globally (`core.hooksPath=/dev/null`, `core.attributesFile=/dev/null`, `core.fsmonitor=false`, `core.protectHFS=true`, `core.protectNTFS=true`, `gc.auto=0`). Never modify `.cargo/config*`, `.yarnrc*`, `.npmrc`, `rust-toolchain*`, or `.gitattributes`, and never invoke `.git/hooks/*`, `git -c` overrides, `--no-verify`, `npm install` without `--ignore-scripts`, `curl`/`wget`, or unrequested `git push` / `gh` / Workspace mutations.
+6. **Structured Friction & False-Positive Reporting**: Never retry a blocked command in a loop. If a legitimate workflow hits a false-positive block, missing safe CLI flag, or workflow friction, reference the emitted `[denial_id: dnl_<hex>]` once via `dotagent feedback submit --denial-id <id> --category <false_positive_block|missing_safe_flag|pagination_or_budget_friction|unclear_remediation|adapter_or_workflow_bug> [--reason-code <token>]` (or MCP `dotagent_submit_friction`), then proceed with a compliant alternative or report the block to the user.
 "#
     .replace(
         "__SPOTLIGHT_OPEN__",

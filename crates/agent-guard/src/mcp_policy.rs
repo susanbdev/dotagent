@@ -40,9 +40,9 @@ pub struct McpManifestRule {
 /// Canonical declarative capability table exported for both runtime enforcement and Policy-IR compilation.
 pub const MCP_CAPABILITY_MANIFEST: &[McpManifestRule] = &[
     McpManifestRule {
-        pattern: "ping|health|status|version|dotagent_status",
+        pattern: "ping|health|status|version|dotagent_status|dotagent_submit_friction",
         class: McpRpcClass::ReadOnly,
-        description: "Liveness and read-only health metadata",
+        description: "Liveness, read-only health metadata, and taint-quarantined friction ballot submission",
     },
     McpManifestRule {
         pattern: "get_*|list_*|read_*|search|search_*|query|query_*|inspect_*|describe_*|explain_*|verify_*|diff|diff_*|check_*|audit_*|lookup_*|dotagent_read_file|dotagent_search",
@@ -80,6 +80,7 @@ const READONLY_EXACT_METHODS: &[&str] = &[
     "dotagent_read_file",
     "dotagent_search",
     "dotagent_status",
+    "dotagent_submit_friction",
 ];
 
 const READONLY_PREFIXES: &[&str] = &[
