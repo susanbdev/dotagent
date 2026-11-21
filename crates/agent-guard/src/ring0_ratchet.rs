@@ -60,17 +60,6 @@ pub const POLICY_ALLOWLIST_PATHS: &[&str] = &[
 pub const ALLOWED_CORPUS_KINDS: &[&str] =
     &["cmd", "read_path", "write_path", "glob", "content", "mcp"];
 
-/// One-time self-extinguishing genesis commit SHA of `susanbdev/dotagent` `v2.0.0` prior to
-/// `config/allowed_human_signers` existing on `main`. Once `config/allowed_human_signers` lands on
-/// `main`, `origin/main` advances permanently off this SHA and this genesis clause never fires again.
-const RING0_SIGNERS_GENESIS_BASE_SHA: &str = "0194af29450aa65d1699337ec731d1740efc00e4";
-
-/// SHA-256 of the exact genesis `config/allowed_human_signers` bytes (two GitHub-published
-/// `sk-ssh-ed25519@openssh.com` FIDO2 keys of `susanbeasles`). Genesis enrollment is accepted only
-/// for this precise keyring; any other bytes on the genesis base fail closed.
-const RING0_GENESIS_SIGNERS_SHA256: &str =
-    "89ce5a026336a21d62959969b1552654c79709d03601d82f16fc3102d1dd7692";
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RatchetReport {
     pub base_ref: String,
@@ -607,7 +596,7 @@ impl<'a> CorpusTomlParser<'a> {
 
 /// Builds a hardened `git` invocation: hooks, attributes, fsmonitor, external diff drivers and
 /// textconv filters are neutralized through environment-scoped config (never `git -c`).
-fn git_cmd(repo_root: &Path) -> Command {
+pub(crate) fn git_cmd(repo_root: &Path) -> Command {
     let mut cmd = Command::new("git");
     cmd.current_dir(repo_root)
         .env_remove("GIT_EXTERNAL_DIFF")
@@ -631,26 +620,6 @@ fn git_cmd(repo_root: &Path) -> Command {
         .env("GIT_CONFIG_KEY_2", "core.attributesFile")
         .env("GIT_CONFIG_VALUE_2", "/dev/null");
     cmd
-}
-
-fn resolve_git_commit_oid(repo_root: &Path, rev: &str) -> Result<String, String> {
-    validate_git_ref_arg(rev)?;
-    let out = git_cmd(repo_root)
-        .args([
-            "rev-parse",
-            "--verify",
-            "--end-of-options",
-            &format!("{rev}^{{commit}}"),
-        ])
-        .output()
-        .map_err(|e| format!("git rev-parse '{rev}' failed: {e}"))?;
-    if !out.status.success() {
-        return Err(format!(
-            "RING0_RATCHET_VIOLATION: cannot resolve git commit '{rev}': {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        ));
-    }
-    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
 fn resolve_merge_base(repo_root: &Path, base_ref: &str) -> Result<String, String> {
@@ -981,7 +950,7 @@ fn verify_commit_ssh_signature_against_signers(
 
 fn check_all_commits_human_hardware_signed(
     repo_root: &Path,
-    base_ref: &str,
+    _base_ref: &str,
     merge_base: &str,
     has_uncommitted_or_untracked: bool,
 ) -> Result<bool, String> {
@@ -996,47 +965,6 @@ fn check_all_commits_human_hardware_signed(
         .map_err(|e| format!("git show '{signers_spec}' failed: {e}"))?;
 
     if !signers_out.status.success() {
-        // One-time self-extinguishing genesis enrollment: `merge_base` must descend from the
-        // v2.0.0 genesis SHA, `base_ref` must still lack `config/allowed_human_signers`, and
-        // `HEAD:config/allowed_human_signers` must match the pinned SHA-256 digest byte-for-byte.
-        let base_oid = resolve_git_commit_oid(repo_root, base_ref)?;
-        let mb_oid = resolve_git_commit_oid(repo_root, merge_base)?;
-        let descends_from_v2_genesis = git_cmd(repo_root)
-            .args([
-                "merge-base",
-                "--is-ancestor",
-                "--end-of-options",
-                RING0_SIGNERS_GENESIS_BASE_SHA,
-                &mb_oid,
-            ])
-            .status()
-            .is_ok_and(|s| s.success());
-        let base_lacks_signers = !git_cmd(repo_root)
-            .args([
-                "cat-file",
-                "-e",
-                &format!("{base_oid}:config/allowed_human_signers"),
-            ])
-            .status()
-            .is_ok_and(|s| s.success());
-        if descends_from_v2_genesis && base_lacks_signers {
-            let head_signers = git_cmd(repo_root)
-                .args([
-                    "show",
-                    "--end-of-options",
-                    "HEAD:config/allowed_human_signers",
-                ])
-                .output()
-                .map_err(|e| format!("git show HEAD:config/allowed_human_signers failed: {e}"))?;
-            if head_signers.status.success()
-                && crate::crypto::sha256_hex(&head_signers.stdout) == RING0_GENESIS_SIGNERS_SHA256
-            {
-                eprintln!(
-                    "[ring0-ratchet] GENESIS_SIGNER_ENROLLMENT: base {base_oid} has no signer keyring; accepting pinned-digest enrollment once (self-extinguishes when main has config/allowed_human_signers)."
-                );
-                return Ok(true);
-            }
-        }
         return Ok(false);
     }
 
@@ -1298,17 +1226,31 @@ fn verify_vector_triggers_deny_and_matches_target(
     payload: &str,
     modified_targets: &BTreeSet<String>,
     require_target_match: bool,
+    skip_policy_eval: bool,
 ) -> Result<bool, String> {
     let blocked = match kind {
-        "cmd" => evaluate_shell_command(payload, repo_root, repo_root, false).is_err(),
-        "read_path" => validate_path(repo_root, repo_root, payload, PathAccess::Read).is_err(),
-        "write_path" => validate_path(repo_root, repo_root, payload, PathAccess::Write).is_err(),
-        "glob" => glob_corpus_vector_blocked(repo_root, payload),
-        "mcp" => mcp_corpus_vector_blocked(payload),
+        "cmd" => {
+            skip_policy_eval
+                || evaluate_shell_command(payload, repo_root, repo_root, false).is_err()
+        }
+        "read_path" => {
+            skip_policy_eval
+                || validate_path(repo_root, repo_root, payload, PathAccess::Read).is_err()
+        }
+        "write_path" => {
+            skip_policy_eval
+                || validate_path(repo_root, repo_root, payload, PathAccess::Write).is_err()
+        }
+        "glob" => skip_policy_eval || glob_corpus_vector_blocked(repo_root, payload),
+        "mcp" => skip_policy_eval || mcp_corpus_vector_blocked(payload),
         "content" => {
-            let uni = scan_unicode(payload, ScanMode::UntrustedContent);
-            let inj = scan_untrusted_content(payload, repo_root, repo_root, false);
-            !uni.is_empty() || inj.first_halt().is_some() || !inj.findings.is_empty()
+            if skip_policy_eval {
+                true
+            } else {
+                let uni = scan_unicode(payload, ScanMode::UntrustedContent);
+                let inj = scan_untrusted_content(payload, repo_root, repo_root, false);
+                !uni.is_empty() || inj.first_halt().is_some() || !inj.findings.is_empty()
+            }
         }
         other => {
             return Err(format!("unknown vector kind '{other}'"));
@@ -1360,10 +1302,67 @@ const CONSTITUTIONAL_CODE_GUARDED_FILES: &[&str] = &[
     "crates/agent-guard/src/diagnostics.rs",
 ];
 
+fn strip_rust_comments(raw: &str) -> String {
+    let bytes = raw.as_bytes();
+    let mut out = String::with_capacity(raw.len());
+    let mut i = 0usize;
+    let mut in_str = false;
+    let mut esc = false;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if in_str {
+            out.push(b as char);
+            if esc {
+                esc = false;
+            } else if b == b'\\' {
+                esc = true;
+            } else if b == b'"' {
+                in_str = false;
+            }
+            i += 1;
+            continue;
+        }
+        if b == b'"' {
+            in_str = true;
+            out.push('"');
+            i += 1;
+            continue;
+        }
+        if b == b'/' && bytes.get(i + 1) == Some(&b'/') {
+            i += 2;
+            while i < bytes.len() && bytes[i] != b'\n' {
+                i += 1;
+            }
+            continue;
+        }
+        if b == b'/' && bytes.get(i + 1) == Some(&b'*') {
+            i += 2;
+            let mut depth = 1usize;
+            while i < bytes.len() && depth > 0 {
+                if bytes[i] == b'/' && bytes.get(i + 1) == Some(&b'*') {
+                    depth += 1;
+                    i += 2;
+                } else if bytes[i] == b'*' && bytes.get(i + 1) == Some(&b'/') {
+                    depth -= 1;
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+            }
+            out.push(' ');
+            continue;
+        }
+        out.push(b as char);
+        i += 1;
+    }
+    out
+}
+
 fn count_constitutional_codes(raw: &str) -> Vec<usize> {
+    let stripped = strip_rust_comments(raw);
     crate::feedback::RING0_CONSTITUTIONAL_CODES
         .iter()
-        .map(|code| raw.matches(code).count())
+        .map(|code| stripped.matches(code).count())
         .collect()
 }
 
@@ -1410,6 +1409,15 @@ pub fn verify_ring0_ratchet(
     repo_root: &Path,
     base_ref: &str,
     force_ratchet: bool,
+) -> Result<RatchetReport, String> {
+    verify_ring0_ratchet_with_opts(repo_root, base_ref, force_ratchet, false)
+}
+
+pub fn verify_ring0_ratchet_with_opts(
+    repo_root: &Path,
+    base_ref: &str,
+    force_ratchet: bool,
+    trusted_base_mode: bool,
 ) -> Result<RatchetReport, String> {
     validate_git_ref_arg(base_ref)?;
     let merge_base = resolve_merge_base(repo_root, base_ref)?;
@@ -1529,6 +1537,7 @@ pub fn verify_ring0_ratchet(
                 p,
                 &modified_targets,
                 true,
+                trusted_base_mode,
             )? {
                 target_matched_count += 1;
             }
@@ -1548,6 +1557,7 @@ pub fn verify_ring0_ratchet(
                 p,
                 &empty_targets,
                 false,
+                trusted_base_mode,
             )?;
         }
     }
@@ -1591,8 +1601,14 @@ pub fn verify_corpus_monotonic_only(
         verify_corpus_prefix_and_no_duplicates(&base_ordered, &head_ordered, "working tree")?;
     let empty_targets = BTreeSet::new();
     for (k, p) in &added {
-        let _ =
-            verify_vector_triggers_deny_and_matches_target(repo_root, k, p, &empty_targets, false)?;
+        let _ = verify_vector_triggers_deny_and_matches_target(
+            repo_root,
+            k,
+            p,
+            &empty_targets,
+            false,
+            false,
+        )?;
     }
     Ok(RatchetReport {
         base_ref: base_ref.to_string(),
@@ -1610,6 +1626,7 @@ pub fn verify_corpus_monotonic_only(
 pub fn run_verify_ring0_ratchet_cli(args: &[String], cwd: &Path) -> ExitCode {
     let mut base_ref = String::from("origin/main");
     let mut force_ratchet = false;
+    let mut trusted_base_mode = false;
     let mut corpus_only = false;
     let mut json_mode = false;
     let mut repo_override: Option<String> = None;
@@ -1629,6 +1646,10 @@ pub fn run_verify_ring0_ratchet_cli(args: &[String], cwd: &Path) -> ExitCode {
                 force_ratchet = true;
                 i += 1;
             }
+            "--trusted-base-mode" => {
+                trusted_base_mode = true;
+                i += 1;
+            }
             "--corpus-only" => {
                 corpus_only = true;
                 i += 1;
@@ -1639,7 +1660,7 @@ pub fn run_verify_ring0_ratchet_cli(args: &[String], cwd: &Path) -> ExitCode {
             }
             other => {
                 eprintln!(
-                    "[dotagent verify-ring0-ratchet] unrecognized argument '{other}' (expected --base <ref> [--require-ratchet] [--repo <dir>] [--json])"
+                    "[dotagent verify-ring0-ratchet] unrecognized argument '{other}' (expected --base <ref> [--require-ratchet] [--trusted-base-mode] [--repo <dir>] [--json])"
                 );
                 return ExitCode::from(2);
             }
@@ -1655,7 +1676,7 @@ pub fn run_verify_ring0_ratchet_cli(args: &[String], cwd: &Path) -> ExitCode {
     let res = if corpus_only {
         verify_corpus_monotonic_only(&target_dir, &base_ref)
     } else {
-        verify_ring0_ratchet(&target_dir, &base_ref, force_ratchet)
+        verify_ring0_ratchet_with_opts(&target_dir, &base_ref, force_ratchet, trusted_base_mode)
     };
 
     match res {

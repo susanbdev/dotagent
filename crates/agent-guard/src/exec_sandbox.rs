@@ -145,6 +145,7 @@ struct SandboxPolicyOpts {
     invokes_git: bool,
     invokes_swarm_tool: bool,
     invokes_feedback_submit: bool,
+    has_swarm_session: bool,
 }
 
 /// Formats a shell command to execute through `agent-guard exec-sandbox` with optional
@@ -520,15 +521,6 @@ pub fn run_exec_sandbox_cli(args: &[String], default_cwd: &Path) -> ExitCode {
     let invokes_git = is_atomic_leading_command(&shell_script, "git");
     let invokes_swarm_tool = is_atomic_leading_command(&shell_script, "swarm-tool");
     let invokes_feedback_submit = is_atomic_feedback_submit_command(&shell_script);
-    let opts = SandboxPolicyOpts {
-        writes_allowed,
-        deny_net: explicit_deny_net || profile_denies_net,
-        invokes_git,
-        invokes_swarm_tool,
-        invokes_feedback_submit,
-    };
-
-    let common_repo = crate::resolve_common_repo_root(&repo_root);
     let env_session_id = env::var("AGENT_GUARD_SESSION_ID")
         .ok()
         .map(|s| s.trim().to_string())
@@ -537,7 +529,21 @@ pub fn run_exec_sandbox_cli(args: &[String], default_cwd: &Path) -> ExitCode {
         .clone()
         .or_else(|| cli_session_id.clone())
         .unwrap_or_else(|| "default".to_string());
-    let has_swarm_session = effective_session_id.starts_with("swm_");
+    let has_swarm_session = effective_session_id.starts_with("swm_")
+        && effective_session_id.len() <= 128
+        && effective_session_id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-');
+    let opts = SandboxPolicyOpts {
+        writes_allowed,
+        deny_net: explicit_deny_net || profile_denies_net,
+        invokes_git,
+        invokes_swarm_tool,
+        invokes_feedback_submit,
+        has_swarm_session,
+    };
+
+    let common_repo = crate::resolve_common_repo_root(&repo_root);
 
     // Snapshot `.git/config` digest prior to vetted `git` writes so any `.git` lockfile access
     // granted for `git add` / `git commit` can never tamper with `.git/config` unnoticed.
@@ -848,12 +854,16 @@ pub(crate) fn is_atomic_feedback_submit_command(script: &str) -> bool {
     {
         return false;
     }
+    let bytes = script.trim().as_bytes();
+    if bytes.is_empty() {
+        return false;
+    }
     let mut toks = Vec::new();
     let mut cur = String::new();
     let mut in_s = false;
     let mut in_d = false;
     let mut esc = false;
-    for b in script.trim().bytes() {
+    for &b in bytes {
         if esc {
             cur.push(b as char);
             esc = false;
@@ -868,12 +878,11 @@ pub(crate) fn is_atomic_feedback_submit_command(script: &str) -> bool {
             continue;
         }
         if in_d {
-            if b == b'\\' {
-                esc = true;
-            } else if b == b'"' {
-                in_d = false;
-            } else {
-                cur.push(b as char);
+            match b {
+                b'\\' => esc = true,
+                b'"' => in_d = false,
+                b'`' | b'$' => return false,
+                _ => cur.push(b as char),
             }
             continue;
         }
@@ -881,25 +890,32 @@ pub(crate) fn is_atomic_feedback_submit_command(script: &str) -> bool {
             b'\\' => esc = true,
             b'\'' => in_s = true,
             b'"' => in_d = true,
+            b';' | b'|' | b'&' | b'\n' | b'\r' | b'`' | b'<' | b'>' | b'(' | b')' | b'$' | b'{'
+            | b'}' | b'#' | b'!' | b'*' | b'?' | b'~' => return false,
             b' ' | b'\t' => {
                 if !cur.is_empty() {
                     toks.push(std::mem::take(&mut cur));
-                    if toks.len() >= 4 {
-                        break;
-                    }
                 }
             }
             _ => cur.push(b as char),
         }
     }
-    if !cur.is_empty() && toks.len() < 4 {
+    if in_s || in_d || esc {
+        return false;
+    }
+    if !cur.is_empty() {
         toks.push(cur);
     }
-    (toks.get(1).map(String::as_str) == Some("feedback")
+    let is_submit = (toks.get(1).map(String::as_str) == Some("feedback")
         && toks.get(2).map(String::as_str) == Some("submit"))
         || (toks.get(1).map(String::as_str) == Some("guard")
             && toks.get(2).map(String::as_str) == Some("feedback")
-            && toks.get(3).map(String::as_str) == Some("submit"))
+            && toks.get(3).map(String::as_str) == Some("submit"));
+    if !is_submit {
+        return false;
+    }
+    // Reject any trailing tokens containing shell-assignment or NUL bytes
+    toks.iter().all(|t| !t.contains('\0'))
 }
 
 fn precreate_swarm_tool_sandbox_targets(repo_root: &Path, _shell_script: &str) {
@@ -1439,24 +1455,61 @@ fn apply_linux_landlock(
     }
 
     // 3. User-space toolchain directories (Rustup, Cargo, NVM/Volta/fnm) WITHOUT exposing ~/.ssh, ~/.aws, ~/.local/state/agent-guard
+    let is_safe_toolchain_dir = |p: &Path, home: &Path| -> bool {
+        let Ok(meta) = fs::symlink_metadata(p) else {
+            return false;
+        };
+        if meta.file_type().is_symlink() || !meta.file_type().is_dir() {
+            return false;
+        }
+        let Ok(canon) = fs::canonicalize(p) else {
+            return false;
+        };
+        let canon_home = fs::canonicalize(home).unwrap_or_else(|_| home.to_path_buf());
+        if canon == canon_home {
+            return false;
+        }
+        let s = canon.to_string_lossy();
+        let forbidden = [
+            "/tmp",
+            "/var/tmp",
+            "/dev/shm",
+            "/run/user",
+            "/.ssh",
+            "/.aws",
+            "/.gnupg",
+            "/.config/gh",
+            "/.local/state/agent-guard",
+            "/.git",
+            "/proc",
+            "/etc",
+        ];
+        !forbidden.iter().any(|f| {
+            if f.starts_with("/.") {
+                s.contains(f)
+            } else {
+                s == *f || s.starts_with(&format!("{f}/"))
+            }
+        })
+    };
     if let Some(ref home) = home_opt {
         let rustup = env::var_os("RUSTUP_HOME")
             .map(PathBuf::from)
             .unwrap_or_else(|| home.join(".rustup"));
-        if rustup.exists() {
+        if is_safe_toolchain_dir(&rustup, home) {
             add_path(&rustup, ro_access);
         }
         let cargo_home = env::var_os("CARGO_HOME")
             .map(PathBuf::from)
             .unwrap_or_else(|| home.join(".cargo"));
-        if cargo_home.exists() {
+        if is_safe_toolchain_dir(&cargo_home, home) {
             let cargo_bin = cargo_home.join("bin");
-            if cargo_bin.exists() {
+            if is_safe_toolchain_dir(&cargo_bin, home) {
                 add_path(&cargo_bin, ro_access);
             }
             for sub in ["registry", "git", ".package-cache", ".package-cache-mutate"] {
                 let sp = cargo_home.join(sub);
-                if sp.exists() {
+                if is_safe_toolchain_dir(&sp, home) {
                     add_path(
                         &sp,
                         if opts.writes_allowed {
@@ -1498,8 +1551,7 @@ fn apply_linux_landlock(
     // 4b. Granular Swarm state access:
     //     `<swarm_state_dir>/vault` (`hmac.key`, `stop_receipt_ed25519.pub`) is UNCONDITIONALLY OMITTED (`EACCES`)!
     let canon_repo = fs::canonicalize(repo_root).unwrap_or_else(|_| repo_root.to_path_buf());
-    let has_swarm_session =
-        env::var("AGENT_GUARD_SESSION_ID").is_ok_and(|s| s.trim().starts_with("swm_"));
+    let has_swarm_session = opts.has_swarm_session;
     if opts.invokes_swarm_tool {
         if let Ok(sdir) = crate::breadcrumbs::swarm_state_dir(&canon_repo) {
             for allowed_sub in ["ipc", "sessions", "spools", "ledger"] {
@@ -1757,8 +1809,7 @@ fn render_macos_seatbelt_profile(
     let canon_repo = fs::canonicalize(repo_root).unwrap_or_else(|_| repo_root.to_path_buf());
     let repo_s = escape_sbpl_literal(&canon_repo.to_string_lossy());
     let home_s = escape_sbpl_literal(&env::var("HOME").unwrap_or_default());
-    let has_swarm_session =
-        env::var("AGENT_GUARD_SESSION_ID").is_ok_and(|s| s.trim().starts_with("swm_"));
+    let has_swarm_session = opts.has_swarm_session;
     let mut p = String::from("(version 1)\n(allow default)\n");
 
     if opts.deny_net {

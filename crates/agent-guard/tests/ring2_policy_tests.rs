@@ -35,7 +35,7 @@ fn ring2_baseline_policy_and_diagnostics_invariants_hold() {
     );
     assert_eq!(
         classify_mcp_sub_method("dotagent_submit_friction"),
-        McpRpcClass::ReadOnly
+        McpRpcClass::FeedbackSubmit
     );
     assert!(lookup_explanation("FEEDBACK_RATE_LIMIT_EXCEEDED").is_some());
 }

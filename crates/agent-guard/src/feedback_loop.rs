@@ -148,10 +148,46 @@ pub fn verify_feedback_operator_or_ci_loop(cmd_label: &str) -> Result<(), String
 }
 
 pub fn resolve_gh_bin() -> PathBuf {
-    if let Ok(custom) = std::env::var("DOTAGENT_GH_BIN")
-        && !custom.trim().is_empty()
-    {
-        return PathBuf::from(custom.trim());
+    if let Ok(custom) = std::env::var("DOTAGENT_GH_BIN") {
+        let trimmed = custom.trim();
+        if !trimmed.is_empty() {
+            let p = Path::new(trimmed);
+            let trusted_dir = p.parent().is_some_and(|dir| {
+                matches!(
+                    dir.to_str(),
+                    Some(
+                        "/usr/bin"
+                            | "/bin"
+                            | "/usr/local/bin"
+                            | "/opt/homebrew/bin"
+                            | "/opt/antigravity/bin"
+                    )
+                )
+            });
+            let test_mock_allowed =
+                cfg!(test) || std::env::var("DOTAGENT_ALLOW_TEST_GH_BIN").as_deref() == Ok("1");
+            if p.is_absolute() && trusted_dir && crate::coordinator::is_trusted_executable_file(p) {
+                return p.to_path_buf();
+            }
+            if p.is_absolute()
+                && test_mock_allowed
+                && std::fs::symlink_metadata(p)
+                    .is_ok_and(|m| m.file_type().is_file() && !m.file_type().is_symlink())
+            {
+                return p.to_path_buf();
+            }
+        }
+    }
+    for sys_gh in [
+        "/opt/antigravity/bin/gh",
+        "/usr/bin/gh",
+        "/usr/local/bin/gh",
+        "/opt/homebrew/bin/gh",
+    ] {
+        let p = Path::new(sys_gh);
+        if crate::coordinator::is_trusted_executable_file(p) {
+            return p.to_path_buf();
+        }
     }
     PathBuf::from("gh")
 }
@@ -169,6 +205,47 @@ pub fn validate_owner_repo(full_repo: &str) -> Result<(String, String), String> 
     validate_github_ident(owner)?;
     validate_github_ident(repo)?;
     Ok((owner.to_string(), repo.to_string()))
+}
+
+fn parse_github_owner_repo_from_remote(url: &str) -> Option<String> {
+    let trimmed = url.trim().trim_end_matches('/');
+    let rest = trimmed
+        .strip_prefix("https://github.com/")
+        .or_else(|| trimmed.strip_prefix("http://github.com/"))
+        .or_else(|| trimmed.strip_prefix("ssh://git@github.com/"))
+        .or_else(|| trimmed.strip_prefix("git@github.com:"))?;
+    let slug = rest.strip_suffix(".git").unwrap_or(rest);
+    let (o, r) = validate_owner_repo(slug).ok()?;
+    Some(format!("{o}/{r}"))
+}
+
+fn validate_checkout_matches_target_repo(
+    repo_root: &Path,
+    target_repo: &str,
+) -> Result<(), String> {
+    let out = crate::ring0_ratchet::git_cmd(repo_root)
+        .args(["remote", "get-url", "origin"])
+        .output()
+        .map_err(|e| format!("failed reading git origin remote: {e}"))?;
+    if !out.status.success() {
+        return Err("REPO_IDENTITY_MISMATCH: checkout has no 'origin' remote".to_string());
+    }
+    let origin_url = String::from_utf8_lossy(&out.stdout);
+    if let Some(origin_slug) = parse_github_owner_repo_from_remote(&origin_url) {
+        if !origin_slug.eq_ignore_ascii_case(target_repo) {
+            return Err(format!(
+                "REPO_IDENTITY_MISMATCH: --repo '{target_repo}' does not match checkout origin '{origin_slug}'"
+            ));
+        }
+        return Ok(());
+    }
+    if std::env::var("DOTAGENT_ALLOW_TEST_GH_BIN").as_deref() == Ok("1") {
+        return Ok(());
+    }
+    Err(format!(
+        "REPO_IDENTITY_MISMATCH: checkout origin '{}' is not a verified github.com repository for '--repo {target_repo}'",
+        origin_url.trim()
+    ))
 }
 
 fn push_lp_bytes(buf: &mut Vec<u8>, b: &[u8]) {
@@ -1052,21 +1129,21 @@ pub fn run_feedback_sync_github_cli(args: &[String], cwd: &Path) -> ExitCode {
         }
     }
 
-    let (_, target_repo_short) = match validate_owner_repo(&target_repo) {
+    let (target_owner, target_repo_short) = match validate_owner_repo(&target_repo) {
         Ok(pair) => pair,
         Err(e) => {
             eprintln!("[dotagent feedback sync-github] HARD DENY: {e}");
             return ExitCode::from(2);
         }
     };
+    let canonical_target_repo = format!("{target_owner}/{target_repo_short}");
 
     let repo_root = resolve_repo_root(cwd);
-    let ballot_res = if target_repo_short.eq_ignore_ascii_case("dotagent") {
-        load_verified_ballots(&repo_root)
-    } else {
-        load_verified_ballots_for_repo(&repo_root)
-    };
-    let all_ballots = match ballot_res {
+    if let Err(e) = validate_checkout_matches_target_repo(&repo_root, &canonical_target_repo) {
+        eprintln!("[dotagent feedback sync-github] HARD DENY: {e}");
+        return ExitCode::from(2);
+    }
+    let all_ballots = match load_verified_ballots_for_repo(&repo_root) {
         Ok(b) => b,
         Err(e) => {
             eprintln!("[dotagent feedback sync-github] HARD DENY: {e}");

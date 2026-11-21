@@ -22,8 +22,18 @@ audit_prebuild_traps() {
                 echo "[activate-local] HARD DENY: symlinked .cargo config at ${cargo_cfg}" >&2
                 exit 2
             fi
-            if [[ -f "${cargo_cfg}" ]] && grep -Eiq '(rustc-wrapper|workspace-wrapper|linker\s*=|runner\s*=|\brustc\s*=)' "${cargo_cfg}"; then
-                echo "[activate-local] HARD DENY: dangerous Cargo wrapper/linker/runner in ${cargo_cfg}" >&2
+            if [[ -f "${cargo_cfg}" ]] && grep -Eiq '(rustc-wrapper|workspace-wrapper|linker\s*=|runner\s*=|\brustc\s*=|\[alias\]|\[env\]|\[target\.|rustflags|rustdocflags|credential-provider)' "${cargo_cfg}"; then
+                echo "[activate-local] HARD DENY: dangerous Cargo directive in ${cargo_cfg}" >&2
+                exit 2
+            fi
+        done
+        for tc_cfg in "${scan_dir}/rust-toolchain" "${scan_dir}/rust-toolchain.toml"; do
+            if [[ -L "${tc_cfg}" ]]; then
+                echo "[activate-local] HARD DENY: symlinked rust-toolchain at ${tc_cfg}" >&2
+                exit 2
+            fi
+            if [[ -f "${tc_cfg}" ]] && [[ "${scan_dir}" == "${DOTAGENT_ROOT}" || "${scan_dir}" == "${DOTAGENT_ROOT}"/* ]]; then
+                echo "[activate-local] HARD DENY: repo rust-toolchain override at ${tc_cfg}" >&2
                 exit 2
             fi
         done
@@ -36,6 +46,18 @@ audit_prebuild_traps() {
             break
         fi
         scan_dir="${parent_dir}"
+    done
+
+    local cargo_home="${CARGO_HOME:-${HOME}/.cargo}"
+    for cargo_cfg in "${cargo_home}/config" "${cargo_home}/config.toml"; do
+        if [[ -L "${cargo_cfg}" ]]; then
+            echo "[activate-local] HARD DENY: symlinked CARGO_HOME config at ${cargo_cfg}" >&2
+            exit 2
+        fi
+        if [[ -f "${cargo_cfg}" ]] && grep -Eiq '(rustc-wrapper|workspace-wrapper|linker\s*=|runner\s*=|\brustc\s*=|\[alias\]|\[env\]|\[target\.|rustflags|rustdocflags|credential-provider)' "${cargo_cfg}"; then
+            echo "[activate-local] HARD DENY: dangerous Cargo directive in ${cargo_cfg}" >&2
+            exit 2
+        fi
     done
 
     if [[ -L "${DOTAGENT_ROOT}/AGENTS.md" ]]; then

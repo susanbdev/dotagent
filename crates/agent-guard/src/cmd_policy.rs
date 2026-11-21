@@ -2229,31 +2229,84 @@ fn check_cargo_command(
     repo_root: &Path,
     cwd: &Path,
 ) -> Result<(), CommandViolation> {
-    // Inspect `.cargo/config.toml` and `.cargo/config` (no-symlink, bounded, key-only) for RCE traps!
-    for rel in [".cargo/config.toml", ".cargo/config"] {
-        if let Some(keys) = read_bounded_nonsymlink_config_keys(repo_root, rel)? {
-            for bad in [
-                "rustc-wrapper",
-                "rustc_wrapper",
-                "workspace-wrapper",
-                "linker",
-                "runner",
-                "[alias]",
-                "rustc",
-            ] {
-                if keys
-                    .iter()
-                    .any(|k| k == bad || (bad != "rustc" && k.contains(bad)))
-                {
-                    return Err(CommandViolation {
-                        code: "CARGO_CONFIG_EXEC_TRAP",
-                        detail: format!(
-                            "Repository '{rel}' contains dangerous execution directive matching `{bad}` — refusing `cargo` invocation."
-                        ),
-                        halt_session: true,
-                    });
+    // Inspect `.cargo/config.toml` and `.cargo/config` (no-symlink, bounded, key-only) across
+    // `repo_root`, `cwd`, and any `--manifest-path` / `-C` directory for RCE traps!
+    let mut check_roots = vec![repo_root.to_path_buf(), cwd.to_path_buf()];
+    let mut idx = 0usize;
+    while idx < args.len() {
+        let a = args[idx].as_str();
+        if (a == "--manifest-path" || a == "-C")
+            && let Some(val) = args.get(idx + 1)
+        {
+            let p = if Path::new(val).is_absolute() {
+                std::path::PathBuf::from(val)
+            } else {
+                cwd.join(val)
+            };
+            let dir = if a == "--manifest-path" {
+                p.parent().map(Path::to_path_buf).unwrap_or(p)
+            } else {
+                p
+            };
+            check_roots.push(dir);
+            idx += 2;
+            continue;
+        }
+        if let Some(val) = a.strip_prefix("--manifest-path=") {
+            let p = if Path::new(val).is_absolute() {
+                std::path::PathBuf::from(val)
+            } else {
+                cwd.join(val)
+            };
+            if let Some(dir) = p.parent() {
+                check_roots.push(dir.to_path_buf());
+            }
+        }
+        idx += 1;
+    }
+    let mut visited = Vec::new();
+    for root in check_roots {
+        let mut cur = Some(root.as_path());
+        while let Some(dir) = cur {
+            if !visited.iter().any(|v: &std::path::PathBuf| v == dir) {
+                visited.push(dir.to_path_buf());
+                for rel in [".cargo/config.toml", ".cargo/config"] {
+                    if let Some(keys) = read_bounded_nonsymlink_config_keys(dir, rel)? {
+                        for bad in [
+                            "rustc-wrapper",
+                            "rustc_wrapper",
+                            "workspace-wrapper",
+                            "linker",
+                            "runner",
+                            "[alias]",
+                            "[env]",
+                            "[target.",
+                            "rustflags",
+                            "rustdocflags",
+                            "credential-provider",
+                            "rustc",
+                        ] {
+                            if keys
+                                .iter()
+                                .any(|k| k == bad || (bad != "rustc" && k.contains(bad)))
+                            {
+                                return Err(CommandViolation {
+                                    code: "CARGO_CONFIG_EXEC_TRAP",
+                                    detail: format!(
+                                        "Repository '{rel}' under '{}' contains dangerous execution directive matching `{bad}` — refusing `cargo` invocation.",
+                                        dir.display()
+                                    ),
+                                    halt_session: true,
+                                });
+                            }
+                        }
+                    }
                 }
             }
+            if dir == repo_root {
+                break;
+            }
+            cur = dir.parent().filter(|p| p.starts_with(repo_root));
         }
     }
 
