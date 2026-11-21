@@ -37,7 +37,12 @@ jobs:
       - name: Prefer trusted system Git on macOS
         if: runner.os == 'macOS'
         shell: bash
-        run: echo "/usr/bin" >> "${GITHUB_PATH}"
+        run: |
+          set -euo pipefail
+          git_bin="${RUNNER_TEMP}/dotagent-system-git"
+          install -d -m 0755 "${git_bin}"
+          ln -s /usr/bin/git "${git_bin}/git"
+          echo "${git_bin}" >> "${GITHUB_PATH}"
 
       - name: Install stable Rust toolchain
         run: |
