@@ -1443,7 +1443,7 @@ pub fn verify_ring0_ratchet(
     };
     let enforce_ring0_paths = force_ratchet || !human_hardware_signed;
 
-    if enforce_ring0_paths && let Some(mode_err) = diff_summary.forbidden_mode_mutation {
+    if let Some(mode_err) = diff_summary.forbidden_mode_mutation {
         return Err(mode_err);
     }
 

@@ -568,7 +568,7 @@ fn verify_bundle_rollout_provenance(bundle_root: &Path) -> Result<(), String> {
     let pages = v
         .as_array()
         .ok_or_else(|| "check-runs --slurp output is not an array".to_string())?;
-    let mut latest: BTreeMap<String, (String, String)> = BTreeMap::new();
+    let mut latest: BTreeMap<String, (u64, String, String)> = BTreeMap::new();
     for page in pages {
         let runs = page
             .get("check_runs")
@@ -576,17 +576,29 @@ fn verify_bundle_rollout_provenance(bundle_root: &Path) -> Result<(), String> {
             .ok_or_else(|| "missing check_runs array".to_string())?;
         for r in runs {
             let name = r.get("name").and_then(JsonValue::as_str).unwrap_or("");
+            let id = r.get("id").and_then(JsonValue::as_u64).unwrap_or(0);
             let status = r.get("status").and_then(JsonValue::as_str).unwrap_or("");
             let concl = r
                 .get("conclusion")
                 .and_then(JsonValue::as_str)
                 .unwrap_or("");
-            latest
-                .entry(name.to_string())
-                .or_insert_with(|| (status.to_string(), concl.to_string()));
+            match latest.get_mut(name) {
+                Some((prev_id, prev_st, prev_concl)) if id >= *prev_id => {
+                    *prev_id = id;
+                    *prev_st = status.to_string();
+                    *prev_concl = concl.to_string();
+                }
+                Some(_) => {}
+                None => {
+                    latest.insert(
+                        name.to_string(),
+                        (id, status.to_string(), concl.to_string()),
+                    );
+                }
+            }
         }
     }
-    for (name, (status, concl)) in &latest {
+    for (name, (_, status, concl)) in &latest {
         // The Ring-0 ratchet job is intentionally skipped on main pushes (enforced at PR time).
         let skipped_ok = name == "Ring-0 Constitutional Ratchet" && concl == "skipped";
         if status != "completed" || (concl != "success" && !skipped_ok) {
@@ -597,7 +609,7 @@ fn verify_bundle_rollout_provenance(bundle_root: &Path) -> Result<(), String> {
     }
     for &req in MAIN_PUSH_REQUIRED_CHECK_RUNS {
         match latest.get(req) {
-            Some((st, c)) if st == "completed" && c == "success" => {}
+            Some((_, st, c)) if st == "completed" && c == "success" => {}
             _ => {
                 return Err(format!(
                     "HEAD '{head_oid}' is missing required green main-push check-run '{req}'"

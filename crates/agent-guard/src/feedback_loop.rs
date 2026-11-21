@@ -43,7 +43,7 @@ use crate::feedback::{
     AGENTPI_EVENT_SCHEMA, AGENTPI_STDOUT_PREFIX, AggregatedFrictionCluster,
     aggregate_verified_clusters, clean_single_line_ascii, compute_cluster_key,
     current_host_spool_id, feedback_state_dir, is_ring0_constitutional_code, is_valid_cluster_key,
-    load_verified_ballots,
+    load_verified_ballots, load_verified_ballots_for_repo,
 };
 use crate::github_governance::{DOTAGENT_REQUIRED_CHECKS, validate_github_ident};
 use crate::json::JsonValue;
@@ -189,7 +189,18 @@ pub fn resolve_gh_bin() -> PathBuf {
             return p.to_path_buf();
         }
     }
-    PathBuf::from("gh")
+    if let Ok(path_var) = std::env::var("PATH") {
+        for dir in std::env::split_paths(&path_var) {
+            if !dir.is_absolute() {
+                continue;
+            }
+            let cand = dir.join("gh");
+            if is_safe_executable_file(&cand) {
+                return cand;
+            }
+        }
+    }
+    PathBuf::from("/usr/bin/gh")
 }
 
 pub fn validate_owner_repo(full_repo: &str) -> Result<(String, String), String> {
@@ -1133,7 +1144,15 @@ pub fn run_feedback_sync_github_cli(args: &[String], cwd: &Path) -> ExitCode {
         eprintln!("[dotagent feedback sync-github] HARD DENY: {e}");
         return ExitCode::from(2);
     }
-    let all_ballots = match load_verified_ballots(&repo_root) {
+    let all_ballots = match if target_repo
+        .rsplit('/')
+        .next()
+        .is_some_and(|s| s.eq_ignore_ascii_case("dotagent"))
+    {
+        load_verified_ballots(&repo_root)
+    } else {
+        load_verified_ballots_for_repo(&repo_root)
+    } {
         Ok(b) => b,
         Err(e) => {
             eprintln!("[dotagent feedback sync-github] HARD DENY: {e}");

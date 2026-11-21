@@ -912,8 +912,8 @@ pub(crate) fn is_atomic_feedback_submit_command(script: &str) -> bool {
     let mut idx = tail_start;
     while idx < toks.len() {
         match toks[idx].as_str() {
-            "--note-stdin" => idx += 1,
-            "--denial-id" | "--trace-id" | "--category" | "--reason-code" | "--note"
+            "--note-stdin" | "--json" => idx += 1,
+            "--denial-id" | "--trace-id" | "--category" | "-c" | "--reason-code" | "--note"
             | "--summary" => {
                 if idx + 1 >= toks.len() {
                     return false;
