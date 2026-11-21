@@ -8,13 +8,14 @@ members = [
 ]
 
 [workspace.package]
-version = "1.0.0"
+version = "2.0.0"
 edition = "2024"
 license = "LicenseRef-Proprietary"
 rust-version = "1.88"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)'] }
 
 [workspace.lints.clippy]
 all = { level = "deny", priority = -1 }

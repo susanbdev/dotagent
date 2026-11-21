@@ -17,6 +17,7 @@
 pub mod bench_suite;
 pub mod bootstrap_suite;
 pub mod compiler_suite;
+pub mod contract_suite;
 pub mod corpus_suite;
 pub mod sandbox;
 pub mod scenario;
@@ -38,6 +39,7 @@ pub enum SuiteSelection {
     Compiler,
     Bootstrap,
     Corpus,
+    Contracts,
 }
 
 impl SuiteSelection {
@@ -49,8 +51,9 @@ impl SuiteSelection {
             "compiler" => Ok(Self::Compiler),
             "bootstrap" | "activate" => Ok(Self::Bootstrap),
             "corpus" => Ok(Self::Corpus),
+            "contracts" | "contract" => Ok(Self::Contracts),
             other => Err(format!(
-                "unknown suite '{other}' (expected all|scenarios|swarm|compiler|bootstrap|corpus)"
+                "unknown suite '{other}' (expected all|scenarios|swarm|compiler|bootstrap|corpus|contracts)"
             )),
         }
     }
@@ -302,6 +305,13 @@ pub fn list_cases(cfg: &HarnessConfig) -> Result<Vec<String>, String> {
             }
         }
     }
+    if cfg.suite.includes(SuiteSelection::Contracts) {
+        for id in contract_suite::load_contract_case_ids(&cfg.workspace_root)? {
+            if matches_filter(&id, cfg.filter.as_deref()) {
+                ids.push(id);
+            }
+        }
+    }
     Ok(ids)
 }
 
@@ -310,7 +320,8 @@ pub fn run_harness(cfg: &HarnessConfig) -> Result<HarnessReport, String> {
     let needs_bins = cfg.suite.includes(SuiteSelection::Scenarios)
         || cfg.suite.includes(SuiteSelection::Swarm)
         || cfg.suite.includes(SuiteSelection::Compiler)
-        || cfg.suite.includes(SuiteSelection::Bootstrap);
+        || cfg.suite.includes(SuiteSelection::Bootstrap)
+        || cfg.suite.includes(SuiteSelection::Contracts);
     let bins = if needs_bins {
         Some(resolve_workspace_binaries(cfg)?)
     } else {
@@ -367,6 +378,15 @@ pub fn run_harness(cfg: &HarnessConfig) -> Result<HarnessReport, String> {
             &cfg.workspace_root,
             cfg.filter.as_deref(),
         ));
+    }
+
+    if cfg.suite.includes(SuiteSelection::Contracts) {
+        let b = bins.as_ref().expect("resolved binaries");
+        cases.extend(contract_suite::run_contract_suite(
+            &cfg.workspace_root,
+            &b.agent_guard,
+            cfg.filter.as_deref(),
+        )?);
     }
 
     let total = cases.len();

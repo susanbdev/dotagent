@@ -1,7 +1,7 @@
 # dotagent Threat Model & Security Architecture
 
-Status: Normative (`v1.0.0`)
-Scope: `agent-guard` (`dotagent`), `swarm-tool`, `dotagent-compiler`, `dotagent-harness`, and compiled harness bundles (`dist/`).
+Status: Normative (`v2.0.0`)
+Scope: `agent-guard` (`dotagent`, `agent-guard-sh`), `swarm-tool`, `dotagent-compiler`, `dotagent-harness`, and compiled Policy-IR harness bundles (`dist/`).
 
 ## 1. Adversary Model
 
@@ -41,22 +41,24 @@ Swarm state integrity relies on `sha2::Sha256` and `hmac::Hmac<Sha256>` (`RFC 21
    - `dotagent:swarm-v2:capability:v1` (`sessions/<sid>.cap.json` -- `master` role minting hard-blocked over `coord.sock`)
    - `dotagent:swarm-v2:breadcrumb-event:v1` (`spool/*.spool` & `.breadcrumbs.jsonl` -- validated against open session capability and `PLAN.lock.json` read/write scope)
    - `dotagent:swarm-v2:work-ledger:v1` (`ledger/WORK_LEDGER.jsonl` -- bound to scoped Git tree OID, authenticated edit provenance, and green test checkpoint)
-4. **Zero-Oracle Verification RPCs**: `coord.sock` sits inside a `0700` `run/` directory created prior to `bind(2)`, serves bounded requests across a 16-worker thread pool, and exposes boolean-only MAC verification (`verify_mac` returns `valid: bool`, never raw expected tag bytes).
+4. **Zero-Oracle Verification & Host-Only Hook Daemon Separation**: `coord.sock` sits inside a `0700` `ipc/` directory, serves bounded requests across a 16-worker thread pool, exposes boolean-only MAC verification (`verify_mac` returns `valid: bool`), and strictly rejects `eval_hook` (`EVAL_HOOK_FORBIDDEN_ON_WORKER_SOCKET`). Warm `pre-tool`/`post-tool` evaluation runs over a separate host-only `~/.local/state/agent-guard/daemon/hook.sock` inaccessible to sandboxed workers.
+
+5. **Asymmetric Ed25519 `StopReceipt` Attestation (`vault/stop_receipt_ed25519.key`)**: `0600` Ed25519 signing seed isolated inside `vault/` (inaccessible to `exec-sandbox` workers). `agent-guard on-stop` signs `(repo_id, head_commit_oid, work_tree_oid, bundle_manifest_sha256, ledger_clean_summary, epoch_id)` under `DOTAGENT_STOP_RECEIPT_ED25519_V2`, verified in CI against a pinned public key via `dotagent verify-receipt --pubkey <hex|path>` alongside live repo/HEAD/worktree/manifest digest checks.
 
 ## 5. OS Kernel Enforcement Matrix
 
 `agent-guard exec-sandbox` applies defense-in-depth OS confinement on top of `PreToolUse` AST policy:
 
-| Host Platform | VFS Read/Write Mediation | Outbound / Inbound TCP (`--deny-net`) | `--require-kernel` Behavior |
+| Host Platform | VFS Read/Write Mediation | Outbound / Inbound Network (`--deny-net`) | `--require-kernel` Behavior |
 | :--- | :--- | :--- | :--- |
-| Linux `>= 6.7` (Landlock ABI `V4..V5`) | Kernel-enforced `AccessFs` allowlist (`.git` objects/index writable, `.git/hooks` & `.git/config` unwritable) | Kernel-enforced `AccessNet::BindTcp \| ConnectTcp` empty port ruleset (hard `EACCES`) | Allowed (Full VFS + TCP kernel isolation) |
-| Linux `5.13 .. 6.6` (Landlock ABI `V1..V3`) | Kernel-enforced `AccessFs` allowlist | Landlock `V1..V3` lacks `AccessNet`; user-space AST blocks network binaries | **Fails closed (`exit 2`)** when `--deny-net` + `--require-kernel` are both requested |
-| Containerized Linux (Landlock disabled / unprivileged seccomp) | User-space `PreToolUse` path & shell AST enforcement + sanitized environment (`--norc --noprofile`, `process_group(0)`) | User-space AST network binary block | **Fails closed (`exit 2`)** (`KERNEL_SANDBOX_UNAVAILABLE`) |
-| macOS (`sandbox-exec` SBPL) | `(deny file-write*)` with escaped literal/subpath allowlist (`escape_sbpl_literal`) and hard deny on `.git/hooks` & `.git/config` | `(deny network*)` when `--deny-net` is enabled | Allowed when `/usr/bin/sandbox-exec` is present; fails closed otherwise |
+| Linux `>= 6.7` (Landlock ABI `V4..V5`) | Kernel-enforced `AccessFs` allowlist (`.git` objects/index writable, `.git/hooks` & `.git/config` unwritable) | Landlock `AccessNet::BindTcp \| ConnectTcp` + strict `seccomp-bpf` allowlist on newly created `SYS_socket`/`SYS_socketpair` (`domain != AF_UNIX && domain != AF_NETLINK` -> `EPERM`) | Allowed (Full VFS + TCP/new-socket kernel isolation) |
+| Linux `5.13 .. 6.6` (Landlock ABI `V1..V3`) | Kernel-enforced `AccessFs` allowlist | Strict `seccomp-bpf` allowlist on newly created `SYS_socket`/`SYS_socketpair` (`AF_UNIX`/`AF_NETLINK` only; new IP/packet/vsock/RDS/TIPC sockets -> `EPERM`) | Allowed when Landlock VFS + seccomp filter succeed |
+| Containerized Linux (Landlock disabled / unprivileged seccomp) | User-space `PreToolUse` path & shell AST enforcement + sanitized environment (`--norc --noprofile`, `process_group(0)`) | Strict `seccomp-bpf` allowlist on newly created `SYS_socket`/`SYS_socketpair` (`EPERM`, fails closed on filter error) + probed `unshare --user --net` when Landlock is absent | **Fails closed (`exit 2`)** (`KERNEL_SANDBOX_UNAVAILABLE` / `KERNEL_NET_SANDBOX_FAILED`) |
+| macOS (`sandbox-exec` SBPL) | `(deny file-write*)` with escaped literal/subpath allowlist (`escape_sbpl_literal`) and hard deny on `.git/hooks` & `.git/config` | `(deny network*)` (with scoped `AF_UNIX` allowance for `ipc/coord.sock`) when `--deny-net` is enabled | Allowed when `/usr/bin/sandbox-exec` is present; fails closed otherwise |
 
 ## 6. Explicit Non-Goals & Residual Assumptions
 
 1. **Host Root / Kernel / `ptrace` Compromise**: `dotagent` confines unprivileged AI coding agents and subprocesses. It does not defend against a local attacker who already possesses `uid 0`, `CAP_SYS_ADMIN`, or `CAP_SYS_PTRACE` outside the sandbox.
 2. **Hardware & Microarchitectural Side Channels**: Constant-time MAC verification prevents timing oracles over IPC, but speculative-execution attacks (`Spectre`/`MDS`) remain the responsibility of the host kernel and hypervisor.
-3. **Interactive Human Operator Trust (`dotagent session-reset`)**: `session-reset` requires an interactive human TTY (`isatty` on stdin and stderr) and refuses execution when `AGENT_GUARD_*` sandbox markers are set. A human operator deliberately resetting a halted session at their terminal assumes responsibility for resuming that session.
-4. **Kernel TCP Mediation Below Linux `6.7` Without `--require-kernel`**: On Linux kernels `5.13..6.6` where Landlock `V4` `AccessNet` is absent and `--require-kernel` is not passed, VFS isolation remains kernel-enforced while network restriction falls back to user-space command policy. High-assurance CI or production deployments requiring mandatory kernel TCP isolation must pass `--require-kernel` on Linux `>= 6.7` or macOS.
+3. **Interactive Human Operator Trust (`dotagent session-reset` & `dotagent telemetry`)**: Both commands require an interactive human TTY (`isatty` on stdin and stdout) and refuse execution when any `AGENT_GUARD_*` or AI harness environment markers are active.
+

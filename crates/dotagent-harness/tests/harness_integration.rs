@@ -46,6 +46,11 @@ fn canonical_bypass_corpus_suite_passes() {
 }
 
 #[test]
+fn upstream_wire_and_sidecar_contracts_suite_passes() {
+    assert_suite_passes(SuiteSelection::Contracts);
+}
+
+#[test]
 fn cli_binary_supports_list_and_structured_json_reports() {
     let ws = discover_workspace_root();
     let cfg = HarnessConfig::for_workspace(ws.clone());

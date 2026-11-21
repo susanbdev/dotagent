@@ -51,18 +51,109 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: Verify strict lints, forbid(unsafe_code), & zero-panic kernel (cargo clippy)
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
       - name: Run unit, 305+ adversarial corpus, Swarm v2, & 5,300+ property fuzz suites
-        run: cargo test --workspace
+        run: cargo test --workspace --locked
 
-      - name: Build release binaries & verify bundles, repo audit, and microbenchmarks
+      - name: Build release binaries & verify bundles, repo audit, StopReceipt, and microbenchmarks
         run: |
-          cargo build --release --workspace
+          cargo build --release --locked --workspace
           ./target/release/dotagent-compiler verify .
           ./target/release/dotagent audit-repo .
+          openssl genpkey -algorithm ED25519 -out "${RUNNER_TEMP}/ci_receipt_ed25519.pem"
+          SEED_HEX="$(openssl pkey -in "${RUNNER_TEMP}/ci_receipt_ed25519.pem" -outform DER | tail -c 32 | od -An -tx1 | tr -d ' \n')"
+          PUBKEY_HEX="$(openssl pkey -in "${RUNNER_TEMP}/ci_receipt_ed25519.pem" -pubout -outform DER | tail -c 32 | od -An -tx1 | tr -d ' \n')"
+          rm -f "${RUNNER_TEMP}/ci_receipt_ed25519.pem"
+          DOTAGENT_RECEIPT_SEED_HEX="${SEED_HEX}" \
+            ./target/release/dotagent on-stop --receipt-out target/ci.receipt.json
+          ./target/release/dotagent verify-receipt target/ci.receipt.json --repo . \
+            --pubkey "${PUBKEY_HEX}"
           ./target/release/dotagent-harness bench --quick
-          rm -rf target/test-workspaces target/tbench-*
+          chmod -R u+w target/test-workspaces 2>/dev/null || true
+          rm -rf target/test-workspaces target/tbench-* target/ci.receipt.json || true
+
+  supply-chain-deny:
+    name: Supply-Chain Advisory & License Gate (cargo-deny)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout repository (zero persisted credentials)
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+          submodules: false
+
+      - name: Install SHA-256-pinned cargo-deny 0.22.0 & audit advisories, licenses, bans, and sources
+        shell: bash
+        run: |
+          set -euo pipefail
+          ARCHIVE="${RUNNER_TEMP}/cargo-deny-0.22.0-x86_64-unknown-linux-musl.tar.gz"
+          python3 - "${ARCHIVE}" <<'PY'
+          import hashlib, sys, urllib.request
+          url = "https://github.com/EmbarkStudios/cargo-deny/releases/download/0.22.0/cargo-deny-0.22.0-x86_64-unknown-linux-musl.tar.gz"
+          expected = "98c56e6a408bfa5c3c60744b6015aaa6aa08f743fdeb88386d06fca035bb1786"
+          data = urllib.request.urlopen(url, timeout=60).read()
+          actual = hashlib.sha256(data).hexdigest()
+          if actual != expected:
+              raise SystemExit(f"cargo-deny SHA-256 mismatch: expected {expected}, got {actual}")
+          with open(sys.argv[1], "wb") as fh:
+              fh.write(data)
+          PY
+          tar -xzf "${ARCHIVE}" -C "${RUNNER_TEMP}"
+          "${RUNNER_TEMP}/cargo-deny-0.22.0-x86_64-unknown-linux-musl/cargo-deny" check advisories licenses bans sources
+
+  kani-formal-proofs:
+    name: Kani Bounded Model Checking Proofs
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      CARGO_TERM_COLOR: always
+    steps:
+      - name: Checkout repository (zero persisted credentials)
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+          submodules: false
+
+      - name: Install stable Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      - name: Cache Kani 0.68.0 verifier & CBMC bundle
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            ~/.cargo/bin/kani
+            ~/.cargo/bin/cargo-kani
+            ~/.kani
+          key: ${{ runner.os }}-kani-0.68.0-v1
+
+      - name: Install SHA-256-pinned Kani 0.68.0 bundle & verify proofs on agent-guard
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! command -v cargo-kani >/dev/null 2>&1 || [ ! -d "${HOME}/.kani/kani-0.68.0" ]; then
+            cargo +stable install --locked --version 0.68.0 kani-verifier
+            BUNDLE="${RUNNER_TEMP}/kani-0.68.0-x86_64-unknown-linux-gnu.tar.gz"
+            python3 - "${BUNDLE}" <<'PY'
+          import hashlib, sys, urllib.request
+          url = "https://github.com/model-checking/kani/releases/download/kani-0.68.0/kani-0.68.0-x86_64-unknown-linux-gnu.tar.gz"
+          expected = "32e2b484d73ede0bbf64a2cf0879c4259422497d8aec4ee67d448de9ae7843d3"
+          data = urllib.request.urlopen(url, timeout=120).read()
+          actual = hashlib.sha256(data).hexdigest()
+          if actual != expected:
+              raise SystemExit(f"kani bundle SHA-256 mismatch: expected {expected}, got {actual}")
+          with open(sys.argv[1], "wb") as fh:
+              fh.write(data)
+          PY
+            cargo-kani setup --use-local-bundle "${BUNDLE}"
+            rm -f "${BUNDLE}"
+          else
+            rustup toolchain install "$(cat "${HOME}/.kani/kani-0.68.0/rust-toolchain-version")" --profile minimal || cargo-kani setup
+          fi
+          cargo kani -p agent-guard
 
   msrv-1-88:
     name: MSRV 1.88.0 Compatibility Gate
@@ -90,4 +181,6 @@ jobs:
             ${{ runner.os }}-cargo-msrv-1-88-
 
       - name: Check entire workspace against Rust 1.88.0
-        run: cargo +1.88.0 check --workspace --all-targets
+        run: cargo +1.88.0 check --workspace --all-targets --locked
+
+

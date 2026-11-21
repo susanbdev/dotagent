@@ -34,6 +34,21 @@ use crate::json::JsonValue;
 
 pub const MAX_REFERENCE_LEVEL: u8 = 2;
 
+pub type HotLedgerCache = Mutex<BTreeMap<String, (u128, u64, u64, SessionLedger)>>;
+
+fn meta_inode(meta: &fs::Metadata) -> u64 {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        meta.ino()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = meta;
+        0
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TraversalNode {
     /// 1 = direct read (A), 2 = first hop (A -> B), 3+ = forbidden hop (A -> B -> C)
@@ -162,6 +177,64 @@ impl SessionLedger {
     /// avoiding a redundant disk re-read + JSON re-parse on the hook hot path while still
     /// forcing durable storage sync whenever `halted` or `tainted` is set.
     pub fn save_locked(&self, repo_root: &Path) -> Result<(), String> {
+        self.save_locked_with_cache(repo_root, None)
+    }
+
+    pub fn load_or_create_with_cache(
+        repo_root: &Path,
+        session_id: &str,
+        cache: Option<&HotLedgerCache>,
+    ) -> Self {
+        let key_hash = compute_session_key_hash(repo_root, session_id);
+        let path = ledger_file_path_for_hash(&key_hash);
+        if let Some(hot) = cache
+            && let Ok(meta) = fs::symlink_metadata(&path)
+            && !meta.file_type().is_symlink()
+            && meta.file_type().is_file()
+            && let Some(mtime_nanos) = meta
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                .map(|d| d.as_nanos())
+            && mtime_nanos != 0
+            && let Ok(guard) = hot.lock()
+            && let Some((cached_mtime, cached_len, cached_ino, cached_ledger)) =
+                guard.get(&key_hash)
+            && *cached_mtime == mtime_nanos
+            && *cached_len == meta.len()
+            && *cached_ino == meta_inode(&meta)
+        {
+            return cached_ledger.clone();
+        }
+        let loaded = Self::load_or_create(repo_root, session_id);
+        if let Some(hot) = cache
+            && let Ok(meta) = fs::symlink_metadata(&path)
+            && !meta.file_type().is_symlink()
+            && meta.file_type().is_file()
+            && let Some(mtime_nanos) = meta
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                .map(|d| d.as_nanos())
+            && mtime_nanos != 0
+            && let Ok(mut guard) = hot.lock()
+        {
+            if guard.len() >= 256 && !guard.contains_key(&key_hash) {
+                guard.clear();
+            }
+            guard.insert(
+                key_hash,
+                (mtime_nanos, meta.len(), meta_inode(&meta), loaded.clone()),
+            );
+        }
+        loaded
+    }
+
+    pub fn save_locked_with_cache(
+        &self,
+        repo_root: &Path,
+        cache: Option<&HotLedgerCache>,
+    ) -> Result<(), String> {
         let key_hash = if self.session_key_hash.is_empty() {
             compute_session_key_hash(repo_root, &self.session_id)
         } else {
@@ -173,7 +246,28 @@ impl SessionLedger {
             &path,
             serialized.as_bytes(),
             self.halted || self.tainted,
-        )
+        )?;
+        if let Some(hot) = cache
+            && let Ok(meta) = fs::symlink_metadata(&path)
+            && !meta.file_type().is_symlink()
+            && meta.file_type().is_file()
+            && let Some(mtime_nanos) = meta
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                .map(|d| d.as_nanos())
+            && mtime_nanos != 0
+            && let Ok(mut guard) = hot.lock()
+        {
+            if guard.len() >= 256 && !guard.contains_key(&key_hash) {
+                guard.clear();
+            }
+            guard.insert(
+                key_hash,
+                (mtime_nanos, meta.len(), meta_inode(&meta), self.clone()),
+            );
+        }
+        Ok(())
     }
 
     pub fn reset_for_new_user_prompt(repo_root: &Path, session_id: &str) -> Result<Self, String> {
@@ -976,6 +1070,7 @@ pub fn append_audit_jsonl(
         ("detail".to_string(), JsonValue::Str(ascii_detail)),
     ]);
 
+    let _audit_lock = ExclusiveFileLockGuard::acquire(&path);
     let file_opt = match fs::symlink_metadata(&path) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             let mut opts = OpenOptions::new();
@@ -1025,7 +1120,12 @@ pub fn append_audit_jsonl(
 }
 
 pub fn compute_session_key_hash(repo_root: &Path, raw_session_id: &str) -> String {
-    let repo_bytes = repo_root.to_string_lossy();
+    let effective_repo = if repo_root.join(".git").is_file() {
+        crate::resolve_common_repo_root(repo_root)
+    } else {
+        repo_root.to_path_buf()
+    };
+    let repo_bytes = effective_repo.to_string_lossy();
     let framed = format!(
         "v2:{}:{}:{}:{}",
         repo_bytes.len(),
@@ -1034,6 +1134,11 @@ pub fn compute_session_key_hash(repo_root: &Path, raw_session_id: &str) -> Strin
         raw_session_id
     );
     sha256_hex(framed.as_bytes())
+}
+
+pub fn session_ledger_path(repo_root: &Path, session_id: &str) -> PathBuf {
+    let key_hash = compute_session_key_hash(repo_root, session_id);
+    ledger_file_path_for_hash(&key_hash)
 }
 
 fn ledger_file_path_for_hash(session_key_hash: &str) -> PathBuf {

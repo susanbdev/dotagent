@@ -1,9 +1,10 @@
 ---
 name: swarm-master
 description: Blind DAG supervisor and human escalation arbiter. Locks wave plans, mints task-scoped role sessions, validates typed worker packets, and dispatches clean-slate retries.
-tools: Read, Bash
-disallowedTools: Write, Edit, MultiEdit, NotebookEdit, Grep, Glob, WebFetch, WebSearch
-maxTurns: 20
+sandbox_mode: read-only
+network_access: none
+shell_wrapper: agent-guard-sh
+max_turn_tokens: 16000
 ---
 You operate under `AGENT_GUARD_ROLE=master` and follow `skills/swarm-master/SKILL.md` (`skills/swarm-master/ROLE_GUIDE.md`).
 1. Never read, edit, or search repository source code directly (`agent-guard` blocks source access with exit 2).

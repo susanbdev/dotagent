@@ -68,19 +68,31 @@ pub fn run_cli_entrypoint() -> ExitCode {
         "session-reset" => crate::operator::run_session_reset_cli(&args[1..], &cwd),
         "activate" => crate::operator::run_activate_cli(&args[1..], &cwd),
         "deactivate" => crate::operator::run_deactivate_cli(&args[1..], &cwd),
+        "fleet" => crate::fleet::run_fleet_cli(&args[1..], &cwd),
+        "telemetry" => crate::telemetry::run_telemetry_cli(&args[1..]),
+        "self-verify" => crate::fleet::run_self_verify_cli(&args[1..]),
+        "verify-receipt" => crate::stop_receipt::run_verify_receipt_cli(&args[1..], &cwd),
+        "receipt-pubkey" => crate::stop_receipt::run_receipt_pubkey_cli(&args[1..], &cwd),
+        "mcp-gateway" => crate::mcp_gateway::run_mcp_gateway_cli(&args[1..], &cwd),
         "pre-tool" => {
             let payload = match read_bounded_stdin_or_arg(&args[1..]) {
                 Ok(s) => s,
                 Err(msg) => return emit_hook_denial("HOOK_INPUT_OVERFLOW", &msg, true),
             };
-            emit_hook_decision(handle_pre_tool_hook(&payload, &cwd), HookPhase::PreTool)
+            let decision = eval_hook_preferring_hot_coord("pre-tool", &payload, &cwd, || {
+                handle_pre_tool_hook(&payload, &cwd)
+            });
+            emit_hook_decision(decision, HookPhase::PreTool)
         }
         "post-tool" => {
             let payload = match read_bounded_stdin_or_arg(&args[1..]) {
                 Ok(s) => s,
                 Err(msg) => return emit_hook_denial("HOOK_INPUT_OVERFLOW", &msg, false),
             };
-            emit_hook_decision(handle_post_tool_hook(&payload, &cwd), HookPhase::PostTool)
+            let decision = eval_hook_preferring_hot_coord("post-tool", &payload, &cwd, || {
+                handle_post_tool_hook(&payload, &cwd)
+            });
+            emit_hook_decision(decision, HookPhase::PostTool)
         }
         "user-prompt" => {
             let payload = match read_bounded_stdin_or_arg(&args[1..]) {
@@ -159,7 +171,7 @@ pub fn run_cli_entrypoint() -> ExitCode {
                 ExitCode::from(2)
             }
         }
-        "on-stop" => run_on_stop(&cwd),
+        "on-stop" => run_on_stop(&args[1..], &cwd),
         "check-cmd" => {
             let Some(cmd) = args.get(1) else {
                 eprintln!("[AGENT-GUARD] usage: agent-guard check-cmd \"<command>\"");
@@ -228,6 +240,7 @@ pub fn run_cli_entrypoint() -> ExitCode {
             }
         }
         "coordinator" => crate::coordinator::run_coordinator_cli(&args[1..], &cwd),
+        "hook-daemon" => crate::coordinator::run_hook_daemon_cli(&args[1..]),
         "exec-sandbox" => crate::exec_sandbox::run_exec_sandbox_cli(&args[1..], &cwd),
         "sandbox-status" => crate::exec_sandbox::run_sandbox_status_cli(),
         "--probe-landlock-child" => crate::exec_sandbox::run_probe_landlock_child(),
@@ -251,24 +264,29 @@ pub fn run_cli_entrypoint() -> ExitCode {
                  Operator & Onboarding Commands:\n\
                  \x20 activate [--workspace <dir>] [--dry-run]  Non-destructive multi-harness activation & backups\n\
                  \x20 deactivate [--workspace <dir>]            Restore .dotagent.bak files & remove deployed plane\n\
+                 \x20 fleet <audit|doctor|sync|build-image>     Polyrepo org sync, drift audit, & /opt/dotagent builder\n\
+                 \x20 telemetry <summary|top-denies|rotate|export-otlp>  Human-TTY-only security analytics\n\
+                 \x20 verify-receipt [receipt.json] [--pubkey]  Verify asymmetric Ed25519 StopReceipt attestation\n\
+                 \x20 self-verify --sums <SHA256SUMS>           Verify binary SHA-256 & SLSA v1.0 provenance\n\
                  \x20 doctor [--json] [path]                    Run 7-point live security & sandbox health report\n\
                  \x20 explain <CODE|--list> [--json]            Explain any guard code with rationale & remediation\n\
                  \x20 session-reset [--session <id>|--all]      Reset halted session state (interactive human TTY only)\n\
-                 \x20 swarm <role> <subcommand> ...             Forward to zero-trust Swarm v2 role-capability CLI\n\
-                 \x20 compile <build|verify> [root]             Forward to deterministic dist/ manifest compiler\n\
-                 \x20 harness <run|bench> ...                   Forward to adversarial & microbenchmark harness\n\
+                 \x20 swarm <run|role> ...                      Active multi-worktree DAG wave runner & Swarm CLI\n\
+                 \x20 compile <build|verify> [root]             Deterministic Policy-IR & embedded Regorus compiler\n\
+                 \x20 harness <run|bench> ...                   Adversarial, contract, & microbenchmark harness\n\
                  Kernel & Hook Commands:\n\
+                 \x20 mcp-gateway           Local zero-trust mediating MCP JSON-RPC 2.0 sidecar (PKCE + DPoP)\n\
                  \x20 pre-tool              PreToolUse / BeforeTool JSON hook gate (stdin)\n\
                  \x20 post-tool             PostToolUse / AfterTool JSON output scanner (stdin)\n\
                  \x20 user-prompt           UserPromptSubmit turn-isolation reset hook (stdin)\n\
                  \x20 pre-compact           PreCompact / PreCompress step-budget reset & ASCII directive\n\
-                 \x20 exec-sandbox          Execute shell command inside OS Landlock/Seatbelt VFS+TCP sandbox\n\
+                 \x20 exec-sandbox          Execute shell command inside Landlock/Seatbelt/Seccomp VFS+Net sandbox\n\
                  \x20 sandbox-status        Report active host kernel VFS sandbox enforcement mode\n\
-                 \x20 coordinator           Run privilege-separated UNIX domain HMAC/capability daemon\n\
+                 \x20 coordinator           Privilege-separated UNIX domain HMAC/epoch/hook daemon\n\
                  \x20 sanitize-stream       Pre-buffer 7-bit ASCII sanitizer & 120-line stream compactor\n\
                  \x20 read-safe <path>      Read & neuter file into 128-bit spotlighted 7-bit ASCII\n\
                  \x20 post-edit [file]      Incremental post-edit Unicode/secret/immutability check\n\
-                 \x20 on-stop               Verification & git-hook lockdown gate before completion\n\
+                 \x20 on-stop               Verification, git-hook lockdown, & Ed25519 StopReceipt gate\n\
                  \x20 check-cmd \"<cmd>\"     Validate a shell command against the AST policy\n\
                  \x20 check-path <path>     Validate a path (--write for write check)\n\
                  \x20 scan-file <path>      Scan file for prompt injection, Unicode, & token bombs\n\
@@ -751,8 +769,53 @@ fn run_scan_file(raw_path: &str, cwd: &Path) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-fn run_on_stop(cwd: &Path) -> ExitCode {
+fn eval_hook_preferring_hot_coord<F>(
+    phase: &str,
+    payload: &str,
+    cwd: &Path,
+    local_fallback: F,
+) -> Decision
+where
+    F: FnOnce() -> Decision,
+{
+    if std::env::var("AGENT_GUARD_HOT_COORD").as_deref() == Ok("1") {
+        let repo_root = resolve_repo_root(cwd);
+        if let Ok(dec) = crate::coordinator::rpc_eval_hook(&repo_root, phase, payload, cwd) {
+            return dec;
+        }
+    }
+    local_fallback()
+}
+
+fn run_on_stop(args: &[String], cwd: &Path) -> ExitCode {
+    let mut receipt_out: Option<PathBuf> = None;
+    let mut i = 0usize;
+    while i < args.len() {
+        if args[i] == "--receipt-out" && i + 1 < args.len() {
+            receipt_out = Some(PathBuf::from(&args[i + 1]));
+            i += 2;
+        } else {
+            i += 1;
+        }
+    }
+
     let repo_root = resolve_repo_root(cwd);
+
+    let sid = std::env::var("AGENT_GUARD_SESSION_ID").unwrap_or_else(|_| "default".to_string());
+    {
+        let _ledger_lock = SessionLedger::acquire_lock(&repo_root, &sid);
+        let ledger = SessionLedger::load_or_create(&repo_root, &sid);
+        if ledger.halted {
+            let reason = ledger
+                .halt_reason
+                .as_deref()
+                .unwrap_or("circuit breaker tripped");
+            eprintln!(
+                "[AGENT-GUARD ON-STOP FAIL] SESSION_CIRCUIT_BREAKER_HALTED: session '{sid}' is halted ({reason})."
+            );
+            return ExitCode::from(2);
+        }
+    }
 
     if let Err(err) = verify_global_git_hardening() {
         eprintln!("[AGENT-GUARD ON-STOP FAIL] {err}");
@@ -768,6 +831,31 @@ fn run_on_stop(cwd: &Path) -> ExitCode {
 
     if let Err(swarm_err) = crate::work_ledger::verify_on_stop_swarm_gates(&repo_root) {
         eprintln!("[AGENT-GUARD ON-STOP FAIL] {swarm_err}");
+        return ExitCode::from(2);
+    }
+
+    if std::env::var("AGENT_GUARD_IN_SANDBOX").as_deref() != Ok("1")
+        && std::env::var("AGENT_GUARD_WORKER_LOCK").as_deref() != Ok("1")
+    {
+        match crate::stop_receipt::issue_verified_stop_receipt(&repo_root, receipt_out.as_deref()) {
+            Ok((receipt, path)) => {
+                println!(
+                    "[AGENT-GUARD ON-STOP OK] Repository '{}' passed security audit (StopReceipt='{}' ed25519={}).",
+                    repo_root.display(),
+                    path.display(),
+                    &receipt.pubkey_ed25519_hex[..16]
+                );
+                return ExitCode::SUCCESS;
+            }
+            Err(err) => {
+                eprintln!("[AGENT-GUARD ON-STOP FAIL] {err}");
+                return ExitCode::from(2);
+            }
+        }
+    } else if receipt_out.is_some() {
+        eprintln!(
+            "[AGENT-GUARD ON-STOP FAIL] STOP_RECEIPT_DENIED_IN_SANDBOX: StopReceipt signing requires host authority."
+        );
         return ExitCode::from(2);
     }
 

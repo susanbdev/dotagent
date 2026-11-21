@@ -29,6 +29,9 @@ static SANDBOX_SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUs
 
 impl TestSandbox {
     pub fn create(workspace_root: &Path, suite_slug: &str) -> Result<Self, String> {
+        let canon_ws =
+            fs::canonicalize(workspace_root).unwrap_or_else(|_| workspace_root.to_path_buf());
+        let workspace_root = canon_ws.as_path();
         let sanitized_slug = sanitize_slug(suite_slug);
         let seq = SANDBOX_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let root = workspace_root

@@ -18,7 +18,7 @@ use crate::coordinator::{coordinator_socket_path, ping_coordinator};
 use crate::exec_sandbox::probe_host_sandbox_mode;
 use crate::json::JsonValue;
 use crate::qa_suspects::plan_lock_state_path;
-use crate::traversal_ledger::{SessionLedger, compute_session_key_hash, state_base_dir};
+use crate::traversal_ledger::{SessionLedger, state_base_dir};
 use crate::{audit_repository, resolve_repo_root, verify_global_git_hardening};
 
 const REQUIRED_GIT_SETTINGS: &[(&str, &str)] = &[
@@ -211,7 +211,13 @@ fn check_binaries_health() -> DoctorCheck {
         let bin_dir = PathBuf::from(home).join(".local/bin");
         let mut present = Vec::new();
         let mut writable = Vec::new();
-        for name in ["agent-guard", "dotagent-compiler", "swarm-tool", "dotagent"] {
+        for name in [
+            "agent-guard",
+            "agent-guard-sh",
+            "dotagent-compiler",
+            "swarm-tool",
+            "dotagent",
+        ] {
             let p = bin_dir.join(name);
             if let Ok(meta) = fs::symlink_metadata(&p) {
                 if meta.file_type().is_symlink() {
@@ -276,8 +282,7 @@ fn check_session_state_health(repo_root: &Path) -> DoctorCheck {
         };
     }
     let sid = std::env::var("AGENT_GUARD_SESSION_ID").unwrap_or_else(|_| "default".to_string());
-    let key_hash = compute_session_key_hash(repo_root, &sid);
-    let session_file = base.join("sessions").join(format!("{key_hash}.json"));
+    let session_file = crate::traversal_ledger::session_ledger_path(repo_root, &sid);
     if !session_file.exists() {
         return DoctorCheck {
             name: "session_state",
@@ -339,7 +344,7 @@ pub fn run_session_reset_cli(args: &[String], cwd: &Path) -> ExitCode {
     }
 
     if reset_all {
-        let sessions_dir = state_base_dir().join("sessions");
+        let sessions_dir = state_base_dir();
         let mut removed = 0usize;
         if let Ok(entries) = fs::read_dir(&sessions_dir) {
             for entry in entries.flatten() {
@@ -366,10 +371,7 @@ pub fn run_session_reset_cli(args: &[String], cwd: &Path) -> ExitCode {
         .unwrap_or_else(|| "default".to_string());
 
     let _lock = SessionLedger::acquire_lock(&repo_root, &sid);
-    let key_hash = compute_session_key_hash(&repo_root, &sid);
-    let session_file = state_base_dir()
-        .join("sessions")
-        .join(format!("{key_hash}.json"));
+    let session_file = crate::traversal_ledger::session_ledger_path(&repo_root, &sid);
     if session_file.exists()
         && let Err(e) = fs::remove_file(&session_file)
     {
@@ -380,7 +382,7 @@ pub fn run_session_reset_cli(args: &[String], cwd: &Path) -> ExitCode {
         return ExitCode::from(2);
     }
     let fresh = SessionLedger::new(&repo_root, &sid);
-    if let Err(e) = fresh.save(&repo_root) {
+    if let Err(e) = fresh.save_locked(&repo_root) {
         eprintln!("[AGENT-GUARD] failed writing fresh session state: {e}");
         return ExitCode::from(2);
     }
@@ -914,7 +916,7 @@ fn deploy_workspace_bundle(
     Ok(())
 }
 
-fn execute_activate(
+pub(crate) fn execute_activate(
     home: &Path,
     bin_dir: &Path,
     dotagent_root: &Path,
@@ -1062,6 +1064,57 @@ fn execute_activate(
         "[activate] Zero-trust guards, non-destructive backups, pinned GUI hooks, zsh/bash PATH, 19-key git lockdown, and read-only control plane active for '{}'.",
         target_ws.display()
     ));
+    Ok(log)
+}
+
+/// Deploys the `0444` read-only control plane + swarm state invalidation + repository security audit
+/// onto a single external workspace without touching `$HOME` or `dotagent_root`, enabling safe
+/// multi-threaded `dotagent fleet sync` across sibling repositories.
+pub(crate) fn activate_external_workspace_only(
+    bin_dir: &Path,
+    dotagent_root: &Path,
+    target_ws: &Path,
+    dry_run: bool,
+) -> Result<Vec<String>, String> {
+    let mut log = Vec::new();
+    let canon_dotagent =
+        fs::canonicalize(dotagent_root).unwrap_or_else(|_| dotagent_root.to_path_buf());
+    let canon_target = fs::canonicalize(target_ws).unwrap_or_else(|_| target_ws.to_path_buf());
+    if canon_target == canon_dotagent {
+        return Ok(log);
+    }
+
+    let installed_guard = bin_dir.join("agent-guard");
+    let fallback_exe = std::env::current_exe().ok().filter(|p| {
+        p.file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n == "agent-guard" || n == "dotagent")
+    });
+    let abs_guard_opt = if installed_guard.is_file() {
+        Some(installed_guard.as_path())
+    } else {
+        fallback_exe.as_deref()
+    };
+
+    deploy_workspace_bundle(
+        dotagent_root,
+        target_ws,
+        0o444,
+        true,
+        abs_guard_opt,
+        dry_run,
+        &mut log,
+    )?;
+    invalidate_or_purge_swarm_state(target_ws, false, dry_run, &mut log)?;
+    if !dry_run && target_ws.join(".git").exists() {
+        if let Err(errs) = audit_repository(target_ws) {
+            return Err(format!(
+                "target workspace '{}' failed security audit: {}",
+                target_ws.display(),
+                errs.join("; ")
+            ));
+        }
+    }
     Ok(log)
 }
 

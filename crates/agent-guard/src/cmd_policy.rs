@@ -856,6 +856,15 @@ fn check_single_command(
         });
     }
 
+    if bin == "agent-guard-sh" {
+        return Err(CommandViolation {
+            code: "SELF_TAMPERING_BLOCKED",
+            detail: "Agents may not invoke `agent-guard-sh` directly to nest shell wrappers."
+                .to_string(),
+            halt_session: true,
+        });
+    }
+
     // Prevent agent from invoking `agent-guard` / `dotagent` hooks, state resets, or unwrapped sandbox helpers
     if matches!(bin, "agent-guard" | "dotagent") {
         let sub_args: &[String] = if args.first().map(String::as_str) == Some("guard") {
@@ -884,13 +893,20 @@ fn check_single_command(
                     | "pre-compact"
                     | "compact-reset"
                     | "coordinator"
+                    | "hook-daemon"
                     | "activate"
                     | "deactivate"
+                    | "telemetry"
+                    | "fleet"
+                    | "self-verify"
+                    | "verify-receipt"
+                    | "receipt-pubkey"
+                    | "mcp-gateway"
             ) {
                 return Err(CommandViolation {
                     code: "SELF_TAMPERING_BLOCKED",
                     detail:
-                        "Agents may not reset agent-guard session/compaction state, spoof lifecycle hooks, mutate activation, or directly invoke the vault coordinator."
+                        "Agents may not reset agent-guard session/compaction state, spoof lifecycle hooks, mutate activation/fleet, read human telemetry, or invoke internal daemons/gateways."
                             .to_string(),
                     halt_session: true,
                 });
@@ -916,6 +932,7 @@ fn check_single_command(
             }
             if matches!(sub, "read-safe" | "scan-file") {
                 if let Some(target_file) = sub_args.get(1) {
+                    reject_shell_glob_in_operand(sub, target_file)?;
                     validate_path(repo_root, cwd, target_file, PathAccess::Read).map_err(|pv| {
                         CommandViolation {
                             code: pv.code,
@@ -1150,6 +1167,38 @@ fn check_env_assignment(
             code: "DANGEROUS_ENV_OVERRIDE",
             detail: format!(
                 "Overriding security-critical environment variable `{key}` is hard-blocked."
+            ),
+            halt_session: true,
+        });
+    }
+
+    if ku == "CARGO_TARGET_DIR" || ku == "CARGO_HOME" || ku == "RUSTUP_HOME" {
+        if ku != "CARGO_TARGET_DIR" {
+            return Err(CommandViolation {
+                code: "DANGEROUS_ENV_OVERRIDE",
+                detail: format!(
+                    "Overriding security-critical toolchain directory `{key}` is hard-blocked."
+                ),
+                halt_session: true,
+            });
+        }
+        reject_shell_glob_in_operand(key, val)?;
+        validate_path(repo_root, cwd, val, PathAccess::Write).map_err(|pv| CommandViolation {
+            code: pv.code,
+            detail: format!("`CARGO_TARGET_DIR={val}` denied: {}", pv.detail),
+            halt_session: pv.is_poisoned_zone,
+        })?;
+        return Ok(());
+    }
+    if ku.starts_with("CARGO_TARGET_")
+        || ku.starts_with("CARGO_ALIAS_")
+        || ku.starts_with("CARGO_REGISTRIES_")
+        || ku.starts_with("CARGO_SOURCE_")
+    {
+        return Err(CommandViolation {
+            code: "DANGEROUS_ENV_OVERRIDE",
+            detail: format!(
+                "Overriding Cargo runner/linker/registry variable `{key}` is hard-blocked."
             ),
             halt_session: true,
         });
@@ -1756,6 +1805,7 @@ fn check_node_pkg_manager(
                     halt_session: false,
                 });
             };
+            reject_shell_glob_in_operand(bin, dir_arg)?;
             let valid =
                 validate_path(repo_root, cwd, dir_arg, PathAccess::Write).map_err(|pv| {
                     CommandViolation {
@@ -1773,6 +1823,7 @@ fn check_node_pkg_manager(
             .or_else(|| a.strip_prefix("--cwd="))
             .or_else(|| a.strip_prefix("--dir="))
         {
+            reject_shell_glob_in_operand(bin, dir_arg)?;
             let valid =
                 validate_path(repo_root, cwd, dir_arg, PathAccess::Write).map_err(|pv| {
                     CommandViolation {
@@ -1975,6 +2026,7 @@ fn check_cargo_command(
                     halt_session: false,
                 });
             };
+            reject_shell_glob_in_operand("cargo", p)?;
             validate_path(repo_root, cwd, p, PathAccess::Read).map_err(|pv| CommandViolation {
                 code: pv.code,
                 detail: pv.detail,
@@ -1984,6 +2036,7 @@ fn check_cargo_command(
             continue;
         }
         if let Some(p) = a.strip_prefix("--manifest-path=") {
+            reject_shell_glob_in_operand("cargo", p)?;
             validate_path(repo_root, cwd, p, PathAccess::Read).map_err(|pv| CommandViolation {
                 code: pv.code,
                 detail: pv.detail,
@@ -2000,6 +2053,7 @@ fn check_cargo_command(
                     halt_session: false,
                 });
             };
+            reject_shell_glob_in_operand("cargo", p)?;
             validate_path(repo_root, cwd, p, PathAccess::Write).map_err(|pv| CommandViolation {
                 code: pv.code,
                 detail: pv.detail,
@@ -2009,6 +2063,7 @@ fn check_cargo_command(
             continue;
         }
         if let Some(p) = a.strip_prefix("--target-dir=") {
+            reject_shell_glob_in_operand("cargo", p)?;
             validate_path(repo_root, cwd, p, PathAccess::Write).map_err(|pv| CommandViolation {
                 code: pv.code,
                 detail: pv.detail,
@@ -4241,6 +4296,15 @@ fn inspect_sed_script(script: &str) -> Result<(), CommandViolation> {
 }
 
 fn reject_shell_glob_in_operand(ctx: &str, operand: &str) -> Result<(), CommandViolation> {
+    if operand.contains('$') {
+        return Err(CommandViolation {
+            code: "SHELL_DYNAMIC_PATH_BLOCKED",
+            detail: format!(
+                "`{ctx}` file/path operand '{operand}' contains dynamic shell variable/parameter expansion (`$`), which resolves unpredictably at runtime and cannot be statically validated."
+            ),
+            halt_session: false,
+        });
+    }
     if operand.contains('*') || operand.contains('?') || operand.contains('[') {
         return Err(CommandViolation {
             code: "SHELL_GLOB_OPERAND_BLOCKED",
@@ -4573,8 +4637,17 @@ fn parse_shell_script(
                 halt_session: false,
             });
         }
-        // Brace group `{ ...; }`
-        if b == b'{' || b == b'}' {
+        // Brace group `{ ...; }` ONLY when `{` or `}` is a standalone reserved token
+        let is_brace_group_open =
+            b == b'{' && matches!(bytes.get(i + 1), Some(b' ' | b'\t' | b'\n' | b'\r'));
+        let is_brace_group_close = b == b'}'
+            && cur_argv.is_empty()
+            && (i + 1 >= bytes.len()
+                || matches!(
+                    bytes[i + 1],
+                    b' ' | b'\t' | b'\n' | b'\r' | b';' | b'|' | b'&' | b')'
+                ));
+        if is_brace_group_open || is_brace_group_close {
             has_compound_list_op = true;
             flush(
                 &mut cur_env,
@@ -4706,6 +4779,9 @@ fn read_shell_word(
     let bytes = script.as_bytes();
     let mut i = start;
     let mut out = String::new();
+    let mut brace_stack: Vec<(bool, bool)> = Vec::new();
+    let mut prev_unquoted_dollar = false;
+    let mut prev_unquoted_dot = false;
 
     while i < bytes.len() {
         let b = bytes[i];
@@ -4716,6 +4792,8 @@ fn read_shell_word(
             break;
         }
         if b == b'\\' {
+            prev_unquoted_dollar = false;
+            prev_unquoted_dot = false;
             if i + 1 >= bytes.len() {
                 return Err(CommandViolation {
                     code: "UNTERMINATED_SHELL_ESCAPE",
@@ -4732,6 +4810,8 @@ fn read_shell_word(
             continue;
         }
         if b == b'\'' {
+            prev_unquoted_dollar = false;
+            prev_unquoted_dot = false;
             i += 1;
             let start_sq = i;
             while i < bytes.len() && bytes[i] != b'\'' {
@@ -4749,6 +4829,8 @@ fn read_shell_word(
             continue;
         }
         if b == b'"' {
+            prev_unquoted_dollar = false;
+            prev_unquoted_dot = false;
             i += 1;
             while i < bytes.len() && bytes[i] != b'"' {
                 if bytes[i] == b'\\' && i + 1 < bytes.len() {
@@ -4784,6 +4866,8 @@ fn read_shell_word(
             continue;
         }
         if b == b'$' && bytes.get(i + 1) == Some(&b'(') {
+            prev_unquoted_dollar = false;
+            prev_unquoted_dot = false;
             let (inner, next_i) = extract_balanced_parens(script, i + 1)?;
             subscripts.push(inner);
             out.push_str("$()");
@@ -4791,11 +4875,62 @@ fn read_shell_word(
             continue;
         }
         if b == b'`' {
+            prev_unquoted_dollar = false;
+            prev_unquoted_dot = false;
             let (inner, next_i) = extract_backticks(script, i)?;
             subscripts.push(inner);
             out.push_str("``");
             i = next_i;
             continue;
+        }
+
+        match b {
+            b'{' => {
+                brace_stack.push((prev_unquoted_dollar, false));
+                prev_unquoted_dollar = false;
+                prev_unquoted_dot = false;
+            }
+            b',' => {
+                if let Some((is_param, saw_exp)) = brace_stack.last_mut()
+                    && !*is_param
+                {
+                    *saw_exp = true;
+                }
+                prev_unquoted_dollar = false;
+                prev_unquoted_dot = false;
+            }
+            b'.' => {
+                if prev_unquoted_dot
+                    && let Some((is_param, saw_exp)) = brace_stack.last_mut()
+                    && !*is_param
+                {
+                    *saw_exp = true;
+                }
+                prev_unquoted_dollar = false;
+                prev_unquoted_dot = true;
+            }
+            b'}' => {
+                if let Some((is_param, saw_exp)) = brace_stack.pop()
+                    && !is_param
+                    && saw_exp
+                {
+                    return Err(CommandViolation {
+                        code: "SHELL_BRACE_EXPANSION_BLOCKED",
+                        detail: "Unquoted Bash brace expansion (`{a,b}` / `{a..b}`) synthesizes unvalidated command or path tokens at runtime and is forbidden.".to_string(),
+                        halt_session: false,
+                    });
+                }
+                prev_unquoted_dollar = false;
+                prev_unquoted_dot = false;
+            }
+            b'$' => {
+                prev_unquoted_dollar = true;
+                prev_unquoted_dot = false;
+            }
+            _ => {
+                prev_unquoted_dollar = false;
+                prev_unquoted_dot = false;
+            }
         }
 
         let tail = &script[i..];
@@ -4919,6 +5054,138 @@ fn extract_backticks(script: &str, open_idx: usize) -> Result<(String, usize), C
         detail: "Unterminated backtick command substitution.".to_string(),
         halt_session: false,
     })
+}
+
+/// Pure, iterative, syscall-free shell script tokenizer entry point for bounded Kani model checking.
+pub fn tokenize_shell_script_pure(script: &str) -> Result<usize, &'static str> {
+    let mut subscripts = Vec::new();
+    parse_shell_script(script, &mut subscripts)
+        .map(|(cmds, _)| cmds.len())
+        .map_err(|v| v.code)
+}
+
+/// Compact `u8`-discriminant error code for `scan_shell_brace_and_quote_bytes` so CBMC/Kani
+/// verifies exact error variants in `O(1)` without string `memcmp` loop unrolling.
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShellScanError {
+    UnterminatedEscape = 1,
+    UnterminatedSingleQuote = 2,
+    UnterminatedDoubleQuote = 3,
+    NestingExceeded = 4,
+    BraceExpansionBlocked = 5,
+}
+
+/// Zero-heap-allocation byte-level shell quote, escape, and unquoted brace-expansion verifier
+/// (`{a,b}` / `{a..b}` vs `${VAR}`) with a fixed stack depth of 8 for fast CBMC/Kani model checking.
+pub const fn scan_shell_brace_and_quote_bytes(bytes: &[u8]) -> Result<usize, ShellScanError> {
+    let mut i = 0usize;
+    let mut stack_is_param = [false; 8];
+    let mut stack_saw_exp = [false; 8];
+    let mut sp = 0usize;
+    let mut prev_unquoted_dollar = false;
+    let mut prev_unquoted_dot = false;
+    let mut tokens = 0usize;
+
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b == b'\\' {
+            if i + 1 >= bytes.len() {
+                return Err(ShellScanError::UnterminatedEscape);
+            }
+            prev_unquoted_dollar = false;
+            prev_unquoted_dot = false;
+            i += 2;
+            continue;
+        }
+        if b == b'\'' {
+            prev_unquoted_dollar = false;
+            prev_unquoted_dot = false;
+            i += 1;
+            while i < bytes.len() && bytes[i] != b'\'' {
+                i += 1;
+            }
+            if i >= bytes.len() {
+                return Err(ShellScanError::UnterminatedSingleQuote);
+            }
+            tokens += 1;
+            i += 1;
+            continue;
+        }
+        if b == b'"' {
+            prev_unquoted_dollar = false;
+            prev_unquoted_dot = false;
+            i += 1;
+            while i < bytes.len() && bytes[i] != b'"' {
+                if bytes[i] == b'\\' {
+                    if i + 1 >= bytes.len() {
+                        return Err(ShellScanError::UnterminatedDoubleQuote);
+                    }
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+            }
+            if i >= bytes.len() {
+                return Err(ShellScanError::UnterminatedDoubleQuote);
+            }
+            tokens += 1;
+            i += 1;
+            continue;
+        }
+        match b {
+            b'{' => {
+                if sp >= 8 {
+                    return Err(ShellScanError::NestingExceeded);
+                }
+                stack_is_param[sp] = prev_unquoted_dollar;
+                stack_saw_exp[sp] = false;
+                sp += 1;
+                prev_unquoted_dollar = false;
+                prev_unquoted_dot = false;
+            }
+            b',' => {
+                if sp > 0 && !stack_is_param[sp - 1] {
+                    stack_saw_exp[sp - 1] = true;
+                }
+                prev_unquoted_dollar = false;
+                prev_unquoted_dot = false;
+            }
+            b'.' => {
+                if prev_unquoted_dot && sp > 0 && !stack_is_param[sp - 1] {
+                    stack_saw_exp[sp - 1] = true;
+                }
+                prev_unquoted_dollar = false;
+                prev_unquoted_dot = true;
+            }
+            b'}' => {
+                if sp > 0 {
+                    sp -= 1;
+                    if !stack_is_param[sp] && stack_saw_exp[sp] {
+                        return Err(ShellScanError::BraceExpansionBlocked);
+                    }
+                }
+                prev_unquoted_dollar = false;
+                prev_unquoted_dot = false;
+            }
+            b'$' => {
+                prev_unquoted_dollar = true;
+                prev_unquoted_dot = false;
+            }
+            b' ' | b'\t' | b'\n' | b';' => {
+                sp = 0;
+                prev_unquoted_dollar = false;
+                prev_unquoted_dot = false;
+            }
+            _ => {
+                tokens += 1;
+                prev_unquoted_dollar = false;
+                prev_unquoted_dot = false;
+            }
+        }
+        i += 1;
+    }
+    Ok(tokens)
 }
 
 #[cfg(test)]

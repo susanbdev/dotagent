@@ -221,7 +221,7 @@ pub fn swarm_state_dir_if_exists(repo_root: &Path) -> Option<PathBuf> {
     if !swarm_root.is_dir() {
         return None;
     }
-    let canon = fs::canonicalize(repo_root).unwrap_or_else(|_| repo_root.to_path_buf());
+    let canon = crate::resolve_common_repo_root(repo_root);
     let repo_hash = hex_encode(&sha256_digest(canon.to_string_lossy().as_bytes()));
     let dir = swarm_root.join(&repo_hash[..24]);
     if dir.is_dir() { Some(dir) } else { None }
@@ -235,7 +235,7 @@ pub fn swarm_state_dir(repo_root: &Path) -> Result<PathBuf, String> {
     } else {
         base
     };
-    let canon = fs::canonicalize(repo_root).unwrap_or_else(|_| repo_root.to_path_buf());
+    let canon = crate::resolve_common_repo_root(repo_root);
     let repo_hash = hex_encode(&sha256_digest(canon.to_string_lossy().as_bytes()));
     let dir = parent.join("swarm").join(&repo_hash[..24]);
     if !dir.is_dir() {
@@ -802,10 +802,11 @@ pub fn append_breadcrumb_for_path(
     line_range: Option<(u64, u64)>,
     doc_sha256: [u8; 32],
 ) -> Result<SignedBreadcrumbRecord, String> {
-    let canon_repo = fs::canonicalize(repo_root).unwrap_or_else(|_| repo_root.to_path_buf());
-    let repo_sha256 = sha256_digest(canon_repo.to_string_lossy().as_bytes());
+    let local_root = fs::canonicalize(repo_root).unwrap_or_else(|_| repo_root.to_path_buf());
+    let common_repo = crate::resolve_common_repo_root(&local_root);
+    let repo_sha256 = sha256_digest(common_repo.to_string_lossy().as_bytes());
 
-    let spool_path = spool_file_path(&canon_repo, session_id)?;
+    let spool_path = spool_file_path(&common_repo, session_id)?;
     let _spool_lock = ExclusiveFileLockGuard::acquire(&spool_path)?;
 
     let recovery = recover_spool_frames(&spool_path)?;
@@ -827,15 +828,15 @@ pub fn append_breadcrumb_for_path(
         line_range,
         doc_sha256,
     };
-    let record_mac = compute_event_mac_for_repo(&canon_repo, &event)?;
+    let record_mac = compute_event_mac_for_repo(&common_repo, &event)?;
     let signed = SignedBreadcrumbRecord { event, record_mac };
 
     append_spool_frame_unlocked(&spool_path, &signed)?;
-    let _ = ensure_git_info_exclude(&canon_repo);
+    let _ = ensure_git_info_exclude(&local_root);
 
-    let trail_path = trail_path_for_rel_path(&canon_repo, canonical_rel_path)?;
+    let trail_path = trail_path_for_rel_path(&local_root, canonical_rel_path)?;
     if let Err(e) = flush_records_idempotent(&trail_path, std::slice::from_ref(&signed)) {
-        let root_trail = canon_repo.join(".breadcrumbs.jsonl");
+        let root_trail = local_root.join(".breadcrumbs.jsonl");
         if std::env::var("AGENT_GUARD_IN_SANDBOX").ok().as_deref() == Some("1")
             && trail_path != root_trail
         {

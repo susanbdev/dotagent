@@ -4,6 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
+publish = false
 description = "Deterministic zero-trust execution, path, traversal, Unicode, token-budget, and prompt-injection guard for AI coding agents"
 
 [lints]
@@ -17,10 +18,17 @@ path = "src/main.rs"
 name = "dotagent"
 path = "src/bin/dotagent.rs"
 
+[[bin]]
+name = "agent-guard-sh"
+path = "src/bin/agent-guard-sh.rs"
+
 [dependencies]
 crc32fast = "1.4"
+ed25519-dalek = { version = "2.1", default-features = false, features = ["fast", "std", "zeroize"] }
 hmac = "0.12"
 sha2 = "0.10"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 landlock = "0.4.7"
+seccompiler = { version = "0.5", default-features = false }
+

@@ -4,10 +4,15 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
+publish = false
 description = "Deterministic multi-harness bundle compiler and SHA-256 snapshot verifier for susanbdev/dotagent"
 
 [lints]
 workspace = true
+
+[lib]
+name = "dotagent_compiler"
+path = "src/lib.rs"
 
 [[bin]]
 name = "dotagent-compiler"
@@ -15,3 +20,4 @@ path = "src/main.rs"
 
 [dependencies]
 agent-guard = { path = "../agent-guard" }
+regorus = { version = "0.10", default-features = false, features = ["std", "arc"] }

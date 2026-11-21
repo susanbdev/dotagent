@@ -443,7 +443,7 @@ impl<'a> Parser<'a> {
         loop {
             self.skip_ws();
             let key = self.parse_string()?;
-            if entries.iter().any(|(existing, _)| existing == &key) {
+            if !is_unique_object_key(&entries, &key) {
                 return Err(format!(
                     "duplicate JSON object key '{key}' rejected (RFC 7493 I-JSON anti-differential)"
                 ));
@@ -468,6 +468,25 @@ impl<'a> Parser<'a> {
             }
         }
     }
+}
+
+/// Pure RFC 7493 duplicate-key check used by `Parser::parse_object` and Kani formal proofs.
+pub fn is_unique_object_key(entries: &[(String, JsonValue)], candidate_key: &str) -> bool {
+    !entries
+        .iter()
+        .any(|(existing, _)| existing == candidate_key)
+}
+
+/// Zero-heap-allocation RFC 7493 duplicate-key predicate for bounded Kani verification.
+pub fn is_unique_str_key(existing: &[&str], candidate_key: &str) -> bool {
+    let mut i = 0usize;
+    while i < existing.len() {
+        if existing[i] == candidate_key {
+            return false;
+        }
+        i += 1;
+    }
+    true
 }
 
 #[cfg(test)]
