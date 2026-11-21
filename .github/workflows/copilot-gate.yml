@@ -51,7 +51,6 @@ jobs:
           PR_AUTHOR_TYPE: ${{ github.event.pull_request.user.type }}
           PR_AUTHOR_ASSOC: ${{ github.event.pull_request.author_association }}
           PR_HEAD_REF: ${{ github.event.pull_request.head.ref }}
-          EVENT_ACTOR: ${{ github.actor }}
         run: |
           set -euo pipefail
           BASE_OID="$(git rev-parse --verify "origin/${BASE_REF}^{commit}")"
@@ -66,8 +65,8 @@ jobs:
           if git -C "${TRUSTED}" grep -q -F 'verify-ring0-ratchet' -- crates/agent-guard/src/cli.rs; then
             (cd "${TRUSTED}" && CARGO_TARGET_DIR="${RUNNER_TEMP}/trusted-target" \
               cargo build --locked -p agent-guard --bin dotagent)
-            case "${EVENT_ACTOR}:${PR_AUTHOR}:${PR_AUTHOR_TYPE}:${PR_HEAD_REF}" in
-              *"[bot]"*|*":Bot:"*|*":bot:"*|*":auto/"*)
+            case "${PR_AUTHOR_TYPE}:${PR_AUTHOR}:${PR_HEAD_REF}" in
+              [Bb]ot:*|*"[bot]:"*|*:friction-loop/*|*:agent-feedback/*|*:auto/*)
                 "${RUNNER_TEMP}/trusted-target/debug/dotagent" verify-ring0-ratchet \
                   --base "origin/${BASE_REF}" --require-ratchet
                 ;;

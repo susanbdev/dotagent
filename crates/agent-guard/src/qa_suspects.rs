@@ -397,13 +397,33 @@ pub fn save_locked_plan(
     plan: &LockedPlan,
     allow_amend_with_human_approval: bool,
 ) -> Result<PathBuf, String> {
+    save_locked_plan_after_validation(repo_root, plan, allow_amend_with_human_approval, || Ok(()))
+}
+
+/// Validates the existing plan before changing the signing epoch and writes the new lock under
+/// the same file lock. The callback must not attempt to acquire the plan lock.
+pub fn save_locked_plan_after_validation(
+    repo_root: &Path,
+    plan: &LockedPlan,
+    allow_amend_with_human_approval: bool,
+    prepare: impl FnOnce() -> Result<(), String>,
+) -> Result<PathBuf, String> {
     let lock_path = plan_lock_state_path(repo_root)?;
     let _guard = ExclusiveFileLockGuard::acquire(&lock_path)?;
 
-    if lock_path.exists()
-        && fs::metadata(&lock_path).is_ok_and(|m| m.len() > 0)
-        && !allow_amend_with_human_approval
-    {
+    let existing_len = match fs::symlink_metadata(&lock_path) {
+        Ok(meta) if meta.file_type().is_symlink() => {
+            return Err(format!(
+                "SYMLINK_REJECTED: PLAN.lock.json path '{}' is a symlink",
+                lock_path.display()
+            ));
+        }
+        Ok(meta) if meta.is_file() => meta.len(),
+        Ok(_) => return Err("PLAN_LOCK_TAMPERED: PLAN.lock.json must be a regular file".into()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => 0,
+        Err(err) => return Err(format!("failed inspecting PLAN.lock.json: {err}")),
+    };
+    if existing_len > 0 && !allow_amend_with_human_approval {
         let existing = load_locked_plan_unlocked(repo_root, &lock_path)?;
         if existing.plan_sha256 != plan.plan_sha256 {
             return Err(format!(
@@ -421,9 +441,10 @@ pub fn save_locked_plan(
             plan.plan_sha256
         ));
     }
+    let parsed_tasks = JsonValue::parse(&canonical).map_err(|e| e.to_string())?;
+    prepare()?;
     let record_mac =
         compute_arbitrary_hmac_hex(repo_root, PLAN_LOCK_HMAC_DOMAIN, canonical.as_bytes())?;
-    let parsed_tasks = JsonValue::parse(&canonical).map_err(|e| e.to_string())?;
     let wrapper = JsonValue::Object(vec![
         ("plan_id".to_string(), JsonValue::Str(plan.plan_id.clone())),
         (
@@ -439,19 +460,9 @@ pub fn save_locked_plan(
         ),
         ("record_mac".to_string(), JsonValue::Str(record_mac)),
     ]);
-    if fs::symlink_metadata(&lock_path).is_ok_and(|m| m.file_type().is_symlink()) {
-        return Err(format!(
-            "SYMLINK_REJECTED: PLAN.lock.json path '{}' is a symlink",
-            lock_path.display()
-        ));
-    }
-    fs::write(&lock_path, format!("{}\n", wrapper.to_json_string()))
+    let encoded = format!("{}\n", wrapper.to_json_string());
+    crate::traversal_ledger::atomic_write_nonsymlink_state_file(&lock_path, encoded.as_bytes())
         .map_err(|e| format!("failed writing PLAN.lock.json: {e}"))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = fs::set_permissions(&lock_path, fs::Permissions::from_mode(0o600));
-    }
     Ok(lock_path)
 }
 
@@ -670,8 +681,7 @@ pub fn verify_attribution_against_plan(
 /// 1. Validates `rules` against `plan` (`verify_attribution_against_plan`).
 /// 2. Scans `tests/` to reject `#[ignore]`, `test.skip(...)`, or `it.skip(...)` on attributed tests.
 /// 3. Requires every `SecurityCritical` or `StatefulCore` task in `plan` to have at least one
-///    attributed integration/boundary test (`boundary_interfaces` non-empty, `e2e`/`integration`/`live`
-///    test name, or test body located under `tests/`).
+///    attributed test declaration with a body under `tests/`.
 pub fn verify_live_integration_contracts(
     repo_root: &Path,
     rules: &[TestAttributionRule],
@@ -693,42 +703,19 @@ pub fn verify_live_integration_contracts(
     let mut names_found_in_tests_dir = BTreeSet::new();
 
     for (rel_path, content) in &test_files {
-        let mut prev_ignored = false;
-        for raw_line in content.lines() {
-            let trimmed = raw_line.trim();
-            if trimmed.starts_with("#[ignore")
-                || trimmed.starts_with("@unittest.skip")
-                || trimmed.starts_with("@pytest.mark.skip")
-            {
-                prev_ignored = true;
+        let Some(language) = TestSourceLanguage::from_path(Path::new(rel_path)) else {
+            continue;
+        };
+        for (name, skipped) in test_declarations(content, language) {
+            if !attributed_names.contains(name) {
                 continue;
             }
-            for &tname in &attributed_names {
-                if trimmed.contains(tname) {
-                    names_found_in_tests_dir.insert(tname.to_string());
-                    let is_js_or_py_inline_skip = (trimmed.contains("test.skip(")
-                        || trimmed.contains("it.skip(")
-                        || trimmed.contains("self.skipTest(")
-                        || trimmed.contains("pytest.skip("))
-                        && trimmed.contains(tname);
-                    let is_annotated_skip = prev_ignored
-                        && (trimmed.contains(&format!("fn {tname}"))
-                            || trimmed.contains(&format!("def {tname}")));
-                    if is_js_or_py_inline_skip || is_annotated_skip {
-                        return Err(format!(
-                            "SKIPPED_ATTRIBUTED_TEST_FORBIDDEN: attributed test '{tname}' is marked ignored/skipped in '{rel_path}'"
-                        ));
-                    }
-                }
+            if skipped {
+                return Err(format!(
+                    "SKIPPED_ATTRIBUTED_TEST_FORBIDDEN: attributed test '{name}' is marked ignored/skipped in '{rel_path}'"
+                ));
             }
-            if !trimmed.is_empty()
-                && !trimmed.starts_with("#[")
-                && !trimmed.starts_with('@')
-                && !trimmed.starts_with("//")
-                && !trimmed.starts_with('#')
-            {
-                prev_ignored = false;
-            }
+            names_found_in_tests_dir.insert(name);
         }
     }
 
@@ -742,7 +729,7 @@ pub fn verify_live_integration_contracts(
         let has_live_or_integration = rules.iter().any(|r| {
             let covers_task = r.primary_suspect == task.task_id
                 || r.secondary_suspects.iter().any(|s| s == &task.task_id);
-            covers_task && names_found_in_tests_dir.contains(&r.test_name)
+            covers_task && names_found_in_tests_dir.contains(r.test_name.as_str())
         });
         if !has_live_or_integration {
             return Err(format!(
@@ -753,6 +740,551 @@ pub fn verify_live_integration_contracts(
     }
 
     Ok(())
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TestSourceLanguage {
+    Rust,
+    Python,
+    JavaScript,
+}
+
+impl TestSourceLanguage {
+    fn from_path(path: &Path) -> Option<Self> {
+        Some(match path.extension()?.to_str()? {
+            "rs" => Self::Rust,
+            "py" => Self::Python,
+            "js" | "mjs" | "cjs" | "jsx" | "ts" | "mts" | "cts" | "tsx" => Self::JavaScript,
+            _ => return None,
+        })
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct SourceToken<'a> {
+    pub(crate) text: &'a str,
+    pub(crate) line: usize,
+    pub(crate) offset: usize,
+    column: usize,
+    literal: bool,
+}
+
+impl SourceToken<'_> {
+    pub(crate) fn is(self, text: &str) -> bool {
+        !self.literal && self.text == text
+    }
+
+    fn identifier(self) -> bool {
+        !self.literal
+            && self
+                .text
+                .starts_with(|c: char| c == '_' || c.is_alphabetic())
+    }
+}
+
+pub(crate) fn rust_source_tokens(source: &str) -> Vec<SourceToken<'_>> {
+    source_tokens(source, TestSourceLanguage::Rust)
+}
+
+fn source_tokens(source: &str, language: TestSourceLanguage) -> Vec<SourceToken<'_>> {
+    let mut tokens: Vec<SourceToken<'_>> = Vec::new();
+    let mut offset = 0;
+    let mut line = 1;
+    let mut line_start = 0;
+    while let Some(first) = source[offset..].chars().next() {
+        let rest = &source[offset..];
+        let comment_len = if rest.starts_with("//") && language != TestSourceLanguage::Python
+            || first == '#' && language == TestSourceLanguage::Python
+        {
+            Some(rest.find('\n').unwrap_or(rest.len()))
+        } else if rest.starts_with("/*") && language != TestSourceLanguage::Python {
+            Some(block_comment_len(
+                rest,
+                language == TestSourceLanguage::Rust,
+            ))
+        } else {
+            None
+        };
+        let len = if let Some(len) = comment_len {
+            len
+        } else if first.is_whitespace() {
+            first.len_utf8()
+        } else {
+            let literal_len = source_literal_len(rest, language, tokens.last().copied());
+            let len = literal_len.unwrap_or_else(|| {
+                if language == TestSourceLanguage::Rust
+                    && let Some(identifier) = rest.strip_prefix("r#")
+                    && identifier.starts_with(|c: char| c == '_' || c.is_alphabetic())
+                {
+                    return 2 + identifier
+                        .find(|c: char| !source_identifier_char(c, language))
+                        .unwrap_or(identifier.len());
+                }
+                if source_identifier_char(first, language) {
+                    rest.find(|c: char| !source_identifier_char(c, language))
+                        .unwrap_or(rest.len())
+                } else {
+                    first.len_utf8()
+                }
+            });
+            tokens.push(SourceToken {
+                text: &rest[..len],
+                line,
+                offset,
+                column: offset - line_start,
+                literal: literal_len.is_some(),
+            });
+            len
+        };
+        let consumed = &rest[..len];
+        if let Some(last_newline) = consumed.rfind('\n') {
+            line += consumed.bytes().filter(|&b| b == b'\n').count();
+            line_start = offset + last_newline + 1;
+        }
+        offset += len;
+    }
+    tokens
+}
+
+fn source_identifier_char(c: char, language: TestSourceLanguage) -> bool {
+    c.is_alphanumeric()
+        || c == '_'
+        || c == '$' && language == TestSourceLanguage::JavaScript
+        || !c.is_ascii() && !c.is_whitespace()
+}
+
+fn block_comment_len(source: &str, nested: bool) -> usize {
+    let mut depth = 1;
+    let mut offset = 2;
+    let bytes = source.as_bytes();
+    while offset + 1 < bytes.len() {
+        match &bytes[offset..offset + 2] {
+            b"*/" => {
+                depth -= 1;
+                offset += 2;
+                if depth == 0 {
+                    return offset;
+                }
+            }
+            b"/*" if nested => {
+                depth += 1;
+                offset += 2;
+            }
+            _ => offset += 1,
+        }
+    }
+    source.len()
+}
+
+fn source_literal_len(
+    source: &str,
+    language: TestSourceLanguage,
+    previous: Option<SourceToken<'_>>,
+) -> Option<usize> {
+    let bytes = source.as_bytes();
+    let first = bytes[0];
+    if language == TestSourceLanguage::Rust {
+        let raw = source.strip_prefix(['b', 'c']).unwrap_or(source);
+        if let Some(rest) = raw.strip_prefix('r') {
+            let hashes = rest.bytes().take_while(|&b| b == b'#').count();
+            if rest.as_bytes().get(hashes) == Some(&b'"') {
+                let opening = source.len() - rest.len() + hashes + 1;
+                return Some(delimited_len(bytes, opening, b'"', hashes, false));
+            }
+        }
+        if first == b'\'' {
+            // A lifetime has no closing apostrophe after a single character.
+            let character = source[1..].chars().next()?;
+            if character == '\\' {
+                return Some(delimited_len(bytes, 1, b'\'', 0, true));
+            }
+            let end = 1 + character.len_utf8();
+            return (bytes.get(end) == Some(&b'\'')).then_some(end + 1);
+        }
+    }
+    let quote = first == b'"'
+        || first == b'\'' && language != TestSourceLanguage::Rust
+        || first == 0x60 && language == TestSourceLanguage::JavaScript;
+    if quote {
+        let extra_quotes = if language == TestSourceLanguage::Python
+            && bytes.get(1) == Some(&first)
+            && bytes.get(2) == Some(&first)
+        {
+            2
+        } else {
+            0
+        };
+        return Some(delimited_len(
+            bytes,
+            1 + extra_quotes,
+            first,
+            extra_quotes,
+            true,
+        ));
+    }
+    if first == b'/'
+        && language == TestSourceLanguage::JavaScript
+        && previous.is_none_or(|p| {
+            ["=", "(", ",", "{", ";", ":", "return", ">", "[", "!", "?"]
+                .iter()
+                .any(|s| p.is(s))
+        })
+    {
+        return javascript_regex_len(bytes);
+    }
+    None
+}
+
+fn delimited_len(
+    bytes: &[u8],
+    mut offset: usize,
+    delimiter: u8,
+    suffix: usize,
+    escapes: bool,
+) -> usize {
+    let suffix_byte = if escapes { delimiter } else { b'#' };
+    while let Some(&byte) = bytes.get(offset) {
+        if byte == delimiter
+            && bytes
+                .get(offset + 1..offset + 1 + suffix)
+                .is_some_and(|tail| tail.iter().all(|&b| b == suffix_byte))
+        {
+            return offset + 1 + suffix;
+        }
+        offset += if escapes && byte == b'\\' { 2 } else { 1 };
+    }
+    bytes.len()
+}
+
+fn javascript_regex_len(bytes: &[u8]) -> Option<usize> {
+    let mut offset = 1;
+    let mut in_class = false;
+    while let Some(&byte) = bytes.get(offset) {
+        match byte {
+            b'\n' | b'\r' => return None,
+            b'/' if !in_class => return Some(offset + 1),
+            b'[' => in_class = true,
+            b']' => in_class = false,
+            b'\\' => offset += 1,
+            _ => {}
+        }
+        offset += 1;
+    }
+    None
+}
+
+fn token_is(tokens: &[SourceToken<'_>], index: usize, value: &str) -> bool {
+    tokens.get(index).is_some_and(|token| token.is(value))
+}
+
+fn group_end(
+    tokens: &[SourceToken<'_>],
+    start: usize,
+    opener: &str,
+    closer: &str,
+) -> Option<usize> {
+    if !token_is(tokens, start, opener) {
+        return None;
+    }
+    let mut depth = 1;
+    for (index, token) in tokens.iter().enumerate().skip(start + 1) {
+        if token.is(opener) {
+            depth += 1;
+        } else if token.is(closer) {
+            depth -= 1;
+            if depth == 0 {
+                return Some(index);
+            }
+        }
+    }
+    None
+}
+
+fn test_declarations(source: &str, language: TestSourceLanguage) -> Vec<(&str, bool)> {
+    let tokens = source_tokens(source, language);
+    match language {
+        TestSourceLanguage::Rust => rust_test_declarations(&tokens),
+        TestSourceLanguage::Python => python_test_declarations(&tokens),
+        TestSourceLanguage::JavaScript => javascript_test_declarations(&tokens),
+    }
+}
+
+fn rust_test_declarations<'a>(tokens: &[SourceToken<'a>]) -> Vec<(&'a str, bool)> {
+    let mut tests = Vec::new();
+    let mut index = 0;
+    while index < tokens.len() {
+        let mut annotated_test = false;
+        let mut ignored = false;
+        while token_is(tokens, index, "#") {
+            let Some(end) = group_end(tokens, index + 1, "[", "]") else {
+                break;
+            };
+            let attr = &tokens[index + 2..end];
+            annotated_test |= attr.len() == 1 && token_is(attr, 0, "test")
+                || attr.first().is_some_and(|a| {
+                    a.is("tokio") || a.is("async_std") || a.is("actix_rt") || a.is("actix_web")
+                }) && token_is(attr, 1, ":")
+                    && token_is(attr, 2, ":")
+                    && token_is(attr, 3, "test");
+            ignored |= token_is(attr, 0, "ignore") && (attr.len() == 1 || token_is(attr, 1, "="));
+            index = end + 1;
+        }
+        if token_is(tokens, index, "pub") {
+            index = group_end(tokens, index + 1, "(", ")").map_or(index + 1, |end| end + 1);
+        }
+        while matches!(
+            tokens.get(index).map(|t| t.text),
+            Some("async" | "unsafe" | "const")
+        ) {
+            index += 1;
+        }
+        if token_is(tokens, index, "mod") && token_is(tokens, index + 2, "{") {
+            index += 3;
+            continue;
+        }
+        if token_is(tokens, index, "fn")
+            && let Some(name) = tokens.get(index + 1).filter(|name| name.identifier())
+            && let Some(args_end) = group_end(tokens, index + 2, "(", ")")
+            && let Some(body) = tokens
+                .iter()
+                .enumerate()
+                .skip(args_end + 1)
+                .find_map(|(i, token)| (token.is("{") || token.is(";")).then_some(i))
+            && let Some(body_end) = group_end(tokens, body, "{", "}")
+        {
+            if annotated_test && args_end == index + 3 && (ignored || body_end > body + 1) {
+                tests.push((name.text.strip_prefix("r#").unwrap_or(name.text), ignored));
+            }
+            index = body_end + 1;
+            continue;
+        }
+        let group = [("(", ")"), ("[", "]"), ("{", "}")]
+            .into_iter()
+            .find_map(|(open, close)| group_end(tokens, index, open, close));
+        index = group.map_or(index + 1, |end| end + 1);
+    }
+    tests
+}
+
+fn python_test_declarations<'a>(tokens: &[SourceToken<'a>]) -> Vec<(&'a str, bool)> {
+    let mut tests = Vec::new();
+    let mut index = 0;
+    let mut skipped = false;
+    let mut class_body = None;
+    while let Some(start) = tokens.get(index) {
+        let first_on_line = index == 0 || tokens[index - 1].line < start.line;
+        if first_on_line && start.column == 0 {
+            class_body = None;
+        }
+        if !first_on_line
+            || start.column != 0 && !class_body.is_some_and(|(indent, _)| indent == start.column)
+        {
+            index += 1;
+            continue;
+        }
+        if start.is("@") {
+            skipped |= (token_is(tokens, index + 1, "unittest")
+                && token_is(tokens, index + 2, ".")
+                && ["skip", "skipIf", "skipUnless"]
+                    .iter()
+                    .any(|name| token_is(tokens, index + 3, name)))
+                || (token_is(tokens, index + 1, "pytest")
+                    && token_is(tokens, index + 2, ".")
+                    && token_is(tokens, index + 3, "mark")
+                    && token_is(tokens, index + 4, ".")
+                    && ["skip", "skipif"]
+                        .iter()
+                        .any(|name| token_is(tokens, index + 5, name)));
+            while tokens
+                .get(index)
+                .is_some_and(|token| token.line == start.line)
+            {
+                index = group_end(tokens, index, "(", ")").map_or(index + 1, |end| end + 1);
+            }
+            continue;
+        }
+        if start.column == 0 && start.is("class") {
+            let parents_end = group_end(tokens, index + 2, "(", ")");
+            let valid_base = parents_end
+                .is_some_and(|end| tokens[index + 3..end].iter().any(|t| t.is("TestCase")));
+            let test_class = tokens[index + 1..]
+                .first()
+                .is_some_and(|t| t.identifier() && t.text.starts_with("Test"))
+                || valid_base;
+            let colon = parents_end.map_or(index + 2, |end| end + 1);
+            if test_class
+                && token_is(tokens, colon, ":")
+                && let Some(body) = tokens
+                    .get(colon + 1)
+                    .filter(|body| body.line > tokens[colon].line && body.column > 0)
+            {
+                class_body = Some((body.column, skipped));
+                index = colon + 1;
+                skipped = false;
+                continue;
+            }
+        }
+        let def = index + usize::from(start.is("async"));
+        if token_is(tokens, def, "def")
+            && let Some(name) = tokens
+                .get(def + 1)
+                .filter(|t| t.identifier() && t.text.starts_with("test_"))
+            && let Some(args_end) = group_end(tokens, def + 2, "(", ")")
+            && let Some(colon) = python_body_colon(tokens, args_end + 1)
+        {
+            let mut body_end = colon + 1;
+            while tokens
+                .get(body_end)
+                .is_some_and(|t| t.line == tokens[colon].line || t.column > start.column)
+            {
+                body_end += 1;
+            }
+            let body = &tokens[colon + 1..body_end];
+            let skipped_in_body = body.windows(4).any(|t| {
+                (t[0].is("self") && t[2].is("skipTest") || t[0].is("pytest") && t[2].is("skip"))
+                    && t[1].is(".")
+                    && t[3].is("(")
+            });
+            let skipped_test =
+                skipped || skipped_in_body || class_body.is_some_and(|(_, skipped)| skipped);
+            if skipped_test
+                || body
+                    .iter()
+                    .any(|t| !t.literal && !t.is("pass") && !t.is("."))
+            {
+                tests.push((name.text, skipped_test));
+            }
+            index = body_end;
+            skipped = false;
+            continue;
+        }
+        skipped = false;
+        index += 1;
+    }
+    tests
+}
+
+fn python_body_colon(tokens: &[SourceToken<'_>], start: usize) -> Option<usize> {
+    let mut index = start;
+    while let Some(token) = tokens
+        .get(index)
+        .filter(|token| token.line == tokens[start - 1].line)
+    {
+        if token.is(":") {
+            return Some(index);
+        }
+        index = group_end(tokens, index, "[", "]").map_or(index + 1, |end| end + 1);
+    }
+    None
+}
+
+fn javascript_test_declarations<'a>(tokens: &[SourceToken<'a>]) -> Vec<(&'a str, bool)> {
+    let mut tests = Vec::new();
+    for (index, token) in tokens.iter().enumerate() {
+        if !(token.is("test") || token.is("it")) || index > 0 && token_is(tokens, index - 1, ".") {
+            continue;
+        }
+        let (call, skipped) = if token_is(tokens, index + 1, ".") {
+            match tokens.get(index + 2).map(|t| t.text) {
+                Some("skip" | "todo" | "fixme") => (index + 3, true),
+                Some("only") => (index + 3, false),
+                _ => continue,
+            }
+        } else {
+            (index + 1, false)
+        };
+        let Some(end) = group_end(tokens, call, "(", ")") else {
+            continue;
+        };
+        let Some(name) = tokens.get(call + 1).filter(|t| t.literal).and_then(|t| {
+            t.text
+                .strip_prefix('"')
+                .and_then(|s| s.strip_suffix('"'))
+                .or_else(|| t.text.strip_prefix('\'').and_then(|s| s.strip_suffix('\'')))
+        }) else {
+            continue;
+        };
+        if skipped
+            || token_is(tokens, call + 2, ",") && javascript_test_body(&tokens[call + 3..end])
+        {
+            tests.push((name, skipped));
+        }
+    }
+    tests
+}
+
+fn javascript_test_body(tokens: &[SourceToken<'_>]) -> bool {
+    let start = usize::from(token_is(tokens, 0, "async"));
+    if token_is(tokens, start, "function") {
+        return tokens.iter().enumerate().skip(start + 1).any(|(index, t)| {
+            t.is("{") && group_end(tokens, index, "{", "}").is_some_and(|end| end > index + 1)
+        });
+    }
+    let params_end = group_end(tokens, start, "(", ")").unwrap_or(start);
+    token_is(tokens, params_end + 1, "=")
+        && token_is(tokens, params_end + 2, ">")
+        && tokens.get(params_end + 3).is_some_and(|t| {
+            if t.is("{") {
+                group_end(tokens, params_end + 3, "{", "}").is_some_and(|end| end > params_end + 4)
+            } else {
+                !t.literal
+            }
+        })
+}
+
+#[cfg(test)]
+mod source_declaration_tests {
+    use super::{TestSourceLanguage, test_declarations};
+
+    #[test]
+    fn rust_requires_an_attributed_function_body() {
+        let source = r##"
+            //! Unit tests in this module.
+            const DESCRIPTION: &str = r#"Documentation for example_test"#;
+            fn helper() { assert_eq!(2 + 2, 4); }
+            #[test]
+            fn example_test() { helper(); }
+            #[test]
+            #[ignore = "needs hardware"]
+            fn hardware_test() { helper(); }
+        "##;
+        assert_eq!(
+            test_declarations(source, TestSourceLanguage::Rust),
+            vec![("example_test", false), ("hardware_test", true)],
+        );
+    }
+
+    #[test]
+    fn python_recognizes_functions_and_testcase_methods() {
+        let source = r#"
+"""Integration checks for arithmetic."""
+
+def test_arithmetic():
+    assert 2 + 2 == 4
+
+@unittest.skip("needs hardware")
+class HardwareCases(unittest.TestCase):
+    def test_hardware(self):
+        self.assertTrue(connected())
+"#;
+        assert_eq!(
+            test_declarations(source, TestSourceLanguage::Python),
+            vec![("test_arithmetic", false), ("test_hardware", true)],
+        );
+    }
+
+    #[test]
+    fn javascript_matches_the_registration_name() {
+        let source = r#"
+            const help = "Example math test";
+            test("arithmetic", () => { expect(2 + 2).toBe(4); });
+            it.skip("hardware", () => { expect(connected()).toBe(true); });
+        "#;
+        assert_eq!(
+            test_declarations(source, TestSourceLanguage::JavaScript),
+            vec![("arithmetic", false), ("hardware", true)],
+        );
+    }
 }
 
 fn collect_integration_test_sources(dir: &Path, depth: usize, out: &mut Vec<(String, String)>) {
@@ -773,15 +1305,9 @@ fn collect_integration_test_sources(dir: &Path, depth: usize, out: &mut Vec<(Str
         if ft.is_dir() {
             collect_integration_test_sources(&p, depth + 1, out);
         } else if ft.is_file() {
-            let ext = p
-                .extension()
-                .and_then(|e| e.to_str())
-                .unwrap_or("")
-                .to_ascii_lowercase();
-            if matches!(ext.as_str(), "toml" | "json" | "md" | "lock" | "txt") {
-                continue;
-            }
-            if let Ok(text) = fs::read_to_string(&p) {
+            if TestSourceLanguage::from_path(&p).is_some()
+                && let Ok(text) = fs::read_to_string(&p)
+            {
                 out.push((p.to_string_lossy().into_owned(), text));
             }
         }

@@ -2,8 +2,6 @@ name: Verifiable Release & SLSA Provenance
 
 on:
   push:
-    branches:
-      - "main"
     tags:
       - "v*"
   workflow_dispatch:
@@ -16,86 +14,6 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  auto-tag-release:
-    name: auto-tag-release
-    if: github.ref == 'refs/heads/main'
-    environment: release
-    runs-on: ubuntu-24.04
-    timeout-minutes: 5
-    steps:
-      - name: Checkout main (zero persisted credentials)
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          fetch-depth: 0
-          persist-credentials: false
-          submodules: false
-
-      - name: Validate SemVer Cargo.toml version & check remote release tags
-        id: check_ver
-        shell: bash
-        run: |
-          set -euo pipefail
-          VER="$(python3 - <<'PY'
-          import re, sys, tomllib
-          ver = tomllib.load(open("Cargo.toml", "rb"))["workspace"]["package"]["version"]
-          if not isinstance(ver, str) or not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?", ver):
-              sys.stderr.write(f"INVALID_SEMVER: '{ver}'\n")
-              sys.exit(1)
-          print(ver)
-          PY
-          )"
-          TAG="v${VER}"
-          echo "tag=${TAG}" >> "${GITHUB_OUTPUT}"
-          if git ls-remote --exit-code --tags origin "refs/tags/${TAG}" >/dev/null 2>&1; then
-            echo "needs_tag=false" >> "${GITHUB_OUTPUT}"
-            echo "[auto-tag-release] Remote tag ${TAG} already exists; nothing to tag."
-          else
-            echo "needs_tag=true" >> "${GITHUB_OUTPUT}"
-            echo "[auto-tag-release] Detected untagged workspace version ${TAG} on main."
-          fi
-
-      - name: Notice when Promoter App is not configured for untagged version bump
-        if: steps.check_ver.outputs.needs_tag == 'true' && vars.PROMOTER_APP_ID == ''
-        env:
-          RELEASE_TAG: ${{ steps.check_ver.outputs.tag }}
-        run: |
-          echo "::notice::Detected new version ${RELEASE_TAG}; configure vars.PROMOTER_APP_ID or push tag ${RELEASE_TAG} to publish release."
-
-      - name: Mint least-privilege repo-scoped dotagent-promoter[bot] token
-        id: app_token
-        if: steps.check_ver.outputs.needs_tag == 'true' && vars.PROMOTER_APP_ID != ''
-        uses: actions/create-github-app-token@f418cff399f7aef4c2f0ad47e25ca7a6abbdd6fc # v3.4.0
-        with:
-          app-id: ${{ vars.PROMOTER_APP_ID }}
-          private-key: ${{ secrets.PROMOTER_APP_PRIVATE_KEY }}
-          repositories: ${{ github.event.repository.name }}
-          permission-contents: write
-
-      - name: Atomically create annotated release tag via GitHub API (zero token in argv)
-        if: steps.check_ver.outputs.needs_tag == 'true' && vars.PROMOTER_APP_ID != ''
-        shell: bash
-        env:
-          GH_TOKEN: ${{ steps.app_token.outputs.token }}
-          TAG: ${{ steps.check_ver.outputs.tag }}
-          REPO_FULL: ${{ github.repository }}
-          TARGET_SHA: ${{ github.sha }}
-        run: |
-          set -euo pipefail
-          if gh api "repos/${REPO_FULL}/git/ref/tags/${TAG}" >/dev/null 2>&1; then
-            echo "[auto-tag-release] Tag ${TAG} already created concurrently; skipping."
-            exit 0
-          fi
-          TAG_OBJ_SHA="$(gh api --method POST "repos/${REPO_FULL}/git/tags" \
-            -f tag="${TAG}" \
-            -f message="dotagent ${TAG}" \
-            -f object="${TARGET_SHA}" \
-            -f type="commit" \
-            --jq '.sha')"
-          gh api --method POST "repos/${REPO_FULL}/git/refs" \
-            -f ref="refs/tags/${TAG}" \
-            -f sha="${TAG_OBJ_SHA}" >/dev/null
-          echo "[auto-tag-release] Pushed annotated tag ${TAG} -> ${TARGET_SHA}"
-
   verify-release-gate:
     name: Pre-Release Security & Manifest Gate
     if: startsWith(github.ref, 'refs/tags/v')
@@ -115,7 +33,6 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
           submodules: false
-          fetch-depth: 0
 
       - name: Require a GitHub-verified annotated tag whose commit is on main
         env:
@@ -174,7 +91,12 @@ jobs:
           tar -xzf "${ARCHIVE}" -C "${RUNNER_TEMP}"
           "${RUNNER_TEMP}/cargo-deny-0.22.0-x86_64-unknown-linux-musl/cargo-deny" check advisories licenses bans sources
 
-      - name: Run fmt, strict clippy, MSRV 1.88 check, full test & fuzz suite, compiler verify, repo audit, & FIDO2 tag check
+      - name: Require an enrolled FIDO2 signature on the release tag
+        run: |
+          cargo run --release --locked -p agent-guard --bin dotagent -- verify-ring0-ratchet \
+            --verify-release-tag "${GITHUB_REF_NAME}" --base refs/remotes/origin/main
+
+      - name: Run fmt, strict clippy, MSRV 1.88 check, full test & fuzz suite, compiler verify, and repo audit
         run: |
           cargo fmt --all -- --check
           cargo +1.88.0 check --workspace --all-targets --locked
@@ -182,10 +104,6 @@ jobs:
           cargo test --workspace --locked
           cargo run --release --locked -p dotagent-compiler -- verify .
           cargo run --release --locked -p agent-guard --bin dotagent -- audit-repo .
-          if git cat-file tag "refs/tags/${GITHUB_REF_NAME}" 2>/dev/null | grep -q -F "-----BEGIN SSH SIGNATURE-----"; then
-            cargo run --release --locked -p agent-guard --bin dotagent -- verify-ring0-ratchet \
-              --verify-release-tag "${GITHUB_REF_NAME}" --base refs/remotes/origin/main
-          fi
 
       - name: Run packaging tests (installer, repackager, ceremony script)
         run: |

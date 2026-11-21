@@ -18,6 +18,7 @@ use crate::breadcrumbs::{
 };
 use crate::json::JsonValue;
 use crate::path_policy::{PathAccess, validate_path_with_max_depth};
+use crate::qa_suspects::{SourceToken, rust_source_tokens};
 use crate::role_sandbox::{
     close_open_session, load_session_capability, path_matches_any_scope, resolve_active_role,
     save_session_capability,
@@ -472,11 +473,22 @@ pub fn scan_production_stub_smells(repo_root: &Path, write_patterns: &[String]) 
         if crate::role_sandbox::is_qa_writable_path(&rel) {
             continue;
         }
-        let effective = if rel.ends_with(".rs") {
-            strip_rust_cfg_test_tail(&body)
+        let rust_tokens = if rel.ends_with(".rs") {
+            rust_source_tokens(&body)
         } else {
-            body.as_str()
+            Vec::new()
         };
+        let test_tail_offset = rust_tokens
+            .windows(7)
+            .find(|tokens| {
+                tokens
+                    .iter()
+                    .zip(["#", "[", "cfg", "(", "test", ")", "]"])
+                    .all(|(token, expected)| token.is(expected))
+            })
+            .map_or(body.len(), |tokens| tokens[0].offset);
+        let effective = &body[..test_tail_offset];
+        let macro_lines = rust_stub_macro_lines(&rust_tokens, test_tail_offset);
 
         let mut in_drop_fn = false;
         let mut drop_brace_depth: i32 = 0;
@@ -484,6 +496,12 @@ pub fn scan_production_stub_smells(repo_root: &Path, write_patterns: &[String]) 
 
         for (idx, raw_line) in effective.lines().enumerate() {
             let line_no = idx + 1;
+            if macro_lines.contains(&line_no) {
+                out.push(SmellBadge {
+                    bucket: SmellBucket::Risky,
+                    signal: format!("hollow_stub:todo_macro:{rel}:{line_no}"),
+                });
+            }
             let trimmed = raw_line.trim();
             if trimmed.is_empty()
                 || trimmed.starts_with("//")
@@ -495,15 +513,6 @@ pub fn scan_production_stub_smells(repo_root: &Path, write_patterns: &[String]) 
             }
             let code_only = trimmed.split("//").next().unwrap_or(trimmed).trim();
             let lower = code_only.to_ascii_lowercase();
-
-            if contains_macro_invocation(code_only, "todo!")
-                || contains_macro_invocation(code_only, "unimplemented!")
-            {
-                out.push(SmellBadge {
-                    bucket: SmellBucket::Risky,
-                    signal: format!("hollow_stub:todo_macro:{rel}:{line_no}"),
-                });
-            }
 
             if is_empty_string_literal_match_arm(code_only) {
                 out.push(SmellBadge {
@@ -640,34 +649,40 @@ fn collect_scoped_source_files(
     }
 }
 
-fn strip_rust_cfg_test_tail(src: &str) -> &str {
-    let mut byte_offset = 0usize;
-    for raw_line in src.lines() {
-        let trimmed = raw_line.trim();
-        if trimmed == "#[cfg(test)]" {
-            return &src[..byte_offset];
-        }
-        byte_offset = byte_offset
-            .saturating_add(raw_line.len() + 1)
-            .min(src.len());
-    }
-    src
+fn rust_stub_macro_lines(tokens: &[SourceToken<'_>], end_offset: usize) -> BTreeSet<usize> {
+    tokens
+        .windows(3)
+        .take_while(|t| t[0].offset < end_offset)
+        .filter(|t| {
+            (t[0].is("todo")
+                || t[0].is("unimplemented")
+                || t[0].is("r#todo")
+                || t[0].is("r#unimplemented"))
+                && t[1].is("!")
+                && (t[2].is("(") || t[2].is("[") || t[2].is("{"))
+        })
+        .map(|t| t[0].line)
+        .collect()
 }
 
-fn contains_macro_invocation(line: &str, mac_prefix: &str) -> bool {
-    let mut rest = line;
-    while let Some(pos) = rest.find(mac_prefix) {
-        let before_ok = pos == 0
-            || !rest.as_bytes()[pos - 1].is_ascii_alphanumeric()
-                && rest.as_bytes()[pos - 1] != b'_';
-        let after = rest[pos + mac_prefix.len()..].trim_start();
-        if before_ok && (after.starts_with('(') || after.starts_with('[') || after.starts_with('{'))
-        {
-            return true;
-        }
-        rest = &rest[pos + mac_prefix.len()..];
+#[cfg(test)]
+mod stub_macro_tests {
+    use super::{rust_source_tokens, rust_stub_macro_lines};
+    use std::collections::BTreeSet;
+
+    #[test]
+    fn recognizes_invocations_and_preserves_source_lines() {
+        let source = r##"
+            const HELP: &str = "Use todo!() during development.";
+            /* Guide: compile out unimplemented!() before release. */
+            const RAW: &str = r#"Both todo!() and unimplemented!() require review."#;
+            fn draft() { todo ! ("pending implementation"); }
+        "##;
+        assert_eq!(
+            rust_stub_macro_lines(&rust_source_tokens(source), source.len()),
+            BTreeSet::from([5]),
+        );
     }
-    false
 }
 
 fn is_empty_string_literal_match_arm(code_only: &str) -> bool {

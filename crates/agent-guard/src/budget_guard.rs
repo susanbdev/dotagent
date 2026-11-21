@@ -178,7 +178,7 @@ pub fn inspect_vetted_webfont_asset_on_disk(
             });
         }
 
-        let file = File::open(path).map_err(|e| BudgetViolation {
+        let mut file = open_vetted_webfont_nofollow(path).map_err(|e| BudgetViolation {
             code: "FILE_OPEN_ERROR",
             detail: format!("Cannot open '{}': {e}", path.display()),
         })?;
@@ -186,23 +186,31 @@ pub fn inspect_vetted_webfont_asset_on_disk(
             code: "FILE_STAT_ERROR",
             detail: format!("Cannot fstat '{}': {e}", path.display()),
         })?;
-        if !fd_meta.file_type().is_file() || fd_meta.len() > MAX_VETTED_WEBFONT_BYTES {
+        if !fd_meta.is_file() || !same_vetted_webfont(&meta, &fd_meta) {
             return Err(BudgetViolation {
                 code: "FILE_TOCTOU_REJECTED",
-                detail: format!(
-                    "Opened descriptor for '{}' failed regular-file or webfont size check.",
-                    path.display()
-                ),
+                detail: format!("Webfont asset '{}' changed while opening.", path.display()),
             });
         }
 
         let mut raw = Vec::new();
-        file.take(MAX_VETTED_WEBFONT_BYTES + 1)
+        (&mut file)
+            .take(fd_meta.len() + 1)
             .read_to_end(&mut raw)
             .map_err(|e| BudgetViolation {
                 code: "FILE_READ_ERROR",
                 detail: format!("Cannot read '{}': {e}", path.display()),
             })?;
+        let after = file.metadata().map_err(|e| BudgetViolation {
+            code: "FILE_STAT_ERROR",
+            detail: format!("Cannot fstat '{}': {e}", path.display()),
+        })?;
+        if raw.len() as u64 != fd_meta.len() || !same_vetted_webfont(&fd_meta, &after) {
+            return Err(BudgetViolation {
+                code: "FILE_TOCTOU_REJECTED",
+                detail: format!("Webfont asset '{}' changed while reading.", path.display()),
+            });
+        }
         if raw.len() < 44 || &raw[..4] != expected_magic {
             return Err(BudgetViolation {
                 code: "INVALID_WEBFONT_MAGIC",
@@ -216,6 +224,49 @@ pub fn inspect_vetted_webfont_asset_on_disk(
     };
 
     Some(check())
+}
+
+#[cfg(unix)]
+fn open_vetted_webfont_nofollow(path: &Path) -> std::io::Result<File> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let nofollow = crate::traversal_ledger::O_NOFOLLOW_FLAG;
+    if nofollow == 0 {
+        return Err(std::io::ErrorKind::Unsupported.into());
+    }
+    // A replacement FIFO must not block the open before the descriptor can be checked.
+    let nonblock = if cfg!(target_os = "macos") {
+        0x4
+    } else {
+        0o4000
+    };
+    std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(nofollow | nonblock)
+        .open(path)
+}
+
+#[cfg(not(unix))]
+fn open_vetted_webfont_nofollow(_path: &Path) -> std::io::Result<File> {
+    Err(std::io::ErrorKind::Unsupported.into())
+}
+
+#[cfg(unix)]
+fn same_vetted_webfont(before: &std::fs::Metadata, after: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+
+    before.dev() == after.dev()
+        && before.ino() == after.ino()
+        && before.size() == after.size()
+        && before.mtime() == after.mtime()
+        && before.mtime_nsec() == after.mtime_nsec()
+        && before.ctime() == after.ctime()
+        && before.ctime_nsec() == after.ctime_nsec()
+}
+
+#[cfg(not(unix))]
+fn same_vetted_webfont(_before: &std::fs::Metadata, _after: &std::fs::Metadata) -> bool {
+    false
 }
 
 /// Safely reads up to `MAX_RAW_FILE_BYTES + 1` (or bounded slice) using `Read::take`

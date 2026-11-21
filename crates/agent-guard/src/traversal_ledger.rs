@@ -431,7 +431,7 @@ impl SessionLedger {
 
     /// Validates whether reading `rel_path` violates the max-2-level pointer hop chain
     /// (`A -> B` allowed, `A -> B -> C` hard-denied!) and records the read + token budget.
-    /// Returns the assigned level (`1` or `2`) of `rel_path`.
+    /// Returns the recorded traversal level of `rel_path`.
     pub fn authorize_and_record_read(
         &mut self,
         rel_path: &str,
@@ -519,10 +519,6 @@ impl SessionLedger {
 
         let assigned_level = if let Some(node) = self.nodes.get_mut(rel_path) {
             node.was_read = true;
-            if capability_preapproved && node.level > MAX_REFERENCE_LEVEL {
-                node.level = 1;
-                node.chain = rel_path.to_string();
-            }
             node.level
         } else {
             self.nodes.insert(
@@ -1710,7 +1706,7 @@ fn ledger_file_path_for_hash(session_key_hash: &str) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
-    use super::{SessionLedger, compute_session_key_hash};
+    use super::{MAX_REFERENCE_LEVEL, SessionLedger, TraversalNode, compute_session_key_hash};
     use std::path::Path;
 
     #[test]
@@ -1750,5 +1746,32 @@ mod tests {
             compute_session_key_hash(Path::new("/repo"), "\u{03B1}"),
             compute_session_key_hash(Path::new("/repo"), "\u{03B2}")
         );
+    }
+
+    #[test]
+    fn capability_read_retains_traversal_provenance() {
+        let mut ledger = SessionLedger::new(Path::new("/repo"), "scoped");
+        let path = "docs/assigned.md";
+        let level = MAX_REFERENCE_LEVEL + 1;
+        let chain = "docs/root.md -> docs/intermediate.md";
+        ledger.nodes.insert(
+            path.to_string(),
+            TraversalNode {
+                level,
+                chain: chain.to_string(),
+                was_read: false,
+            },
+        );
+
+        assert_eq!(
+            ledger.authorize_and_record_read_with_scope(path, 100, 5, 1000, true),
+            Ok(level)
+        );
+        assert_eq!(ledger.nodes[path].chain, chain);
+        assert!(ledger.nodes[path].was_read);
+
+        let next = "docs/reference.md";
+        ledger.register_outgoing_pointers(path, &[next.to_string()]);
+        assert_eq!(ledger.nodes[next].level, level + 1);
     }
 }

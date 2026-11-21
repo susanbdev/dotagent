@@ -21,8 +21,8 @@ use agent_guard::json::JsonValue;
 use agent_guard::path_policy::{PathAccess, validate_path};
 use agent_guard::qa_suspects::{
     compute_task_coverage_targets, load_locked_plan, parse_and_validate_dag_json,
-    parse_attribution_toml, plan_lock_state_path, save_locked_plan, triangulate_faults,
-    verify_attribution_against_plan, verify_live_integration_contracts,
+    parse_attribution_toml, plan_lock_state_path, save_locked_plan_after_validation,
+    triangulate_faults, verify_attribution_against_plan, verify_live_integration_contracts,
 };
 use agent_guard::resolve_repo_root;
 use agent_guard::role_sandbox::{
@@ -31,7 +31,7 @@ use agent_guard::role_sandbox::{
     list_session_capabilities, load_active_session_slot, load_open_session_capabilities,
     load_session_capability, lookup_pinned_package_doc, mint_discovery_investigator_capability,
     mint_session_capability, parse_and_validate_worker_packet, path_matches_any_scope,
-    reset_closed_sessions_for_rotated_epoch, scout_repo_signatures,
+    rotate_closed_session_epoch, scout_repo_signatures,
 };
 use agent_guard::swarm_contracts::{
     EventOp, ReviewVerdictOutcome, SessionCapability, SuspectVerdict, SwarmRole, WorkerPacket,
@@ -73,25 +73,25 @@ fn main() -> ExitCode {
     let result = match role_ns {
         "run" => run_dag_cli(&repo_root, &cwd, rest),
         "master" => enforce_ambient_role_namespace(&repo_root, SwarmRole::Master, role_ns, rest)
-            .and_then(|()| run_master(&repo_root, &cwd, rest)),
+            .and_then(|master_sid| run_master(&repo_root, &cwd, rest, master_sid.as_deref())),
         "investigator" => {
             enforce_ambient_role_namespace(&repo_root, SwarmRole::Investigator, role_ns, rest)
-                .and_then(|()| run_investigator(&repo_root, rest))
+                .and_then(|_| run_investigator(&repo_root, rest))
         }
         "qa" => enforce_ambient_role_namespace(&repo_root, SwarmRole::QaEngineer, role_ns, rest)
-            .and_then(|()| run_qa(&repo_root, &cwd, rest)),
+            .and_then(|_| run_qa(&repo_root, &cwd, rest)),
         "grunt" => enforce_ambient_role_namespace(&repo_root, SwarmRole::Grunt, role_ns, rest)
-            .and_then(|()| run_grunt(&repo_root, &cwd, rest)),
+            .and_then(|_| run_grunt(&repo_root, &cwd, rest)),
         "reviewer" => enforce_ambient_role_namespace(
             &repo_root,
             SwarmRole::AdversarialReviewer,
             role_ns,
             rest,
         )
-        .and_then(|()| run_reviewer(&repo_root, rest)),
+        .and_then(|_| run_reviewer(&repo_root, rest)),
         "coroner" => {
             enforce_ambient_role_namespace(&repo_root, SwarmRole::ForensicCoroner, role_ns, rest)
-                .and_then(|()| run_coroner(&repo_root, &cwd, rest))
+                .and_then(|_| run_coroner(&repo_root, &cwd, rest))
         }
         "--help" | "-h" | "help" => {
             print_usage();
@@ -204,7 +204,7 @@ fn enforce_ambient_role_namespace(
     expected_role: SwarmRole,
     role_ns: &str,
     sub_args: &[String],
-) -> Result<(), String> {
+) -> Result<Option<String>, String> {
     let mut explicit_env_role = None;
     if let Ok(env_role_raw) = std::env::var("AGENT_GUARD_ROLE") {
         let raw = env_role_raw.trim();
@@ -271,9 +271,9 @@ fn enforce_ambient_role_namespace(
         let master_flag_cap = master_flag_sid
             .map(|sid| load_capability_for_role(repo_root, &sid, SwarmRole::Master, "master"))
             .transpose()?;
-        let has_signed_master_cap = env_cap.is_some() || master_flag_cap.is_some();
+        let master_sid = master_flag_cap.or(env_cap).map(|cap| cap.session_id);
 
-        if !has_signed_master_cap {
+        if master_sid.is_none() {
             if std::env::var("AGENT_GUARD_IN_SANDBOX").as_deref() == Ok("1") {
                 return Err(
                     "ROLE_CAPABILITY_MISMATCH: sandboxed subprocess cannot authenticate to 'swarm-tool master' via bare AGENT_GUARD_ROLE=master; present a signed Master capability"
@@ -294,7 +294,7 @@ fn enforce_ambient_role_namespace(
                             .to_string(),
                     );
                 }
-                return Ok(());
+                return Ok(None);
             }
             if let Ok(open_sessions) = load_open_session_capabilities(repo_root)
                 && let Some(worker_cap) = open_sessions.iter().find(|c| c.role != SwarmRole::Master)
@@ -310,11 +310,11 @@ fn enforce_ambient_role_namespace(
                     .to_string(),
             );
         }
-        return Ok(());
+        return Ok(master_sid);
     }
 
     let _ = resolve_worker_capability(repo_root, sub_args, expected_role, role_ns)?;
-    Ok(())
+    Ok(None)
 }
 
 fn load_capability_for_role(
@@ -350,19 +350,25 @@ fn load_capability_for_role(
     Ok(cap)
 }
 
-fn resolve_env_swarm_or_bound_sid(repo_root: &Path) -> Option<String> {
-    let raw = std::env::var("AGENT_GUARD_SESSION_ID").ok()?;
+fn resolve_env_swarm_or_bound_sid(repo_root: &Path) -> Result<Option<String>, String> {
+    let raw = match std::env::var("AGENT_GUARD_SESSION_ID") {
+        Ok(raw) => raw,
+        Err(std::env::VarError::NotPresent) => return Ok(None),
+        Err(std::env::VarError::NotUnicode(_)) => {
+            return Err("INVALID_SESSION_ID: AGENT_GUARD_SESSION_ID must contain UTF-8".into());
+        }
+    };
     let trimmed = raw.trim();
     if trimmed.is_empty() {
-        return None;
+        return Ok(None);
     }
     if trimmed.starts_with("swm_") {
-        return Some(trimmed.to_string());
+        return Ok(Some(trimmed.to_string()));
     }
-    agent_guard::role_sandbox::lookup_bound_hook_capability(repo_root, trimmed)
-        .ok()
-        .flatten()
-        .map(|c| c.session_id)
+    Ok(
+        agent_guard::role_sandbox::lookup_bound_hook_capability(repo_root, trimmed)?
+            .map(|c| c.session_id),
+    )
 }
 
 fn resolve_worker_capability(
@@ -375,28 +381,26 @@ fn resolve_worker_capability(
         expected_role == SwarmRole::ForensicCoroner && args.first().is_some_and(|s| s == "triage");
 
     let candidate_sid = if is_coroner_triage {
-        flag_val(args, "--coroner-session")
-            .or_else(|| {
-                if flag_val(args, "--target-session").is_some() {
-                    flag_val(args, "--session")
-                } else {
-                    None
-                }
-            })
-            .or_else(|| resolve_env_swarm_or_bound_sid(repo_root))
-            .filter(|s| !s.trim().is_empty())
+        flag_val(args, "--coroner-session").or_else(|| {
+            if flag_val(args, "--target-session").is_some() {
+                flag_val(args, "--session")
+            } else {
+                None
+            }
+        })
     } else {
         let is_attach = args.first().is_some_and(|s| s == "attach");
-        flag_val(args, "--session")
-            .or_else(|| {
-                if is_attach {
-                    args.get(1).filter(|s| s.starts_with("swm_")).cloned()
-                } else {
-                    None
-                }
-            })
-            .or_else(|| resolve_env_swarm_or_bound_sid(repo_root))
-            .filter(|s| !s.trim().is_empty())
+        flag_val(args, "--session").or_else(|| {
+            if is_attach {
+                args.get(1).filter(|s| s.starts_with("swm_")).cloned()
+            } else {
+                None
+            }
+        })
+    };
+    let candidate_sid = match candidate_sid {
+        Some(sid) if !sid.trim().is_empty() => Some(sid),
+        _ => resolve_env_swarm_or_bound_sid(repo_root)?,
     };
 
     if let Some(sid) = candidate_sid {
@@ -496,7 +500,12 @@ fn verify_worker_packet_provenance(repo_root: &Path, pkt: &WorkerPacket) -> Resu
     Ok(())
 }
 
-fn run_master(repo_root: &Path, cwd: &Path, args: &[String]) -> Result<(), String> {
+fn run_master(
+    repo_root: &Path,
+    cwd: &Path,
+    args: &[String],
+    master_session_id: Option<&str>,
+) -> Result<(), String> {
     let sub = args.first().map(String::as_str).unwrap_or("--help");
     match sub {
         "lock-plan" => {
@@ -529,25 +538,17 @@ fn run_master(repo_root: &Path, cwd: &Path, args: &[String]) -> Result<(), Strin
                 );
             }
             let explicit_rotate = args.iter().any(|a| a == "--rotate-epoch");
-            let open_caps = load_open_session_capabilities(repo_root).unwrap_or_default();
-            if explicit_rotate && !open_caps.is_empty() {
-                return Err(
-                    "EPOCH_ROTATE_OPEN_SESSIONS: close all open worker sessions before rotating vault HMAC epoch"
-                        .to_string(),
-                );
-            }
-            let has_any_prior_caps = list_session_capabilities(repo_root)
-                .map(|caps| !caps.is_empty())
-                .unwrap_or(false);
-            let fresh_plan =
-                load_locked_plan(repo_root).is_err() && open_caps.is_empty() && !has_any_prior_caps;
-            if explicit_rotate || (!allow_amend && fresh_plan) {
-                let _ = agent_guard::coordinator::rotate_vault_hmac_epoch(repo_root)?;
-                if explicit_rotate {
-                    reset_closed_sessions_for_rotated_epoch(repo_root)?;
+            let rotate_fresh = !explicit_rotate
+                && !allow_amend
+                && load_locked_plan(repo_root).is_err()
+                && load_open_session_capabilities(repo_root)?.is_empty()
+                && list_session_capabilities(repo_root)?.is_empty();
+            let saved_path = save_locked_plan_after_validation(repo_root, &plan, allow_amend, || {
+                if explicit_rotate || rotate_fresh {
+                    rotate_closed_session_epoch(repo_root, master_session_id)?;
                 }
-            }
-            let saved_path = save_locked_plan(repo_root, &plan, allow_amend)?;
+                Ok(())
+            })?;
             let out = JsonValue::Object(vec![
                 (
                     "status".to_string(),

@@ -337,6 +337,8 @@ pub fn set_active_session_slot(repo_root: &Path, session_id: &str) -> Result<(),
     for attempt in 0..8u8 {
         let guard = ExclusiveFileLockGuard::acquire(&path)?;
         let mut reg = load_registry_unlocked(repo_root, &path)?;
+        // A concurrent epoch rotation may have invalidated a capability before registration.
+        load_session_capability(repo_root, session_id)?;
         if !reg.open_sessions.iter().any(|s| s == session_id) {
             reg.open_sessions.push(session_id.to_string());
         }
@@ -402,11 +404,11 @@ pub fn bind_hook_session_to_swarm_session(
     if hs.is_empty() || hs == "default" || hs.starts_with("swm_") {
         return Ok(());
     }
-    let cap = load_session_capability(repo_root, swarm_session_id)?;
     let path = active_session_slot_path(repo_root)?;
     for attempt in 0..8u8 {
         let guard = ExclusiveFileLockGuard::acquire(&path)?;
         let mut reg = load_registry_unlocked(repo_root, &path)?;
+        let cap = load_session_capability(repo_root, swarm_session_id)?;
         let is_bindable = cap.role == SwarmRole::Master
             || reg.open_sessions.iter().any(|s| s == swarm_session_id);
         if !is_bindable {
@@ -435,32 +437,64 @@ pub fn bind_hook_session_to_swarm_session(
     Err("active_sessions CAS retry limit exceeded".to_string())
 }
 
-/// Resets closed `sessions/swm_*.json` records and re-signs `active_sessions.json` under the
-/// current vault HMAC key after an explicit host vault epoch rotation.
-pub fn reset_closed_sessions_for_rotated_epoch(repo_root: &Path) -> Result<(), String> {
-    let dir = sessions_dir(repo_root)?;
-    if let Ok(entries) = fs::read_dir(&dir) {
-        for entry in entries.flatten() {
-            let p = entry.path();
-            if let Ok(meta) = fs::symlink_metadata(&p)
-                && !meta.file_type().is_symlink()
-                && meta.file_type().is_file()
-                && p.extension().is_some_and(|e| e == "json")
-                && let Some(stem) = p.file_stem().and_then(|s| s.to_str())
-                && stem.starts_with("swm_")
-            {
-                let _ = fs::remove_file(&p);
-            }
-        }
-    }
+/// Rotates the vault epoch with no open worker sessions, retaining the authenticated Master
+/// capability and its hook bindings under the fresh key.
+pub fn rotate_closed_session_epoch(
+    repo_root: &Path,
+    master_session_id: Option<&str>,
+) -> Result<(), String> {
     let slot_path = active_session_slot_path(repo_root)?;
     let guard = ExclusiveFileLockGuard::acquire(&slot_path)?;
-    let fresh_reg = ActiveSessionRegistry {
-        revision: 1,
-        open_sessions: Vec::new(),
-        hook_bindings: BTreeMap::new(),
-    };
-    commit_registry_with_lock(repo_root, &slot_path, guard, &fresh_reg)
+    let mut registry = load_registry_unlocked(repo_root, &slot_path)?;
+    if !registry.open_sessions.is_empty() {
+        return Err(
+            "EPOCH_ROTATE_OPEN_SESSIONS: close all open worker sessions before rotating vault HMAC epoch"
+                .to_string(),
+        );
+    }
+    let master = master_session_id
+        .map(|sid| load_session_capability(repo_root, sid))
+        .transpose()?;
+    if let Some(cap) = &master
+        && cap.role != SwarmRole::Master
+    {
+        return Err("ROLE_CAPABILITY_MISMATCH: epoch rotation requires a Master capability".into());
+    }
+    let master_path = master
+        .as_ref()
+        .map(|cap| session_capability_path(repo_root, &cap.session_id))
+        .transpose()?;
+    registry
+        .hook_bindings
+        .retain(|_, sid| master_session_id == Some(sid.as_str()));
+    registry.revision = registry
+        .revision
+        .checked_add(1)
+        .ok_or_else(|| "active_sessions revision overflow".to_string())?;
+
+    let dir = sessions_dir(repo_root)?;
+    let mut retired = Vec::new();
+    let entries = fs::read_dir(&dir).map_err(|e| format!("failed reading swarm sessions: {e}"))?;
+    for entry in entries {
+        let entry = entry.map_err(|e| format!("failed reading swarm session entry: {e}"))?;
+        let path = entry.path();
+        if path.extension().is_some_and(|ext| ext == "json")
+            && let Some(sid) = path.file_stem().and_then(|stem| stem.to_str())
+            && sid.starts_with("swm_")
+            && master_path.as_ref() != Some(&path)
+            && entry.file_type().is_ok_and(|kind| kind.is_file())
+        {
+            retired.push(path);
+        }
+    }
+    crate::coordinator::rotate_vault_hmac_epoch(repo_root)?;
+    if let Some(cap) = &master {
+        save_session_capability(repo_root, cap)?;
+    }
+    for path in retired {
+        let _ = fs::remove_file(path);
+    }
+    commit_registry_with_lock(repo_root, &slot_path, guard, &registry)
 }
 
 /// Loads all currently open non-Master session capabilities in deterministic registration order.
@@ -491,6 +525,9 @@ pub fn lookup_bound_hook_capability(
         if cap.role == SwarmRole::Master || reg.open_sessions.iter().any(|s| s == target_sid) {
             return Ok(Some(cap));
         }
+        return Err(format!(
+            "SESSION_CLOSED_OR_INACTIVE: bound session '{target_sid}' is closed or inactive"
+        ));
     }
     Ok(None)
 }

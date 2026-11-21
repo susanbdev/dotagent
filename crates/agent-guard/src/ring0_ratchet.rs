@@ -850,20 +850,20 @@ fn is_bot_github_actor() -> bool {
     if std::env::var("DOTAGENT_AUTONOMOUS_LOOP").as_deref() == Ok("1") {
         return true;
     }
-    for var in ["GITHUB_ACTOR", "EVENT_ACTOR", "PR_AUTHOR"] {
-        if let Ok(actor) = std::env::var(var) {
-            let lower = actor.trim().to_ascii_lowercase();
-            if lower.ends_with("[bot]") || lower == "dotagent-loop" || lower == "github-actions" {
-                return true;
-            }
-        }
-    }
     if let Ok(ptype) = std::env::var("PR_AUTHOR_TYPE")
         && ptype.trim().eq_ignore_ascii_case("bot")
     {
         return true;
     }
-    false
+    let author = std::env::var("PR_AUTHOR")
+        .ok()
+        .filter(|name| !name.trim().is_empty())
+        .or_else(|| std::env::var("GITHUB_ACTOR").ok())
+        .or_else(|| std::env::var("EVENT_ACTOR").ok());
+    author.is_some_and(|actor| {
+        let login = actor.trim().to_ascii_lowercase();
+        login.ends_with("[bot]") || login == "dotagent-loop" || login == "github-actions"
+    })
 }
 
 fn is_autonomous_bot_or_loop_context(repo_root: &Path, merge_base: &str) -> bool {
@@ -873,7 +873,10 @@ fn is_autonomous_bot_or_loop_context(repo_root: &Path, merge_base: &str) -> bool
     for ref_var in ["PR_HEAD_REF", "GITHUB_HEAD_REF"] {
         if let Ok(r) = std::env::var(ref_var) {
             let trimmed = r.trim().trim_start_matches("refs/heads/");
-            if trimmed.starts_with("auto/") {
+            if ["auto/", "friction-loop/", "agent-feedback/"]
+                .iter()
+                .any(|prefix| trimmed.starts_with(prefix))
+            {
                 return true;
             }
         }
@@ -1932,7 +1935,6 @@ pub fn run_verify_ring0_ratchet_cli(args: &[String], cwd: &Path) -> ExitCode {
     let mut json_mode = false;
     let mut repo_override: Option<String> = None;
     let mut release_tag: Option<String> = None;
-    let mut allow_software_ssh_for_test = false;
 
     let mut i = 0usize;
     while i < args.len() {
@@ -1948,10 +1950,6 @@ pub fn run_verify_ring0_ratchet_cli(args: &[String], cwd: &Path) -> ExitCode {
             "--verify-release-tag" if i + 1 < args.len() => {
                 release_tag = Some(args[i + 1].clone());
                 i += 2;
-            }
-            "--allow-software-ssh-for-test" => {
-                allow_software_ssh_for_test = true;
-                i += 1;
             }
             "--require-ratchet" | "--enforce-ring0" => {
                 force_ratchet = true;
@@ -1981,12 +1979,7 @@ pub fn run_verify_ring0_ratchet_cli(args: &[String], cwd: &Path) -> ExitCode {
         .unwrap_or_else(|| resolve_repo_root(cwd));
 
     if let Some(tag) = release_tag {
-        match verify_release_tag_signature(
-            &target_dir,
-            &tag,
-            &base_ref,
-            !allow_software_ssh_for_test,
-        ) {
+        match verify_release_tag_signature(&target_dir, &tag, &base_ref, true) {
             Ok(rep) => {
                 if json_mode {
                     println!("{}", rep.to_json_value().to_json_string());
