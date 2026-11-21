@@ -4,10 +4,15 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
+publish = false
 description = "Role-specific deterministic Rust CLI tooling for dotagent Zero-Trust Swarm v2 skills (master, investigator, qa-engineer, grunt, adversarial-reviewer, forensic-coroner)"
 
 [lints]
 workspace = true
+
+[lib]
+name = "swarm_tools"
+path = "src/lib.rs"
 
 [[bin]]
 name = "swarm-tool"

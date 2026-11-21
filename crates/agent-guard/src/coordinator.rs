@@ -578,8 +578,910 @@ pub fn rpc_verify_event_mac(
     }
 }
 
-/// CLI entrypoint for `agent-guard coordinator --repo <path> [--idle-secs <N>]`.
+/// Returns the active vault HMAC key epoch counter (`>= 1`) for `repo_root`.
+pub fn current_hmac_epoch_id(repo_root: &Path) -> Result<u64, String> {
+    let epoch_file = swarm_state_dir(repo_root)?.join("vault/hmac_epoch.json");
+    let Ok(raw) = fs::read_to_string(&epoch_file) else {
+        return Ok(1);
+    };
+    let Ok(val) = JsonValue::parse(&raw) else {
+        return Ok(1);
+    };
+    Ok(val
+        .get("epoch_id")
+        .and_then(JsonValue::as_u64)
+        .unwrap_or(1)
+        .max(1))
+}
+
+static ATOMIC_TMP_COUNTER: AtomicU64 = AtomicU64::new(1);
+
+pub(crate) fn write_atomic_private_0600(path: &Path, body: &[u8]) -> Result<(), String> {
+    if let Ok(meta) = fs::symlink_metadata(path)
+        && meta.file_type().is_symlink()
+    {
+        return Err(format!(
+            "SYMLINK_TAMPER_DETECTED: refusing to overwrite symlink '{}'",
+            path.display()
+        ));
+    }
+    let parent = path
+        .parent()
+        .ok_or_else(|| format!("missing parent directory for '{}'", path.display()))?;
+    let seq = ATOMIC_TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let fname = path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("atomic.dat");
+    let tmp_path = parent.join(format!(".{fname}.tmp.{}.{seq}", std::process::id()));
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut f = fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .mode(0o600)
+            .open(&tmp_path)
+            .map_err(|e| format!("failed creating atomic temp '{}': {e}", tmp_path.display()))?;
+        if let Err(e) = f.write_all(body).and_then(|()| f.sync_all()) {
+            let _ = fs::remove_file(&tmp_path);
+            return Err(format!(
+                "failed syncing atomic temp '{}': {e}",
+                tmp_path.display()
+            ));
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        fs::write(&tmp_path, body)
+            .map_err(|e| format!("failed writing atomic temp '{}': {e}", tmp_path.display()))?;
+    }
+    if let Err(e) = fs::rename(&tmp_path, path) {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(format!(
+            "failed renaming atomic temp onto '{}': {e}",
+            path.display()
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn socket_dev_ino(path: &Path) -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    let m = fs::symlink_metadata(path).ok()?;
+    Some((m.dev(), m.ino()))
+}
+
+#[cfg(unix)]
+fn unlink_if_same_inode(path: &Path, expected_id: Option<(u64, u64)>) {
+    if let Some(exp) = expected_id {
+        if socket_dev_ino(path) == Some(exp) {
+            let _ = fs::remove_file(path);
+        }
+    }
+}
+
+/// Rotates `<swarm_state_dir>/vault/hmac.key` to a fresh 256-bit OS CSPRNG key (`0600`),
+/// increments `vault/hmac_epoch.json`, and retires any active `coord.sock` bound to the old epoch.
+/// Strictly host-only: hard-denied inside `exec-sandbox` or worker locks.
+pub fn rotate_vault_hmac_epoch(repo_root: &Path) -> Result<u64, String> {
+    if std::env::var("AGENT_GUARD_IN_SANDBOX").as_deref() == Ok("1")
+        || std::env::var("AGENT_GUARD_WORKER_LOCK").as_deref() == Ok("1")
+    {
+        return Err(
+            "EPOCH_ROTATION_DENIED_IN_SANDBOX: vault HMAC rotation requires trusted host authority"
+                .to_string(),
+        );
+    }
+    let lock_path = crate::breadcrumbs::swarm_locks_dir()?.join("vault_hmac_epoch.lock");
+    let _guard = ExclusiveFileLockGuard::acquire(&lock_path)?;
+
+    let canon_repo = fs::canonicalize(repo_root).unwrap_or_else(|_| repo_root.to_path_buf());
+    let _ = load_or_init_vault_hmac_key(&canon_repo)?;
+    let vault_dir = swarm_state_dir(&canon_repo)?.join("vault");
+    let key_file = vault_dir.join("hmac.key");
+    let epoch_file = vault_dir.join("hmac_epoch.json");
+
+    if let Ok(meta) = fs::symlink_metadata(&key_file)
+        && meta.file_type().is_symlink()
+    {
+        return Err("VAULT_SYMLINK_TAMPER: vault/hmac.key is a symlink".to_string());
+    }
+    if let Ok(meta) = fs::symlink_metadata(&epoch_file)
+        && meta.file_type().is_symlink()
+    {
+        return Err("VAULT_SYMLINK_TAMPER: vault/hmac_epoch.json is a symlink".to_string());
+    }
+
+    let next_epoch = current_hmac_epoch_id(&canon_repo)?.saturating_add(1);
+    let mut fresh_key = [0u8; 32];
+    #[cfg(unix)]
+    {
+        let mut urandom = fs::File::open("/dev/urandom")
+            .map_err(|e| format!("failed opening /dev/urandom for epoch rotation: {e}"))?;
+        urandom
+            .read_exact(&mut fresh_key)
+            .map_err(|e| format!("failed reading 32 CSPRNG bytes: {e}"))?;
+    }
+    #[cfg(not(unix))]
+    {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        fresh_key = crate::crypto::sha256_bytes(&nanos.to_le_bytes());
+    }
+
+    let fresh_zk = ZeroizingKey::new(fresh_key);
+    zeroize_raw_arr(&mut fresh_key);
+    let hex_body = format!("{}\n", hex_encode(fresh_zk.as_bytes()));
+    write_atomic_private_0600(&key_file, hex_body.as_bytes())
+        .map_err(|e| format!("failed rotating vault/hmac.key: {e}"))?;
+
+    let meta_json = JsonValue::Object(vec![
+        ("epoch_id".to_string(), JsonValue::Uint(next_epoch)),
+        (
+            "rotated_at_unix".to_string(),
+            JsonValue::Uint(now_epoch_secs()),
+        ),
+    ])
+    .to_json_string();
+    let epoch_body = format!("{meta_json}\n");
+    write_atomic_private_0600(&epoch_file, epoch_body.as_bytes())
+        .map_err(|e| format!("failed writing vault/hmac_epoch.json: {e}"))?;
+
+    // Unlink existing socket path so the next coordinator call binds with the rotated key
+    if let Ok(sock) = coordinator_socket_path(&canon_repo) {
+        let _ = fs::remove_file(sock);
+    }
+    Ok(next_epoch)
+}
+
+fn zeroize_raw_arr(buf: &mut [u8; 32]) {
+    crate::crypto::zeroize_slice(buf);
+}
+
+/// Returns the host-only warm hook daemon socket path (`~/.local/state/agent-guard/daemon/hook.sock`).
+/// This path resides inside `state_base_dir()`, which is hard-blocked by Landlock, Seatbelt, and
+/// `path_policy.rs`, ensuring sandboxed worker subprocesses can NEVER connect to `hook.sock`.
+pub fn hook_daemon_socket_path() -> Result<PathBuf, String> {
+    let base = crate::traversal_ledger::state_base_dir();
+    let daemon_dir = base.join("daemon");
+    if let Ok(meta) = fs::symlink_metadata(&daemon_dir)
+        && meta.file_type().is_symlink()
+    {
+        return Err("HOOK_DAEMON_SYMLINK_TAMPER: daemon directory is a symlink".to_string());
+    }
+    fs::create_dir_all(&daemon_dir).map_err(|e| {
+        format!(
+            "failed creating hook daemon dir '{}': {e}",
+            daemon_dir.display()
+        )
+    })?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&daemon_dir, fs::Permissions::from_mode(0o700))
+            .map_err(|e| format!("failed setting 0700 on hook daemon dir: {e}"))?;
+    }
+    Ok(daemon_dir.join("hook.sock"))
+}
+
+pub fn ping_hook_daemon() -> bool {
+    #[cfg(unix)]
+    {
+        let Ok(sock_path) = hook_daemon_socket_path() else {
+            return false;
+        };
+        let req = JsonValue::Object(vec![("op".to_string(), JsonValue::Str("ping".to_string()))]);
+        send_rpc_request(&sock_path, &req).is_ok()
+    }
+    #[cfg(not(unix))]
+    {
+        false
+    }
+}
+
+pub fn ensure_hook_daemon() -> Result<PathBuf, String> {
+    if std::env::var("AGENT_GUARD_IN_SANDBOX").as_deref() == Ok("1")
+        || std::env::var("AGENT_GUARD_WORKER_LOCK").as_deref() == Ok("1")
+    {
+        return Err("HOOK_DAEMON_DENIED_IN_SANDBOX: warm hook daemon is host-only".to_string());
+    }
+    let sock_path = hook_daemon_socket_path()?;
+    if ping_hook_daemon() {
+        return Ok(sock_path);
+    }
+    let Some(bin) = find_agent_guard_binary() else {
+        return Err("agent-guard binary not found to spawn hook daemon".to_string());
+    };
+    let parent = sock_path
+        .parent()
+        .ok_or_else(|| "missing hook.sock parent".to_string())?;
+    let spawn_lock = parent.join("hook_daemon.spawn");
+    let _guard = ExclusiveFileLockGuard::acquire(&spawn_lock)?;
+    if ping_hook_daemon() {
+        return Ok(sock_path);
+    }
+    let mut daemon_cmd = std::process::Command::new(bin);
+    daemon_cmd
+        .arg("hook-daemon")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    for scrub_key in [
+        "AGENT_GUARD_ALLOW_SWARM",
+        "AGENT_GUARD_ALLOW_DEPUTY",
+        "AGENT_GUARD_ALLOW_INTERPRETER",
+        "AGENT_GUARD_WRAP_BASH_ASCII",
+        "AGENT_GUARD_PROFILE",
+        "AGENT_GUARD_ROLE",
+        "AGENT_GUARD_SESSION_ID",
+        "AGENT_GUARD_REPO_ROOT",
+    ] {
+        daemon_cmd.env_remove(scrub_key);
+    }
+    let _child = daemon_cmd
+        .spawn()
+        .map_err(|e| format!("failed spawning hook-daemon: {e}"))?;
+    for _ in 0..40 {
+        if ping_hook_daemon() {
+            return Ok(sock_path);
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    Err("timed out waiting for hook-daemon socket".to_string())
+}
+
+/// Evaluates `pre-tool` or `post-tool` over the host-only `hook.sock` daemon (`< 150 us` steady-state
+/// with hot in-memory `SessionLedger` write-through cache). Never touches worker `coord.sock` and
+/// hard-rejects `user-prompt` / `pre-compact`, sandboxed callers, or custom per-process override flags.
+pub fn rpc_eval_hook(
+    repo_root: &Path,
+    phase: &str,
+    hook_payload: &str,
+    cwd: &Path,
+) -> Result<crate::Decision, String> {
+    if std::env::var("AGENT_GUARD_IN_SANDBOX").as_deref() == Ok("1")
+        || std::env::var("AGENT_GUARD_WORKER_LOCK").as_deref() == Ok("1")
+    {
+        return Err("HOOK_DAEMON_DENIED_IN_SANDBOX".to_string());
+    }
+    if !matches!(phase, "pre-tool" | "post-tool") {
+        return Err(format!(
+            "UNSUPPORTED_HOOK_DAEMON_PHASE: '{phase}' must execute in-process"
+        ));
+    }
+    // Any non-default per-process override flag executes in-process so `hook-daemon` stays 100% privilege-neutral.
+    for custom_flag in [
+        "AGENT_GUARD_ALLOW_SWARM",
+        "AGENT_GUARD_ALLOW_DEPUTY",
+        "AGENT_GUARD_ALLOW_INTERPRETER",
+        "AGENT_GUARD_WRAP_BASH_ASCII",
+        "AGENT_GUARD_REPO_ROOT",
+    ] {
+        if std::env::var_os(custom_flag).is_some() {
+            return Err("HOOK_DAEMON_CUSTOM_ENV_INPROC".to_string());
+        }
+    }
+    #[cfg(unix)]
+    {
+        let sock_path = hook_daemon_socket_path()?;
+        let caller_sid = std::env::var("AGENT_GUARD_SESSION_ID").ok();
+        let caller_profile = std::env::var("AGENT_GUARD_PROFILE").ok();
+        let caller_role = std::env::var("AGENT_GUARD_ROLE").ok();
+        let req = JsonValue::Object(vec![
+            ("op".to_string(), JsonValue::Str("eval_hook".to_string())),
+            ("phase".to_string(), JsonValue::Str(phase.to_string())),
+            (
+                "payload".to_string(),
+                JsonValue::Str(hook_payload.to_string()),
+            ),
+            (
+                "repo_root".to_string(),
+                JsonValue::Str(repo_root.to_string_lossy().into_owned()),
+            ),
+            (
+                "cwd".to_string(),
+                JsonValue::Str(cwd.to_string_lossy().into_owned()),
+            ),
+            (
+                "caller_session_id".to_string(),
+                caller_sid.map_or(JsonValue::Null, JsonValue::Str),
+            ),
+            (
+                "caller_profile".to_string(),
+                caller_profile.map_or(JsonValue::Null, JsonValue::Str),
+            ),
+            (
+                "caller_role".to_string(),
+                caller_role.map_or(JsonValue::Null, JsonValue::Str),
+            ),
+        ]);
+        let resp = match send_rpc_request(&sock_path, &req) {
+            Ok(r) => r,
+            Err(_) => {
+                let fresh_sock = ensure_hook_daemon()?;
+                send_rpc_request(&fresh_sock, &req)?
+            }
+        };
+        let allow = resp
+            .get("allow")
+            .and_then(JsonValue::as_bool)
+            .ok_or_else(|| "missing allow boolean in eval_hook response".to_string())?;
+        if allow {
+            Ok(crate::Decision::Allow {
+                advisory: resp
+                    .get("advisory")
+                    .and_then(JsonValue::as_str)
+                    .map(String::from),
+                updated_input_json: resp
+                    .get("updated_input_json")
+                    .and_then(JsonValue::as_str)
+                    .map(String::from),
+                updated_bash_cmd: resp
+                    .get("updated_bash_cmd")
+                    .and_then(JsonValue::as_str)
+                    .map(String::from),
+            })
+        } else {
+            let code_str = resp
+                .get("code")
+                .and_then(JsonValue::as_str)
+                .unwrap_or("COORDINATOR_HOOK_DENY");
+            let reason = resp
+                .get("reason")
+                .and_then(JsonValue::as_str)
+                .unwrap_or("Denied by hook daemon")
+                .to_string();
+            let halt_session = resp
+                .get("halt_session")
+                .and_then(JsonValue::as_bool)
+                .unwrap_or(false);
+            Ok(crate::Decision::Deny {
+                code: intern_known_guard_code(code_str),
+                reason,
+                halt_session,
+            })
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (repo_root, phase, hook_payload, cwd);
+        Err("Unix domain sockets unsupported on this platform".to_string())
+    }
+}
+
+fn intern_known_guard_code(code: &str) -> &'static str {
+    const KNOWN_GUARD_CODES: &[&str] = &[
+        "ADVERSARIAL_ROUND_CAP_EXCEEDED",
+        "AMBIGUOUS_REQUIREMENT",
+        "AMBIGUOUS_TOOL_PARAM_ALIAS",
+        "ANSI_C_QUOTE_ESCAPE",
+        "AWK_FILE_REDIR_BLOCKED",
+        "AWK_SYSTEM_EXEC_BLOCKED",
+        "BIDI_CONTROL_CHARACTER",
+        "BINARY_FILE_BLOCKED",
+        "CAPABILITY_SCOPE_ESCALATION_DENIED",
+        "CARGO_CONFIG_EXEC_TRAP",
+        "CARGO_CONFIG_OVERRIDE_BLOCKED",
+        "CARGO_MUTATION_BLOCKED",
+        "CONFIG_OPEN_ERROR",
+        "CONFIG_READ_ERROR",
+        "CONFIG_STAT_ERROR",
+        "CONFLICTING_CONSTRAINTS",
+        "CONFUSED_DEPUTY_BLOCKED",
+        "CONFUSED_DEPUTY_GH_MUTATION",
+        "CONFUSED_DEPUTY_GIT_PUSH",
+        "CONFUSED_DEPUTY_TAINTED_SESSION",
+        "CONFUSED_DEPUTY_WORKSPACE_CLI",
+        "CONTENT_BYTE_BUDGET_EXCEEDED",
+        "CONTROL_ESCAPE_INJECTION",
+        "COORDINATOR_HOOK_DENY",
+        "CORONER_WEB_FORBIDDEN",
+        "CORONER_WRITE_FORBIDDEN",
+        "CORRUPT_SESSION_STATE",
+        "CROSS_REPOSITORY_ESCAPE",
+        "CROSS_REPO_CWD_SPOOF",
+        "DANGEROUS_ENV_OVERRIDE",
+        "DENSE_ESCAPE_OBFUSCATION",
+        "DESTRUCTIVE_GIT_BLOCKED",
+        "DYNAMIC_COMMAND_OBFUSCATION",
+        "DYNAMIC_FILES0_BLOCKED",
+        "EMBEDDED_FORBIDDEN_PATH_BLOCKED",
+        "EMPTY_PATH",
+        "ENCODED_ESCAPE_SMUGGLING",
+        "ENCODED_EXECUTION_PIPELINE",
+        "ENCODED_UNICODE_SMUGGLING",
+        "ENV_FLAG_BLOCKED",
+        "FILE_ABSOLUTE_SIZE_EXCEEDED",
+        "FILE_BYTE_BUDGET_EXCEEDED",
+        "FILE_BYTE_CAP_EXCEEDED",
+        "FILE_OPEN_ERROR",
+        "FILE_READ_BUDGET_EXCEEDED",
+        "FILE_READ_ERROR",
+        "FILE_STAT_ERROR",
+        "FILE_TOCTOU_REJECTED",
+        "FIND_DEPTH_BYPASS_BLOCKED",
+        "FIND_EXEC_OR_DELETE_BLOCKED",
+        "FIND_SYMLINK_FOLLOW_BLOCKED",
+        "FORBIDDEN_BINARY",
+        "FORBIDDEN_BUILD_ARTIFACT_PATH",
+        "FORBIDDEN_CACHE_PATH",
+        "FORBIDDEN_DEPENDENCY_PATH",
+        "FORBIDDEN_DIRECTORY_ACCESS",
+        "FORBIDDEN_GIT_CONTROL_PATH",
+        "FORBIDDEN_GUARD_STATE_PATH",
+        "FORBIDDEN_PATH_ZONE",
+        "FORBIDDEN_SECRET_PATH",
+        "FORBIDDEN_TMP_PATH",
+        "GH_COMPOUND_CHAIN_BLOCKED",
+        "GH_CREDENTIAL_ACCESS_BLOCKED",
+        "GH_WORKFLOW_CHAIN_BLOCKED",
+        "GIT_BRANCH_DELETE_BLOCKED",
+        "GIT_CLEAN_BLOCKED",
+        "GIT_CONFIG_MUTATION_BLOCKED",
+        "GIT_CONFIG_OVERRIDE_BLOCKED",
+        "GIT_DESTRUCTIVE_AMEND",
+        "GIT_DESTRUCTIVE_RESET",
+        "GIT_FORCE_PUSH_BLOCKED",
+        "GIT_HARDENING_MISSING",
+        "GIT_HISTORY_REWRITE_BLOCKED",
+        "GIT_HOOKS_NOT_DISABLED",
+        "GIT_HOOK_EXECUTION_BLOCKED",
+        "GIT_NO_VERIFY_BLOCKED",
+        "GIT_RCE_FLAG_BLOCKED",
+        "GIT_REMOTE_MUTATION_BLOCKED",
+        "GIT_SUBMODULE_OR_CLONE_BLOCKED",
+        "GRUNT_MISSING_CAPABILITY",
+        "GRUNT_READ_OUT_OF_SCOPE",
+        "GRUNT_SEARCH_FORBIDDEN",
+        "GRUNT_WRITE_OUT_OF_SCOPE",
+        "HARDCODED_SECRET_LITERAL",
+        "HIDDEN_COMMENT_INJECTION",
+        "HOMOGLYPH_SPOOFING",
+        "HOOK_INPUT_OVERFLOW",
+        "HTML_ENTITY_UNICODE_SMUGGLING",
+        "IMMUTABLE_CONTROL_PLANE",
+        "IMMUTABLE_ROOT_AUTHORITY",
+        "INTERPRETER_DANGEROUS_CAPABILITY_BLOCKED",
+        "INVALID_BUILD_CONFIG_UTF8",
+        "INVALID_CAPABILITY_SESSION_ID",
+        "INVALID_HOOK_JSON",
+        "INVALID_SWARM_ROLE",
+        "INVALID_UTF8_BLOCKED",
+        "INVESTIGATOR_WEB_FORBIDDEN",
+        "INVESTIGATOR_WRITE_FORBIDDEN",
+        "INVISIBLE_UNICODE_SMUGGLING",
+        "LEDGER_SENTENCE_COUNT_INVALID",
+        "LEGACY_HMAC_V1_STATE_INVALIDATED",
+        "LIFECYCLE_SCRIPTS_NOT_DISABLED",
+        "LINE_COUNT_BUDGET_EXCEEDED",
+        "LOCKFILE_OR_BUNDLE_BLOCKED",
+        "LS_SYMLINK_FOLLOW_BLOCKED",
+        "MALFORMED_AWK_COMMAND",
+        "MALFORMED_CARGO_COMMAND",
+        "MALFORMED_FIND_COMMAND",
+        "MALFORMED_HOOK_JSON",
+        "MALFORMED_PKG_COMMAND",
+        "MALFORMED_PROFILE_TOML",
+        "MALFORMED_REDIRECTION",
+        "MALFORMED_SED_COMMAND",
+        "MALFORMED_SUBSHELL",
+        "MALFORMED_UNITTEST_COMMAND",
+        "MARKDOWN_IMAGE_EXFILTRATION",
+        "MASTER_SEARCH_FORBIDDEN",
+        "MASTER_SHELL_RESTRICTED",
+        "MASTER_SOURCE_READ_FORBIDDEN",
+        "MASTER_WRITE_FORBIDDEN",
+        "MAX_DEPTH_EXCEEDED",
+        "MAX_TRAVERSAL_DEPTH_EXCEEDED",
+        "MCP_ARG_BYTES_EXCEEDED",
+        "MCP_CAPABILITY_UNDECLARED",
+        "MCP_ENDPOINT_PIN_VIOLATION",
+        "MCP_EXTERNAL_MUTATION_TAINTED",
+        "MCP_INVALID_ARG_SCHEMA",
+        "MCP_WRITE_DISABLED_BY_PROFILE",
+        "MISSING_COMMAND",
+        "MISSING_CONTENT",
+        "MISSING_FILE_PATH",
+        "MISSING_PATCH_TARGETS",
+        "MISSING_PATH",
+        "MISSING_PATTERN",
+        "MISSING_POST_EDIT_PATH",
+        "MISSING_WRITE_TARGETS",
+        "MIXED_SCRIPT_HOMOGLYPH",
+        "NETWORK_EXFILTRATION_BLOCKED",
+        "NON_ASCII_SANITIZED_PREBUFFER",
+        "NON_REGULAR_FILE",
+        "NPMRC_SCRIPT_TRAP",
+        "OUT_OF_SCOPE_BOUNDARY",
+        "OVERSIZED_BUILD_CONFIG_BLOCKED",
+        "OVERSIZED_PROFILE_BLOCKED",
+        "PACKAGE_CACHE_BLEED_BLOCKED",
+        "PATH_CONTROL_INJECTION",
+        "PERMISSION_MUTATION_BLOCKED",
+        "PKG_CONFIG_OR_GLOBAL_BLOCKED",
+        "PKG_EXEC_OR_PUBLISH_BLOCKED",
+        "POISONED_POINTER_DETECTED",
+        "POISONED_TRAVERSAL_POINTER",
+        "PRIVATE_USE_UNICODE",
+        "PRIVILEGED_DOMAIN_DENIED",
+        "PRIVILEGED_ROLE_DENIED",
+        "PRIVILEGE_ESCALATION_BLOCKED",
+        "PROFILE_INVARIANT_LOOSENED",
+        "PROFILE_WRITE_TOOLS_DISABLED",
+        "PROMPT_DELIMITER_INJECTION",
+        "PROMPT_INJECTION_DETECTED",
+        "PROMPT_INJECTION_OVERRIDE",
+        "QA_PRODUCTION_WRITE_FORBIDDEN",
+        "REPETITION_SATURATION_BOMB",
+        "REPO_BOUNDARY_ESCAPE",
+        "REPO_GIT_CONFIG_TRAP",
+        "REVIEWER_EXFILTRATION_URL_BLOCKED",
+        "REVIEWER_WRITE_FORBIDDEN",
+        "ROLE_CAPABILITY_MISMATCH",
+        "ROLE_NAMESPACE_ESCALATION_BLOCKED",
+        "ROLE_NETWORK_EXFIL_BLOCKED",
+        "ROLE_SHELL_WRITE_FORBIDDEN",
+        "SANDBOX_BINARY_UNAVAILABLE",
+        "SEARCH_IGNORE_BYPASS_BLOCKED",
+        "SECRET_ENV_DUMP_BLOCKED",
+        "SED_EXEC_OR_FILE_IO_BLOCKED",
+        "SELF_TAMPERING_BLOCKED",
+        "SESSION_CIRCUIT_BREAKER_HALTED",
+        "SESSION_CIRCUIT_BREAKER_TRIPPED",
+        "SESSION_HALTED_OR_EXHAUSTED",
+        "SESSION_RESET_DENIED_IN_SANDBOX",
+        "SESSION_RESET_REQUIRES_HUMAN_TTY",
+        "SHADOW_AUTHORITY_FILE_BLOCKED",
+        "SHELL_BRACE_EXPANSION_BLOCKED",
+        "SHELL_DYNAMIC_PATH_BLOCKED",
+        "SHELL_GLOB_OPERAND_BLOCKED",
+        "SHELL_IFS_OBFUSCATION",
+        "SHELL_NESTING_EXCEEDED",
+        "SHELL_RCFILE_OVERRIDE_BLOCKED",
+        "SINGLE_LINE_BOMB_BLOCKED",
+        "SLICE_LINE_CAP_EXCEEDED",
+        "SORT_COMPRESS_EXEC_BLOCKED",
+        "STATE_WRITE_ERROR",
+        "STDIN_SCRIPT_EXECUTION_BLOCKED",
+        "SUBAGENT_DELEGATION_BLOCKED",
+        "SUBAGENT_RETURN_BUDGET_EXCEEDED",
+        "SYMLINKED_BUILD_CONFIG_BLOCKED",
+        "SYMLINKED_GIT_DIR_BLOCKED",
+        "SYMLINKED_GIT_HOOKS_BLOCKED",
+        "SYMLINKED_PROFILE_BLOCKED",
+        "SYMLINK_BOUNDARY_ESCAPE",
+        "SYMLINK_ESCAPE_BLOCKED",
+        "SYMLINK_LOOP_DEPTH_EXCEEDED",
+        "SYMLINK_READ_ERROR",
+        "TAINTED_EXTERNAL_MUTATION_BLOCKED",
+        "TOKENIZER_SPLITTER_BOMB",
+        "TOKEN_ESTIMATE_EXCEEDED",
+        "TOOL_OUTPUT_FLOOD_BLOCKED",
+        "TRANSITIVE_DEPTH_EXCEEDED",
+        "TRANSITIVE_HOP_LIMIT_EXCEEDED",
+        "TURN_READ_COUNT_EXCEEDED",
+        "TURN_TOKEN_BUDGET_EXCEEDED",
+        "TURN_TOOL_CALL_LIMIT_EXCEEDED",
+        "UNAPPROVED_INTERPRETER_BLOCKED",
+        "UNAUTHORIZED_INSTRUCTION_FILE",
+        "UNBALANCED_SUBSHELL",
+        "UNBOUNDED_GIT_LOG",
+        "UNBOUNDED_GREP_RECURSIVE",
+        "UNBOUNDED_LS_RECURSIVE",
+        "UNBOUNDED_TRAVERSAL_BLOCKED",
+        "UNEXPECTED_SHELL_TOKEN",
+        "UNICODE_TAG_SMUGGLING",
+        "UNICODE_TROJAN_BIDI",
+        "UNKNOWN_PROFILE_KEY",
+        "UNKNOWN_RUNTIME_PROFILE",
+        "UNKNOWN_SUBCOMMAND",
+        "UNMINTED_CAPABILITY_DENIED",
+        "UNREADABLE_PROFILE_BLOCKED",
+        "UNRECOGNIZED_HMAC_DOMAIN_DENIED",
+        "UNRECOGNIZED_TOOL_BLOCKED",
+        "UNTERMINATED_BACKTICK",
+        "UNTERMINATED_DOUBLE_QUOTE",
+        "UNTERMINATED_SHELL_ESCAPE",
+        "UNTERMINATED_SINGLE_QUOTE",
+        "UNTRUSTED_WEB_FETCH_BLOCKED",
+        "UNVETTED_MCP_SERVER_BLOCKED",
+        "UNVETTED_NPX_BLOCKED",
+        "UNVETTED_URL_PACKAGE_BLOCKED",
+        "URL_ENCODED_BIDI_SMUGGLING",
+        "URL_ENCODED_PATH_SMUGGLING",
+        "USER_PROMPT_DENIED_IN_SANDBOX",
+        "VARIATION_SELECTOR_SMUGGLING",
+        "WRITE_IO_ERROR",
+        "XARGS_DYNAMIC_ARGS_BLOCKED",
+        "YARN_CONFIG_EXEC_TRAP",
+    ];
+    KNOWN_GUARD_CODES
+        .iter()
+        .copied()
+        .find(|&known| known == code)
+        .unwrap_or("COORDINATOR_HOOK_DENY")
+}
+
+/// CLI entrypoint for host-only `agent-guard hook-daemon [--idle-secs <N>]`.
+pub fn run_hook_daemon_cli(args: &[String]) -> ExitCode {
+    if std::env::var("AGENT_GUARD_IN_SANDBOX").as_deref() == Ok("1")
+        || std::env::var("AGENT_GUARD_WORKER_LOCK").as_deref() == Ok("1")
+    {
+        eprintln!(
+            "[agent-guard hook-daemon] HARD DENY: hook-daemon is restricted to host authority."
+        );
+        return ExitCode::from(2);
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = args;
+        eprintln!("[agent-guard hook-daemon] Unix domain sockets require a Unix host.");
+        ExitCode::from(2)
+    }
+    #[cfg(unix)]
+    {
+        let mut idle_secs = DEFAULT_IDLE_TIMEOUT_SECS;
+        let mut idx = 0usize;
+        while idx < args.len() {
+            if args[idx] == "--idle-secs" && idx + 1 < args.len() {
+                if let Ok(v) = args[idx + 1].parse::<u64>() {
+                    idle_secs = v.clamp(2, 3600);
+                }
+                idx += 2;
+            } else {
+                idx += 1;
+            }
+        }
+
+        let sock_path = match hook_daemon_socket_path() {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("[agent-guard hook-daemon] socket path error: {e}");
+                return ExitCode::from(2);
+            }
+        };
+        if ping_hook_daemon() {
+            return ExitCode::SUCCESS;
+        }
+        let _ = fs::remove_file(&sock_path);
+        let listener = match bind_unix_short_path(&sock_path) {
+            Ok(l) => l,
+            Err(e) => {
+                eprintln!("[agent-guard hook-daemon] bind error: {e}");
+                return ExitCode::from(2);
+            }
+        };
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = fs::set_permissions(&sock_path, fs::Permissions::from_mode(0o600));
+        }
+        let bound_inode = socket_dev_ino(&sock_path);
+        let _ = listener.set_nonblocking(true);
+
+        let hot_cache: Arc<crate::traversal_ledger::HotLedgerCache> =
+            Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::new()));
+        let last_activity = Arc::new(AtomicU64::new(now_epoch_secs()));
+        let active_clients = Arc::new(AtomicUsize::new(0));
+        loop {
+            match listener.accept() {
+                Ok((stream, _addr)) => {
+                    last_activity.store(now_epoch_secs(), Ordering::Relaxed);
+                    if active_clients.load(Ordering::Relaxed) >= MAX_CONCURRENT_IPC_CLIENTS {
+                        drop(stream);
+                        continue;
+                    }
+                    active_clients.fetch_add(1, Ordering::AcqRel);
+                    let cache_ref = Arc::clone(&hot_cache);
+                    let active_ref = Arc::clone(&active_clients);
+                    std::thread::spawn(move || {
+                        let _ = handle_hook_daemon_client(stream, &cache_ref);
+                        active_ref.fetch_sub(1, Ordering::AcqRel);
+                    });
+                }
+                Err(e) if e.kind() == ErrorKind::WouldBlock => {
+                    let socket_replaced = socket_dev_ino(&sock_path) != bound_inode;
+                    let elapsed =
+                        now_epoch_secs().saturating_sub(last_activity.load(Ordering::Relaxed));
+                    if (socket_replaced || elapsed >= idle_secs)
+                        && active_clients.load(Ordering::Acquire) == 0
+                    {
+                        unlink_if_same_inode(&sock_path, bound_inode);
+                        return ExitCode::SUCCESS;
+                    }
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                Err(_) => {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+fn handle_hook_daemon_client(
+    mut stream: UnixStream,
+    hot_cache: &crate::traversal_ledger::HotLedgerCache,
+) -> Result<(), String> {
+    let _ = stream.set_nonblocking(false);
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+    let _ = stream.set_write_timeout(Some(Duration::from_secs(2)));
+
+    let mut line = String::new();
+    {
+        let mut reader = BufReader::new((&mut stream).take(MAX_RPC_LINE_BYTES as u64));
+        reader
+            .read_line(&mut line)
+            .map_err(|e| format!("read error: {e}"))?;
+    }
+    let resp = match process_hook_daemon_line(line.trim(), hot_cache) {
+        Ok(val) => val,
+        Err(err) => JsonValue::Object(vec![
+            ("ok".to_string(), JsonValue::Bool(false)),
+            ("error".to_string(), JsonValue::Str(err)),
+        ]),
+    };
+    let mut encoded = resp.to_json_string();
+    encoded.push('\n');
+    stream
+        .write_all(encoded.as_bytes())
+        .map_err(|e| format!("write error: {e}"))?;
+    let _ = stream.flush();
+    Ok(())
+}
+
+fn process_hook_daemon_line(
+    raw: &str,
+    hot_cache: &crate::traversal_ledger::HotLedgerCache,
+) -> Result<JsonValue, String> {
+    let req = JsonValue::parse(raw).map_err(|e| format!("invalid JSON: {e}"))?;
+    let op = req
+        .get("op")
+        .and_then(JsonValue::as_str)
+        .ok_or_else(|| "missing op field".to_string())?;
+    match op {
+        "ping" => Ok(JsonValue::Object(vec![(
+            "ok".to_string(),
+            JsonValue::Bool(true),
+        )])),
+        "eval_hook" => {
+            let phase = req
+                .get("phase")
+                .and_then(JsonValue::as_str)
+                .ok_or_else(|| "missing phase field".to_string())?;
+            if !matches!(phase, "pre-tool" | "post-tool") {
+                return Err(format!(
+                    "UNSUPPORTED_HOOK_DAEMON_PHASE: phase '{phase}' is forbidden over hook.sock"
+                ));
+            }
+            let payload = req
+                .get("payload")
+                .and_then(JsonValue::as_str)
+                .ok_or_else(|| "missing payload field".to_string())?;
+            let raw_repo = req
+                .get("repo_root")
+                .and_then(JsonValue::as_str)
+                .ok_or_else(|| "missing repo_root field".to_string())?;
+            let canon_repo = fs::canonicalize(raw_repo).unwrap_or_else(|_| PathBuf::from(raw_repo));
+            let raw_cwd = req
+                .get("cwd")
+                .and_then(JsonValue::as_str)
+                .map(PathBuf::from)
+                .unwrap_or_else(|| canon_repo.clone());
+            let checked_cwd = fs::canonicalize(&raw_cwd).unwrap_or(raw_cwd);
+            if !checked_cwd.starts_with(&canon_repo) {
+                return Err(
+                    "EVAL_HOOK_OUTSIDE_REPO_DENIED: cwd must reside within repository".to_string(),
+                );
+            }
+            let caller_ctx = crate::HookCallerContext {
+                session_id: req
+                    .get("caller_session_id")
+                    .and_then(JsonValue::as_str)
+                    .map(String::from),
+                profile_id: req
+                    .get("caller_profile")
+                    .and_then(JsonValue::as_str)
+                    .map(String::from),
+                role_id: req
+                    .get("caller_role")
+                    .and_then(JsonValue::as_str)
+                    .map(String::from),
+            };
+            let decision = match phase {
+                "pre-tool" => crate::handle_pre_tool_hook_with_context(
+                    payload,
+                    &checked_cwd,
+                    &caller_ctx,
+                    Some(hot_cache),
+                ),
+                "post-tool" => crate::handle_post_tool_hook_with_context(
+                    payload,
+                    &checked_cwd,
+                    &caller_ctx,
+                    Some(hot_cache),
+                ),
+                _ => return Err(format!("unsupported hook phase '{phase}'")),
+            };
+            match decision {
+                crate::Decision::Allow {
+                    advisory,
+                    updated_input_json,
+                    updated_bash_cmd,
+                } => Ok(JsonValue::Object(vec![
+                    ("ok".to_string(), JsonValue::Bool(true)),
+                    ("allow".to_string(), JsonValue::Bool(true)),
+                    (
+                        "advisory".to_string(),
+                        advisory.map_or(JsonValue::Null, JsonValue::Str),
+                    ),
+                    (
+                        "updated_input_json".to_string(),
+                        updated_input_json.map_or(JsonValue::Null, JsonValue::Str),
+                    ),
+                    (
+                        "updated_bash_cmd".to_string(),
+                        updated_bash_cmd.map_or(JsonValue::Null, JsonValue::Str),
+                    ),
+                ])),
+                crate::Decision::Deny {
+                    code,
+                    reason,
+                    halt_session,
+                } => Ok(JsonValue::Object(vec![
+                    ("ok".to_string(), JsonValue::Bool(true)),
+                    ("allow".to_string(), JsonValue::Bool(false)),
+                    ("code".to_string(), JsonValue::Str(code.to_string())),
+                    ("reason".to_string(), JsonValue::Str(reason)),
+                    ("halt_session".to_string(), JsonValue::Bool(halt_session)),
+                ])),
+            }
+        }
+        other => Err(format!("unknown hook-daemon op '{other}'")),
+    }
+}
+
+/// CLI entrypoint for `agent-guard coordinator [rotate-epoch|epoch-status] [--repo <path>] [--idle-secs <N>]`.
 pub fn run_coordinator_cli(args: &[String], default_cwd: &Path) -> ExitCode {
+    if let Some(sub @ ("rotate-epoch" | "epoch-status")) = args.first().map(String::as_str) {
+        let mut repo_root = crate::resolve_repo_root(default_cwd);
+        let mut i = 1usize;
+        while i < args.len() {
+            if args[i] == "--repo" && i + 1 < args.len() {
+                repo_root = PathBuf::from(&args[i + 1]);
+                i += 2;
+            } else {
+                i += 1;
+            }
+        }
+        if sub == "epoch-status" {
+            match current_hmac_epoch_id(&repo_root) {
+                Ok(ep) => {
+                    println!(r#"{{"status":"OK","epoch_id":{ep}}}"#);
+                    return ExitCode::SUCCESS;
+                }
+                Err(e) => {
+                    eprintln!("[agent-guard coordinator] {e}");
+                    return ExitCode::from(2);
+                }
+            }
+        }
+        match rotate_vault_hmac_epoch(&repo_root) {
+            Ok(ep) => {
+                println!(r#"{{"status":"HMAC_EPOCH_ROTATED","epoch_id":{ep}}}"#);
+                return ExitCode::SUCCESS;
+            }
+            Err(e) => {
+                eprintln!("[agent-guard coordinator] HARD DENY: {e}");
+                return ExitCode::from(2);
+            }
+        }
+    }
+
     #[cfg(not(unix))]
     {
         let _ = (args, default_cwd);
@@ -610,6 +1512,13 @@ pub fn run_coordinator_cli(args: &[String], default_cwd: &Path) -> ExitCode {
         }
 
         let canon_repo = Arc::new(fs::canonicalize(&repo_root).unwrap_or(repo_root));
+        let bound_epoch = match current_hmac_epoch_id(&canon_repo) {
+            Ok(ep) => ep,
+            Err(e) => {
+                eprintln!("[agent-guard coordinator] epoch read error: {e}");
+                return ExitCode::from(2);
+            }
+        };
         let key = match load_or_init_vault_hmac_key(&canon_repo) {
             Ok(k) => Arc::new(ZeroizingKey::new(k)),
             Err(e) => {
@@ -641,6 +1550,7 @@ pub fn run_coordinator_cli(args: &[String], default_cwd: &Path) -> ExitCode {
             use std::os::unix::fs::PermissionsExt;
             let _ = fs::set_permissions(&sock_path, fs::Permissions::from_mode(0o600));
         }
+        let bound_inode = socket_dev_ino(&sock_path);
         let _ = listener.set_nonblocking(true);
 
         let last_activity = Arc::new(AtomicU64::new(now_epoch_secs()));
@@ -648,6 +1558,14 @@ pub fn run_coordinator_cli(args: &[String], default_cwd: &Path) -> ExitCode {
         loop {
             match listener.accept() {
                 Ok((stream, _addr)) => {
+                    if current_hmac_epoch_id(&canon_repo).unwrap_or(bound_epoch) != bound_epoch {
+                        drop(stream);
+                        if active_clients.load(Ordering::Acquire) == 0 {
+                            unlink_if_same_inode(&sock_path, bound_inode);
+                            return ExitCode::SUCCESS;
+                        }
+                        continue;
+                    }
                     last_activity.store(now_epoch_secs(), Ordering::Relaxed);
                     if active_clients.load(Ordering::Relaxed) >= MAX_CONCURRENT_IPC_CLIENTS {
                         // Drop excess connection immediately to prevent fd/thread exhaustion
@@ -659,15 +1577,25 @@ pub fn run_coordinator_cli(args: &[String], default_cwd: &Path) -> ExitCode {
                     let repo_ref = Arc::clone(&canon_repo);
                     let active_ref = Arc::clone(&active_clients);
                     std::thread::spawn(move || {
-                        let _ = handle_coordinator_client(stream, key_ref.as_bytes(), &repo_ref);
+                        let _ = handle_coordinator_client(
+                            stream,
+                            key_ref.as_bytes(),
+                            &repo_ref,
+                            bound_epoch,
+                        );
                         active_ref.fetch_sub(1, Ordering::AcqRel);
                     });
                 }
                 Err(e) if e.kind() == ErrorKind::WouldBlock => {
+                    let epoch_retired =
+                        current_hmac_epoch_id(&canon_repo).unwrap_or(bound_epoch) != bound_epoch;
+                    let socket_replaced = socket_dev_ino(&sock_path) != bound_inode;
                     let elapsed =
                         now_epoch_secs().saturating_sub(last_activity.load(Ordering::Relaxed));
-                    if elapsed >= idle_secs && active_clients.load(Ordering::Acquire) == 0 {
-                        let _ = fs::remove_file(&sock_path);
+                    if (epoch_retired || socket_replaced || elapsed >= idle_secs)
+                        && active_clients.load(Ordering::Acquire) == 0
+                    {
+                        unlink_if_same_inode(&sock_path, bound_inode);
                         return ExitCode::SUCCESS;
                     }
                     std::thread::sleep(Duration::from_millis(20));
@@ -685,6 +1613,7 @@ fn handle_coordinator_client(
     mut stream: UnixStream,
     key: &[u8; 32],
     canon_repo: &Path,
+    bound_epoch: u64,
 ) -> Result<(), String> {
     let _ = stream.set_nonblocking(false);
     let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
@@ -697,12 +1626,26 @@ fn handle_coordinator_client(
             .read_line(&mut line)
             .map_err(|e| format!("read error: {e}"))?;
     }
-    let resp = match process_rpc_line(line.trim(), key, canon_repo) {
-        Ok(val) => val,
-        Err(err) => JsonValue::Object(vec![
+    let live_epoch = current_hmac_epoch_id(canon_repo).unwrap_or(bound_epoch);
+    let resp = if live_epoch != bound_epoch {
+        JsonValue::Object(vec![
             ("ok".to_string(), JsonValue::Bool(false)),
-            ("error".to_string(), JsonValue::Str(err)),
-        ]),
+            (
+                "error".to_string(),
+                JsonValue::Str(
+                    "STALE_COORDINATOR_EPOCH: coordinator daemon bound to retired epoch"
+                        .to_string(),
+                ),
+            ),
+        ])
+    } else {
+        match process_rpc_line(line.trim(), key, canon_repo) {
+            Ok(val) => val,
+            Err(err) => JsonValue::Object(vec![
+                ("ok".to_string(), JsonValue::Bool(false)),
+                ("error".to_string(), JsonValue::Str(err)),
+            ]),
+        }
     };
     let mut encoded = resp.to_json_string();
     encoded.push('\n');
@@ -1065,13 +2008,8 @@ fn commit_ipc_active_slot_update(
         &candidate_bindings_map,
         &new_mac_hex,
     );
-    fs::write(&slot_file, body)
+    write_atomic_private_0600(&slot_file, body.as_bytes())
         .map_err(|e| format!("failed committing active_sessions.json: {e}"))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = fs::set_permissions(&slot_file, fs::Permissions::from_mode(0o600));
-    }
     Ok(new_tag)
 }
 
@@ -1218,6 +2156,17 @@ pub(crate) fn process_rpc_line(
                 ("valid".to_string(), JsonValue::Bool(valid)),
             ]))
         }
+        "epoch_status" => {
+            let ep = current_hmac_epoch_id(canon_repo)?;
+            Ok(JsonValue::Object(vec![
+                ("ok".to_string(), JsonValue::Bool(true)),
+                ("epoch_id".to_string(), JsonValue::Uint(ep)),
+            ]))
+        }
+        "eval_hook" => Err(
+            "EVAL_HOOK_FORBIDDEN_ON_WORKER_SOCKET: eval_hook is restricted to host-only hook.sock"
+                .to_string(),
+        ),
         other => Err(format!("unknown coordinator op '{other}'")),
     }
 }

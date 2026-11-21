@@ -70,6 +70,7 @@ fn main() -> ExitCode {
     }
 
     let result = match role_ns {
+        "run" => run_dag_cli(&repo_root, &cwd, rest),
         "master" => enforce_ambient_role_namespace(&repo_root, SwarmRole::Master, role_ns, rest)
             .and_then(|()| run_master(&repo_root, &cwd, rest)),
         "investigator" => {
@@ -96,7 +97,7 @@ fn main() -> ExitCode {
             Ok(())
         }
         other => Err(format!(
-            "UNKNOWN_SUBCOMMAND: unknown role namespace '{other}' (expected master, investigator, qa, grunt, reviewer, or coroner)"
+            "UNKNOWN_SUBCOMMAND: unknown role namespace '{other}' (expected run, master, investigator, qa, grunt, reviewer, or coroner)"
         )),
     };
 
@@ -107,6 +108,76 @@ fn main() -> ExitCode {
             ExitCode::from(2)
         }
     }
+}
+
+fn run_dag_cli(repo_root: &Path, cwd: &Path, args: &[String]) -> Result<(), String> {
+    if std::env::var("AGENT_GUARD_IN_SANDBOX").as_deref() == Ok("1")
+        || std::env::var("AGENT_GUARD_WORKER_LOCK").as_deref() == Ok("1")
+    {
+        return Err(
+            "SWARM_SUPERVISOR_DENIED_IN_SANDBOX: active DAG wave runner requires host supervisor authority outside exec-sandbox"
+                .to_string(),
+        );
+    }
+    let _ = load_or_init_vault_hmac_key(repo_root).map_err(|_| {
+        "SWARM_SUPERVISOR_VAULT_REQUIRED: missing host vault authority to run DAG supervisor"
+            .to_string()
+    })?;
+
+    let dag_arg = flag_val(args, "--dag")
+        .or_else(|| args.iter().find(|a| !a.starts_with('-')).cloned())
+        .ok_or_else(|| {
+            "usage: dotagent swarm run <dag.json> [--worker-cmd <cmd>] [--frontier-cmd <cmd>] [--mid-cmd <cmd>] [--test-cmd <cmd>] [--reviewer-cmd <cmd>] [--llvm-cov-json <path>] [--task-timeout-ms <N>] [--max-task-tokens <N>] [--rotate-epoch] [--dry-run]".to_string()
+        })?;
+    let valid = validate_path(repo_root, cwd, &dag_arg, PathAccess::Read)
+        .map_err(|pv| format!("{}: {}", pv.code, pv.detail))?;
+    let raw_dag = fs::read_to_string(&valid.canonical_or_norm)
+        .map_err(|e| format!("cannot read '{}': {e}", valid.repo_rel))?;
+
+    let wants_amend = args.iter().any(|a| a == "--amend");
+    let allow_amend = wants_amend && args.iter().any(|a| a == "--human-approved");
+    if wants_amend
+        && (!allow_amend
+            || !std::io::IsTerminal::is_terminal(&std::io::stdin())
+            || !std::io::IsTerminal::is_terminal(&std::io::stdout()))
+    {
+        return Err(
+            "PLAN_AMEND_REQUIRES_HUMAN_TTY: `swarm run --amend --human-approved` requires an interactive human terminal (stdin/stdout TTY) so AI agents cannot self-approve plan amendments."
+                .to_string(),
+        );
+    }
+
+    let llvm_cov_json = if let Some(cov_raw) = flag_val(args, "--llvm-cov-json") {
+        let _ = validate_path(repo_root, cwd, &cov_raw, PathAccess::Read)
+            .map_err(|pv| format!("{}: {}", pv.code, pv.detail))?;
+        Some(std::path::PathBuf::from(cov_raw))
+    } else {
+        None
+    };
+
+    let mut cfg = swarm_tools::WaveSupervisorConfig {
+        worker_cmd: flag_val(args, "--worker-cmd")
+            .or_else(|| std::env::var("DOTAGENT_SWARM_WORKER_CMD").ok()),
+        frontier_cmd: flag_val(args, "--frontier-cmd"),
+        mid_cmd: flag_val(args, "--mid-cmd"),
+        test_cmd: flag_val(args, "--test-cmd"),
+        reviewer_cmd: flag_val(args, "--reviewer-cmd"),
+        llvm_cov_json,
+        dry_run: args.iter().any(|a| a == "--dry-run"),
+        rotate_epoch: args.iter().any(|a| a == "--rotate-epoch"),
+        allow_amend,
+        ..swarm_tools::WaveSupervisorConfig::default()
+    };
+    if let Some(ms) = flag_val(args, "--task-timeout-ms").and_then(|s| s.parse::<u64>().ok()) {
+        cfg.task_timeout_ms = ms;
+    }
+    if let Some(toks) = flag_val(args, "--max-task-tokens").and_then(|s| s.parse::<usize>().ok()) {
+        cfg.max_task_tokens = toks;
+    }
+
+    let report = swarm_tools::run_swarm_dag_supervisor(repo_root, &raw_dag, &cfg)?;
+    println!("{}", report.to_json_value().to_json_string());
+    Ok(())
 }
 
 fn enforce_ambient_role_namespace(
@@ -168,9 +239,6 @@ fn enforce_ambient_role_namespace(
                 );
             }
             if explicit_env_role == Some(SwarmRole::Master) {
-                // Verify direct host vault possession first so a Landlocked/Seatbelted worker that stripped
-                // `AGENT_GUARD_IN_SANDBOX` via `env -u` fails closed (`EACCES` on `vault/hmac.key`)
-                // before touching any session/lock state directory.
                 let _ = load_or_init_vault_hmac_key(repo_root).map_err(|_| {
                     "ROLE_CAPABILITY_MISMATCH: sandboxed process lacks vault authority and cannot invoke 'swarm-tool master' without a signed Master capability"
                         .to_string()
@@ -203,9 +271,6 @@ fn enforce_ambient_role_namespace(
         return Ok(());
     }
 
-    // For all 5 non-Master worker namespaces: if another worker session is open with a different role
-    // and caller did not present an explicit `--session` or `AGENT_GUARD_SESSION_ID` for `expected_role`,
-    // fail closed immediately (`ROLE_CAPABILITY_MISMATCH` or `AMBIGUOUS_CONCURRENT_SWARM_SESSIONS`).
     let _ = resolve_worker_capability(repo_root, sub_args, expected_role, role_ns)?;
     Ok(())
 }
@@ -264,6 +329,22 @@ fn resolve_worker_capability(
 
     if let Some(sid) = candidate_sid {
         return load_capability_for_role(repo_root, sid.trim(), expected_role, role_ns);
+    }
+
+    if let Some(task_filter) = flag_val(args, "--task") {
+        let attempt_filter = flag_val(args, "--attempt").and_then(|a| a.parse::<u32>().ok());
+        let open_caps = load_open_session_capabilities(repo_root)?;
+        let matched: Vec<SessionCapability> = open_caps
+            .into_iter()
+            .filter(|c| {
+                c.role == expected_role
+                    && c.task_id == task_filter
+                    && attempt_filter.is_none_or(|att| c.attempt == att)
+            })
+            .collect();
+        if let [single] = matched.as_slice() {
+            return Ok(single.clone());
+        }
     }
 
     match load_active_session_slot(repo_root)? {
@@ -375,6 +456,14 @@ fn run_master(repo_root: &Path, cwd: &Path, args: &[String]) -> Result<(), Strin
                         .to_string(),
                 );
             }
+            let explicit_rotate = args.iter().any(|a| a == "--rotate-epoch");
+            let fresh_plan = load_locked_plan(repo_root).is_err()
+                && load_open_session_capabilities(repo_root)
+                    .map(|caps| caps.is_empty())
+                    .unwrap_or(true);
+            if explicit_rotate || (!allow_amend && fresh_plan) {
+                let _ = agent_guard::coordinator::rotate_vault_hmac_epoch(repo_root)?;
+            }
             let saved_path = save_locked_plan(repo_root, &plan, allow_amend)?;
             let out = JsonValue::Object(vec![
                 (
@@ -466,6 +555,7 @@ fn run_master(repo_root: &Path, cwd: &Path, args: &[String]) -> Result<(), Strin
             };
             let (pkt, trigger) = parse_and_validate_worker_packet(&raw)?;
             verify_worker_packet_provenance(repo_root, &pkt)?;
+            swarm_tools::verify_ingested_packet_doc_digests(repo_root, &raw)?;
             let pkt_kind = match pkt {
                 WorkerPacket::ObservedFact { .. } => "ObservedFact",
                 WorkerPacket::WorkerHypothesis { .. } => "WorkerHypothesis",
@@ -493,6 +583,7 @@ fn run_master(repo_root: &Path, cwd: &Path, args: &[String]) -> Result<(), Strin
             println!("{}", out.to_json_string());
             Ok(())
         }
+        "run-dag" => run_dag_cli(repo_root, cwd, &args[1..]),
         "close-session" => {
             let target_sid = flag_val(args, "--session").or_else(|| {
                 args.get(1)
@@ -512,17 +603,21 @@ fn run_master(repo_root: &Path, cwd: &Path, args: &[String]) -> Result<(), Strin
         }
         "status" => {
             let lock_file = plan_lock_state_path(repo_root)?;
-            let plan_summary = if lock_file.exists()
+            let (plan_id_str, plan_summary) = if lock_file.exists()
                 && fs::metadata(&lock_file).is_ok_and(|m| m.len() > 0)
             {
                 let p = load_locked_plan(repo_root)?;
-                JsonValue::Object(vec![
-                    ("plan_id".to_string(), JsonValue::Str(p.plan_id)),
-                    ("plan_sha256".to_string(), JsonValue::Str(p.plan_sha256)),
-                    ("tasks".to_string(), JsonValue::Number(p.tasks.len() as f64)),
-                ])
+                let pid = p.plan_id.clone();
+                (
+                    pid,
+                    JsonValue::Object(vec![
+                        ("plan_id".to_string(), JsonValue::Str(p.plan_id)),
+                        ("plan_sha256".to_string(), JsonValue::Str(p.plan_sha256)),
+                        ("tasks".to_string(), JsonValue::Number(p.tasks.len() as f64)),
+                    ]),
+                )
             } else {
-                JsonValue::Null
+                ("UNBOUND".to_string(), JsonValue::Null)
             };
             let open_caps = load_open_session_capabilities(repo_root)?;
             let active_slot = if open_caps.len() == 1 {
@@ -530,6 +625,15 @@ fn run_master(repo_root: &Path, cwd: &Path, args: &[String]) -> Result<(), Strin
             } else {
                 JsonValue::Null
             };
+            let slot_entries: Vec<(String, JsonValue)> = open_caps
+                .iter()
+                .map(|c| {
+                    (
+                        format!("{plan_id_str}:{}:{}", c.task_id, c.attempt),
+                        JsonValue::Str(c.session_id.clone()),
+                    )
+                })
+                .collect();
             let open_ids: Vec<JsonValue> = open_caps
                 .into_iter()
                 .map(|c| JsonValue::Str(c.session_id))
@@ -540,6 +644,7 @@ fn run_master(repo_root: &Path, cwd: &Path, args: &[String]) -> Result<(), Strin
                 ("locked_plan".to_string(), plan_summary),
                 ("active_session_slot".to_string(), active_slot),
                 ("open_sessions".to_string(), JsonValue::Array(open_ids)),
+                ("capability_slots".to_string(), JsonValue::Object(slot_entries)),
                 (
                     "minted_sessions".to_string(),
                     JsonValue::Number(sessions.len() as f64),
@@ -553,7 +658,7 @@ fn run_master(repo_root: &Path, cwd: &Path, args: &[String]) -> Result<(), Strin
             Ok(())
         }
         _ => Err(
-            "usage: swarm-tool master <lock-plan|mint-session|close-session|ingest-packet|status> ..."
+            "usage: swarm-tool master <lock-plan|mint-session|close-session|ingest-packet|run-dag|status> ..."
                 .to_string(),
         ),
     }
@@ -587,12 +692,16 @@ fn run_investigator(repo_root: &Path, args: &[String]) -> Result<(), String> {
             let claim = flag_val(args, "--claim")
                 .ok_or_else(|| "missing --claim \"<ascii>\"".to_string())?;
             let slices = flag_vals_multi(args, "--slice");
-            for sl in &slices {
-                let p = sl.split(':').next().unwrap_or(sl.as_str());
-                validate_path(repo_root, repo_root, p, PathAccess::Read)
-                    .map_err(|pv| format!("invalid evidence slice '{sl}': {}", pv.detail))?;
-            }
-            let obj = JsonValue::Object(vec![
+            let explicit_doc = flag_val(args, "--doc");
+            let expected_sha = flag_val(args, "--doc-sha256");
+            let (primary_doc_sha, doc_digests) = swarm_tools::compute_and_verify_fact_doc_digests(
+                repo_root,
+                &slices,
+                explicit_doc.as_deref(),
+                expected_sha.as_deref(),
+            )?;
+
+            let mut fields = vec![
                 (
                     "packet_type".to_string(),
                     JsonValue::Str("ObservedFact".to_string()),
@@ -604,7 +713,18 @@ fn run_investigator(repo_root: &Path, args: &[String]) -> Result<(), String> {
                     "evidence_slices".to_string(),
                     JsonValue::Array(slices.into_iter().map(JsonValue::Str).collect()),
                 ),
-            ]);
+            ];
+            if let Some(sha) = primary_doc_sha {
+                fields.push(("doc_sha256".to_string(), JsonValue::Str(sha)));
+            }
+            if !doc_digests.is_empty() {
+                let map_entries = doc_digests
+                    .into_iter()
+                    .map(|(k, v)| (k, JsonValue::Str(v)))
+                    .collect();
+                fields.push(("doc_sha256_map".to_string(), JsonValue::Object(map_entries)));
+            }
+            let obj = JsonValue::Object(fields);
             let serialized = obj.to_json_string();
             let _ = parse_and_validate_worker_packet(&serialized)?;
             println!("{serialized}");
@@ -692,14 +812,33 @@ fn run_qa(repo_root: &Path, cwd: &Path, args: &[String]) -> Result<(), String> {
                 .map_err(|pv| format!("{}: {}", pv.code, pv.detail))?;
             let raw = fs::read_to_string(&valid.canonical_or_norm).map_err(|e| e.to_string())?;
             let rules = parse_attribution_toml(&raw)?;
-            let failing = split_csv(&flag_val(args, "--failing").unwrap_or_default());
-            let passing = split_csv(&flag_val(args, "--passing").unwrap_or_default());
+
+            let mut failing = split_csv(&flag_val(args, "--failing").unwrap_or_default());
+            let mut passing = split_csv(&flag_val(args, "--passing").unwrap_or_default());
+            if let Some(report_arg) = flag_val(args, "--test-report") {
+                let rv = validate_path(repo_root, cwd, &report_arg, PathAccess::Read)
+                    .map_err(|pv| format!("{}: {}", pv.code, pv.detail))?;
+                let rtext = fs::read_to_string(&rv.canonical_or_norm).map_err(|e| e.to_string())?;
+                let (rf, rp) = swarm_tools::parse_structured_test_report(&rtext)?;
+                failing.extend(rf);
+                passing.extend(rp);
+            }
+
+            let cov_summary_opt = if let Some(cov_arg) = flag_val(args, "--llvm-cov-json") {
+                let cv = validate_path(repo_root, cwd, &cov_arg, PathAccess::Read)
+                    .map_err(|pv| format!("{}: {}", pv.code, pv.detail))?;
+                let ctext = fs::read_to_string(&cv.canonical_or_norm).map_err(|e| e.to_string())?;
+                Some(swarm_tools::parse_llvm_cov_file_percentages(&ctext)?)
+            } else {
+                None
+            };
+
             let verdict = triangulate_faults(&rules, &failing, &passing);
-            let out = match verdict {
+            let mut out_fields = match verdict {
                 SuspectVerdict::SuspectIsolated {
                     primary_suspect,
                     failing_tests,
-                } => JsonValue::Object(vec![
+                } => vec![
                     (
                         "verdict".to_string(),
                         JsonValue::Str("SuspectIsolated".to_string()),
@@ -712,12 +851,12 @@ fn run_qa(repo_root: &Path, cwd: &Path, args: &[String]) -> Result<(), String> {
                         "failing_tests".to_string(),
                         JsonValue::Array(failing_tests.into_iter().map(JsonValue::Str).collect()),
                     ),
-                ]),
+                ],
                 SuspectVerdict::BlockedByNeighbor {
                     victim,
                     neighbor_suspect,
                     boundary_test,
-                } => JsonValue::Object(vec![
+                } => vec![
                     (
                         "verdict".to_string(),
                         JsonValue::Str("BlockedByNeighbor".to_string()),
@@ -728,12 +867,12 @@ fn run_qa(repo_root: &Path, cwd: &Path, args: &[String]) -> Result<(), String> {
                         JsonValue::Str(neighbor_suspect),
                     ),
                     ("boundary_test".to_string(), JsonValue::Str(boundary_test)),
-                ]),
+                ],
                 SuspectVerdict::SeamOrSpecConflict {
                     task_a,
                     task_b,
                     boundary_test,
-                } => JsonValue::Object(vec![
+                } => vec![
                     (
                         "verdict".to_string(),
                         JsonValue::Str("SeamOrSpecConflict".to_string()),
@@ -741,16 +880,38 @@ fn run_qa(repo_root: &Path, cwd: &Path, args: &[String]) -> Result<(), String> {
                     ("task_a".to_string(), JsonValue::Str(task_a)),
                     ("task_b".to_string(), JsonValue::Str(task_b)),
                     ("boundary_test".to_string(), JsonValue::Str(boundary_test)),
-                ]),
-                SuspectVerdict::InconclusiveAskMaster { reason } => JsonValue::Object(vec![
+                ],
+                SuspectVerdict::InconclusiveAskMaster { reason } => vec![
                     (
                         "verdict".to_string(),
                         JsonValue::Str("InconclusiveAskMaster".to_string()),
                     ),
                     ("reason".to_string(), JsonValue::Str(reason)),
-                ]),
+                ],
             };
-            println!("{}", out.to_json_string());
+            if let Some(cov_map) = cov_summary_opt {
+                if let Some(min_raw) = flag_val(args, "--min-coverage-pct") {
+                    let min_pct = min_raw.parse::<u8>().map_err(|_| {
+                        format!("invalid --min-coverage-pct '{min_raw}' (expected 0..=100)")
+                    })?;
+                    let explicit_files = split_csv(&flag_val(args, "--files").unwrap_or_default());
+                    let targets: Vec<String> = if explicit_files.is_empty() {
+                        cov_map.keys().cloned().collect()
+                    } else {
+                        explicit_files
+                    };
+                    swarm_tools::verify_llvm_cov_meets_target(&cov_map, &targets, min_pct)?;
+                }
+                let cov_entries = cov_map
+                    .into_iter()
+                    .map(|(k, v)| (k, JsonValue::Number(v)))
+                    .collect();
+                out_fields.push((
+                    "llvm_cov_line_pct".to_string(),
+                    JsonValue::Object(cov_entries),
+                ));
+            }
+            println!("{}", JsonValue::Object(out_fields).to_json_string());
             Ok(())
         }
         _ => Err(

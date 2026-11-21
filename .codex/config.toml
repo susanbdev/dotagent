@@ -1,9 +1,9 @@
-# Managed by susanbdev/dotagent -- OpenAI Codex Zero-Trust Configuration
+# Managed by susanbdev/dotagent -- OpenAI Codex Zero-Trust Configuration (Policy-IR v2)
 approval_policy = "on-request"
 sandbox_mode = "workspace-write"
 project_doc_max_bytes = 16384
 project_doc_fallback_filenames = []
-model_auto_compact_token_limit = 20000
+model_auto_compact_token_limit = 16000
 tool_output_token_limit = 2500
 notify = ["agent-guard", "on-stop"]
 
@@ -16,7 +16,7 @@ exclude_slash_tmp = true
 inherit = "all"
 ignore_default_excludes = false
 exclude = ["AWS_*", "GITHUB_*", "GH_*", "ANTHROPIC_*", "OPENAI_*", "GEMINI_*", "*_TOKEN", "*_SECRET", "*_KEY", "AGENT_GUARD_ALLOW_*"]
-include_only = ["PATH", "HOME", "USER", "LOGNAME", "SHELL", "LANG", "LC_*", "TERM", "CARGO_HOME", "RUSTUP_HOME", "XDG_RUNTIME_DIR", "GIT_CONFIG_GLOBAL", "GIT_CONFIG_NOSYSTEM", "AGENT_GUARD_PROFILE", "AGENT_GUARD_ROLE", "AGENT_GUARD_SESSION_ID", "AGENT_GUARD_STATE_DIR", "AGENT_GUARD_COORDINATOR_SOCK"]
+include_only = ["PATH", "HOME", "USER", "LOGNAME", "SHELL", "LANG", "LC_*", "TERM", "CARGO_HOME", "RUSTUP_HOME", "XDG_RUNTIME_DIR", "GIT_CONFIG_GLOBAL", "GIT_CONFIG_NOSYSTEM", "AGENT_GUARD_PROFILE", "AGENT_GUARD_ROLE", "AGENT_GUARD_SESSION_ID", "AGENT_GUARD_STATE_DIR", "AGENT_GUARD_COORDINATOR_SOCK", "AGENT_GUARD_HOT_COORD"]
 
 [mcp_servers.susanbdev]
 url = "https://mcp.zt.susanb.dev/mcp"

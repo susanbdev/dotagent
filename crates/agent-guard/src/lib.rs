@@ -26,15 +26,22 @@ pub mod coordinator;
 pub mod crypto;
 pub mod diagnostics;
 pub mod exec_sandbox;
+pub mod fleet;
 pub mod injection_scan;
 pub mod json;
+pub mod kani_proofs;
+pub mod mcp_gateway;
+pub mod mcp_policy;
 pub mod operator;
 pub mod path_policy;
 pub mod qa_suspects;
 pub mod repo_audit;
 pub mod role_sandbox;
 pub mod sanitizer;
+pub mod shell_wrapper;
+pub mod stop_receipt;
 pub mod swarm_contracts;
+pub mod telemetry;
 pub mod traversal_ledger;
 pub mod unicode_guard;
 pub mod work_ledger;
@@ -154,8 +161,51 @@ pub fn resolve_repo_root(cwd: &Path) -> PathBuf {
     resolve_repo_root_from_canon(&canon)
 }
 
+/// Resolves a linked Git worktree root (`.git` regular file containing
+/// `gitdir: <common_repo>/.git/worktrees/<slot>`) back to `<common_repo>` so Swarm capabilities,
+/// `PLAN.lock.json`, `coord.sock`, and `WORK_LEDGER.jsonl` share the base repository's Swarm
+/// state namespace while `resolve_repo_root` continues confining VFS/path checks to the worktree.
+pub fn resolve_common_repo_root(repo_or_worktree: &Path) -> PathBuf {
+    let canon =
+        fs::canonicalize(repo_or_worktree).unwrap_or_else(|_| repo_or_worktree.to_path_buf());
+    let dot_git = canon.join(".git");
+    if let Ok(meta) = fs::symlink_metadata(&dot_git)
+        && !meta.file_type().is_symlink()
+        && meta.file_type().is_file()
+        && meta.len() <= 4_096
+        && let Ok(raw) = fs::read_to_string(&dot_git)
+        && let Some(rest) = raw.trim().strip_prefix("gitdir:")
+    {
+        let target_raw = Path::new(rest.trim());
+        let resolved = if target_raw.is_absolute() {
+            target_raw.to_path_buf()
+        } else {
+            canon.join(target_raw)
+        };
+        let canon_gitdir = fs::canonicalize(&resolved).unwrap_or(resolved);
+        if let Some(worktrees_dir) = canon_gitdir.parent()
+            && worktrees_dir.file_name().is_some_and(|n| n == "worktrees")
+            && let Some(common_git) = worktrees_dir.parent()
+            && common_git.file_name().is_some_and(|n| n == ".git")
+            && let Some(common_repo) = common_git.parent()
+        {
+            return common_repo.to_path_buf();
+        }
+    }
+    canon
+}
+
 /// Handles `UserPromptSubmit`: resets per-turn hop ledger, 128-bit spotlight nonce, and micro-window budget.
 pub fn handle_user_prompt_hook(raw_json: &str, fallback_cwd: &Path) -> Decision {
+    if std::env::var("AGENT_GUARD_IN_SANDBOX").as_deref() == Ok("1")
+        || std::env::var("AGENT_GUARD_WORKER_LOCK").as_deref() == Ok("1")
+    {
+        return Decision::deny(
+            "USER_PROMPT_DENIED_IN_SANDBOX",
+            "`agent-guard user-prompt` cannot be invoked from inside `exec-sandbox` or a locked worker.",
+            true,
+        );
+    }
     let parsed = if raw_json.trim().is_empty() {
         JsonValue::Object(Vec::new())
     } else {
@@ -234,10 +284,34 @@ pub fn handle_pre_compact_hook(raw_json: &str, fallback_cwd: &Path) -> Decision 
     ))
 }
 
+/// Explicit caller context passed over the host-only warm `hook.sock` daemon so the daemon
+/// evaluates hooks under the invoking harness's exact session, profile, and Swarm role
+/// rather than reading ambient daemon environment variables.
+#[derive(Debug, Clone, Default)]
+pub struct HookCallerContext {
+    pub session_id: Option<String>,
+    pub profile_id: Option<String>,
+    pub role_id: Option<String>,
+}
+
 /// Evaluates `PreToolUse` across Claude Code, Gemini/Antigravity, Cursor, and Codex payloads.
 /// Performs FULL pre-ingestion inspection and pre-buffer ASCII sanitization BEFORE a single
 /// non-ASCII byte or escape sequence can reach the LLM context window or KV cache.
 pub fn handle_pre_tool_hook(raw_json: &str, fallback_cwd: &Path) -> Decision {
+    let ctx = HookCallerContext {
+        session_id: std::env::var("AGENT_GUARD_SESSION_ID").ok(),
+        profile_id: std::env::var("AGENT_GUARD_PROFILE").ok(),
+        role_id: std::env::var("AGENT_GUARD_ROLE").ok(),
+    };
+    handle_pre_tool_hook_with_context(raw_json, fallback_cwd, &ctx, None)
+}
+
+pub fn handle_pre_tool_hook_with_context(
+    raw_json: &str,
+    fallback_cwd: &Path,
+    caller_ctx: &HookCallerContext,
+    hot_cache: Option<&traversal_ledger::HotLedgerCache>,
+) -> Decision {
     let parsed = match JsonValue::parse(raw_json) {
         Ok(v) => v,
         Err(e) => {
@@ -253,16 +327,25 @@ pub fn handle_pre_tool_hook(raw_json: &str, fallback_cwd: &Path) -> Decision {
         Ok(pair) => pair,
         Err(dec) => return dec,
     };
-    let profile = match load_active_profile(&repo_root) {
+    let profile_res = match caller_ctx
+        .profile_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        Some(pid) => budget_guard::load_profile_by_id(&repo_root, pid),
+        None => load_active_profile(&repo_root),
+    };
+    let profile = match profile_res {
         Ok(p) => p,
         Err(bv) => return Decision::deny(bv.code, bv.detail, false),
     };
-    let session_id = extract_session_id(&parsed);
+    let session_id = extract_session_id_with_override(&parsed, caller_ctx.session_id.as_deref());
     let _session_lock = SessionLedger::acquire_lock(&repo_root, &session_id);
-    let mut ledger = SessionLedger::load_or_create(&repo_root, &session_id);
+    let mut ledger = SessionLedger::load_or_create_with_cache(&repo_root, &session_id, hot_cache);
 
     if let Err(msg) = ledger.record_tool_call_with_limit(profile.max_turn_tool_calls) {
-        let _ = ledger.save_locked(&repo_root);
+        let _ = ledger.save_locked_with_cache(&repo_root, hot_cache);
         append_audit_jsonl(
             &repo_root,
             &session_id,
@@ -277,7 +360,12 @@ pub fn handle_pre_tool_hook(raw_json: &str, fallback_cwd: &Path) -> Decision {
     let tool_name = extract_tool_name(&parsed);
     let tool_input = parsed.get("tool_input").unwrap_or(&parsed);
 
-    let (role, cap_opt) = match role_sandbox::resolve_active_role(&repo_root, &session_id) {
+    let (role, cap_opt) = match role_sandbox::resolve_active_role_with_overrides(
+        &repo_root,
+        &session_id,
+        caller_ctx.role_id.as_deref(),
+        caller_ctx.session_id.as_deref(),
+    ) {
         Ok(rc) => rc,
         Err(err) => {
             return Decision::deny("INVALID_SWARM_ROLE", err, true);
@@ -330,7 +418,7 @@ pub fn handle_pre_tool_hook(raw_json: &str, fallback_cwd: &Path) -> Decision {
             halt_session,
         );
     }
-    let _ = ledger.save_locked(&repo_root);
+    let _ = ledger.save_locked_with_cache(&repo_root, hot_cache);
     decision
 }
 
@@ -1064,26 +1152,14 @@ fn evaluate_tool_invocation(
         }
         if is_approved_mcp {
             let sub_action = &norm_tool[ALLOWED_MCP_SERVER_PREFIX.len()..];
-            if is_mutating_mcp_sub_action(sub_action) {
-                if writes_disabled {
-                    return Decision::deny(
-                        "PROFILE_WRITE_TOOLS_DISABLED",
-                        format!(
-                            "Active runtime profile '{}' forbids mutating MCP tool '{tool_name}' (`enable_write_tools = false`).",
-                            profile.profile_id
-                        ),
-                        false,
-                    );
-                }
-                if ledger.tainted {
-                    return Decision::deny(
-                        "TAINTED_EXTERNAL_MUTATION_BLOCKED",
-                        format!(
-                            "Tainted session cannot invoke mutating MCP tool '{tool_name}' (confused-deputy prevention)."
-                        ),
-                        true,
-                    );
-                }
+            if let Err((code, reason, halt)) = mcp_policy::authorize_mcp_rpc_invocation(
+                tool_name,
+                sub_action,
+                writes_disabled,
+                ledger.tainted,
+                &profile.profile_id,
+            ) {
+                return Decision::deny(code, reason, halt);
             }
         }
         return Decision::allow();
@@ -1369,6 +1445,20 @@ fn pre_inspect_file_for_ingestion_with_profile(
 /// Catches runtime command stdout floods, dynamic prompt injections, Unicode smuggling,
 /// and poisoned pointers, while tracking step tokens to trigger immediate compaction!
 pub fn handle_post_tool_hook(raw_json: &str, fallback_cwd: &Path) -> Decision {
+    let ctx = HookCallerContext {
+        session_id: std::env::var("AGENT_GUARD_SESSION_ID").ok(),
+        profile_id: std::env::var("AGENT_GUARD_PROFILE").ok(),
+        role_id: std::env::var("AGENT_GUARD_ROLE").ok(),
+    };
+    handle_post_tool_hook_with_context(raw_json, fallback_cwd, &ctx, None)
+}
+
+pub fn handle_post_tool_hook_with_context(
+    raw_json: &str,
+    fallback_cwd: &Path,
+    caller_ctx: &HookCallerContext,
+    hot_cache: Option<&traversal_ledger::HotLedgerCache>,
+) -> Decision {
     let parsed = match JsonValue::parse(raw_json) {
         Ok(v) => v,
         Err(e) => {
@@ -1389,13 +1479,22 @@ pub fn handle_post_tool_hook(raw_json: &str, fallback_cwd: &Path) -> Decision {
         return Decision::allow();
     }
 
-    let profile = match load_active_profile(&repo_root) {
+    let profile_res = match caller_ctx
+        .profile_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        Some(pid) => budget_guard::load_profile_by_id(&repo_root, pid),
+        None => load_active_profile(&repo_root),
+    };
+    let profile = match profile_res {
         Ok(p) => p,
         Err(bv) => return Decision::deny(bv.code, bv.detail, false),
     };
-    let session_id = extract_session_id(&parsed);
+    let session_id = extract_session_id_with_override(&parsed, caller_ctx.session_id.as_deref());
     let _session_lock = SessionLedger::acquire_lock(&repo_root, &session_id);
-    let mut ledger = SessionLedger::load_or_create(&repo_root, &session_id);
+    let mut ledger = SessionLedger::load_or_create_with_cache(&repo_root, &session_id, hot_cache);
 
     let raw_tool_name = extract_tool_name(&parsed);
     let tool_label = if raw_tool_name.is_empty() {
@@ -1417,7 +1516,7 @@ pub fn handle_post_tool_hook(raw_json: &str, fallback_cwd: &Path) -> Decision {
         let uni = scan_unicode(inspect_slice, ScanMode::UntrustedContent);
         if let Some(first) = uni.first() {
             ledger.trip_circuit_breaker(format!("{}: {}", first.code, first.detail));
-            let _ = ledger.save_locked(&repo_root);
+            let _ = ledger.save_locked_with_cache(&repo_root, hot_cache);
             append_audit_jsonl(
                 &repo_root,
                 &session_id,
@@ -1439,7 +1538,7 @@ pub fn handle_post_tool_hook(raw_json: &str, fallback_cwd: &Path) -> Decision {
         let scan = scan_untrusted_content(inspect_slice, &repo_root, &cwd, false);
         if let Some(halt) = scan.first_halt() {
             ledger.trip_circuit_breaker(format!("{}: {}", halt.code, halt.detail));
-            let _ = ledger.save_locked(&repo_root);
+            let _ = ledger.save_locked_with_cache(&repo_root, hot_cache);
             append_audit_jsonl(
                 &repo_root,
                 &session_id,
@@ -1459,7 +1558,7 @@ pub fn handle_post_tool_hook(raw_json: &str, fallback_cwd: &Path) -> Decision {
         );
         let compacted_tokens = estimate_bpe_tokens(&compacted.clean_ascii);
         ledger.cumulative_tokens = ledger.cumulative_tokens.saturating_add(compacted_tokens);
-        let _ = ledger.save_locked(&repo_root);
+        let _ = ledger.save_locked_with_cache(&repo_root, hot_cache);
 
         let wrapped =
             wrap_spotlight_envelope(&compacted.clean_ascii, &ledger.turn_nonce, tool_label);
@@ -1481,7 +1580,7 @@ pub fn handle_post_tool_hook(raw_json: &str, fallback_cwd: &Path) -> Decision {
     }
 
     if let Err(bv) = analyze_text_budget(&output_text, false) {
-        let _ = ledger.save_locked(&repo_root);
+        let _ = ledger.save_locked_with_cache(&repo_root, hot_cache);
         append_audit_jsonl(
             &repo_root,
             &session_id,
@@ -1497,7 +1596,7 @@ pub fn handle_post_tool_hook(raw_json: &str, fallback_cwd: &Path) -> Decision {
     let uni = scan_unicode(&output_text, ScanMode::UntrustedContent);
     if let Some(first) = uni.first() {
         ledger.trip_circuit_breaker(format!("{}: {}", first.code, first.detail));
-        let _ = ledger.save_locked(&repo_root);
+        let _ = ledger.save_locked_with_cache(&repo_root, hot_cache);
         append_audit_jsonl(
             &repo_root,
             &session_id,
@@ -1520,7 +1619,7 @@ pub fn handle_post_tool_hook(raw_json: &str, fallback_cwd: &Path) -> Decision {
     let scan = scan_untrusted_content(&output_text, &repo_root, &cwd, false);
     if let Some(halt) = scan.first_halt() {
         ledger.trip_circuit_breaker(format!("{}: {}", halt.code, halt.detail));
-        let _ = ledger.save_locked(&repo_root);
+        let _ = ledger.save_locked_with_cache(&repo_root, hot_cache);
         append_audit_jsonl(
             &repo_root,
             &session_id,
@@ -1550,7 +1649,7 @@ pub fn handle_post_tool_hook(raw_json: &str, fallback_cwd: &Path) -> Decision {
         )
         && out_tokens > summary_cap
     {
-        let _ = ledger.save_locked(&repo_root);
+        let _ = ledger.save_locked_with_cache(&repo_root, hot_cache);
         let detail = format!(
             "Subagent return summary ({out_tokens} est. tokens) exceeds airlock cap ({summary_cap} ASCII tokens for profile '{}').",
             profile.profile_id
@@ -1568,7 +1667,7 @@ pub fn handle_post_tool_hook(raw_json: &str, fallback_cwd: &Path) -> Decision {
     let next_total = ledger.cumulative_tokens.saturating_add(out_tokens);
     ledger.cumulative_tokens = next_total;
     if next_total > profile.max_turn_tokens {
-        let _ = ledger.save_locked(&repo_root);
+        let _ = ledger.save_locked_with_cache(&repo_root, hot_cache);
         let detail = format!(
             "Dynamic tool output (+{out_tokens} est. tokens) pushed step context to {next_total} tokens (> {} hard step ceiling for profile '{}'). Compact step context immediately before continuing.",
             profile.max_turn_tokens, profile.profile_id
@@ -1583,7 +1682,7 @@ pub fn handle_post_tool_hook(raw_json: &str, fallback_cwd: &Path) -> Decision {
         );
         return Decision::deny("TURN_TOKEN_BUDGET_EXCEEDED", detail, false);
     }
-    let _ = ledger.save_locked(&repo_root);
+    let _ = ledger.save_locked_with_cache(&repo_root, hot_cache);
 
     if sanitized.was_modified {
         let wrapped =
@@ -1746,12 +1845,17 @@ fn resolve_validated_cwd(v: &JsonValue, fallback: &Path) -> Result<(PathBuf, Pat
 }
 
 fn extract_session_id(v: &JsonValue) -> String {
+    let env_sid = std::env::var("AGENT_GUARD_SESSION_ID").ok();
+    extract_session_id_with_override(v, env_sid.as_deref())
+}
+
+fn extract_session_id_with_override(v: &JsonValue, env_sid_override: Option<&str>) -> String {
     if let Some(s) = extract_first_str(v, &["session_id", "conversation_id", "transcript_path"]) {
         return s.to_string();
     }
-    if let Ok(env_sid) = std::env::var("AGENT_GUARD_SESSION_ID") {
+    if let Some(env_sid) = env_sid_override {
         if !env_sid.trim().is_empty() {
-            return env_sid;
+            return env_sid.to_string();
         }
     }
     "default".to_string()
@@ -2066,39 +2170,6 @@ fn build_updated_shell_input_json(
         }
     }
     Some(JsonValue::Object(updated).to_json_string())
-}
-
-fn is_mutating_mcp_sub_action(sub_action: &str) -> bool {
-    let lower = sub_action.to_ascii_lowercase();
-    if [
-        "write", "create", "update", "delete", "remove", "publish", "modify", "trigger", "approve",
-        "comment", "upload", "deploy",
-    ]
-    .iter()
-    .any(|verb| lower.contains(verb))
-    {
-        return true;
-    }
-    lower
-        .split(|c: char| !c.is_ascii_alphanumeric())
-        .filter(|seg| !seg.is_empty())
-        .any(|seg| {
-            matches!(
-                seg,
-                "put"
-                    | "patch"
-                    | "post"
-                    | "send"
-                    | "push"
-                    | "merge"
-                    | "drop"
-                    | "set"
-                    | "edit"
-                    | "exec"
-                    | "run"
-                    | "close"
-            )
-        })
 }
 
 fn extract_first_str<'a>(v: &'a JsonValue, keys: &[&str]) -> Option<&'a str> {

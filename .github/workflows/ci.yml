@@ -51,18 +51,54 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: Verify strict lints, forbid(unsafe_code), & zero-panic kernel (cargo clippy)
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
       - name: Run unit, 305+ adversarial corpus, Swarm v2, & 5,300+ property fuzz suites
-        run: cargo test --workspace
+        run: cargo test --workspace --locked
 
-      - name: Build release binaries & verify bundles, repo audit, and microbenchmarks
+      - name: Build release binaries & verify bundles, repo audit, StopReceipt, and microbenchmarks
         run: |
-          cargo build --release --workspace
+          cargo build --release --locked --workspace
           ./target/release/dotagent-compiler verify .
           ./target/release/dotagent audit-repo .
+          ./target/release/dotagent on-stop --receipt-out target/ci.receipt.json
+          PUBKEY="$(./target/release/dotagent receipt-pubkey --repo .)"
+          ./target/release/dotagent verify-receipt target/ci.receipt.json --repo . --pubkey "${PUBKEY}"
           ./target/release/dotagent-harness bench --quick
-          rm -rf target/test-workspaces target/tbench-*
+          rm -rf target/test-workspaces target/tbench-* target/ci.receipt.json
+
+  supply-chain-deny:
+    name: Supply-Chain Advisory & License Gate (cargo-deny)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout repository (zero persisted credentials)
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+          submodules: false
+
+      - name: Audit advisories, licenses, bans, and registry sources
+        uses: EmbarkStudios/cargo-deny-action@17aeb3c839e42274e2b8adf721c8c65edfdc74dd # v2
+        with:
+          command: check advisories licenses bans sources
+
+  kani-formal-proofs:
+    name: Kani Bounded Model Checking Proofs
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout repository (zero persisted credentials)
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+          submodules: false
+
+      - name: Run Kani proofs on agent-guard security kernel
+        uses: model-checking/kani-github-action@f838096619a707b0f6b2118cf435eaccfa33e51f # v1.1
+        with:
+          kani-version: 0.68.0
+          args: -p agent-guard
 
   msrv-1-88:
     name: MSRV 1.88.0 Compatibility Gate
@@ -90,4 +126,6 @@ jobs:
             ${{ runner.os }}-cargo-msrv-1-88-
 
       - name: Check entire workspace against Rust 1.88.0
-        run: cargo +1.88.0 check --workspace --all-targets
+        run: cargo +1.88.0 check --workspace --all-targets --locked
+
+

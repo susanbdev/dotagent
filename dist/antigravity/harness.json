@@ -1,0 +1,25 @@
+{
+  "schema": "dotagent.antigravity.v2",
+  "profile_id": "coding-agent",
+  "autoMemoryEnabled": false,
+  "shellWrapper": "agent-guard-sh",
+  "mediatingSidecar": [
+    "agent-guard",
+    "mcp-gateway"
+  ],
+  "stopReceiptVerify": [
+    "dotagent",
+    "verify-receipt"
+  ],
+  "budgets": {
+    "maxSliceLines": 150,
+    "maxRawFileBytes": 24576,
+    "maxTurnTokens": 16000,
+    "subagentAirlockMaxTokens": 200
+  },
+  "mcpServers": {
+    "susanbdev": {
+      "url": "https://mcp.zt.susanb.dev/mcp"
+    }
+  }
+}

@@ -220,6 +220,68 @@ pub(crate) fn serialize_active_sessions_json(
     format!("{}\n", obj.to_json_string())
 }
 
+static TEMP_STATE_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+fn write_private_state_file_atomic(path: &Path, body: &[u8]) -> Result<(), String> {
+    if let Ok(meta) = fs::symlink_metadata(path)
+        && meta.file_type().is_symlink()
+    {
+        return Err(format!(
+            "SYMLINK_TAMPER_DETECTED: refusing to write symlinked state file '{}'",
+            path.display()
+        ));
+    }
+    let parent = path
+        .parent()
+        .ok_or_else(|| format!("missing parent directory for '{}'", path.display()))?;
+    let seq = TEMP_STATE_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let fname = path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("state.json");
+    let tmp_path = parent.join(format!(".{fname}.tmp.{}.{seq}", std::process::id()));
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut f = fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .mode(0o600)
+            .open(&tmp_path)
+            .map_err(|e| {
+                format!(
+                    "failed creating atomic temp file '{}': {e}",
+                    tmp_path.display()
+                )
+            })?;
+        if let Err(e) = f.write_all(body).and_then(|()| f.sync_all()) {
+            let _ = fs::remove_file(&tmp_path);
+            return Err(format!(
+                "failed syncing atomic temp file '{}': {e}",
+                tmp_path.display()
+            ));
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        fs::write(&tmp_path, body).map_err(|e| {
+            format!(
+                "failed writing atomic temp file '{}': {e}",
+                tmp_path.display()
+            )
+        })?;
+    }
+    if let Err(e) = fs::rename(&tmp_path, path) {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(format!(
+            "failed renaming atomic temp file onto '{}': {e}",
+            path.display()
+        ));
+    }
+    Ok(())
+}
+
 fn commit_registry_with_lock(
     repo_root: &Path,
     path: &Path,
@@ -242,12 +304,7 @@ fn commit_registry_with_lock(
             &reg.hook_bindings,
             &mac_hex,
         );
-        fs::write(path, body).map_err(|e| format!("failed writing active_sessions.json: {e}"))?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o600));
-        }
+        write_private_state_file_atomic(path, body.as_bytes())?;
         drop(guard);
         return Ok(());
     }
@@ -268,41 +325,59 @@ fn commit_registry_with_lock(
 /// Registers an open non-Master session capability WITHOUT clobbering concurrent parallel-wave sessions.
 pub fn set_active_session_slot(repo_root: &Path, session_id: &str) -> Result<(), String> {
     let path = active_session_slot_path(repo_root)?;
-    let guard = ExclusiveFileLockGuard::acquire(&path)?;
-    let mut reg = load_registry_unlocked(repo_root, &path)?;
-    if !reg.open_sessions.iter().any(|s| s == session_id) {
-        reg.open_sessions.push(session_id.to_string());
+    for attempt in 0..8u8 {
+        let guard = ExclusiveFileLockGuard::acquire(&path)?;
+        let mut reg = load_registry_unlocked(repo_root, &path)?;
+        if !reg.open_sessions.iter().any(|s| s == session_id) {
+            reg.open_sessions.push(session_id.to_string());
+        }
+        reg.revision = reg
+            .revision
+            .checked_add(1)
+            .ok_or_else(|| "active_sessions revision overflow".to_string())?;
+        match commit_registry_with_lock(repo_root, &path, guard, &reg) {
+            Ok(()) => return Ok(()),
+            Err(e) if attempt < 7 && e.contains("STALE_ACTIVE_SESSIONS_CAS_CONFLICT") => {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            Err(e) => return Err(e),
+        }
     }
-    reg.revision = reg
-        .revision
-        .checked_add(1)
-        .ok_or_else(|| "active_sessions revision overflow".to_string())?;
-    commit_registry_with_lock(repo_root, &path, guard, &reg)
+    Err("active_sessions CAS retry limit exceeded".to_string())
 }
 
 /// Closes a single open session (`Some(sid)`) or all open sessions (`None`), preserving concurrent siblings.
 pub fn close_open_session(repo_root: &Path, session_id: Option<&str>) -> Result<(), String> {
     let path = active_session_slot_path(repo_root)?;
-    let guard = ExclusiveFileLockGuard::acquire(&path)?;
-    if !path.exists() {
-        return Ok(());
-    }
-    let mut reg = load_registry_unlocked(repo_root, &path)?;
-    match session_id {
-        Some(sid) => {
-            reg.open_sessions.retain(|s| s != sid);
-            reg.hook_bindings.retain(|_, v| v != sid);
+    for attempt in 0..8u8 {
+        let guard = ExclusiveFileLockGuard::acquire(&path)?;
+        if !path.exists() {
+            return Ok(());
         }
-        None => {
-            reg.open_sessions.clear();
-            reg.hook_bindings.clear();
+        let mut reg = load_registry_unlocked(repo_root, &path)?;
+        match session_id {
+            Some(sid) => {
+                reg.open_sessions.retain(|s| s != sid);
+                reg.hook_bindings.retain(|_, v| v != sid);
+            }
+            None => {
+                reg.open_sessions.clear();
+                reg.hook_bindings.clear();
+            }
+        }
+        reg.revision = reg
+            .revision
+            .checked_add(1)
+            .ok_or_else(|| "active_sessions revision overflow".to_string())?;
+        match commit_registry_with_lock(repo_root, &path, guard, &reg) {
+            Ok(()) => return Ok(()),
+            Err(e) if attempt < 7 && e.contains("STALE_ACTIVE_SESSIONS_CAS_CONFLICT") => {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            Err(e) => return Err(e),
         }
     }
-    reg.revision = reg
-        .revision
-        .checked_add(1)
-        .ok_or_else(|| "active_sessions revision overflow".to_string())?;
-    commit_registry_with_lock(repo_root, &path, guard, &reg)
+    Err("active_sessions CAS retry limit exceeded".to_string())
 }
 
 pub fn clear_active_session_slot(repo_root: &Path) -> Result<(), String> {
@@ -319,20 +394,30 @@ pub fn bind_hook_session_to_swarm_session(
         return Ok(());
     }
     let path = active_session_slot_path(repo_root)?;
-    let guard = ExclusiveFileLockGuard::acquire(&path)?;
-    let mut reg = load_registry_unlocked(repo_root, &path)?;
-    if reg.open_sessions.iter().any(|s| s == swarm_session_id)
-        && reg.hook_bindings.get(hs).map(String::as_str) != Some(swarm_session_id)
-    {
-        reg.hook_bindings
-            .insert(hs.to_string(), swarm_session_id.to_string());
-        reg.revision = reg
-            .revision
-            .checked_add(1)
-            .ok_or_else(|| "active_sessions revision overflow".to_string())?;
-        commit_registry_with_lock(repo_root, &path, guard, &reg)?;
+    for attempt in 0..8u8 {
+        let guard = ExclusiveFileLockGuard::acquire(&path)?;
+        let mut reg = load_registry_unlocked(repo_root, &path)?;
+        if reg.open_sessions.iter().any(|s| s == swarm_session_id)
+            && reg.hook_bindings.get(hs).map(String::as_str) != Some(swarm_session_id)
+        {
+            reg.hook_bindings
+                .insert(hs.to_string(), swarm_session_id.to_string());
+            reg.revision = reg
+                .revision
+                .checked_add(1)
+                .ok_or_else(|| "active_sessions revision overflow".to_string())?;
+            match commit_registry_with_lock(repo_root, &path, guard, &reg) {
+                Ok(()) => return Ok(()),
+                Err(e) if attempt < 7 && e.contains("STALE_ACTIVE_SESSIONS_CAS_CONFLICT") => {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                Err(e) => return Err(e),
+            }
+        } else {
+            return Ok(());
+        }
     }
-    Ok(())
+    Err("active_sessions CAS retry limit exceeded".to_string())
 }
 
 /// Loads all currently open non-Master session capabilities in deterministic registration order.
@@ -406,7 +491,7 @@ pub fn mint_session_capability(
     if role == SwarmRole::StandardCoding {
         return Err("mint-session requires an explicit swarm role".to_string());
     }
-    let canon_repo = fs::canonicalize(repo_root).unwrap_or_else(|_| repo_root.to_path_buf());
+    let canon_repo = crate::resolve_common_repo_root(repo_root);
     let repo_sha256 = hex_encode(&sha256_digest(canon_repo.to_string_lossy().as_bytes()));
 
     let locked = load_locked_plan(&canon_repo)?;
@@ -548,14 +633,8 @@ pub fn save_session_capability(repo_root: &Path, cap: &SessionCapability) -> Res
         ),
         ("record_mac".to_string(), JsonValue::Str(record_mac)),
     ]);
-    fs::write(&path, format!("{}\n", obj.to_json_string()))
-        .map_err(|e| format!("failed writing session capability: {e}"))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = fs::set_permissions(&path, fs::Permissions::from_mode(0o600));
-    }
-    Ok(())
+    let encoded = format!("{}\n", obj.to_json_string());
+    write_private_state_file_atomic(&path, encoded.as_bytes())
 }
 
 pub(crate) fn parse_session_capability_record_json(
@@ -694,8 +773,24 @@ pub fn resolve_active_role(
     repo_root: &Path,
     session_id: &str,
 ) -> Result<(SwarmRole, Option<SessionCapability>), String> {
-    let env_role = match std::env::var("AGENT_GUARD_ROLE") {
-        Ok(raw_role) if !raw_role.trim().is_empty() => {
+    let env_role_raw = std::env::var("AGENT_GUARD_ROLE").ok();
+    let env_sid_raw = std::env::var("AGENT_GUARD_SESSION_ID").ok();
+    resolve_active_role_with_overrides(
+        repo_root,
+        session_id,
+        env_role_raw.as_deref(),
+        env_sid_raw.as_deref(),
+    )
+}
+
+pub fn resolve_active_role_with_overrides(
+    repo_root: &Path,
+    session_id: &str,
+    role_override: Option<&str>,
+    explicit_sid_override: Option<&str>,
+) -> Result<(SwarmRole, Option<SessionCapability>), String> {
+    let env_role = match role_override {
+        Some(raw_role) if !raw_role.trim().is_empty() => {
             let trimmed = raw_role.trim();
             Some(
                 SwarmRole::from_str_id(trimmed)
@@ -715,8 +810,7 @@ pub fn resolve_active_role(
         );
     }
 
-    let explicit_sid = std::env::var("AGENT_GUARD_SESSION_ID")
-        .ok()
+    let explicit_sid = explicit_sid_override
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
         .or_else(|| {

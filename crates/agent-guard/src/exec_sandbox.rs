@@ -465,9 +465,13 @@ pub fn run_exec_sandbox_cli(args: &[String], default_cwd: &Path) -> ExitCode {
         invokes_swarm_tool,
     };
 
+    let common_repo = crate::resolve_common_repo_root(&repo_root);
+    let has_swarm_session =
+        env::var("AGENT_GUARD_SESSION_ID").is_ok_and(|s| s.trim().starts_with("swm_"));
+
     // Snapshot `.git/config` digest prior to vetted `git` writes so any `.git` lockfile access
     // granted for `git add` / `git commit` can never tamper with `.git/config` unnoticed.
-    let git_cfg_path = repo_root.join(".git/config");
+    let git_cfg_path = common_repo.join(".git/config");
     let pre_git_cfg_digest = if opts.invokes_git && opts.writes_allowed {
         fs::read(&git_cfg_path).ok().map(|b| sha256_bytes(&b))
     } else {
@@ -475,10 +479,24 @@ pub fn run_exec_sandbox_cli(args: &[String], default_cwd: &Path) -> ExitCode {
     };
 
     // Pre-launch the out-of-sandbox Vault Coordinator daemon BEFORE `restrict_self()` so
-    // `swarm-tool` can sign/verify provenance via `ipc/coord.sock` while `vault/hmac.key`
-    // stays 100% kernel-inaccessible (`EACCES`) inside Landlock/Seatbelt!
+    // `swarm-tool` (atomic or inside a `swm_*` worker stage) can authenticate via `ipc/coord.sock`
+    // while `vault/hmac.key` stays 100% kernel-inaccessible (`EACCES`) inside Landlock/Seatbelt!
+    if opts.invokes_swarm_tool || has_swarm_session {
+        let _ = crate::coordinator::ensure_coordinator_daemon(&common_repo);
+        if let Ok(sdir) = crate::breadcrumbs::swarm_state_dir(&common_repo) {
+            for sub in ["ipc", "sessions", "spools", "ledger"] {
+                let p = sdir.join(sub);
+                let _ = fs::create_dir_all(&p);
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    let _ = fs::set_permissions(&p, fs::Permissions::from_mode(0o700));
+                }
+            }
+        }
+        let _ = crate::breadcrumbs::swarm_locks_dir();
+    }
     if opts.invokes_swarm_tool {
-        let _ = crate::coordinator::ensure_coordinator_daemon(&repo_root);
         precreate_swarm_tool_sandbox_targets(&repo_root, &shell_script);
     }
 
@@ -486,7 +504,7 @@ pub fn run_exec_sandbox_cli(args: &[String], default_cwd: &Path) -> ExitCode {
     let tmp_dir_path = ephemeral_tmp.as_ref().map(|t| t.path.as_path());
 
     // Apply OS kernel sandbox to THIS process prior to spawning `bash` on Linux (inherited across fork/exec!).
-    let mode = apply_current_process_sandbox(&repo_root, tmp_dir_path, opts);
+    let (mode, net_filter_res) = apply_current_process_sandbox(&repo_root, tmp_dir_path, opts);
     if require_kernel && !mode.is_kernel_enforced() {
         eprintln!(
             "[AGENT-GUARD HARD DENY :: KERNEL_SANDBOX_UNAVAILABLE] Host kernel does not enforce Landlock/Seatbelt VFS containment (mode={}).",
@@ -494,8 +512,18 @@ pub fn run_exec_sandbox_cli(args: &[String], default_cwd: &Path) -> ExitCode {
         );
         return ExitCode::from(2);
     }
+    if opts.deny_net
+        && require_kernel
+        && let Err(seccomp_err) = net_filter_res
+    {
+        eprintln!(
+            "[AGENT-GUARD HARD DENY :: KERNEL_NET_SANDBOX_FAILED] Failed installing kernel network filter: {seccomp_err}"
+        );
+        return ExitCode::from(2);
+    }
 
-    let mut child_cmd = build_child_command(&shell_script, &repo_root, &cwd, tmp_dir_path, opts);
+    let mut child_cmd =
+        build_child_command(&shell_script, &repo_root, &cwd, tmp_dir_path, opts, mode);
 
     let exit_code = if sanitize_stream {
         let mut child = match child_cmd
@@ -553,11 +581,10 @@ pub fn run_exec_sandbox_cli(args: &[String], default_cwd: &Path) -> ExitCode {
             }
         }
 
-        let code = status.code().unwrap_or(1) as u8;
-        ExitCode::from(code)
+        exit_code_from_status(status)
     } else {
         match child_cmd.status() {
-            Ok(s) => ExitCode::from(s.code().unwrap_or(1) as u8),
+            Ok(s) => exit_code_from_status(s),
             Err(e) => {
                 eprintln!("[AGENT-GUARD EXEC ERROR] failed executing sandboxed bash: {e}");
                 return ExitCode::from(126);
@@ -576,6 +603,24 @@ pub fn run_exec_sandbox_cli(args: &[String], default_cwd: &Path) -> ExitCode {
     }
 
     exit_code
+}
+
+fn exit_code_from_status(status: std::process::ExitStatus) -> ExitCode {
+    if let Some(code) = status.code() {
+        if let Ok(byte) = u8::try_from(code) {
+            return ExitCode::from(byte);
+        }
+        return ExitCode::from(1);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        if let Some(sig) = status.signal() {
+            let sig_low = u8::try_from(sig & 0x7f).unwrap_or(1);
+            return ExitCode::from(128u8.saturating_add(sig_low));
+        }
+    }
+    ExitCode::from(1)
 }
 
 /// Returns true ONLY if `script` is a single atomic command (zero unquoted compound operators,
@@ -696,35 +741,73 @@ fn build_child_command(
     cwd: &Path,
     ephemeral_tmp: Option<&Path>,
     opts: SandboxPolicyOpts,
+    mode: KernelSandboxMode,
 ) -> Command {
     #[cfg(target_os = "macos")]
-    let mut cmd = if Path::new("/usr/bin/sandbox-exec").is_file() {
-        let profile = render_macos_seatbelt_profile(repo_root, ephemeral_tmp, opts);
-        let mut c = Command::new("/usr/bin/sandbox-exec");
-        c.arg("-p")
-            .arg(profile)
-            .arg("/bin/bash")
-            .arg("--norc")
-            .arg("--noprofile")
-            .arg("-o")
-            .arg("pipefail")
-            .arg("-c")
-            .arg(shell_script);
-        c
-    } else {
-        let mut c = Command::new("bash");
-        c.arg("--norc")
-            .arg("--noprofile")
-            .arg("-o")
-            .arg("pipefail")
-            .arg("-c")
-            .arg(shell_script);
-        c
+    let mut cmd = {
+        let _ = mode;
+        if Path::new("/usr/bin/sandbox-exec").is_file() {
+            let profile = render_macos_seatbelt_profile(repo_root, ephemeral_tmp, opts);
+            let mut c = Command::new("/usr/bin/sandbox-exec");
+            c.arg("-p")
+                .arg(profile)
+                .arg("/bin/bash")
+                .arg("--norc")
+                .arg("--noprofile")
+                .arg("-o")
+                .arg("pipefail")
+                .arg("-c")
+                .arg(shell_script);
+            c
+        } else {
+            let mut c = Command::new("bash");
+            c.arg("--norc")
+                .arg("--noprofile")
+                .arg("-o")
+                .arg("pipefail")
+                .arg("-c")
+                .arg(shell_script);
+            c
+        }
     };
 
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "linux")]
     let mut cmd = {
         let _ = repo_root;
+        // Only wrap with `/usr/bin/unshare --user --net` when Landlock VFS restriction did NOT
+        // restrict `/proc/self/uid_map` / `/proc/self/setgroups` (under Landlock, seccomp-bpf
+        // already blocks all non-AF_UNIX/non-AF_NETLINK socket creation in-kernel).
+        if opts.deny_net
+            && mode == KernelSandboxMode::FallbackEnvAndAstOnly
+            && probe_linux_unshare_netns()
+        {
+            let mut c = Command::new("/usr/bin/unshare");
+            c.arg("--user")
+                .arg("--net")
+                .arg("--")
+                .arg("bash")
+                .arg("--norc")
+                .arg("--noprofile")
+                .arg("-o")
+                .arg("pipefail")
+                .arg("-c")
+                .arg(shell_script);
+            c
+        } else {
+            let mut c = Command::new("bash");
+            c.arg("--norc")
+                .arg("--noprofile")
+                .arg("-o")
+                .arg("pipefail")
+                .arg("-c")
+                .arg(shell_script);
+            c
+        }
+    };
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    let mut cmd = {
+        let _ = (repo_root, mode);
         let mut c = Command::new("bash");
         c.arg("--norc")
             .arg("--noprofile")
@@ -742,14 +825,35 @@ fn build_child_command(
     for var in SCRUBBED_ENV_VARS {
         cmd.env_remove(var);
     }
-    if !opts.invokes_swarm_tool {
+    let has_swarm_session =
+        env::var("AGENT_GUARD_SESSION_ID").is_ok_and(|s| s.trim().starts_with("swm_"));
+    if !opts.invokes_swarm_tool && !has_swarm_session {
         cmd.env_remove("AGENT_GUARD_COORDINATOR_SOCK");
+    }
+    if let Ok(raw_ctd) = env::var("CARGO_TARGET_DIR") {
+        let ctd_trim = raw_ctd.trim();
+        let has_unsafe_meta = ctd_trim.is_empty()
+            || ctd_trim
+                .bytes()
+                .any(|b| matches!(b, b'$' | b'*' | b'?' | b'[' | b'{' | b'`'));
+        if !opts.writes_allowed
+            || has_unsafe_meta
+            || crate::path_policy::validate_path(
+                repo_root,
+                cwd,
+                ctd_trim,
+                crate::path_policy::PathAccess::Write,
+            )
+            .is_err()
+        {
+            cmd.env_remove("CARGO_TARGET_DIR");
+        }
     }
     // Scrub dynamic Cargo runner/linker/alias/source overrides (`CARGO_TARGET_*`, `CARGO_ALIAS_*`, ...)
     for (env_k, _) in env::vars_os() {
         if let Some(ks) = env_k.to_str() {
             let up = ks.to_ascii_uppercase();
-            if up.starts_with("CARGO_TARGET_")
+            if (up.starts_with("CARGO_TARGET_") && up != "CARGO_TARGET_DIR")
                 || up.starts_with("CARGO_ALIAS_")
                 || up.starts_with("CARGO_REGISTRIES_")
                 || up.starts_with("CARGO_SOURCE_")
@@ -879,28 +983,157 @@ fn is_immutable_control_root_entry(name: &str) -> bool {
     )
 }
 
+#[cfg(target_os = "linux")]
+pub fn probe_linux_unshare_netns() -> bool {
+    static SUPPORTED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *SUPPORTED.get_or_init(|| {
+        let bin = Path::new("/usr/bin/unshare");
+        if !bin.is_file() {
+            return false;
+        }
+        Command::new(bin)
+            .args(["--user", "--net", "--", "/bin/true"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success())
+    })
+}
+
+/// Installs an unprivileged kernel `seccomp-bpf` socket allowlist filter permitting ONLY
+/// `AF_UNIX` (1, required for local privilege-separated `coord.sock` IPC) and `AF_NETLINK`
+/// (16, required by `glibc` interface enumeration) while denying EVERY other address family
+/// (`AF_INET`, `AF_INET6`, `AF_PACKET`, `AF_VSOCK`, `AF_XDP`, `AF_BLUETOOTH`, `AF_CAN`, etc.)
+/// with `EPERM` (1).
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+pub fn apply_linux_seccomp_net_filter() -> Result<(), String> {
+    use seccompiler::{
+        BpfProgram, SeccompAction, SeccompCmpArgLen, SeccompCmpOp, SeccompCondition, SeccompFilter,
+        SeccompRule, TargetArch, apply_filter,
+    };
+    use std::collections::BTreeMap;
+
+    #[cfg(target_arch = "x86_64")]
+    let (arch, sys_socket, sys_socketpair) = (TargetArch::x86_64, 41i64, 53i64);
+    #[cfg(target_arch = "aarch64")]
+    let (arch, sys_socket, sys_socketpair) = (TargetArch::aarch64, 198i64, 199i64);
+
+    const AF_UNIX_DOMAIN: u64 = 1;
+    const AF_NETLINK_DOMAIN: u64 = 16;
+
+    let build_non_local_deny_rule = || -> Result<Vec<SeccompRule>, String> {
+        let not_unix =
+            SeccompCondition::new(0, SeccompCmpArgLen::Dword, SeccompCmpOp::Ne, AF_UNIX_DOMAIN)
+                .map_err(|e| format!("seccomp AF_UNIX condition error: {e}"))?;
+        let not_netlink = SeccompCondition::new(
+            0,
+            SeccompCmpArgLen::Dword,
+            SeccompCmpOp::Ne,
+            AF_NETLINK_DOMAIN,
+        )
+        .map_err(|e| format!("seccomp AF_NETLINK condition error: {e}"))?;
+        let rule = SeccompRule::new(vec![not_unix, not_netlink])
+            .map_err(|e| format!("seccomp allowlist rule error: {e}"))?;
+        Ok(vec![rule])
+    };
+
+    let mut rules_map = BTreeMap::new();
+    rules_map.insert(sys_socket, build_non_local_deny_rule()?);
+    rules_map.insert(sys_socketpair, build_non_local_deny_rule()?);
+    #[cfg(target_arch = "x86_64")]
+    {
+        // Also gate Linux x32 ABI (`__X32_SYSCALL_BIT = 0x4000_0000`) which shares `AUDIT_ARCH_X86_64`.
+        const X32_BIT: i64 = 0x4000_0000;
+        rules_map.insert(X32_BIT | 41, build_non_local_deny_rule()?);
+        rules_map.insert(X32_BIT | 53, build_non_local_deny_rule()?);
+    }
+
+    let filter = SeccompFilter::new(
+        rules_map,
+        SeccompAction::Allow,
+        SeccompAction::Errno(1), // EPERM = 1 across Linux ABIs whenever domain != AF_UNIX && domain != AF_NETLINK
+        arch,
+    )
+    .map_err(|e| format!("seccomp filter init error: {e}"))?;
+
+    let bpf: BpfProgram = filter
+        .try_into()
+        .map_err(|e| format!("seccomp BPF compilation error: {e}"))?;
+    apply_filter(&bpf).map_err(|e| format!("seccomp apply_filter error: {e}"))
+}
+
+#[cfg(all(
+    target_os = "linux",
+    not(any(target_arch = "x86_64", target_arch = "aarch64"))
+))]
+pub fn apply_linux_seccomp_net_filter() -> Result<(), String> {
+    Err("seccomp socket filter unsupported on this CPU architecture".to_string())
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn resolve_linked_worktree_git_dirs(canon_repo: &Path) -> Option<(PathBuf, PathBuf)> {
+    let dot_git = canon_repo.join(".git");
+    let meta = fs::symlink_metadata(&dot_git).ok()?;
+    if meta.file_type().is_symlink() || !meta.file_type().is_file() || meta.len() > 4_096 {
+        return None;
+    }
+    let raw = fs::read_to_string(&dot_git).ok()?;
+    let rest = raw.trim().strip_prefix("gitdir:")?.trim();
+    let target_raw = Path::new(rest);
+    let resolved = if target_raw.is_absolute() {
+        target_raw.to_path_buf()
+    } else {
+        canon_repo.join(target_raw)
+    };
+    let canon_gitdir = fs::canonicalize(&resolved).unwrap_or(resolved);
+    let worktrees_dir = canon_gitdir.parent()?;
+    if worktrees_dir.file_name().and_then(|s| s.to_str()) != Some("worktrees") {
+        return None;
+    }
+    let common_git_dir = worktrees_dir.parent()?;
+    if common_git_dir.file_name().and_then(|s| s.to_str()) != Some(".git") {
+        return None;
+    }
+    let common_git_buf = common_git_dir.to_path_buf();
+    Some((canon_gitdir, common_git_buf))
+}
+
 fn apply_current_process_sandbox(
     repo_root: &Path,
     ephemeral_tmp: Option<&Path>,
     opts: SandboxPolicyOpts,
-) -> KernelSandboxMode {
+) -> (KernelSandboxMode, Result<(), String>) {
     #[cfg(target_os = "linux")]
     {
-        apply_linux_landlock(repo_root, ephemeral_tmp, opts)
+        if opts.deny_net {
+            let _ = probe_linux_unshare_netns();
+        }
+        let mode = apply_linux_landlock(repo_root, ephemeral_tmp, opts);
+        let net_res = if opts.deny_net {
+            apply_linux_seccomp_net_filter()
+        } else {
+            Ok(())
+        };
+        (mode, net_res)
     }
     #[cfg(target_os = "macos")]
     {
         let _ = (repo_root, ephemeral_tmp, opts);
-        if Path::new("/usr/bin/sandbox-exec").is_file() {
+        let mode = if Path::new("/usr/bin/sandbox-exec").is_file() {
             KernelSandboxMode::MacosSeatbeltEnforced
         } else {
             KernelSandboxMode::FallbackEnvAndAstOnly
-        }
+        };
+        (mode, Ok(()))
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
         let _ = (repo_root, ephemeral_tmp, opts);
-        KernelSandboxMode::FallbackEnvAndAstOnly
+        (KernelSandboxMode::FallbackEnvAndAstOnly, Ok(()))
     }
 }
 
@@ -1065,9 +1298,11 @@ fn apply_linux_landlock(
         add_path(tmp, rw_access);
     }
 
-    // 4b. Granular Swarm state access ONLY for atomic `swarm-tool` invocations:
-    //     `<swarm_state_dir>/vault` (`hmac.key`) is UNCONDITIONALLY OMITTED (`EACCES`)!
+    // 4b. Granular Swarm state access:
+    //     `<swarm_state_dir>/vault` (`hmac.key`, `stop_receipt_ed25519.pub`) is UNCONDITIONALLY OMITTED (`EACCES`)!
     let canon_repo = fs::canonicalize(repo_root).unwrap_or_else(|_| repo_root.to_path_buf());
+    let has_swarm_session =
+        env::var("AGENT_GUARD_SESSION_ID").is_ok_and(|s| s.trim().starts_with("swm_"));
     if opts.invokes_swarm_tool {
         if let Ok(sdir) = crate::breadcrumbs::swarm_state_dir(&canon_repo) {
             for allowed_sub in ["ipc", "sessions", "spools", "ledger"] {
@@ -1081,6 +1316,91 @@ fn apply_linux_landlock(
             && locks_dir.is_dir()
         {
             add_path(&locks_dir, rw_access);
+        }
+    } else if has_swarm_session {
+        if let Ok(sdir) = crate::breadcrumbs::swarm_state_dir(&canon_repo) {
+            for rw_sub in ["ipc", "spools", "ledger"] {
+                let sub_p = sdir.join(rw_sub);
+                if sub_p.is_dir() {
+                    add_path(&sub_p, rw_access);
+                }
+            }
+            let sess_p = sdir.join("sessions");
+            if sess_p.is_dir() {
+                add_path(&sess_p, ro_access);
+            }
+        }
+        if let Ok(locks_dir) = crate::breadcrumbs::swarm_locks_dir()
+            && locks_dir.is_dir()
+        {
+            add_path(&locks_dir, rw_access);
+        }
+    }
+
+    // 4c. Linked Git worktree support (`git worktree add --detach`):
+    //     Grant read-only access to `<common_repo>/.git` (omitting `hooks/`, keeping `config` read-only,
+    //     and isolating `worktrees/` strictly to THIS worktree's `<wt_gitdir>`).
+    if let Some((wt_gitdir, common_git_dir)) = resolve_linked_worktree_git_dirs(&canon_repo) {
+        add_path(&common_git_dir, dir_list_access);
+        if let Ok(git_entries) = fs::read_dir(&common_git_dir) {
+            for ge in git_entries.flatten() {
+                let gpath = ge.path();
+                let Ok(gmeta) = fs::symlink_metadata(&gpath) else {
+                    continue;
+                };
+                if gmeta.file_type().is_symlink() {
+                    continue;
+                }
+                let gname = ge.file_name().to_string_lossy().into_owned();
+                if gname.eq_ignore_ascii_case("hooks") {
+                    continue;
+                }
+                if gname.eq_ignore_ascii_case("config") {
+                    add_path(&gpath, file_ro_access);
+                    continue;
+                }
+                if gname.eq_ignore_ascii_case("worktrees") {
+                    add_path(&gpath, dir_list_access);
+                    let wt_acc = if opts.invokes_git && opts.writes_allowed {
+                        rw_access
+                    } else {
+                        ro_access
+                    };
+                    add_path(&wt_gitdir, wt_acc);
+                    continue;
+                }
+                let g_access = if (opts.invokes_git
+                    && opts.writes_allowed
+                    && gname.eq_ignore_ascii_case("objects"))
+                    || ((opts.invokes_swarm_tool || has_swarm_session)
+                        && gname.eq_ignore_ascii_case("info"))
+                {
+                    rw_access
+                } else if gmeta.file_type().is_dir() {
+                    ro_access
+                } else {
+                    file_ro_access
+                };
+                add_path(&gpath, g_access);
+            }
+        }
+        if let Some(common_repo) = common_git_dir.parent() {
+            for art in ["PLAN.lock.json", "WORK_LEDGER.jsonl", ".breadcrumbs.jsonl"] {
+                let art_p = common_repo.join(art);
+                if let Ok(ameta) = fs::symlink_metadata(&art_p)
+                    && !ameta.file_type().is_symlink()
+                    && ameta.file_type().is_file()
+                {
+                    let art_acc = if opts.invokes_swarm_tool
+                        || (has_swarm_session && art != "PLAN.lock.json")
+                    {
+                        AccessFs::ReadFile | AccessFs::WriteFile | AccessFs::Truncate
+                    } else {
+                        file_ro_access
+                    };
+                    add_path(&art_p, art_acc);
+                }
+            }
         }
     }
 
@@ -1144,7 +1464,8 @@ fn apply_linux_landlock(
                                 continue;
                             }
                             let g_access = if (opts.invokes_git && opts.writes_allowed)
-                                || (opts.invokes_swarm_tool && gname.eq_ignore_ascii_case("info"))
+                                || ((opts.invokes_swarm_tool || has_swarm_session)
+                                    && gname.eq_ignore_ascii_case("info"))
                             {
                                 rw_access
                             } else if gpath.is_dir() {
@@ -1162,7 +1483,9 @@ fn apply_linux_landlock(
             }
 
             if is_swarm_mutable_root_artifact(&name) {
-                if opts.invokes_swarm_tool {
+                if opts.invokes_swarm_tool
+                    || (has_swarm_session && !name.eq_ignore_ascii_case("PLAN.lock.json"))
+                {
                     add_path(
                         &entry_path,
                         AccessFs::ReadFile | AccessFs::WriteFile | AccessFs::Truncate,
@@ -1230,6 +1553,8 @@ fn render_macos_seatbelt_profile(
     let canon_repo = fs::canonicalize(repo_root).unwrap_or_else(|_| repo_root.to_path_buf());
     let repo_s = escape_sbpl_literal(&canon_repo.to_string_lossy());
     let home_s = escape_sbpl_literal(&env::var("HOME").unwrap_or_default());
+    let has_swarm_session =
+        env::var("AGENT_GUARD_SESSION_ID").is_ok_and(|s| s.trim().starts_with("swm_"));
     let mut p = String::from("(version 1)\n(allow default)\n");
 
     if opts.deny_net {
@@ -1253,6 +1578,14 @@ fn render_macos_seatbelt_profile(
     if !home_s.is_empty() {
         p.push_str(&format!(
             "(deny file-read* file-write* (subpath \"{home_s}/.ssh\") (subpath \"{home_s}/.aws\") (subpath \"{home_s}/.gnupg\") (subpath \"{home_s}/.config/gh\") (subpath \"{home_s}/Library/Keychains\") (subpath \"{home_s}/.local/state/agent-guard\"))\n"
+        ));
+    }
+    let active_state_base = crate::traversal_ledger::state_base_dir();
+    let canon_state_base = fs::canonicalize(&active_state_base).unwrap_or(active_state_base);
+    let sb_s = escape_sbpl_literal(&canon_state_base.to_string_lossy());
+    if !sb_s.is_empty() {
+        p.push_str(&format!(
+            "(deny file-read* file-write* (subpath \"{sb_s}\"))\n"
         ));
     }
     if opts.invokes_swarm_tool {
@@ -1285,16 +1618,93 @@ fn render_macos_seatbelt_profile(
                 "(allow file-read* file-write* (subpath \"{lp}\"))\n"
             ));
         }
+    } else if has_swarm_session {
+        if let Ok(raw_sdir) = crate::breadcrumbs::swarm_state_dir(&canon_repo) {
+            let sdir = fs::canonicalize(&raw_sdir).unwrap_or(raw_sdir);
+            for rw_sub in ["ipc", "spools", "ledger"] {
+                let sub_path = sdir.join(rw_sub);
+                let canon_sub = fs::canonicalize(&sub_path).unwrap_or(sub_path);
+                let sp = escape_sbpl_literal(&canon_sub.to_string_lossy());
+                p.push_str(&format!(
+                    "(allow file-read* file-write* (subpath \"{sp}\"))\n"
+                ));
+                if rw_sub == "ipc" && opts.deny_net {
+                    p.push_str(&format!(
+                        "(allow network-outbound (remote unix-socket (subpath \"{sp}\")))\n"
+                    ));
+                }
+            }
+            let sess_path = sdir.join("sessions");
+            let canon_sess = fs::canonicalize(&sess_path).unwrap_or(sess_path);
+            let sess_s = escape_sbpl_literal(&canon_sess.to_string_lossy());
+            p.push_str(&format!("(allow file-read* (subpath \"{sess_s}\"))\n"));
+            let vault_dir = sdir.join("vault");
+            let canon_vault = fs::canonicalize(&vault_dir).unwrap_or(vault_dir);
+            let vp = escape_sbpl_literal(&canon_vault.to_string_lossy());
+            p.push_str(&format!(
+                "(deny file-read* file-write* (subpath \"{vp}\"))\n"
+            ));
+        }
+        if let Ok(raw_locks) = crate::breadcrumbs::swarm_locks_dir() {
+            let locks_dir = fs::canonicalize(&raw_locks).unwrap_or(raw_locks);
+            let lp = escape_sbpl_literal(&locks_dir.to_string_lossy());
+            p.push_str(&format!(
+                "(allow file-read* file-write* (subpath \"{lp}\"))\n"
+            ));
+        }
+        p.push_str(&format!(
+            "(deny file-write* (literal \"{repo_s}/PLAN.lock.json\"))\n"
+        ));
     } else {
         p.push_str(&format!(
             "(deny file-write* (literal \"{repo_s}/PLAN.lock.json\") (literal \"{repo_s}/WORK_LEDGER.jsonl\") (literal \"{repo_s}/.breadcrumbs.jsonl\"))\n"
         ));
     }
+    let is_linked_worktree = if let Some((wt_gitdir, common_git_dir)) =
+        resolve_linked_worktree_git_dirs(&canon_repo)
+    {
+        let cg_s = escape_sbpl_literal(&common_git_dir.to_string_lossy());
+        let wt_s = escape_sbpl_literal(&wt_gitdir.to_string_lossy());
+        p.push_str(&format!(
+                "(deny file-read* file-write* (subpath \"{cg_s}/hooks\"))\n(deny file-write* (literal \"{cg_s}/config\"))\n"
+            ));
+        if opts.invokes_git && opts.writes_allowed {
+            p.push_str(&format!(
+                "(allow file-write* (subpath \"{wt_s}\") (subpath \"{cg_s}/objects\"))\n"
+            ));
+        }
+        if opts.invokes_swarm_tool || has_swarm_session {
+            p.push_str(&format!("(allow file-write* (subpath \"{cg_s}/info\"))\n"));
+            if let Some(common_repo) = common_git_dir.parent() {
+                let cr_s = escape_sbpl_literal(&common_repo.to_string_lossy());
+                if opts.invokes_swarm_tool {
+                    p.push_str(&format!(
+                            "(allow file-write* (literal \"{cr_s}/PLAN.lock.json\") (literal \"{cr_s}/WORK_LEDGER.jsonl\") (literal \"{cr_s}/.breadcrumbs.jsonl\"))\n"
+                        ));
+                } else {
+                    p.push_str(&format!(
+                            "(allow file-write* (literal \"{cr_s}/WORK_LEDGER.jsonl\") (literal \"{cr_s}/.breadcrumbs.jsonl\"))\n"
+                        ));
+                }
+            }
+        }
+        true
+    } else {
+        false
+    };
+    if !opts.invokes_git {
+        p.push_str(&format!(
+            "(deny file-write* (subpath \"{repo_s}/.git\") (literal \"{repo_s}/.git\"))\n"
+        ));
+    } else if is_linked_worktree {
+        // Keep linked-worktree `.git` (`gitdir:` pointer) kernel-immutable even during `git` writes!
+        p.push_str(&format!("(deny file-write* (literal \"{repo_s}/.git\"))\n"));
+    }
     p.push_str(&format!(
         "(deny file-read* file-write* (regex #\"/\\.env($|\\.)\") (regex #\"\\.(pem|key|p12|pfx)$\") (regex #\"/audit\\.jsonl$\") (subpath \"{repo_s}/.git/hooks\") (subpath \"{repo_s}/node_modules\") (subpath \"{repo_s}/.venv\") (subpath \"{repo_s}/vendor\"))\n"
     ));
     p.push_str(&format!(
-        "(deny file-write* (literal \"{repo_s}/AGENTS.md\") (literal \"{repo_s}/.git/config\") (subpath \"{repo_s}/.claude\") (subpath \"{repo_s}/.codex\") (subpath \"{repo_s}/.cursor\") (subpath \"{repo_s}/.github\") (subpath \"{repo_s}/.cargo\") (literal \"{repo_s}/.gitattributes\") (literal \"{repo_s}/.npmrc\"))\n"
+        "(deny file-write* (literal \"{repo_s}/AGENTS.md\") (literal \"{repo_s}/.git/config\") (subpath \"{repo_s}/.guard\") (subpath \"{repo_s}/.claude\") (subpath \"{repo_s}/.codex\") (subpath \"{repo_s}/.cursor\") (subpath \"{repo_s}/.github\") (subpath \"{repo_s}/.cargo\") (literal \"{repo_s}/.gitattributes\") (literal \"{repo_s}/.npmrc\"))\n"
     ));
     p
 }

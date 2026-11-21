@@ -85,7 +85,8 @@ fn main() -> ExitCode {
                     eprintln!("[dotagent-harness] missing value for --scenario-dir");
                     return ExitCode::from(1);
                 };
-                custom_scenario_path = Some(PathBuf::from(val));
+                let p = std::fs::canonicalize(val).unwrap_or_else(|_| PathBuf::from(val));
+                custom_scenario_path = Some(p);
                 i += 2;
             }
             "--workspace" => {
@@ -93,7 +94,7 @@ fn main() -> ExitCode {
                     eprintln!("[dotagent-harness] missing value for --workspace");
                     return ExitCode::from(1);
                 };
-                let root = PathBuf::from(val);
+                let root = std::fs::canonicalize(val).unwrap_or_else(|_| PathBuf::from(val));
                 cfg.scenario_path = root.join("tests").join("scenarios");
                 cfg.workspace_root = root;
                 i += 2;

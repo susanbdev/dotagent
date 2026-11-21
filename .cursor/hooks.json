@@ -11,6 +11,11 @@
         "command": "agent-guard pre-tool"
       }
     ],
+    "afterShellExecution": [
+      {
+        "command": "agent-guard post-tool"
+      }
+    ],
     "beforeReadFile": [
       {
         "command": "agent-guard pre-tool"
@@ -19,6 +24,16 @@
     "beforeMCPExecution": [
       {
         "command": "agent-guard pre-tool"
+      }
+    ],
+    "afterMCPExecution": [
+      {
+        "command": "agent-guard post-tool"
+      }
+    ],
+    "preCompact": [
+      {
+        "command": "agent-guard pre-compact"
       }
     ],
     "afterFileEdit": [

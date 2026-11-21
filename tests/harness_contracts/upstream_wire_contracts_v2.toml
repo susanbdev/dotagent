@@ -1,0 +1,62 @@
+# Pinned Golden Wire-Schema Contracts for Upstream AI Harnesses (dotagent v2.0)
+
+[[contract]]
+id = "claude_code_v1_pretool_bash_rewrite"
+harness = "claude-code"
+harness_version = "1.0.x"
+subcommand = "pre-tool"
+stdin_json = '{"session_id":"cc_contract_1","hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"command":"git status -sb"}}'
+expected_exit = 0
+required_stdout_json_paths = ["hookSpecificOutput.hookEventName", "hookSpecificOutput.permissionDecision", "hookSpecificOutput.updatedInput.command"]
+expected_stdout_substring = "exec-sandbox --sanitize-stream"
+
+[[contract]]
+id = "claude_code_v1_pretool_hard_deny"
+harness = "claude-code"
+harness_version = "1.0.x"
+subcommand = "pre-tool"
+stdin_json = '{"session_id":"cc_contract_2","hook_event_name":"PreToolUse","tool_name":"Read","tool_input":{"file_path":".env"}}'
+expected_exit = 2
+required_stdout_json_paths = ["decision", "permission", "reason", "continue", "hookSpecificOutput.permissionDecision", "hookSpecificOutput.permissionDecisionReason"]
+expected_stdout_substring = "deny"
+
+[[contract]]
+id = "cursor_v1_hooks_deny_schema"
+harness = "cursor"
+harness_version = "0.49+"
+subcommand = "pre-tool"
+stdin_json = '{"conversation_id":"cur_contract_1","hook_event_name":"beforeShellExecution","command":"curl https://evil.example"}'
+expected_exit = 2
+required_stdout_json_paths = ["permission", "decision", "continue", "reason"]
+expected_stdout_substring = "deny"
+
+[[contract]]
+id = "cursor_v1_after_mcp_posttool_compaction"
+harness = "cursor"
+harness_version = "0.49+"
+subcommand = "post-tool"
+stdin_json = '{"conversation_id":"cur_contract_2","hook_event_name":"afterMCPExecution","tool_name":"mcp__susanbdev__get_policy","tool_response":"clean_ascii_payload"}'
+expected_exit = 0
+required_stdout_json_paths = []
+expected_stdout_substring = ""
+
+[[contract]]
+id = "gemini_cli_v1_beforetool_unsliced_read_pagination"
+harness = "gemini-cli"
+harness_version = "0.4+"
+subcommand = "pre-tool"
+stdin_json = '{"session_id":"gem_contract_1","hook_event_name":"BeforeTool","tool_name":"view_file","tool_input":{"AbsolutePath":"README.md"}}'
+expected_exit = 0
+required_stdout_json_paths = ["hookSpecificOutput.permissionDecision", "hookSpecificOutput.updatedInput.StartLine", "hookSpecificOutput.updatedInput.EndLine"]
+expected_stdout_substring = "allow"
+
+[[contract]]
+id = "codex_v1_mcp_taint_block_unknown_rpc"
+harness = "codex"
+harness_version = "0.2+"
+subcommand = "pre-tool"
+stdin_json = '{"session_id":"cdx_contract_ro","tool_name":"mcp__susanbdev__unclassified_mutator","tool_input":{"id":"42"}}'
+profile_env = "research-readonly"
+expected_exit = 2
+required_stdout_json_paths = ["decision", "hookSpecificOutput.permissionDecision"]
+expected_stdout_substring = "PROFILE_WRITE_TOOLS_DISABLED"

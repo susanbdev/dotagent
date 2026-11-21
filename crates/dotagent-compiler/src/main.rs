@@ -11,9 +11,16 @@ use std::process::ExitCode;
 use agent_guard::crypto::sha256_hex;
 use agent_guard::json::JsonValue;
 use agent_guard::unicode_guard::{ScanMode, scan_unicode};
+use dotagent_compiler::{
+    ALLOWED_MCP_URL, ProfileIr, SkillIr, compile_policy_bundle_ir_json, evaluate_rego_policy_gate,
+    lower_agent_markdown_for_harness, normalize_toml_to_json_value, parse_profile_toml_to_ir,
+    render_antigravity_harness_json_from_ir, render_claude_settings_from_ir,
+    render_codex_config_from_ir, render_cursor_hooks_from_ir, render_cursor_mcp_json_from_ir,
+    render_gemini_settings_from_ir, render_rego_policy_v2, strip_toml_comment,
+    verify_executable_spec_sync,
+};
 
 const MAX_SKILL_BYTES: usize = 3_072; // <= 3 KiB per spec Law 4
-const ALLOWED_MCP_URL: &str = "https://mcp.zt.susanb.dev/mcp";
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -84,19 +91,20 @@ fn is_self_hosted_dotagent_repo(repo_root: &Path) -> bool {
 }
 
 fn build_all(repo_root: &Path) -> Result<usize, String> {
-    let skills_lock_json = validate_and_lock_skills(repo_root)?;
-    let profile_hashes = validate_profiles(repo_root)?;
+    let (skills_lock_json, skill_irs) = validate_and_lock_skills(repo_root)?;
+    let (profile_hashes, profile_irs) = validate_profiles(repo_root)?;
     validate_workflows(repo_root)?;
 
     let skills_lock_path = repo_root.join("skills").join("manifest.lock.json");
     write_file_contained(repo_root, &skills_lock_path, &skills_lock_json)?;
 
-    let artifacts = render_bundle_artifacts();
+    let artifacts = render_bundle_artifacts(&profile_irs, &skill_irs)?;
+    let rego_src = render_rego_policy_v2();
     let dist_root = repo_root.join("dist");
     let mut manifest_lines = Vec::new();
 
     for (rel_path, content) in &artifacts {
-        run_policy_gate_on_artifact(rel_path, content)?;
+        run_policy_gate_on_artifact(rel_path, content, &rego_src)?;
         let out_path = dist_root.join(rel_path);
         write_file_contained(repo_root, &out_path, content)?;
         sync_repo_harness_copy(repo_root, rel_path, content)?;
@@ -133,9 +141,10 @@ fn build_all(repo_root: &Path) -> Result<usize, String> {
 }
 
 fn verify_all(repo_root: &Path) -> Result<usize, String> {
-    let expected_skills_lock = validate_and_lock_skills(repo_root)?;
-    let profile_hashes = validate_profiles(repo_root)?;
+    let (expected_skills_lock, skill_irs) = validate_and_lock_skills(repo_root)?;
+    let (profile_hashes, profile_irs) = validate_profiles(repo_root)?;
     validate_workflows(repo_root)?;
+    verify_executable_spec_sync(repo_root)?;
 
     let actual_skills_lock = read_contained_regular_file(
         repo_root,
@@ -146,10 +155,11 @@ fn verify_all(repo_root: &Path) -> Result<usize, String> {
         return Err("skills/manifest.lock.json is out of sync with skills/*/SKILL.md".to_string());
     }
 
-    let artifacts = render_bundle_artifacts();
+    let artifacts = render_bundle_artifacts(&profile_irs, &skill_irs)?;
+    let rego_src = render_rego_policy_v2();
     let mut expected_lines = Vec::new();
     for (rel_path, expected_content) in &artifacts {
-        run_policy_gate_on_artifact(rel_path, expected_content)?;
+        run_policy_gate_on_artifact(rel_path, expected_content, &rego_src)?;
         let disk_path = repo_root.join("dist").join(rel_path);
         let disk_content = read_contained_regular_file(repo_root, &disk_path).map_err(|e| {
             format!(
@@ -297,7 +307,7 @@ fn read_contained_regular_file(base_dir: &Path, target: &Path) -> Result<String,
     fs::read_to_string(&canon_file).map_err(|e| format!("cannot read '{}': {e}", target.display()))
 }
 
-fn validate_and_lock_skills(repo_root: &Path) -> Result<String, String> {
+fn validate_and_lock_skills(repo_root: &Path) -> Result<(String, Vec<SkillIr>), String> {
     let skills_dir = repo_root.join("skills");
     let _ = ensure_no_symlink_components_under(repo_root, &skills_dir)?;
     let skills_meta = fs::symlink_metadata(&skills_dir)
@@ -309,6 +319,7 @@ fn validate_and_lock_skills(repo_root: &Path) -> Result<String, String> {
         .map_err(|e| format!("cannot read skills dir '{}': {e}", skills_dir.display()))?;
 
     let mut skill_hashes = BTreeMap::new();
+    let mut skill_irs = Vec::new();
     for entry in entries.flatten() {
         let p = entry.path();
         let ft = entry
@@ -368,10 +379,19 @@ fn validate_and_lock_skills(repo_root: &Path) -> Result<String, String> {
         let strict_ascii = skill_name.starts_with("swarm-");
         validate_skill_doc_hygiene(&format!("{skill_name}/SKILL.md"), &body, strict_ascii)?;
 
-        skill_hashes.insert(
-            format!("skills/{skill_name}/SKILL.md"),
-            sha256_hex(body.as_bytes()),
-        );
+        let sha = sha256_hex(body.as_bytes());
+        let desc = body
+            .lines()
+            .find_map(|l| l.trim().strip_prefix("description:"))
+            .map(|s| s.trim().trim_matches('"').to_string())
+            .unwrap_or_default();
+        skill_irs.push(SkillIr {
+            name: skill_name.clone(),
+            description: desc,
+            sha256: sha.clone(),
+            bytes: body.len(),
+        });
+        skill_hashes.insert(format!("skills/{skill_name}/SKILL.md"), sha);
 
         let guide_path = p.join("ROLE_GUIDE.md");
         if strict_ascii && !guide_path.exists() {
@@ -399,6 +419,7 @@ fn validate_and_lock_skills(repo_root: &Path) -> Result<String, String> {
     if skill_hashes.is_empty() {
         return Err("no skills found under skills/".to_string());
     }
+    skill_irs.sort_by(|a, b| a.name.cmp(&b.name));
 
     let mut entries_json = Vec::new();
     for (k, v) in skill_hashes {
@@ -410,7 +431,7 @@ fn validate_and_lock_skills(repo_root: &Path) -> Result<String, String> {
     ]);
     let mut s = lock.to_json_string();
     s.push('\n');
-    Ok(s)
+    Ok((s, skill_irs))
 }
 
 fn validate_skill_doc_hygiene(label: &str, body: &str, strict_ascii: bool) -> Result<(), String> {
@@ -452,28 +473,9 @@ const REQUIRED_PROFILES: &[&str] = &[
     "swarm-forensic-coroner.toml",
 ];
 
-fn strip_toml_line_comment(line: &str) -> &str {
-    let mut in_quotes = false;
-    let mut escaped = false;
-    for (idx, b) in line.bytes().enumerate() {
-        if escaped {
-            escaped = false;
-            continue;
-        }
-        if b == b'\\' && in_quotes {
-            escaped = true;
-            continue;
-        }
-        if b == b'"' {
-            in_quotes = !in_quotes;
-        } else if b == b'#' && !in_quotes {
-            return line[..idx].trim();
-        }
-    }
-    line.trim()
-}
-
-fn validate_profiles(repo_root: &Path) -> Result<BTreeMap<String, String>, String> {
+fn validate_profiles(
+    repo_root: &Path,
+) -> Result<(BTreeMap<String, String>, Vec<ProfileIr>), String> {
     let profiles_dir = repo_root.join("profiles");
     let _ = ensure_no_symlink_components_under(repo_root, &profiles_dir)?;
     let dir_meta = fs::symlink_metadata(&profiles_dir)
@@ -502,7 +504,9 @@ fn validate_profiles(repo_root: &Path) -> Result<BTreeMap<String, String>, Strin
         }
     }
 
+    let rego_src = render_rego_policy_v2();
     let mut hashes = BTreeMap::new();
+    let mut profile_irs = Vec::new();
     for required in REQUIRED_PROFILES {
         let p = profiles_dir.join(required);
         let text = read_contained_regular_file(&profiles_dir, &p)
@@ -517,7 +521,7 @@ fn validate_profiles(repo_root: &Path) -> Result<BTreeMap<String, String>, Strin
         let mut saw_hooks_null = false;
         let mut saw_root_agents = false;
         for raw_line in text.lines() {
-            let clean = strip_toml_line_comment(raw_line);
+            let clean = strip_toml_comment(raw_line);
             if clean.is_empty() || clean.starts_with('[') {
                 continue;
             }
@@ -548,9 +552,19 @@ fn validate_profiles(repo_root: &Path) -> Result<BTreeMap<String, String>, Strin
                 "profile '{required}' missing mandatory hooks_path=/dev/null or root_file=AGENTS.md"
             ));
         }
+        let toml_json = normalize_toml_to_json_value(&text)
+            .map_err(|e| format!("profile '{required}' TOML AST error: {e}"))?;
+        evaluate_rego_policy_gate(
+            "dotagent_harness.rego",
+            &rego_src,
+            &format!("profiles/{required}"),
+            &toml_json.to_json_string(),
+        )?;
+        let ir = parse_profile_toml_to_ir(required, &text)?;
+        profile_irs.push(ir);
         hashes.insert(format!("profiles/{required}"), sha256_hex(text.as_bytes()));
     }
-    Ok(hashes)
+    Ok((hashes, profile_irs))
 }
 
 fn verify_no_untracked_bundle_files(
@@ -650,8 +664,13 @@ fn validate_workflows(repo_root: &Path) -> Result<(), String> {
     }
 }
 
-/// Built-in deterministic policy gate matching `policy-hub/rego/dotagent_harness.rego`.
-fn run_policy_gate_on_artifact(rel_path: &str, content: &str) -> Result<(), String> {
+/// Deterministic policy gate combining 7-bit ASCII/Unicode hygiene with in-process `regorus`
+/// Rego evaluation over both JSON and normalized TOML ASTs.
+fn run_policy_gate_on_artifact(
+    rel_path: &str,
+    content: &str,
+    rego_source: &str,
+) -> Result<(), String> {
     let uni = scan_unicode(content, ScanMode::UntrustedContent);
     if let Some(first) = uni.first() {
         return Err(format!(
@@ -670,14 +689,12 @@ fn run_policy_gate_on_artifact(rel_path: &str, content: &str) -> Result<(), Stri
         ));
     }
 
-    // Zero wildcard command allowlists
     if content.contains("\"Bash(*)\"") || content.contains("\"allow\": [\"*\"]") {
         return Err(format!(
             "Policy violation in '{rel_path}': wildcard command allowlist is forbidden"
         ));
     }
 
-    // Check external URLs: only `https://mcp.zt.susanb.dev/mcp` may appear in harness configs
     for token in content
         .split(|c: char| c.is_ascii_whitespace() || matches!(c, '"' | '\'' | '(' | ')' | ','))
     {
@@ -689,6 +706,18 @@ fn run_policy_gate_on_artifact(rel_path: &str, content: &str) -> Result<(), Stri
                 "Policy violation in '{rel_path}': unapproved external URL '{token}' (only {ALLOWED_MCP_URL} permitted)"
             ));
         }
+    }
+
+    if rel_path.ends_with(".json") {
+        evaluate_rego_policy_gate("dotagent_harness.rego", rego_source, rel_path, content)?;
+    } else if rel_path.ends_with(".toml") {
+        let toml_ast = normalize_toml_to_json_value(content)?;
+        evaluate_rego_policy_gate(
+            "dotagent_harness.rego",
+            rego_source,
+            rel_path,
+            &toml_ast.to_json_string(),
+        )?;
     }
 
     Ok(())
@@ -716,6 +745,10 @@ fn write_file_contained(repo_root: &Path, path: &Path, content: &str) -> Result<
                 path.display()
             ));
         }
+        if meta.file_type().is_file() && fs::read(path).ok().as_deref() == Some(content.as_bytes())
+        {
+            return Ok(());
+        }
     }
     fs::write(path, content.as_bytes())
         .map_err(|e| format!("cannot write '{}': {e}", path.display()))
@@ -727,6 +760,7 @@ fn repo_harness_copy_path(repo_root: &Path, rel_path: &str) -> Option<PathBuf> {
         "cursor/.cursorignore" => Some(repo_root.join(".cursorignore")),
         "claude/settings.json" => Some(repo_root.join(".claude").join("settings.json")),
         "cursor/hooks.json" => Some(repo_root.join(".cursor").join("hooks.json")),
+        "cursor/mcp.json" => Some(repo_root.join(".cursor").join("mcp.json")),
         "codex/config.toml" => Some(repo_root.join(".codex").join("config.toml")),
         _ => rel_path
             .strip_prefix("claude/agents/")
@@ -751,7 +785,18 @@ fn sync_repo_harness_copy(repo_root: &Path, rel_path: &str, content: &str) -> Re
     Ok(())
 }
 
-fn render_bundle_artifacts() -> BTreeMap<String, String> {
+fn render_bundle_artifacts(
+    profiles: &[ProfileIr],
+    skills: &[SkillIr],
+) -> Result<BTreeMap<String, String>, String> {
+    let coding = profiles
+        .iter()
+        .find(|p| p.profile_id == "coding-agent")
+        .ok_or_else(|| "missing canonical 'coding-agent' profile in Policy-IR".to_string())?;
+    let readonly_prof = profiles
+        .iter()
+        .find(|p| p.profile_id == "research-readonly");
+
     let mut map = BTreeMap::new();
     map.insert("AGENTS.md".to_string(), render_canonical_agents_md());
     map.insert(
@@ -759,32 +804,67 @@ fn render_bundle_artifacts() -> BTreeMap<String, String> {
         render_hardened_gitconfig(),
     );
     map.insert(".ignore".to_string(), render_universal_ignore());
-    map.insert("claude/settings.json".to_string(), render_claude_settings());
+    map.insert(
+        "claude/settings.json".to_string(),
+        render_claude_settings_from_ir(coding),
+    );
+
     let airlock = render_claude_research_airlock_agent();
     for harness in ["claude", "cursor", "codex", "gemini"] {
         map.insert(
             format!("{harness}/agents/research-airlock.md"),
-            airlock.clone(),
+            lower_agent_markdown_for_harness(
+                harness,
+                "research-airlock.md",
+                &airlock,
+                readonly_prof,
+            ),
         );
     }
     for (name, body) in render_claude_swarm_role_agents() {
+        let stem = name.trim_end_matches(".md");
+        let matched_prof = profiles.iter().find(|p| p.profile_id == stem);
         for harness in ["claude", "cursor", "codex", "gemini"] {
-            map.insert(format!("{harness}/agents/{name}"), body.clone());
+            map.insert(
+                format!("{harness}/agents/{name}"),
+                lower_agent_markdown_for_harness(harness, name, &body, matched_prof),
+            );
         }
     }
-    map.insert("gemini/settings.json".to_string(), render_gemini_settings());
+    map.insert(
+        "gemini/settings.json".to_string(),
+        render_gemini_settings_from_ir(coding),
+    );
     map.insert("gemini/GEMINI.md".to_string(), render_gemini_global_md());
-    map.insert("cursor/hooks.json".to_string(), render_cursor_hooks());
+    map.insert(
+        "cursor/hooks.json".to_string(),
+        render_cursor_hooks_from_ir(coding),
+    );
+    map.insert(
+        "cursor/mcp.json".to_string(),
+        render_cursor_mcp_json_from_ir(coding),
+    );
     map.insert(
         "cursor/.cursorignore".to_string(),
         render_universal_ignore(),
     );
-    map.insert("codex/config.toml".to_string(), render_codex_config());
+    map.insert(
+        "codex/config.toml".to_string(),
+        render_codex_config_from_ir(coding),
+    );
+    map.insert(
+        "antigravity/harness.json".to_string(),
+        render_antigravity_harness_json_from_ir(coding),
+    );
+    map.insert(
+        "profiles/policy_ir.json".to_string(),
+        compile_policy_bundle_ir_json(profiles, skills),
+    );
     map.insert(
         "policy/dotagent_harness.rego".to_string(),
-        render_rego_policy(),
+        render_rego_policy_v2(),
     );
-    map
+    Ok(map)
 }
 
 fn render_canonical_agents_md() -> String {
@@ -1001,177 +1081,6 @@ CLAUDE.local.md
     .to_string()
 }
 
-fn render_claude_settings() -> String {
-    r#"{
-  "autoMemoryEnabled": false,
-  "disableAllHooks": false,
-  "env": {
-    "AGENT_GUARD_WRAP_BASH_ASCII": "1",
-    "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE": "15",
-    "BASH_MAX_OUTPUT_LENGTH": "12000",
-    "MAX_MCP_OUTPUT_TOKENS": "3000",
-    "GIT_CONFIG_NOSYSTEM": "1",
-    "PYTHONDONTWRITEBYTECODE": "1",
-    "PIP_NO_CACHE_DIR": "1",
-    "NPM_CONFIG_IGNORE_SCRIPTS": "true",
-    "HISTFILE": "/dev/null"
-  },
-  "permissions": {
-    "allow": [],
-    "deny": [
-      "Read(/tmp/**)",
-      "Read(/var/tmp/**)",
-      "Read(/dev/shm/**)",
-      "Read(**/tmp/**)",
-      "Read(**/.tmp/**)",
-      "Read(**/.cache/**)",
-      "Read(~/.cache/**)",
-      "Read(**/__pycache__/**)",
-      "Read(**/.pytest_cache/**)",
-      "Read(**/.mypy_cache/**)",
-      "Read(**/.ruff_cache/**)",
-      "Read(**/.next/**)",
-      "Read(**/.turbo/**)",
-      "Read(**/node_modules/**)",
-      "Read(**/vendor/**)",
-      "Read(**/.venv/**)",
-      "Read(**/venv/**)",
-      "Read(**/site-packages/**)",
-      "Read(target/**)",
-      "Read(build/**)",
-      "Read(dist-build/**)",
-      "Read(.env)",
-      "Read(.env.*)",
-      "Read(.env*)",
-      "Read(**/.env)",
-      "Read(**/.env.*)",
-      "Read(**/.env*)",
-      "Read(**/*.pem)",
-      "Read(**/*.key)",
-      "Read(~/.ssh/**)",
-      "Read(~/.aws/**)",
-      "Read(~/.gnupg/**)",
-      "Read(~/.config/gh/**)",
-      "Read(~/.local/state/agent-guard/**)",
-      "Read(**/audit.jsonl)",
-      "Read(CLAUDE.md)",
-      "Read(**/CLAUDE.md)",
-      "Read(CLAUDE.local.md)",
-      "Read(**/CLAUDE.local.md)",
-      "Read(*/AGENTS.md)",
-      "Read(**/*/AGENTS.md)",
-      "Read(.cursorrules)",
-      "Read(**/.cursorrules)",
-      "Read(.github/copilot-instructions.md)",
-      "Edit(AGENTS.md)",
-      "Write(AGENTS.md)",
-      "Edit(.claude/**)",
-      "Write(.claude/**)",
-      "Edit(.guard/**)",
-      "Write(.guard/**)",
-      "Edit(.git/**)",
-      "Write(.git/**)",
-      "Edit(.cargo/**)",
-      "Write(.cargo/**)",
-      "Edit(.yarn/**)",
-      "Write(.yarn/**)",
-      "Edit(.gitattributes)",
-      "Write(.gitattributes)",
-      "Edit(**/.npmrc)",
-      "Write(**/.npmrc)",
-      "Edit(**/.yarnrc.yml)",
-      "Write(**/.yarnrc.yml)",
-      "Edit(rust-toolchain.toml)",
-      "Write(rust-toolchain.toml)",
-      "Bash(curl *)",
-      "Bash(wget *)",
-      "Bash(nc *)",
-      "Bash(ssh *)",
-      "Bash(sudo *)",
-      "Bash(mktemp*)",
-      "Bash(npx *)",
-      "Bash(uvx *)",
-      "Bash(gh workflow run*)",
-      "Bash(git push*)",
-      "Bash(git remote*)",
-      "Bash(git config*)",
-      "Bash(git -c *)",
-      "Bash(git rebase*)",
-      "Bash(git reset --hard*)",
-      "Bash(git commit --amend*)",
-      "Bash(git hook*)"
-    ]
-  },
-  "hooks": {
-    "UserPromptSubmit": [
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "agent-guard user-prompt",
-            "timeout": 5
-          }
-        ]
-      }
-    ],
-    "PreToolUse": [
-      {
-        "matcher": "*",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "agent-guard pre-tool",
-            "timeout": 5
-          }
-        ]
-      }
-    ],
-    "PostToolUse": [
-      {
-        "matcher": "*",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "agent-guard post-tool",
-            "timeout": 5
-          }
-        ]
-      }
-    ],
-    "PreCompact": [
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "agent-guard pre-compact",
-            "timeout": 5
-          }
-        ]
-      }
-    ],
-    "Stop": [
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "agent-guard on-stop",
-            "timeout": 15
-          }
-        ]
-      }
-    ]
-  },
-  "mcpServers": {
-    "susanbdev": {
-      "type": "http",
-      "url": "https://mcp.zt.susanb.dev/mcp"
-    }
-  }
-}
-"#
-    .to_string()
-}
-
 fn render_claude_research_airlock_agent() -> String {
     r#"---
 name: research-airlock
@@ -1291,94 +1200,6 @@ You operate under `AGENT_GUARD_ROLE=forensic-coroner` and follow `skills/swarm-f
     ]
 }
 
-fn render_gemini_settings() -> String {
-    r#"{
-  "contextFileName": "AGENTS.md",
-  "checkpointing": {
-    "enabled": false
-  },
-  "model": {
-    "compressionThreshold": 0.15,
-    "maxSessionTurns": 25
-  },
-  "tools": {
-    "truncateToolOutputThreshold": 12000,
-    "truncateToolOutputLines": 120
-  },
-  "hooks": {
-    "BeforeAgent": [
-      {
-        "hooks": [
-          {
-            "name": "agent-guard-turn-reset",
-            "type": "command",
-            "command": "agent-guard user-prompt",
-            "timeout": 5000
-          }
-        ]
-      }
-    ],
-    "BeforeTool": [
-      {
-        "matcher": ".*",
-        "hooks": [
-          {
-            "name": "agent-guard-pre-tool",
-            "type": "command",
-            "command": "agent-guard pre-tool",
-            "timeout": 5000
-          }
-        ]
-      }
-    ],
-    "AfterTool": [
-      {
-        "matcher": ".*",
-        "hooks": [
-          {
-            "name": "agent-guard-post-tool",
-            "type": "command",
-            "command": "agent-guard post-tool",
-            "timeout": 5000
-          }
-        ]
-      }
-    ],
-    "PreCompress": [
-      {
-        "hooks": [
-          {
-            "name": "agent-guard-pre-compact",
-            "type": "command",
-            "command": "agent-guard pre-compact",
-            "timeout": 5000
-          }
-        ]
-      }
-    ],
-    "AfterAgent": [
-      {
-        "hooks": [
-          {
-            "name": "agent-guard-on-stop",
-            "type": "command",
-            "command": "agent-guard on-stop",
-            "timeout": 15000
-          }
-        ]
-      }
-    ]
-  },
-  "mcpServers": {
-    "susanbdev": {
-      "httpUrl": "https://mcp.zt.susanb.dev/mcp"
-    }
-  }
-}
-"#
-    .to_string()
-}
-
 fn render_gemini_global_md() -> String {
     r#"# Global Zero-Trust Agent Constitution (`susanbdev/dotagent`)
 
@@ -1401,114 +1222,4 @@ These rules bind every session across Antigravity / Gemini and take absolute pre
         "__SPOTLIGHT_OPEN__",
         concat!("<<<", "UNTRUSTED_ASCII_DATA_<nonce>>>>"),
     )
-}
-
-fn render_cursor_hooks() -> String {
-    r#"{
-  "version": 1,
-  "hooks": {
-    "beforeSubmitPrompt": [
-      {
-        "command": "agent-guard user-prompt"
-      }
-    ],
-    "beforeShellExecution": [
-      {
-        "command": "agent-guard pre-tool"
-      }
-    ],
-    "beforeReadFile": [
-      {
-        "command": "agent-guard pre-tool"
-      }
-    ],
-    "beforeMCPExecution": [
-      {
-        "command": "agent-guard pre-tool"
-      }
-    ],
-    "afterFileEdit": [
-      {
-        "command": "agent-guard post-edit"
-      }
-    ],
-    "stop": [
-      {
-        "command": "agent-guard on-stop"
-      }
-    ]
-  }
-}
-"#
-    .to_string()
-}
-
-fn render_codex_config() -> String {
-    r#"# Managed by susanbdev/dotagent -- OpenAI Codex Zero-Trust Configuration
-approval_policy = "on-request"
-sandbox_mode = "workspace-write"
-project_doc_max_bytes = 16384
-project_doc_fallback_filenames = []
-model_auto_compact_token_limit = 20000
-tool_output_token_limit = 2500
-notify = ["agent-guard", "on-stop"]
-
-[sandbox_workspace_write]
-network_access = false
-exclude_tmpdir_env_var = true
-exclude_slash_tmp = true
-
-[shell_environment_policy]
-inherit = "all"
-ignore_default_excludes = false
-exclude = ["AWS_*", "GITHUB_*", "GH_*", "ANTHROPIC_*", "OPENAI_*", "GEMINI_*", "*_TOKEN", "*_SECRET", "*_KEY", "AGENT_GUARD_ALLOW_*"]
-include_only = ["PATH", "HOME", "USER", "LOGNAME", "SHELL", "LANG", "LC_*", "TERM", "CARGO_HOME", "RUSTUP_HOME", "XDG_RUNTIME_DIR", "GIT_CONFIG_GLOBAL", "GIT_CONFIG_NOSYSTEM", "AGENT_GUARD_PROFILE", "AGENT_GUARD_ROLE", "AGENT_GUARD_SESSION_ID", "AGENT_GUARD_STATE_DIR", "AGENT_GUARD_COORDINATOR_SOCK"]
-
-[mcp_servers.susanbdev]
-url = "https://mcp.zt.susanb.dev/mcp"
-"#
-    .to_string()
-}
-
-fn render_rego_policy() -> String {
-    r#"package susanbdev.dotagent.harness
-
-import rego.v1
-
-allowed_mcp_url := "https://mcp.zt.susanb.dev/mcp"
-
-deny contains msg if {
-    some server_name, cfg in input.mcpServers
-    url := object.get(cfg, "url", object.get(cfg, "httpUrl", ""))
-    url != allowed_mcp_url
-    msg := sprintf("unapproved MCP server '%s' URL '%s'", [server_name, url])
-}
-
-deny contains msg if {
-    some server_name, cfg in input.mcpServers
-    object.get(cfg, "command", "") != ""
-    msg := sprintf("stdio/npx MCP server '%s' is forbidden; only HTTPS susanbdev/mcp allowed", [server_name])
-}
-
-deny contains msg if {
-    some rule in object.get(object.get(input, "permissions", {}), "allow", [])
-    contains(rule, "*")
-    msg := sprintf("wildcard permission allowlist entry '%s' is forbidden", [rule])
-}
-
-deny contains msg if {
-    object.get(input, "autoMemoryEnabled", false) == true
-    msg := "autoMemoryEnabled must be false to prevent cross-session cache bleed"
-}
-
-forbidden_workflow_triggers := {"workflow_run", "workflow_call", "repository_dispatch"}
-
-deny contains msg if {
-    some trigger in forbidden_workflow_triggers
-    on_cfg := object.get(object.get(input, "workflow", {}), "on", {})
-    object.get(on_cfg, trigger, null) != null
-    msg := sprintf("chained GitHub Actions trigger '%s' is strictly forbidden", [trigger])
-}
-"#
-    .to_string()
 }

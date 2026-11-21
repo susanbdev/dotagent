@@ -42,6 +42,12 @@ const ASCII_LUT: [u8; 256] = {
     t
 };
 
+/// Pure O(1) lookup returning `true` iff `b` is strict printable 7-bit ASCII (`0x20..=0x7E`),
+/// `\n`, or `\t` (rejecting all `>= 0x80` high bytes, `\r`, NUL, C0 controls, ESC `0x1B`, and DEL).
+pub const fn is_clean_7bit_ascii_byte(b: u8) -> bool {
+    (ASCII_LUT[b as usize] & LUT_CLEAN) != 0
+}
+
 /// Neuters all non-ASCII characters, strips CR/control/ANSI terminal sequences,
 /// and defangs literal ASCII escape triggers (`\u`, `\U`, `\x`, `\033`, `\e`, `&#`, `%XX`)
 /// so downstream parsers, renderers, shells, and tokenizers can never trigger an escape.
