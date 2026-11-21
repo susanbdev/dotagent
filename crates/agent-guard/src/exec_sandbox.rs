@@ -652,8 +652,15 @@ pub fn run_exec_sandbox_cli(args: &[String], default_cwd: &Path) -> ExitCode {
         return ExitCode::from(2);
     }
 
-    let mut child_cmd =
-        build_child_command(&shell_script, &repo_root, &cwd, tmp_dir_path, opts, mode);
+    let mut child_cmd = build_child_command(
+        &shell_script,
+        &repo_root,
+        &cwd,
+        tmp_dir_path,
+        opts,
+        mode,
+        &effective_session_id,
+    );
     if env_session_id.is_none() {
         if let Some(ref swm_sid) = resolved_cli_swarm_sid {
             child_cmd.env("AGENT_GUARD_SESSION_ID", swm_sid);
@@ -966,6 +973,7 @@ fn precreate_swarm_tool_sandbox_targets(repo_root: &Path, _shell_script: &str) {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_child_command(
     shell_script: &str,
     repo_root: &Path,
@@ -973,12 +981,14 @@ fn build_child_command(
     ephemeral_tmp: Option<&Path>,
     opts: SandboxPolicyOpts,
     mode: KernelSandboxMode,
+    session_hint: &str,
 ) -> Command {
     #[cfg(target_os = "macos")]
     let mut cmd = {
         let _ = mode;
         if Path::new("/usr/bin/sandbox-exec").is_file() {
-            let profile = render_macos_seatbelt_profile(repo_root, ephemeral_tmp, opts);
+            let profile =
+                render_macos_seatbelt_profile(repo_root, ephemeral_tmp, opts, session_hint);
             let mut c = Command::new("/usr/bin/sandbox-exec");
             c.arg("-p")
                 .arg(profile)
@@ -1004,7 +1014,7 @@ fn build_child_command(
 
     #[cfg(target_os = "linux")]
     let mut cmd = {
-        let _ = repo_root;
+        let _ = (repo_root, session_hint);
         // Only wrap with `/usr/bin/unshare --user --net` when Landlock VFS restriction did NOT
         // restrict `/proc/self/uid_map` / `/proc/self/setgroups` (under Landlock, seccomp-bpf
         // already blocks all non-AF_UNIX/non-AF_NETLINK socket creation in-kernel).
@@ -1038,7 +1048,7 @@ fn build_child_command(
 
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     let mut cmd = {
-        let _ = (repo_root, mode);
+        let _ = (repo_root, mode, session_hint);
         let mut c = Command::new("bash");
         c.arg("--norc")
             .arg("--noprofile")
@@ -1135,7 +1145,7 @@ fn build_child_command(
     cmd
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn is_secret_or_forbidden_root_entry(name: &str) -> bool {
     let lower = name.to_ascii_lowercase();
     lower == ".env"
@@ -1182,7 +1192,7 @@ fn is_secret_or_forbidden_root_entry(name: &str) -> bool {
         )
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn is_swarm_mutable_root_artifact(name: &str) -> bool {
     let lower = name.to_ascii_lowercase();
     matches!(
@@ -1191,7 +1201,7 @@ fn is_swarm_mutable_root_artifact(name: &str) -> bool {
     )
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn is_immutable_control_root_entry(name: &str) -> bool {
     let lower = name.to_ascii_lowercase();
     matches!(
@@ -1354,7 +1364,12 @@ fn apply_current_process_sandbox(
     }
     #[cfg(target_os = "macos")]
     {
-        let _ = (repo_root, ephemeral_tmp, opts, session_hint);
+        if opts.writes_allowed {
+            let canon_repo =
+                fs::canonicalize(repo_root).unwrap_or_else(|_| repo_root.to_path_buf());
+            precreate_capability_write_targets(&canon_repo, session_hint);
+        }
+        let _ = ephemeral_tmp;
         let mode = if Path::new("/usr/bin/sandbox-exec").is_file() {
             KernelSandboxMode::MacosSeatbeltEnforced
         } else {
@@ -1369,7 +1384,7 @@ fn apply_current_process_sandbox(
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn precreate_capability_write_targets(canon_repo: &Path, session_hint: &str) {
     use crate::swarm_contracts::SwarmRole;
 
@@ -1892,12 +1907,13 @@ fn render_macos_seatbelt_profile(
     repo_root: &Path,
     ephemeral_tmp: Option<&Path>,
     opts: SandboxPolicyOpts,
+    session_hint: &str,
 ) -> String {
     let canon_repo = fs::canonicalize(repo_root).unwrap_or_else(|_| repo_root.to_path_buf());
     let repo_s = escape_sbpl_literal(&canon_repo.to_string_lossy());
     let home_s = escape_sbpl_literal(&env::var("HOME").unwrap_or_default());
-    let has_swarm_session =
-        env::var("AGENT_GUARD_SESSION_ID").is_ok_and(|s| s.trim().starts_with("swm_"));
+    let has_swarm_session = session_hint.trim().starts_with("swm_")
+        || env::var("AGENT_GUARD_SESSION_ID").is_ok_and(|s| s.trim().starts_with("swm_"));
     let mut p = String::from("(version 1)\n(allow default)\n");
 
     if opts.deny_net {
