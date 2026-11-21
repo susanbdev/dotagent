@@ -9,10 +9,10 @@ use regorus::{Engine, Value as RegoValue};
 use crate::Decision;
 pub use crate::breadcrumbs::{count_verified_quorum_approvals, record_quorum_approval_breadcrumb};
 pub use crate::budget_guard::MAX_PLUGIN_FILE_BYTES;
-use crate::budget_guard::{RuntimeProfile, load_verified_profile_plugins};
+use crate::budget_guard::{RuntimeProfile, load_verified_profile_plugins, parse_plugin_str_list};
 use crate::json::JsonValue;
+use crate::operator::verify_plugin_human_touch;
 pub use crate::path_policy::glob_match_path;
-use crate::sshsig_touch::verify_env_plugin_touch;
 
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -111,34 +111,12 @@ impl HookSnapshot {
 
 type Outcome = (VerdictLevel, usize, Vec<String>, &'static str, String);
 
-fn parse_list(raw: &str) -> Result<Vec<String>, String> {
-    let t = raw.trim();
-    let inner = t.strip_prefix('[').and_then(|x| x.strip_suffix(']'));
-    let inner = inner.ok_or_else(|| "bad array".to_string())?.trim();
-    if inner.is_empty() {
-        return Ok(Vec::new());
-    }
-    let mut out = Vec::new();
-    for item in inner.split(',') {
-        let s = item
-            .trim()
-            .strip_prefix('"')
-            .and_then(|x| x.strip_suffix('"'));
-        out.push(s.ok_or_else(|| "bad str".to_string())?.to_string());
-    }
-    Ok(out)
-}
-
-fn try_eval_toml(name: &str, src: &str, snap: &HookSnapshot) -> Result<Outcome, String> {
+fn eval_toml_block(name: &str, lines: &[&str], snap: &HookSnapshot) -> Result<Outcome, String> {
     let (mut tools, mut globs, mut cmds, mut roles) = (vec![], vec![], vec![], vec![]);
     let (mut write_only, mut when_tainted) = (false, false);
     let (mut min_denials, mut min_anomalies, mut min_steps) = (0u32, 0u32, 0u32);
     let (mut verdict, mut min_app, mut reason) = (VerdictLevel::Allow, 2usize, name.to_string());
-    for raw in src.lines() {
-        let line = raw.split('#').next().unwrap_or("").trim();
-        if line.is_empty() || matches!(line, "[rule]" | "[[rule]]") {
-            continue;
-        }
+    for line in lines {
         let (k, v) = line
             .split_once('=')
             .ok_or_else(|| format!("Malformed line in '{name}'"))?;
@@ -152,10 +130,10 @@ fn try_eval_toml(name: &str, src: &str, snap: &HookSnapshot) -> Result<Outcome, 
             "min_ballot_anomalies" => min_anomalies = val.parse().unwrap_or(u32::MAX),
             "min_steps" => min_steps = val.parse().unwrap_or(u32::MAX),
             "min_approvals" => min_app = val.parse::<usize>().unwrap_or(2).clamp(1, 16),
-            "tools" => tools = parse_list(val)?,
-            "path_globs" => globs = parse_list(val)?,
-            "cmd_programs" => cmds = parse_list(val)?,
-            "roles" => roles = parse_list(val)?,
+            "tools" => tools = parse_plugin_str_list(val)?,
+            "path_globs" => globs = parse_plugin_str_list(val)?,
+            "cmd_programs" => cmds = parse_plugin_str_list(val)?,
+            "roles" => roles = parse_plugin_str_list(val)?,
             "verdict" => {
                 let (lvl, opt_n) = VerdictLevel::parse_tag(val.trim_matches('"'))
                     .ok_or_else(|| format!("Unknown verdict in '{name}'"))?;
@@ -168,6 +146,9 @@ fn try_eval_toml(name: &str, src: &str, snap: &HookSnapshot) -> Result<Outcome, 
         || tools
             .iter()
             .any(|t| t == "*" || t.eq_ignore_ascii_case(&snap.tool_name));
+    let cmd_ok = cmds.is_empty()
+        || cmds.contains(&snap.cmd_program)
+        || snap.cmd_args_sanitized.iter().any(|a| cmds.contains(a));
     let glob_ok = globs.is_empty()
         || snap
             .target_rel_paths
@@ -179,7 +160,7 @@ fn try_eval_toml(name: &str, src: &str, snap: &HookSnapshot) -> Result<Outcome, 
         && snap.ballot_anomaly_count >= min_anomalies
         && snap.step_count >= min_steps
         && tool_ok
-        && (cmds.is_empty() || cmds.contains(&snap.cmd_program))
+        && cmd_ok
         && glob_ok;
     let lvl = if matched {
         verdict
@@ -189,9 +170,38 @@ fn try_eval_toml(name: &str, src: &str, snap: &HookSnapshot) -> Result<Outcome, 
     Ok((lvl, min_app, roles, "PLUGIN_POLICY_DENIED", reason))
 }
 
+fn try_eval_toml(name: &str, src: &str, snap: &HookSnapshot) -> Result<Vec<Outcome>, String> {
+    let (mut blocks, mut cur) = (Vec::new(), Vec::new());
+    for line in src
+        .lines()
+        .map(|r| r.split('#').next().unwrap_or("").trim())
+    {
+        if line.is_empty() {
+            continue;
+        } else if matches!(line, "[rule]" | "[[rule]]") && !cur.is_empty() {
+            blocks.push(std::mem::take(&mut cur));
+        } else if !matches!(line, "[rule]" | "[[rule]]") {
+            cur.push(line);
+        }
+    }
+    if !cur.is_empty() {
+        blocks.push(cur);
+    }
+    blocks
+        .into_iter()
+        .map(|b| eval_toml_block(name, &b, snap))
+        .collect()
+}
+
 fn try_eval_rego(name: &str, src: &str, snap_json: &str) -> Result<Outcome, String> {
+    let compact: String = src
+        .lines()
+        .map(|l| l.split('#').next().unwrap_or(""))
+        .flat_map(str::chars)
+        .filter(|c| !c.is_ascii_whitespace())
+        .collect();
     for banned in ["http.send", "opa.runtime", "net.lookup_ip_addr"] {
-        if src.contains(banned) {
+        if compact.contains(banned) {
             return Err(format!("Forbidden builtin '{banned}' in '{name}'."));
         }
     }
@@ -238,10 +248,8 @@ fn try_eval_rego(name: &str, src: &str, snap_json: &str) -> Result<Outcome, Stri
         && let Some(q) = n.as_u64()
         && q > 0
     {
-        (level, min_app) = (
-            level.max(VerdictLevel::RequireVoteQuorum),
-            (q as usize).clamp(1, 16),
-        );
+        level = level.max(VerdictLevel::RequireVoteQuorum);
+        min_app = (q as usize).clamp(1, 16);
     }
     Ok((level, min_app, Vec::new(), "PLUGIN_POLICY_DENIED", reason))
 }
@@ -268,28 +276,26 @@ pub fn apply_pre_tool_plugin_lattice(
     snap.active_quorum_approvals =
         count_verified_quorum_approvals(repo_root, session_id, paths, &[]);
     let snap_json = snap.to_json_value().to_json_string();
-    let (mut levels, mut max_q, mut q_roles) = (Vec::new(), 1usize, Vec::new());
+    let (mut levels, mut quorums) = (Vec::new(), Vec::new());
     let (mut top_code, mut top_reason) = ("PLUGIN_POLICY_DENIED", String::new());
     for (fname, src) in &plugins {
-        let res = if fname.ends_with(".rego") {
-            try_eval_rego(fname, src, &snap_json)
+        let outs = if fname.ends_with(".rego") {
+            try_eval_rego(fname, src, &snap_json).map(|o| vec![o])
         } else {
             try_eval_toml(fname, src, &snap)
         };
-        let (lvl, min_app, roles, code, reason) =
-            res.unwrap_or_else(|e| (VerdictLevel::Deny, 0, vec![], "PLUGIN_EVALUATION_ERROR", e));
-        if lvl == VerdictLevel::RequireVoteQuorum && min_app >= max_q {
-            max_q = min_app;
-            if !roles.is_empty() {
-                q_roles = roles;
+        let fallback = |e| vec![(VerdictLevel::Deny, 0, vec![], "PLUGIN_EVALUATION_ERROR", e)];
+        for (lvl, min_app, roles, code, reason) in outs.unwrap_or_else(fallback) {
+            if lvl == VerdictLevel::RequireVoteQuorum {
+                quorums.push((min_app, roles, reason.clone()));
             }
+            if (lvl >= VerdictLevel::RequireVoteQuorum && top_reason.is_empty())
+                || code != "PLUGIN_POLICY_DENIED"
+            {
+                (top_code, top_reason) = (code, reason);
+            }
+            levels.push(lvl);
         }
-        if (lvl >= VerdictLevel::RequireVoteQuorum && top_reason.is_empty())
-            || code != "PLUGIN_POLICY_DENIED"
-        {
-            (top_code, top_reason) = (code, reason);
-        }
-        levels.push(lvl);
     }
     let final_level = combine_verdicts(ring0_core, &levels);
     if ring0_core >= VerdictLevel::Deny {
@@ -303,42 +309,28 @@ pub fn apply_pre_tool_plugin_lattice(
     match final_level {
         VerdictLevel::Allow => ring0_decision,
         VerdictLevel::EmitSignal => {
+            let esc_tool = JsonValue::Str(snap.tool_name.clone()).to_json_string();
             eprintln!(
-                "[AGENTPI_EVENT] {{\"schema\":\"dotagent.agentpi.event.v1\",\"event_type\":\"PLUGIN_LATTICE_SIGNAL\",\"risk_level\":\"low\",\"tool_name\":\"{}\"}}",
-                snap.tool_name
+                "[AGENTPI_EVENT] {{\"schema\":\"dotagent.agentpi.event.v1\",\"event_type\":\"PLUGIN_LATTICE_SIGNAL\",\"risk_level\":\"low\",\"tool_name\":{esc_tool}}}"
             );
             ring0_decision
         }
         VerdictLevel::RequireVoteQuorum => {
-            let paths = &snap.target_rel_paths;
-            let v = if q_roles.is_empty() {
-                snap.active_quorum_approvals
-            } else {
-                count_verified_quorum_approvals(repo_root, session_id, paths, &q_roles)
-            };
-            if v >= max_q {
-                ring0_decision
-            } else {
-                let msg = format!("{top_reason} (verified_approvals={v}/{max_q})");
-                Decision::deny("PLUGIN_QUORUM_REQUIRED", msg, false)
+            for (q, r, msg) in &quorums {
+                let v = count_verified_quorum_approvals(repo_root, session_id, paths, r);
+                if v < *q {
+                    let detail = format!("{msg} (verified_approvals={v}/{q})");
+                    return Decision::deny("PLUGIN_QUORUM_REQUIRED", detail, false);
+                }
             }
-        }
-        VerdictLevel::RequireHumanTouch
-            if verify_env_plugin_touch(
-                repo_root,
-                format!(
-                    "dotagent:plugin-touch:v1:{}:{session_id}:{}:{}",
-                    snap.repo_id,
-                    snap.tool_name,
-                    snap.target_rel_paths.join(","),
-                )
-                .as_bytes(),
-            ) =>
-        {
             ring0_decision
         }
         VerdictLevel::RequireHumanTouch => {
-            Decision::deny("PLUGIN_HUMAN_TOUCH_REQUIRED", top_reason, false)
+            if verify_plugin_human_touch(repo_root, session_id, &snap.tool_name, paths) {
+                ring0_decision
+            } else {
+                Decision::deny("PLUGIN_HUMAN_TOUCH_REQUIRED", top_reason, false)
+            }
         }
         VerdictLevel::Deny => Decision::deny(top_code, top_reason, false),
         VerdictLevel::HaltSession => Decision::deny("PLUGIN_POLICY_HALT", top_reason, true),

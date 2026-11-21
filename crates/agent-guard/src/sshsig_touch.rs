@@ -122,11 +122,8 @@ pub fn verify_fido2_sshsig_ed25519(
         .try_into()
         .map_err(|_| gerr("SSHSIG_MALFORMED", "pubkey must be 32 bytes"))?;
     let application = pk_cur.read_bytes()?;
-    if application != b"ssh:dotagent" {
-        return Err(gerr(
-            "SSHSIG_APP_MISMATCH",
-            "sk application must be ssh:dotagent",
-        ));
+    if !matches!(application, b"ssh:" | b"ssh:dotagent") {
+        return Err(gerr("SSHSIG_WRONG_APPLICATION", "untrusted sk application"));
     }
     pk_cur.ensure_empty()?;
 
@@ -186,20 +183,31 @@ pub fn verify_fido2_sshsig_ed25519(
     Ok(counter)
 }
 
-pub fn format_operator_challenge(repo_id: &str, epoch_id: u64, floor_ts_60s: u64) -> String {
-    format!("dotagent:operator:v1:{repo_id}:{epoch_id}:{floor_ts_60s}")
+pub fn format_operator_challenge(
+    action: &str,
+    repo_id: &str,
+    epoch_id: u64,
+    floor_ts_60s: u64,
+) -> String {
+    format!("dotagent:operator:v1:{action}:{repo_id}:{epoch_id}:{floor_ts_60s}")
 }
 
 pub fn load_operator_sk_keys_from_home(home: &Path) -> Result<Option<Vec<[u8; 32]>>, GuardError> {
-    let cfg_dir = home.join(".config/dotagent");
+    if home.as_os_str().is_empty() || !home.is_absolute() {
+        return Err(gerr("SSHSIG_CONFIG_INVALID", "HOME must be absolute"));
+    }
+    let dot_cfg = home.join(".config");
+    let cfg_dir = dot_cfg.join("dotagent");
     let key_file = cfg_dir.join("operator_sk_keys");
-    if fs::symlink_metadata(&cfg_dir).is_ok_and(|m| m.file_type().is_symlink()) {
-        return Err(gerr("SSHSIG_SYMLINK_TAMPER", ".config/dotagent is symlink"));
+    if fs::symlink_metadata(&dot_cfg).is_ok_and(|m| m.file_type().is_symlink())
+        || fs::symlink_metadata(&cfg_dir).is_ok_and(|m| m.file_type().is_symlink())
+    {
+        return Err(gerr("SSHSIG_SYMLINK_TAMPER", ".config path is symlink"));
     }
     let Ok(meta) = fs::symlink_metadata(&key_file) else {
         return Ok(None);
     };
-    if meta.file_type().is_symlink() || !meta.file_type().is_file() {
+    if meta.file_type().is_symlink() || !meta.file_type().is_file() || meta.len() > 65_536 {
         return Err(gerr("SSHSIG_SYMLINK_TAMPER", "invalid operator_sk_keys"));
     }
     let raw = fs::read_to_string(&key_file)
@@ -225,6 +233,8 @@ pub fn load_operator_sk_keys_from_home(home: &Path) -> Result<Option<Vec<[u8; 32
             let mut cur = SshCursor(&blob, 0);
             if cur.read_str()? == SK_ED25519_ALG
                 && let Ok(k) = <[u8; 32]>::try_from(cur.read_bytes()?)
+                && matches!(cur.read_bytes()?, b"ssh:" | b"ssh:dotagent")
+                && cur.ensure_empty().is_ok()
             {
                 keys.push(k);
                 continue;
@@ -236,36 +246,4 @@ pub fn load_operator_sk_keys_from_home(home: &Path) -> Result<Option<Vec<[u8; 32
         return Err(gerr("SSHSIG_KEYRING_EMPTY", "empty operator_sk_keys"));
     }
     Ok(Some(keys))
-}
-
-pub fn verify_env_plugin_touch(repo_root: &Path, challenge: &[u8]) -> bool {
-    let Ok(sig_path) = std::env::var("AGENT_GUARD_PLUGIN_SSHSIG") else {
-        return false;
-    };
-    let Ok(pem) = fs::read_to_string(&sig_path) else {
-        return false;
-    };
-    let Ok(home) = std::env::var("HOME") else {
-        return false;
-    };
-    let Ok(Some(keys)) = load_operator_sk_keys_from_home(Path::new(&home)) else {
-        return false;
-    };
-    if verify_fido2_sshsig_ed25519("dotagent-plugin-touch-v1", challenge, &pem, &keys).is_err() {
-        return false;
-    }
-    let Ok(sdir) = crate::breadcrumbs::swarm_state_dir(repo_root) else {
-        return false;
-    };
-    let touch_dir = sdir.join("plugin_touches");
-    if fs::create_dir_all(&touch_dir).is_err() {
-        return false;
-    }
-    let digest = crate::crypto::sha256_hex(pem.as_bytes());
-    let marker = touch_dir.join(format!("{digest}.used"));
-    fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(marker)
-        .is_ok()
 }

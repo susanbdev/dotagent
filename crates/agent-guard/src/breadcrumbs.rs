@@ -857,7 +857,21 @@ pub fn record_quorum_approval_breadcrumb(
 ) -> Result<SignedBreadcrumbRecord, String> {
     let local_root = fs::canonicalize(repo_root).unwrap_or_else(|_| repo_root.to_path_buf());
     let common_repo = crate::resolve_common_repo_root(&local_root);
+    let cap = crate::role_sandbox::load_session_capability(&common_repo, reviewer_session_id)?;
+    if cap.malicious_flags != 0
+        || !matches!(
+            cap.role,
+            crate::swarm_contracts::SwarmRole::AdversarialReviewer
+                | crate::swarm_contracts::SwarmRole::QaEngineer
+                | crate::swarm_contracts::SwarmRole::Master
+        )
+    {
+        return Err(format!(
+            "session '{reviewer_session_id}' is not an untainted reviewer capability"
+        ));
+    }
     let repo_sha256 = sha256_digest(common_repo.to_string_lossy().as_bytes());
+    let plan_sha256 = hex_decode_32(&cap.plan_sha256).unwrap_or([0u8; 32]);
     let spool_path = spool_file_path(&common_repo, reviewer_session_id)?;
     let _spool_lock = ExclusiveFileLockGuard::acquire(&spool_path)?;
     let recovery = recover_spool_frames(&spool_path)?;
@@ -866,10 +880,17 @@ pub fn record_quorum_approval_breadcrumb(
         None => (1, [0u8; 32]),
     };
     let clean_rel = target_rel_path.trim().trim_start_matches("./");
+    let doc_sha256 = if clean_rel != "*"
+        && let Ok(bytes) = fs::read(local_root.join(clean_rel))
+    {
+        sha256_digest(&bytes)
+    } else {
+        [0u8; 32]
+    };
     let event = AuthenticatedEvent {
         schema_version: AUTH_EVENT_SCHEMA_V1,
         repo_sha256,
-        plan_sha256: [0u8; 32],
+        plan_sha256,
         session_id: reviewer_session_id.to_string(),
         task_id: task_id.to_string(),
         seq_no,
@@ -877,7 +898,7 @@ pub fn record_quorum_approval_breadcrumb(
         op: EventOp::ReviewApprove,
         canonical_rel_path: clean_rel.to_string(),
         line_range: None,
-        doc_sha256: [0u8; 32],
+        doc_sha256,
     };
     let record_mac = compute_event_mac_for_repo(&common_repo, &event)?;
     let signed = SignedBreadcrumbRecord { event, record_mac };
@@ -912,9 +933,15 @@ pub fn count_verified_quorum_approvals(
     } else {
         target_rel_paths.iter().map(String::as_str).collect()
     };
+    let actor_cap = load_session_capability(&common_repo, actor_session_id).ok();
     let mut min_verified: Option<usize> = None;
     for target in targets {
         let clean_t = target.trim().trim_start_matches("./");
+        let expected_doc = (clean_t != "*").then(|| {
+            fs::read(canon_repo.join(clean_t))
+                .map(|b| sha256_digest(&b))
+                .unwrap_or([0u8; 32])
+        });
         let mut trails = vec![canon_repo.join(".breadcrumbs.jsonl")];
         if clean_t != "*"
             && let Ok(tp) = trail_path_for_rel_path(&canon_repo, clean_t)
@@ -940,8 +967,13 @@ pub fn count_verified_quorum_approvals(
                 if rec.event.op != EventOp::ReviewApprove
                     || rec.event.repo_sha256 != expected_repo_sha
                     || rec.event.session_id == actor_session_id
-                    || (rec.event.canonical_rel_path != clean_t
-                        && rec.event.canonical_rel_path != "*")
+                    || rec.event.canonical_rel_path != clean_t
+                    || rec.event.task_id.trim().is_empty()
+                {
+                    continue;
+                }
+                if let Some(exp_doc) = expected_doc
+                    && rec.event.doc_sha256 != exp_doc
                 {
                     continue;
                 }
@@ -951,9 +983,19 @@ pub fn count_verified_quorum_approvals(
                 if SessionLedger::load_or_create(repo_root, &rec.event.session_id).tainted {
                     continue;
                 }
-                let Ok(cap) = load_session_capability(repo_root, &rec.event.session_id) else {
+                let Ok(cap) = load_session_capability(&common_repo, &rec.event.session_id) else {
                     continue;
                 };
+                let exp_plan = hex_decode_32(&cap.plan_sha256).unwrap_or([0u8; 32]);
+                if rec.event.task_id != cap.task_id || rec.event.plan_sha256 != exp_plan {
+                    continue;
+                }
+                if let Some(ac) = &actor_cap
+                    && !ac.task_id.trim().is_empty()
+                    && (rec.event.task_id != ac.task_id || cap.plan_sha256 != ac.plan_sha256)
+                {
+                    continue;
+                }
                 let role_ok = cap.malicious_flags == 0
                     && if allowed_roles.is_empty() {
                         matches!(

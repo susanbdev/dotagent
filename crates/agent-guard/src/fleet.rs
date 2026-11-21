@@ -1434,12 +1434,26 @@ pub fn build_github_fleet_governance_plan(owner: &str, repos: &[String]) -> Json
     ])
 }
 
+fn is_safe_gh_slug(s: &str) -> bool {
+    let t = s.trim();
+    !t.is_empty()
+        && t.len() <= 100
+        && t != "."
+        && t != ".."
+        && !t.starts_with('-')
+        && t.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+}
+
 pub fn verify_github_governance_state(
     actions_perms: &JsonValue,
     workflow_perms: &JsonValue,
     ruleset: &JsonValue,
 ) -> Result<(), Vec<String>> {
     let mut errs = Vec::new();
+    if actions_perms.get("enabled").and_then(JsonValue::as_bool) != Some(true) {
+        errs.push("actions enabled must be true".to_string());
+    }
     if actions_perms
         .get("sha_pinning_required")
         .and_then(JsonValue::as_bool)
@@ -1461,23 +1475,57 @@ pub fn verify_github_governance_state(
     {
         errs.push("can_approve_pull_request_reviews must be false".to_string());
     }
+    if ruleset.get("target").and_then(JsonValue::as_str) != Some("branch")
+        || ruleset.get("enforcement").and_then(JsonValue::as_str) != Some("active")
+    {
+        errs.push("ruleset must have target='branch' and enforcement='active'".to_string());
+    }
+    let cond_ok = ruleset
+        .get("conditions")
+        .and_then(|c| c.get("ref_name"))
+        .is_some_and(|rn| {
+            let inc_ok = rn
+                .get("include")
+                .and_then(JsonValue::as_array)
+                .is_some_and(|inc| inc.iter().any(|x| x.as_str() == Some("~DEFAULT_BRANCH")));
+            let exc_empty = rn
+                .get("exclude")
+                .and_then(JsonValue::as_array)
+                .is_none_or(<[JsonValue]>::is_empty);
+            inc_ok && exc_empty
+        });
+    if !cond_ok {
+        errs.push("ruleset must include ~DEFAULT_BRANCH with empty exclude".to_string());
+    }
     let bypass_ok = ruleset
         .get("bypass_actors")
         .and_then(JsonValue::as_array)
         .is_some_and(|arr| {
-            arr.iter()
-                .any(|a| a.get("bypass_mode").and_then(JsonValue::as_str) == Some("pull_request"))
+            !arr.is_empty()
+                && arr.iter().all(|a| {
+                    let mode_ok =
+                        a.get("bypass_mode").and_then(JsonValue::as_str) == Some("pull_request");
+                    let atype = a.get("actor_type").and_then(JsonValue::as_str);
+                    let aid = a.get("actor_id").and_then(JsonValue::as_u64);
+                    let admin_ok = matches!(
+                        (atype, aid),
+                        (Some("RepositoryRole"), Some(5)) | (Some("OrganizationAdmin"), Some(1))
+                    );
+                    mode_ok && admin_ok
+                })
         });
     if !bypass_ok {
-        errs.push("ruleset missing admin pull_request bypass_actor".to_string());
+        errs.push("ruleset bypass_actors must strictly be admin pull_request only".to_string());
     }
     let rules = ruleset.get("rules").and_then(JsonValue::as_array);
-    let has_linear = rules.is_some_and(|rs| {
-        rs.iter()
-            .any(|r| r.get("type").and_then(JsonValue::as_str) == Some("required_linear_history"))
-    });
-    if !has_linear {
-        errs.push("ruleset missing required_linear_history".to_string());
+    for req_rule in ["deletion", "non_fast_forward", "required_linear_history"] {
+        let present = rules.is_some_and(|rs| {
+            rs.iter()
+                .any(|r| r.get("type").and_then(JsonValue::as_str) == Some(req_rule))
+        });
+        if !present {
+            errs.push(format!("ruleset missing {req_rule}"));
+        }
     }
     let pr_ok = rules.is_some_and(|rs| {
         rs.iter().any(|r| {
@@ -1558,7 +1606,7 @@ fn run_fleet_configure_github_cli(args: &[String], cwd: &Path) -> ExitCode {
             }
         }
     }
-    let Some(owner_str) = owner.filter(|s| !s.trim().is_empty()) else {
+    let Some(owner_str) = owner.filter(|s| is_safe_gh_slug(s)) else {
         eprintln!(
             "[dotagent fleet] usage: dotagent fleet configure-github --owner <org_or_user> [--repo <name> | --all-fleet] [--sshsig <path>] [--dry-run] [--verify]"
         );
@@ -1582,6 +1630,10 @@ fn run_fleet_configure_github_cli(args: &[String], cwd: &Path) -> ExitCode {
         eprintln!("[dotagent fleet configure-github] pass --repo <name> or --all-fleet");
         return ExitCode::from(2);
     };
+    if repos.is_empty() || repos.iter().any(|r| !is_safe_gh_slug(r)) {
+        eprintln!("[dotagent fleet configure-github] invalid or empty repository slug list");
+        return ExitCode::from(2);
+    }
 
     let plan = build_github_fleet_governance_plan(&owner_str, &repos);
     if dry_run {
@@ -1593,43 +1645,33 @@ fn run_fleet_configure_github_cli(args: &[String], cwd: &Path) -> ExitCode {
             eprintln!("[AGENT-GUARD HARD DENY :: {code}] {detail}");
             return ExitCode::from(2);
         }
-        if let Ok(home) = std::env::var("HOME") {
-            match crate::sshsig_touch::load_operator_sk_keys_from_home(Path::new(&home)) {
-                Ok(Some(_)) => {
-                    let repo_root = crate::resolve_repo_root(cwd);
-                    if let Err(ge) = crate::operator::verify_operator_sshsig_gate(
-                        &repo_root,
-                        sshsig_file.as_deref(),
-                    ) {
-                        eprintln!("[AGENT-GUARD HARD DENY :: {}] {}", ge.code, ge.detail);
-                        return ExitCode::from(2);
-                    }
-                }
-                Ok(None) => {}
-                Err(ge) => {
-                    eprintln!("[AGENT-GUARD HARD DENY :: {}] {}", ge.code, ge.detail);
-                    return ExitCode::from(2);
-                }
-            }
+        let repo_root = crate::resolve_repo_root(cwd);
+        if let Err(ge) = crate::operator::verify_operator_sshsig_gate(
+            &repo_root,
+            "configure-github",
+            sshsig_file.as_deref(),
+        ) {
+            eprintln!("[AGENT-GUARD HARD DENY :: {}] {}", ge.code, ge.detail);
+            return ExitCode::from(2);
         }
     }
+    let gh_get = |ep: &str| -> Result<JsonValue, String> {
+        let out = std::process::Command::new("gh")
+            .args(["api", ep])
+            .output()
+            .map_err(|e| format!("gh api '{ep}' failed: {e}"))?;
+        if !out.status.success() {
+            return Err(format!(
+                "gh api '{ep}' exited {}: {}",
+                out.status,
+                String::from_utf8_lossy(&out.stderr).trim()
+            ));
+        }
+        JsonValue::parse(&String::from_utf8_lossy(&out.stdout))
+            .map_err(|e| format!("invalid JSON from '{ep}': {e}"))
+    };
     for repo in &repos {
         if verify_only {
-            let gh_get = |ep: &str| -> Result<JsonValue, String> {
-                let out = std::process::Command::new("gh")
-                    .args(["api", ep])
-                    .output()
-                    .map_err(|e| format!("gh api '{ep}' failed: {e}"))?;
-                if !out.status.success() {
-                    return Err(format!(
-                        "gh api '{ep}' exited {}: {}",
-                        out.status,
-                        String::from_utf8_lossy(&out.stderr).trim()
-                    ));
-                }
-                JsonValue::parse(&String::from_utf8_lossy(&out.stdout))
-                    .map_err(|e| format!("invalid JSON from '{ep}': {e}"))
-            };
             let act = match gh_get(&format!("/repos/{owner_str}/{repo}/actions/permissions")) {
                 Ok(v) => v,
                 Err(e) => {
@@ -1692,7 +1734,25 @@ fn run_fleet_configure_github_cli(args: &[String], cwd: &Path) -> ExitCode {
                     Err(String::from_utf8_lossy(&out.stderr).trim().to_string())
                 }
             };
-            let rs_json = build_github_repo_ruleset_payload().to_json_string();
+            let rs_payload = build_github_repo_ruleset_payload();
+            let rs_name = rs_payload
+                .get("name")
+                .and_then(JsonValue::as_str)
+                .unwrap_or("");
+            let existing_id = gh_get(&format!("/repos/{owner_str}/{repo}/rulesets"))
+                .ok()
+                .and_then(|v| {
+                    v.as_array()?.iter().find_map(|it| {
+                        (it.get("name").and_then(JsonValue::as_str) == Some(rs_name))
+                            .then(|| it.get("id").and_then(JsonValue::as_u64))
+                            .flatten()
+                    })
+                });
+            let (rs_method, rs_ep) = match existing_id {
+                Some(id) => ("PUT", format!("/repos/{owner_str}/{repo}/rulesets/{id}")),
+                None => ("POST", format!("/repos/{owner_str}/{repo}/rulesets")),
+            };
+            let rs_json = rs_payload.to_json_string();
             for (m, ep, b) in [
                 (
                     "PUT",
@@ -1704,7 +1764,7 @@ fn run_fleet_configure_github_cli(args: &[String], cwd: &Path) -> ExitCode {
                     format!("/repos/{owner_str}/{repo}/actions/permissions/workflow"),
                     "{\"default_workflow_permissions\":\"read\",\"can_approve_pull_request_reviews\":false}".to_string(),
                 ),
-                ("POST", format!("/repos/{owner_str}/{repo}/rulesets"), rs_json),
+                (rs_method, rs_ep, rs_json),
             ] {
                 if let Err(e) = gh_put(m, &ep, &b) {
                     eprintln!("[CONFIGURE FAIL] {ep}: {e}");

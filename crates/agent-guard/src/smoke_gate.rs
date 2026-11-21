@@ -4,19 +4,23 @@
 
 use std::collections::BTreeMap;
 use std::fs;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 
 use sha2::{Digest, Sha256};
 
 use crate::crypto::{hex_encode, sha256_hex};
+use crate::json::JsonValue;
 use crate::path_policy::glob_match_path;
-use crate::stop_receipt::dirty_porcelain_paths;
+use crate::stop_receipt::{
+    clean_smoke_rel_nonsymlink, recent_or_dirty_repo_paths, strip_code_comments_preserve_lines,
+    verify_smoke_artifact,
+};
 
-const WASM_V1_MAGIC: &[u8; 8] = b"\0asm\x01\0\0\0";
 const NEEDLE_TODO: &str = concat!("to", "do!(");
 const NEEDLE_UNIMPL: &str = concat!("unimple", "mented!(");
 const NEEDLE_FACADE: &str = concat!("FIXME", "_FACADE");
-const NEEDLE_STUB_JSON: &str = concat!("{\\\"st", "ub\\\"");
+const NEEDLE_STUB_ESC: &str = concat!("{\\\"st", "ub\\\"");
+const NEEDLE_STUB_RAW: &str = concat!("{\"st", "ub\"");
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SmokeGateReport {
@@ -41,137 +45,49 @@ fn parse_str_array(raw: &str) -> Result<Vec<String>, String> {
         .collect()
 }
 
-fn clean_rel_nonsymlink(canon_repo: &Path, rel: &str) -> Result<(PathBuf, String), String> {
-    let trimmed = rel.trim().trim_start_matches("./");
-    if trimmed.is_empty() || Path::new(trimmed).is_absolute() {
-        return Err(format!("SMOKE_ARTIFACT_MISSING: invalid path '{rel}'"));
-    }
-    let (mut cur, mut norm) = (canon_repo.to_path_buf(), Vec::new());
-    for comp in Path::new(trimmed).components() {
-        match comp {
-            Component::CurDir => {}
-            Component::Normal(seg) => {
-                let s = seg.to_string_lossy().into_owned();
-                cur.push(&s);
-                if fs::symlink_metadata(&cur).is_ok_and(|m| m.file_type().is_symlink()) {
-                    return Err(format!("SMOKE_ARTIFACT_MISSING: symlink '{rel}'"));
-                }
-                norm.push(s);
-            }
-            _ => return Err(format!("SMOKE_ARTIFACT_MISSING: traversal '{rel}'")),
-        }
-    }
-    Ok((cur, norm.join("/")))
-}
-
-fn verify_artifact(
-    canon: &Path,
-    rel: &str,
-    hint: &str,
-    out: &mut BTreeMap<String, String>,
-) -> Result<PathBuf, String> {
-    let (full, norm) = clean_rel_nonsymlink(canon, rel)?;
-    let meta = fs::symlink_metadata(&full)
-        .map_err(|_| format!("SMOKE_ARTIFACT_MISSING: '{norm}' ({hint}) missing"))?;
-    if meta.file_type().is_symlink() || !meta.file_type().is_file() || meta.len() == 0 {
-        return Err(format!(
-            "SMOKE_ARTIFACT_MISSING: '{norm}' ({hint}) empty or non-regular"
-        ));
-    }
-    let bytes = fs::read(&full).map_err(|e| format!("SMOKE_ARTIFACT_MISSING: '{norm}': {e}"))?;
-    if norm.ends_with(".wasm") && !bytes.starts_with(WASM_V1_MAGIC) {
-        return Err(format!(
-            "SMOKE_WASM_MAGIC_INVALID: '{norm}' lacks valid Wasm v1 magic"
-        ));
-    }
-    out.insert(norm, sha256_hex(&bytes));
-    Ok(full)
-}
-
-fn strip_jsonc_comments(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    let mut chars = text.chars().peekable();
-    let mut in_str = false;
-    let mut esc = false;
-    while let Some(c) = chars.next() {
-        if in_str {
-            out.push(c);
-            if esc {
-                esc = false;
-            } else if c == '\\' {
-                esc = true;
-            } else if c == '"' {
-                in_str = false;
-            }
-            continue;
-        }
-        if c == '"' {
-            in_str = true;
-            out.push(c);
-        } else if c == '/' && chars.peek() == Some(&'/') {
-            chars.next();
-            for n in chars.by_ref() {
-                if n == '\n' {
-                    out.push('\n');
-                    break;
-                }
-            }
-        } else if c == '/' && chars.peek() == Some(&'*') {
-            chars.next();
-            while let Some(n) = chars.next() {
-                if n == '*' && chars.peek() == Some(&'/') {
-                    chars.next();
-                    break;
-                }
-            }
-        } else {
-            out.push(c);
-        }
-    }
-    out
-}
-
-fn extract_wrangler_main(cfg_name: &str, text: &str) -> Option<String> {
+fn extract_wrangler_main(cfg_name: &str, text: &str) -> Result<String, String> {
     if cfg_name.ends_with(".toml") {
-        for raw in text.lines() {
-            let line = raw.split('#').next().unwrap_or("").trim();
-            if let Some((k, v)) = line.split_once('=')
+        let stripped = strip_code_comments_preserve_lines(text, true);
+        for raw in stripped.lines() {
+            if let Some((k, v)) = raw.trim().split_once('=')
                 && k.trim() == "main"
             {
-                let u = v.trim().trim_matches('"').trim_matches('\'');
+                let u = v.trim().trim_matches('"').trim_matches('\'').trim();
                 if !u.is_empty() {
-                    return Some(u.to_string());
+                    return Ok(u.to_string());
                 }
             }
         }
-        return None;
+        return Err(format!(
+            "SMOKE_CONFIG_INVALID: '{cfg_name}' missing valid main"
+        ));
     }
-    let cleaned = if cfg_name.ends_with(".jsonc") {
-        strip_jsonc_comments(text)
-    } else {
-        text.to_string()
-    };
-    let val = crate::JsonValue::parse(&cleaned).ok()?;
-    let main_s = val.get("main").and_then(crate::JsonValue::as_str)?.trim();
-    if main_s.is_empty() {
-        None
-    } else {
-        Some(main_s.to_string())
-    }
+    let stripped = strip_code_comments_preserve_lines(text, false);
+    let parsed = JsonValue::parse(&stripped)
+        .map_err(|e| format!("SMOKE_CONFIG_INVALID: malformed '{cfg_name}': {e}"))?;
+    let main = parsed
+        .get("main")
+        .and_then(JsonValue::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| format!("SMOKE_CONFIG_INVALID: '{cfg_name}' missing valid main"))?;
+    Ok(main.to_string())
 }
 
 fn collect_wasm_refs(text: &str, base_dir: &str) -> Vec<String> {
     let mut refs = Vec::new();
-    for t in text.split('"').skip(1).step_by(2).map(str::trim) {
-        if t.ends_with(".wasm") && !t.contains("://") && !t.starts_with('/') {
-            let c = t.trim_start_matches("./");
-            let j = if base_dir.is_empty() || !t.starts_with("./") {
-                c.to_string()
-            } else {
-                format!("{base_dir}/{c}")
-            };
-            if !refs.contains(&j) {
-                refs.push(j);
+    for delim in ['"', '\''] {
+        for t in text.split(delim).skip(1).step_by(2).map(str::trim) {
+            if t.ends_with(".wasm") && !t.contains("://") && !t.starts_with('/') {
+                let c = t.trim_start_matches("./");
+                let j = if base_dir.is_empty() {
+                    c.to_string()
+                } else {
+                    format!("{base_dir}/{c}")
+                };
+                if !refs.contains(&j) {
+                    refs.push(j);
+                }
             }
         }
     }
@@ -179,7 +95,7 @@ fn collect_wasm_refs(text: &str, base_dir: &str) -> Vec<String> {
 }
 
 fn is_non_test_source(rel: &str, exempt: &[String]) -> bool {
-    if ![".rs", ".swift", ".ts", ".tsx", ".kt"]
+    if ![".rs", ".swift", ".ts", ".tsx", ".js", ".mjs", ".jsx", ".kt"]
         .iter()
         .any(|e| rel.ends_with(e))
     {
@@ -231,7 +147,7 @@ pub fn verify_repo_smoke_gate(repo_root: &Path) -> Result<SmokeGateReport, Strin
 
     let mut verified = BTreeMap::new();
     for rel in &req_artifacts {
-        verify_artifact(&canon, rel, ".dotagent-smoke.toml", &mut verified)?;
+        verify_smoke_artifact(&canon, rel, ".dotagent-smoke.toml", &mut verified)?;
     }
 
     if detect_wrangler && let Ok(rd) = fs::read_dir(&canon) {
@@ -250,47 +166,50 @@ pub fn verify_repo_smoke_gate(repo_root: &Path) -> Result<SmokeGateReport, Strin
                 .map_err(|e| format!("SMOKE_CONFIG_INVALID: cannot stat '{cfg_name}': {e}"))?;
             if m.file_type().is_symlink() || !m.file_type().is_file() || m.len() > 131_072 {
                 return Err(format!(
-                    "SMOKE_CONFIG_INVALID: '{cfg_name}' is symlink, non-regular file, or exceeds 128 KiB"
+                    "SMOKE_CONFIG_INVALID: '{cfg_name}' symlink or oversized"
                 ));
             }
             let text = fs::read_to_string(&p)
                 .map_err(|e| format!("SMOKE_CONFIG_INVALID: cannot read '{cfg_name}': {e}"))?;
-            let main_rel = extract_wrangler_main(&cfg_name, &text).ok_or_else(|| {
-                format!("SMOKE_CONFIG_INVALID: '{cfg_name}' is missing a valid 'main' entrypoint")
-            })?;
-            let main_full = verify_artifact(&canon, &main_rel, &cfg_name, &mut verified)?;
+            let main_rel = extract_wrangler_main(&cfg_name, &text)?;
+            let main_full = verify_smoke_artifact(&canon, &main_rel, &cfg_name, &mut verified)?;
             let pdir = Path::new(main_rel.trim_start_matches("./"))
                 .parent()
                 .map(|d| d.to_string_lossy().into_owned())
                 .unwrap_or_default();
             for w in collect_wasm_refs(&text, "") {
-                verify_artifact(&canon, &w, &cfg_name, &mut verified)?;
+                verify_smoke_artifact(&canon, &w, &cfg_name, &mut verified)?;
             }
             if let Ok(shim) = fs::read_to_string(&main_full) {
                 for w in collect_wasm_refs(&shim, &pdir) {
-                    verify_artifact(&canon, &w, &main_rel, &mut verified)?;
+                    verify_smoke_artifact(&canon, &w, &main_rel, &mut verified)?;
                 }
             }
         }
     }
 
     if scan_facade {
-        for rel in dirty_porcelain_paths(&canon) {
+        for rel in recent_or_dirty_repo_paths(&canon)? {
             if !is_non_test_source(&rel, &exempt) {
                 continue;
             }
-            let Ok((full, norm)) = clean_rel_nonsymlink(&canon, &rel) else {
+            let Ok((full, norm)) = clean_smoke_rel_nonsymlink(&canon, &rel) else {
                 continue;
             };
             let Ok(text) = fs::read_to_string(&full) else {
                 continue;
             };
-            for (idx, line) in text.lines().enumerate() {
-                let code_part = line.split("//").next().unwrap_or("");
-                if line.contains(NEEDLE_FACADE)
-                    || code_part.contains(NEEDLE_TODO)
-                    || code_part.contains(NEEDLE_UNIMPL)
-                    || code_part.contains(NEEDLE_STUB_JSON)
+            let stripped = strip_code_comments_preserve_lines(&text, false);
+            for (idx, (raw_l, code_l)) in text.lines().zip(stripped.lines()).enumerate() {
+                let nw: String = code_l
+                    .chars()
+                    .filter(|c| !c.is_ascii_whitespace())
+                    .collect();
+                if raw_l.contains(NEEDLE_FACADE)
+                    || nw.contains(NEEDLE_TODO)
+                    || nw.contains(NEEDLE_UNIMPL)
+                    || nw.contains(NEEDLE_STUB_ESC)
+                    || nw.contains(NEEDLE_STUB_RAW)
                 {
                     return Err(format!(
                         "SMOKE_FACADE_TOKEN_DETECTED: stub marker in '{norm}:{}'",

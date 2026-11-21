@@ -108,10 +108,9 @@ fn extract_toml_string_field(line: &str, key: &str) -> Option<String> {
 fn blocks_entire_250_plus_bypass_corpus_at_100_percent() {
     let repo = test_sandbox_root("corpus_sandbox");
     let vectors = load_bypass_corpus();
-    assert_eq!(
-        vectors.len(),
-        333,
-        "Expected exact 333 adversarial bypass vectors, got {}",
+    assert!(
+        vectors.len() >= 335,
+        "Expected >= 335 adversarial bypass vectors, got {}",
         vectors.len()
     );
 

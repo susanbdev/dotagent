@@ -536,9 +536,11 @@ pub fn run_telemetry_cli(args: &[String]) -> ExitCode {
     }
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let repo_root = crate::resolve_repo_root(&cwd);
-    if let Err(ge) =
-        crate::operator::verify_operator_sshsig_gate(&repo_root, sshsig_file.as_deref())
-    {
+    if let Err(ge) = crate::operator::verify_operator_sshsig_gate(
+        &repo_root,
+        "telemetry",
+        sshsig_file.as_deref(),
+    ) {
         eprintln!("[AGENT-GUARD HARD DENY :: {}] {}", ge.code, ge.detail);
         return ExitCode::from(2);
     }
@@ -870,50 +872,79 @@ pub fn run_operator_feedback_triage_cli(args: &[String], cwd: &Path) -> ExitCode
         }
     }
     let repo_root = crate::resolve_repo_root(cwd);
-    if let Ok(home) = std::env::var("HOME") {
-        match crate::sshsig_touch::load_operator_sk_keys_from_home(Path::new(&home)) {
-            Ok(Some(_)) => {
-                if let Err(ge) =
-                    crate::operator::verify_operator_sshsig_gate(&repo_root, sshsig_file.as_deref())
-                {
-                    eprintln!("[AGENT-GUARD HARD DENY :: {}] {}", ge.code, ge.detail);
-                    return ExitCode::from(2);
-                }
-            }
-            Ok(None) => {}
-            Err(ge) => {
-                eprintln!("[AGENT-GUARD HARD DENY :: {}] {}", ge.code, ge.detail);
-                return ExitCode::from(2);
-            }
-        }
+    if let Err(ge) = crate::operator::verify_operator_sshsig_gate(
+        &repo_root,
+        "feedback-triage",
+        sshsig_file.as_deref(),
+    ) {
+        eprintln!("[AGENT-GUARD HARD DENY :: {}] {}", ge.code, ge.detail);
+        return ExitCode::from(2);
     }
-    let key = match crate::breadcrumbs::load_or_init_hmac_key(&repo_root) {
-        Ok(k) => crate::crypto::ZeroizingKey::new(k),
+    let key = match crate::feedback::load_or_init_global_feedback_key() {
+        Ok(zk) => zk,
         Err(e) => {
-            eprintln!("[dotagent feedback triage] failed loading vault key: {e}");
+            eprintln!("[dotagent feedback triage] failed loading feedback vault key: {e}");
             return ExitCode::from(2);
         }
     };
-    let fdir = crate::feedback::feedback_state_dir().unwrap_or_default();
-    let ballots_raw = fs::read_to_string(fdir.join("ballots.jsonl")).unwrap_or_default();
-    let quar_raw = fs::read_to_string(fdir.join("quarantine.jsonl")).unwrap_or_default();
+    let fdir = match crate::feedback::feedback_state_dir() {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("[dotagent feedback triage] FEEDBACK_STATE_TAMPERED: {e}");
+            return ExitCode::from(2);
+        }
+    };
+    let read_state_file = |name: &str| -> Result<String, String> {
+        let p = fdir.join(name);
+        let meta = match fs::symlink_metadata(&p) {
+            Ok(m) => m,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(String::new()),
+            Err(e) => return Err(format!("stat failed on '{name}': {e}")),
+        };
+        if meta.file_type().is_symlink() || !meta.file_type().is_file() || meta.len() > 16_777_216 {
+            return Err(format!("'{name}' is a symlink, non-regular, or >16 MiB"));
+        }
+        let f = File::open(&p).map_err(|e| format!("open failed on '{name}': {e}"))?;
+        let fm = f
+            .metadata()
+            .map_err(|e| format!("fstat failed on '{name}': {e}"))?;
+        if !fm.is_file() || fm.len() > 16_777_216 {
+            return Err(format!("'{name}' descriptor failed regular-file check"));
+        }
+        let mut s = String::new();
+        f.take(16_777_217)
+            .read_to_string(&mut s)
+            .map_err(|e| format!("read failed on '{name}': {e}"))?;
+        Ok(s)
+    };
+    let (ballots_raw, quar_raw) = match (
+        read_state_file("ballots.jsonl"),
+        read_state_file("quarantine.jsonl"),
+    ) {
+        (Ok(b), Ok(q)) => (b, q),
+        (Err(e), _) | (_, Err(e)) => {
+            eprintln!("[dotagent feedback triage] FEEDBACK_STATE_TAMPERED: {e}");
+            return ExitCode::from(2);
+        }
+    };
     let items = aggregate_ballot_worklist(&ballots_raw, &quar_raw, key.as_bytes(), min_votes);
     if json_mode {
         let arr: Vec<JsonValue> = items.iter().map(TriageClusterItem::to_json_value).collect();
         println!("{}", JsonValue::Array(arr).to_json_string());
     } else {
+        let esc = |s: &str| s.replace('|', "\\|").replace('`', "'");
         println!("| Cluster | Votes | Anomalies | Ring0 | Category | Code | Shape |");
         println!("| --- | --- | --- | --- | --- | --- | --- |");
         for it in &items {
             println!(
                 "| `{}` | {} | {} | {} | `{}` | `{}` | `{}` |",
-                it.cluster_key,
+                esc(&it.cluster_key),
                 it.unique_votes,
                 it.anomaly_count,
                 it.ring0_locked,
-                it.category,
-                it.deny_code,
-                it.normalized_shape
+                esc(&it.category),
+                esc(&it.deny_code),
+                esc(&it.normalized_shape)
             );
         }
     }

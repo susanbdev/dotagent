@@ -629,31 +629,85 @@ pub fn load_profile_by_id(
 
 pub const MAX_PLUGIN_FILE_BYTES: u64 = 32_768;
 
+pub(crate) fn parse_plugin_str_list(raw: &str) -> Result<Vec<String>, String> {
+    let t = raw.trim();
+    let inner = t.strip_prefix('[').and_then(|x| x.strip_suffix(']'));
+    let inner = inner.ok_or_else(|| "bad array".to_string())?.trim();
+    if inner.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut out = Vec::new();
+    for item in inner.split(',') {
+        let s = item
+            .trim()
+            .strip_prefix('"')
+            .and_then(|x| x.strip_suffix('"'));
+        out.push(s.ok_or_else(|| "bad str".to_string())?.to_string());
+    }
+    Ok(out)
+}
+
+fn read_policy_ir_plugin_pins(
+    repo_root: &Path,
+) -> Result<Vec<(String, String)>, (&'static str, String)> {
+    let ir_path = repo_root.join("dist/profiles/policy_ir.json");
+    let Ok(meta) = std::fs::symlink_metadata(&ir_path) else {
+        return Ok(Vec::new());
+    };
+    if meta.file_type().is_symlink() || !meta.file_type().is_file() || meta.len() > 262_144 {
+        return Err((
+            "PLUGIN_INTEGRITY_VIOLATION",
+            "Invalid or symlinked 'dist/profiles/policy_ir.json'.".to_string(),
+        ));
+    }
+    let Ok(raw) = std::fs::read_to_string(&ir_path) else {
+        return Err((
+            "PLUGIN_INTEGRITY_VIOLATION",
+            "Cannot read 'dist/profiles/policy_ir.json'.".to_string(),
+        ));
+    };
+    let Ok(v) = crate::json::JsonValue::parse(&raw) else {
+        return Err((
+            "PLUGIN_INTEGRITY_VIOLATION",
+            "Malformed 'dist/profiles/policy_ir.json'.".to_string(),
+        ));
+    };
+    let mut out = Vec::new();
+    if let Some(crate::json::JsonValue::Object(entries)) = v.get("plugins") {
+        for (k, val) in entries {
+            if let Some(h) = val.as_str() {
+                out.push((k.clone(), h.to_string()));
+            }
+        }
+    }
+    Ok(out)
+}
+
+pub fn repo_has_configured_plugins(repo_root: &Path, profile: &RuntimeProfile) -> bool {
+    !profile.pinned_plugins.is_empty()
+        || std::fs::symlink_metadata(repo_root.join("profiles/plugins")).is_ok()
+        || read_policy_ir_plugin_pins(repo_root).is_ok_and(|p| !p.is_empty())
+        || read_policy_ir_plugin_pins(repo_root).is_err()
+}
+
 pub fn load_verified_profile_plugins(
     repo_root: &Path,
     profile: &RuntimeProfile,
 ) -> Result<Vec<(String, String)>, (&'static str, String)> {
     let mut pins = profile.pinned_plugins.clone();
+    for (k, h) in read_policy_ir_plugin_pins(repo_root)? {
+        if pins.get(&k).is_some_and(|prev| prev != &h) {
+            return Err((
+                "PLUGIN_INTEGRITY_VIOLATION",
+                format!("Conflicting SHA-256 pin for plugin '{k}'."),
+            ));
+        }
+        pins.entry(k).or_insert(h);
+    }
     let dir = repo_root.join("profiles/plugins");
     let dir_exists = std::fs::symlink_metadata(&dir).is_ok();
     if pins.is_empty() && !dir_exists {
         return Ok(Vec::new());
-    }
-    if let Ok(raw) = std::fs::read_to_string(repo_root.join("dist/profiles/policy_ir.json"))
-        && let Ok(v) = crate::json::JsonValue::parse(&raw)
-        && let Some(crate::json::JsonValue::Object(entries)) = v.get("plugins")
-    {
-        for (k, val) in entries {
-            if let Some(h) = val.as_str() {
-                if pins.get(k).is_some_and(|prev| prev != h) {
-                    return Err((
-                        "PLUGIN_INTEGRITY_VIOLATION",
-                        format!("Conflicting SHA-256 pin for plugin '{k}'."),
-                    ));
-                }
-                pins.entry(k.clone()).or_insert_with(|| h.to_string());
-            }
-        }
     }
     let dir_meta = std::fs::symlink_metadata(&dir).map_err(|_| {
         (
@@ -678,12 +732,10 @@ pub fn load_verified_profile_plugins(
         let entry =
             entry.map_err(|e| ("PLUGIN_INTEGRITY_VIOLATION", format!("Dir read error: {e}")))?;
         let name = entry.file_name().to_string_lossy().into_owned();
-        if name.starts_with('.') {
-            continue;
-        }
         let meta = std::fs::symlink_metadata(entry.path())
             .map_err(|e| ("PLUGIN_INTEGRITY_VIOLATION", format!("Stat failed: {e}")))?;
-        if meta.file_type().is_symlink()
+        if name.starts_with('.')
+            || meta.file_type().is_symlink()
             || !meta.file_type().is_file()
             || meta.len() > MAX_PLUGIN_FILE_BYTES
             || !(name.ends_with(".rego") || name.ends_with(".toml"))

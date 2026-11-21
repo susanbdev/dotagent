@@ -206,26 +206,39 @@ fn quorum_approval_child_worker() {
     };
     let reviewer = std::env::var("AG_C3_HELPER_REVIEWER").expect("reviewer");
     let rel_path = std::env::var("AG_C3_HELPER_PATH").expect("path");
-    let repo_path = Path::new(&repo);
+    let repo_p = Path::new(&repo);
+    let canon = agent_guard::resolve_common_repo_root(repo_p);
+    let repo_sha = agent_guard::crypto::sha256_hex(canon.to_string_lossy().as_bytes());
+    let role = if reviewer.starts_with("reviewer_") {
+        agent_guard::swarm_contracts::SwarmRole::AdversarialReviewer
+    } else {
+        agent_guard::swarm_contracts::SwarmRole::Grunt
+    };
     let cap = agent_guard::swarm_contracts::SessionCapability {
         session_id: reviewer.clone(),
-        role: agent_guard::swarm_contracts::SwarmRole::AdversarialReviewer,
+        role,
         task_id: "mig-1".to_string(),
         attempt: 1,
-        repo_sha256: "0".repeat(64),
+        repo_sha256: repo_sha,
         plan_sha256: "0".repeat(64),
-        assigned_read_paths: vec![],
-        allowed_write_paths: vec![],
-        assigned_tests: vec![],
+        assigned_read_paths: vec![rel_path.clone()],
+        allowed_write_paths: Vec::new(),
+        assigned_tests: Vec::new(),
         last_green_tree_oid: None,
         consecutive_test_failures: 0,
         blocked_scope_attempts: 0,
         malicious_flags: 0,
     };
-    agent_guard::role_sandbox::save_session_capability(repo_path, &cap)
-        .expect("save reviewer capability");
-    record_quorum_approval_breadcrumb(repo_path, &reviewer, "mig-1", &rel_path)
-        .expect("record quorum approval breadcrumb");
+    agent_guard::role_sandbox::save_session_capability(&canon, &cap).expect("save capability");
+    if role == agent_guard::swarm_contracts::SwarmRole::AdversarialReviewer {
+        record_quorum_approval_breadcrumb(repo_p, &reviewer, "mig-1", &rel_path)
+            .expect("record quorum approval breadcrumb");
+    } else {
+        assert!(
+            record_quorum_approval_breadcrumb(repo_p, &reviewer, "mig-1", &rel_path).is_err(),
+            "non-reviewer capability must be rejected by record_quorum_approval_breadcrumb"
+        );
+    }
 }
 
 fn spawn_record_approval(

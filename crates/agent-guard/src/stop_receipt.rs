@@ -521,10 +521,160 @@ fn parse_porcelain_v1_z_paths(porcelain_z: &[u8]) -> Vec<String> {
     paths
 }
 
-pub(crate) fn dirty_porcelain_paths(canon_repo: &Path) -> Vec<String> {
-    run_git_capture_raw(canon_repo, &["status", "--porcelain=v1", "-z", "-uall"])
-        .map(|raw| parse_porcelain_v1_z_paths(&raw))
-        .unwrap_or_default()
+pub(crate) fn clean_smoke_rel_nonsymlink(
+    canon_repo: &Path,
+    rel: &str,
+) -> Result<(PathBuf, String), String> {
+    use std::path::Component;
+    let trimmed = rel.trim().trim_start_matches("./");
+    if trimmed.is_empty() || Path::new(trimmed).is_absolute() {
+        return Err(format!("SMOKE_ARTIFACT_MISSING: invalid path '{rel}'"));
+    }
+    let (mut cur, mut norm) = (canon_repo.to_path_buf(), Vec::new());
+    for comp in Path::new(trimmed).components() {
+        match comp {
+            Component::CurDir => {}
+            Component::Normal(seg) => {
+                let s = seg.to_string_lossy().into_owned();
+                cur.push(&s);
+                if fs::symlink_metadata(&cur).is_ok_and(|m| m.file_type().is_symlink()) {
+                    return Err(format!("SMOKE_ARTIFACT_MISSING: symlink '{rel}'"));
+                }
+                norm.push(s);
+            }
+            _ => return Err(format!("SMOKE_ARTIFACT_MISSING: traversal '{rel}'")),
+        }
+    }
+    Ok((cur, norm.join("/")))
+}
+
+pub(crate) fn verify_smoke_artifact(
+    canon: &Path,
+    rel: &str,
+    hint: &str,
+    out: &mut std::collections::BTreeMap<String, String>,
+) -> Result<PathBuf, String> {
+    use std::io::Read as _;
+    let (full, norm) = clean_smoke_rel_nonsymlink(canon, rel)?;
+    let meta = fs::symlink_metadata(&full)
+        .map_err(|_| format!("SMOKE_ARTIFACT_MISSING: '{norm}' ({hint}) missing"))?;
+    if meta.file_type().is_symlink()
+        || !meta.file_type().is_file()
+        || meta.len() == 0
+        || meta.len() > 268_435_456
+    {
+        return Err(format!(
+            "SMOKE_ARTIFACT_MISSING: '{norm}' ({hint}) empty, oversized, or non-regular"
+        ));
+    }
+    let mut f =
+        fs::File::open(&full).map_err(|e| format!("SMOKE_ARTIFACT_MISSING: '{norm}': {e}"))?;
+    let mut head = Vec::with_capacity(8);
+    let mut hasher = Sha256::new();
+    let mut buf = [0u8; 65_536];
+    loop {
+        let n = f
+            .read(&mut buf)
+            .map_err(|e| format!("SMOKE_ARTIFACT_MISSING: '{norm}': {e}"))?;
+        if n == 0 {
+            break;
+        }
+        if head.len() < 8 {
+            let take = (8 - head.len()).min(n);
+            head.extend_from_slice(&buf[..take]);
+        }
+        hasher.update(&buf[..n]);
+    }
+    if norm.ends_with(".wasm") && head.as_slice() != b"\0asm\x01\0\0\0" {
+        return Err(format!(
+            "SMOKE_WASM_MAGIC_INVALID: '{norm}' lacks valid Wasm v1 magic"
+        ));
+    }
+    out.insert(norm, crate::crypto::hex_encode(&hasher.finalize()));
+    Ok(full)
+}
+
+pub(crate) fn recent_or_dirty_repo_paths(canon_repo: &Path) -> Result<Vec<String>, String> {
+    let mut set = std::collections::BTreeSet::new();
+    if canon_repo.join(".git").exists() {
+        let raw = run_git_capture_raw(canon_repo, &["status", "--porcelain=v1", "-z", "-uall"])
+            .ok_or_else(|| "SMOKE_CONFIG_INVALID: git status failed".to_string())?;
+        for p in parse_porcelain_v1_z_paths(&raw) {
+            set.insert(p);
+        }
+        if let Some(head_raw) = run_git_capture_raw(
+            canon_repo,
+            &[
+                "diff-tree",
+                "--root",
+                "--no-commit-id",
+                "--name-only",
+                "-z",
+                "-r",
+                "HEAD",
+            ],
+        ) {
+            for entry in head_raw.split(|&b| b == 0).filter(|s| !s.is_empty()) {
+                set.insert(String::from_utf8_lossy(entry).into_owned());
+            }
+        }
+    }
+    Ok(set.into_iter().collect())
+}
+
+pub(crate) fn strip_code_comments_preserve_lines(src: &str, allow_hash: bool) -> String {
+    let bytes = src.as_bytes();
+    let mut out = String::with_capacity(src.len());
+    let (mut i, mut in_str, mut str_delim, mut in_block) = (0usize, false, b'"', false);
+    while i < bytes.len() {
+        let b = bytes[i];
+        if in_block {
+            if b == b'\n' {
+                out.push('\n');
+                i += 1;
+            } else if b == b'*' && bytes.get(i + 1) == Some(&b'/') {
+                in_block = false;
+                i += 2;
+            } else {
+                i += 1;
+            }
+            continue;
+        }
+        if in_str {
+            out.push(b as char);
+            if b == b'\\' && i + 1 < bytes.len() {
+                out.push(bytes[i + 1] as char);
+                i += 2;
+                continue;
+            }
+            if b == str_delim {
+                in_str = false;
+            }
+            i += 1;
+            continue;
+        }
+        if b == b'"' || b == b'\'' {
+            in_str = true;
+            str_delim = b;
+            out.push(b as char);
+            i += 1;
+            continue;
+        }
+        if b == b'/' && bytes.get(i + 1) == Some(&b'*') {
+            in_block = true;
+            i += 2;
+            continue;
+        }
+        if (b == b'/' && bytes.get(i + 1) == Some(&b'/')) || (allow_hash && b == b'#') {
+            while i < bytes.len() && bytes[i] != b'\n' {
+                i += 1;
+            }
+            continue;
+        }
+        out.push(b as char);
+        i += 1;
+    }
+    out
 }
 
 /// Computes canonical `(repo_id, head_commit_oid, work_tree_oid, bundle_manifest_sha256)`

@@ -15,14 +15,15 @@ fn isolated_env(slug: &str) -> (PathBuf, PathBuf, PathBuf, PathBuf) {
         .parent()
         .and_then(Path::parent)
         .expect("workspace root");
+    let short_slug = &slug[..slug.len().min(6)];
     let base = ws_root
         .join("target")
         .join("test-workspaces")
-        .join(format!("ag-c2-{}-{slug}", std::process::id()));
+        .join(format!("c2-{}-{short_slug}", std::process::id()));
     let _ = fs::remove_dir_all(&base);
-    let repo = base.join("repo");
-    let home = base.join("home");
-    let state_root = base.join("guard-state");
+    let repo = base.join("r");
+    let home = base.join("h");
+    let state_root = base.join("g");
     let state_sessions = state_root.join("sessions");
     fs::create_dir_all(repo.join(".git")).expect(".git");
     fs::create_dir_all(home.join(".local/bin")).expect(".local/bin");
@@ -261,6 +262,7 @@ fn sandboxed_worker_submits_over_coord_sock_while_ballots_read_is_denied() {
         "dotagent feedback submit --denial-id {did} --category missing_safe_flag --reason-code max_depth"
     );
     let sbx_out = Command::new(guard_bin)
+        .current_dir(&repo)
         .args([
             "exec-sandbox",
             "--cwd",

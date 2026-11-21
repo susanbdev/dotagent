@@ -440,9 +440,7 @@ pub fn handle_pre_tool_hook_with_context(
             ),
         )
     };
-    let mut decision = if !profile.pinned_plugins.is_empty()
-        || fs::symlink_metadata(repo_root.join("profiles/plugins")).is_ok()
-    {
+    let mut decision = if budget_guard::repo_has_configured_plugins(&repo_root, &profile) {
         let snap =
             build_pre_tool_hook_snapshot(&repo_root, &cwd, role, &tool_name, tool_input, &ledger);
         plugin_lattice::apply_pre_tool_plugin_lattice(
@@ -604,17 +602,24 @@ fn build_pre_tool_hook_snapshot(
                 raw_paths.push(rel);
             }
         }
+        let unquote_tok = |s: &str| -> String {
+            s.chars()
+                .filter(|&c| c != '\'' && c != '"' && c != '\\')
+                .collect()
+        };
         let mut toks = cmd_str
-            .split_whitespace()
-            .filter(|t| !t.contains('=') || t.starts_with('-'));
+            .split([' ', '\t', ';', '|', '&', '\n'])
+            .map(unquote_tok)
+            .filter(|t| !t.is_empty() && (!t.contains('=') || t.starts_with('-')));
         if let Some(first) = toks.next() {
-            let base = first.rsplit('/').next().unwrap_or(first);
+            let base = first.rsplit('/').next().unwrap_or(&first);
             cmd_program = neuter_to_clean_ascii(base).clean_ascii;
             for arg in toks.take(16) {
                 let clean = if arg.contains('=') {
                     "<redacted-kv>".to_string()
                 } else {
-                    neuter_to_clean_ascii(arg.rsplit('/').next().unwrap_or(arg)).clean_ascii
+                    let b = arg.rsplit('/').next().unwrap_or(&arg);
+                    neuter_to_clean_ascii(b).clean_ascii
                 };
                 cmd_args_sanitized.push(clean);
             }

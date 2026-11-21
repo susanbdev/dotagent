@@ -356,6 +356,8 @@ vectors = [
   { kind = "cmd", payload = "dotagent verify-ring0-ratchet --base HEAD --mode automated-pr" },
   { kind = "write_path", payload = "profiles/plugins/rogue.rego" },
   { kind = "write_path", payload = "profiles/coding-agent.toml" },
-  { kind = "write_path", payload = ".dotagent-smoke.toml" }
+  { kind = "write_path", payload = ".dotagent-smoke.toml" },
+  { kind = "cmd", payload = "./bin/dotagent doctor" },
+  { kind = "cmd", payload = "./bin/swarm-tool status" }
 ]
 

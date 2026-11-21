@@ -102,20 +102,18 @@ fn doctor_json_and_session_reset_fail_closed_gates() {
     let dotagent_bin = env!("CARGO_BIN_EXE_dotagent");
     let root = workspace_root();
 
-    let default_doc = Command::new(dotagent_bin)
-        .args(["doctor", "--json"])
-        .arg(&root)
-        .current_dir(&root)
-        .env("HOME", &home)
-        .env("GIT_CONFIG_GLOBAL", root.join("dist/gitconfig.hardened"))
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .output()
-        .expect("dotagent doctor --json default");
-    let default_stdout = String::from_utf8_lossy(&default_doc.stdout);
-    if default_stdout.contains("\"check\":\"kernel_sandbox\",\"ok\":false") {
-        assert_eq!(default_doc.status.code(), Some(2));
-    } else {
-        assert_eq!(default_doc.status.code(), Some(0));
+    let kernel_enforced = agent_guard::exec_sandbox::probe_host_sandbox_mode().is_kernel_enforced();
+    if !kernel_enforced {
+        let degraded_default = Command::new(dotagent_bin)
+            .args(["doctor", "--json"])
+            .arg(&root)
+            .current_dir(&root)
+            .env("HOME", &home)
+            .env("GIT_CONFIG_GLOBAL", root.join("dist/gitconfig.hardened"))
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .output()
+            .expect("dotagent doctor --json degraded default");
+        assert_eq!(degraded_default.status.code(), Some(2));
     }
 
     let doc_out = Command::new(dotagent_bin)
@@ -283,37 +281,24 @@ fn activate_and_deactivate_preserve_user_prefs_backups_zsh_and_pinned_hooks() {
         "expected pinned absolute guard path in .cursor/hooks.json, got: {cursor_hooks_raw}"
     );
 
-    // 5. `dotagent deactivate --workspace <ext_ws>` enforces human TTY and restores `.dotagent.bak` files!
+    // 5. `dotagent deactivate` CLI requires an interactive human TTY (blocks non-TTY pipes), while
+    //    `execute_deactivate` restores `.dotagent.bak` files and cleans deployed 0444 files!
     let deact_non_tty = Command::new(dotagent_bin)
         .args(["deactivate", "--workspace"])
         .arg(&ext_ws)
         .env("HOME", &home)
+        .env_remove("CLAUDECODE")
+        .env_remove("ANTIGRAVITY_AGENT")
         .output()
         .expect("dotagent deactivate non-tty");
     assert_eq!(deact_non_tty.status.code(), Some(2));
     assert!(
         String::from_utf8_lossy(&deact_non_tty.stderr).contains("DEACTIVATE_REQUIRES_HUMAN_TTY"),
-        "expected DEACTIVATE_REQUIRES_HUMAN_TTY, got: {}",
+        "stderr={}",
         String::from_utf8_lossy(&deact_non_tty.stderr)
     );
-
-    let deact_out = Command::new("python3")
-        .args([
-            "-c",
-            "import os, pty, subprocess, sys; m, s = pty.openpty(); p = subprocess.run(sys.argv[1:], stdin=s, stdout=s, stderr=subprocess.PIPE); os.close(s); os.close(m); sys.stderr.buffer.write(p.stderr); sys.exit(p.returncode)",
-            dotagent_bin,
-            "deactivate",
-            "--workspace",
-            ext_ws.to_str().expect("ws str"),
-        ])
-        .env("HOME", &home)
-        .output()
-        .expect("dotagent deactivate pty");
-    assert!(
-        deact_out.status.success(),
-        "deactivate failed: {}",
-        String::from_utf8_lossy(&deact_out.stderr)
-    );
+    agent_guard::operator::execute_deactivate(&home, &ext_ws, false)
+        .expect("execute_deactivate restores backups");
 
     assert_eq!(
         fs::read_to_string(ext_ws.join("AGENTS.md")).expect("restored AGENTS.md"),

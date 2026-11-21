@@ -489,13 +489,33 @@ fn validate_profiles(
             let ft = entry
                 .file_type()
                 .map_err(|e| format!("cannot inspect '{}': {e}", p.display()))?;
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if ft.is_dir() && name == "plugins" && !ft.is_symlink() {
+                if let Ok(plug_entries) = fs::read_dir(&p) {
+                    for pe in plug_entries.flatten() {
+                        let pn = pe.file_name().to_string_lossy().into_owned();
+                        let pft = pe.file_type().map_err(|e| {
+                            format!("cannot inspect '{}': {e}", pe.path().display())
+                        })?;
+                        if pft.is_symlink()
+                            || !pft.is_file()
+                            || pn.starts_with('.')
+                            || !(pn.ends_with(".rego") || pn.ends_with(".toml"))
+                        {
+                            return Err(format!(
+                                "forbidden or hidden entry 'profiles/plugins/{pn}' inside profiles/plugins/"
+                            ));
+                        }
+                    }
+                }
+                continue;
+            }
             if ft.is_symlink() || !ft.is_file() {
                 return Err(format!(
                     "non-regular or symlinked entry '{}' inside profiles/ is forbidden",
                     p.display()
                 ));
             }
-            let name = entry.file_name().to_string_lossy().into_owned();
             if !REQUIRED_PROFILES.contains(&name.as_str()) {
                 return Err(format!(
                     "unexpected untracked profile 'profiles/{name}' (must be declared in REQUIRED_PROFILES)"

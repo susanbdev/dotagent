@@ -550,25 +550,51 @@ pub fn run_exec_sandbox_cli(args: &[String], default_cwd: &Path) -> ExitCode {
     const MAX_GIT_CFG_SNAPSHOT_BYTES: usize = 262_144;
     let git_cfg_path = common_repo.join(".git/config");
     let has_git_dir = common_repo.join(".git").is_dir();
-    let (pre_git_cfg_existed, pre_git_cfg_digest, pre_git_cfg_bytes) = if opts.writes_allowed
+    let (pre_git_cfg_existed, pre_git_cfg_digest, pre_git_cfg_bytes, pre_git_cfg_mode) = if opts
+        .writes_allowed
         && has_git_dir
     {
-        match fs::read(&git_cfg_path) {
-            Ok(bytes) => {
-                if bytes.len() > MAX_GIT_CFG_SNAPSHOT_BYTES {
+        match fs::symlink_metadata(&git_cfg_path) {
+            Ok(m) => {
+                if m.file_type().is_symlink()
+                    || !m.file_type().is_file()
+                    || m.len() > MAX_GIT_CFG_SNAPSHOT_BYTES as u64
+                {
                     eprintln!(
-                        "[AGENT-GUARD HARD DENY :: GIT_CONFIG_TOO_LARGE] .git/config ({} bytes) exceeds restorable snapshot ceiling ({MAX_GIT_CFG_SNAPSHOT_BYTES} bytes)",
-                        bytes.len()
+                        "[AGENT-GUARD HARD DENY :: GIT_CONFIG_UNSAFE] .git/config is a symlink, non-regular, or exceeds {MAX_GIT_CFG_SNAPSHOT_BYTES} bytes"
                     );
                     return ExitCode::from(2);
                 }
-                let digest = sha256_bytes(&bytes);
-                (true, Some(digest), Some(bytes))
+                #[cfg(unix)]
+                let mode_bits = {
+                    use std::os::unix::fs::PermissionsExt;
+                    m.permissions().mode() & 0o777
+                };
+                #[cfg(not(unix))]
+                let mode_bits = 0o644u32;
+                match fs::read(&git_cfg_path) {
+                    Ok(bytes) if bytes.len() <= MAX_GIT_CFG_SNAPSHOT_BYTES => {
+                        let digest = sha256_bytes(&bytes);
+                        (true, Some(digest), Some(bytes), mode_bits)
+                    }
+                    _ => {
+                        eprintln!(
+                            "[AGENT-GUARD HARD DENY :: GIT_CONFIG_UNSAFE] failed reading .git/config prior to sandbox execution"
+                        );
+                        return ExitCode::from(2);
+                    }
+                }
             }
-            Err(_) => (false, None, None),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => (false, None, None, 0o644),
+            Err(e) => {
+                eprintln!(
+                    "[AGENT-GUARD HARD DENY :: GIT_CONFIG_UNSAFE] cannot stat .git/config: {e}"
+                );
+                return ExitCode::from(2);
+            }
         }
     } else {
-        (false, None, None)
+        (false, None, None, 0o644)
     };
 
     // Pre-launch the out-of-sandbox Vault Coordinator daemon BEFORE `restrict_self()` so
@@ -747,7 +773,7 @@ pub fn run_exec_sandbox_cli(args: &[String], default_cwd: &Path) -> ExitCode {
             .map(|b| sha256_bytes(&b));
         if post_digest != Some(expected_digest) {
             if let Some(ref orig_bytes) = pre_git_cfg_bytes {
-                let _ = restore_git_config_atomic(&git_cfg_path, orig_bytes);
+                let _ = restore_git_config_atomic(&git_cfg_path, orig_bytes, pre_git_cfg_mode);
             }
             eprintln!(
                 "[AGENT-GUARD HARD DENY :: GIT_CONFIG_TAMPERED] .git/config changed during sandbox execution; atomically restored!"
@@ -769,18 +795,30 @@ pub fn run_exec_sandbox_cli(args: &[String], default_cwd: &Path) -> ExitCode {
     exit_code
 }
 
-fn restore_git_config_atomic(git_cfg_path: &Path, orig_bytes: &[u8]) -> Result<(), String> {
+fn restore_git_config_atomic(
+    git_cfg_path: &Path,
+    orig_bytes: &[u8],
+    orig_mode: u32,
+) -> Result<(), String> {
     use std::io::Write as _;
     let parent = git_cfg_path
         .parent()
         .ok_or_else(|| "missing .git parent".to_string())?;
-    if let Ok(meta) = fs::symlink_metadata(git_cfg_path)
-        && meta.file_type().is_dir()
-    {
-        let _ = fs::remove_dir_all(git_cfg_path);
+    let pmeta = fs::symlink_metadata(parent).map_err(|e| e.to_string())?;
+    if pmeta.file_type().is_symlink() || !pmeta.file_type().is_dir() {
+        return Err(".git parent is symlink or non-directory".to_string());
+    }
+    if let Ok(meta) = fs::symlink_metadata(git_cfg_path) {
+        if meta.file_type().is_symlink() {
+            let _ = fs::remove_file(git_cfg_path);
+        } else if meta.file_type().is_dir() {
+            let _ = fs::remove_dir_all(git_cfg_path);
+        }
     }
     let objs_dir = parent.join("objects");
-    let staging_dir = if objs_dir.is_dir() {
+    let staging_dir = if fs::symlink_metadata(&objs_dir)
+        .is_ok_and(|m| !m.file_type().is_symlink() && m.file_type().is_dir())
+    {
         objs_dir.as_path()
     } else {
         parent
@@ -806,8 +844,10 @@ fn restore_git_config_atomic(git_cfg_path: &Path, orig_bytes: &[u8]) -> Result<(
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let _ = fs::set_permissions(&tmp, fs::Permissions::from_mode(0o644));
+        let _ = fs::set_permissions(&tmp, fs::Permissions::from_mode(orig_mode & 0o777));
     }
+    #[cfg(not(unix))]
+    let _ = orig_mode;
     if let Err(e) = fs::rename(&tmp, git_cfg_path) {
         let _ = fs::remove_file(&tmp);
         return Err(e.to_string());
@@ -1315,14 +1355,19 @@ fn dir_has_forbidden_descendant(
     dir: &Path,
     depth: usize,
     max_depth: usize,
+    scan_budget: &mut usize,
     canon_repo: &Path,
     verified_dist: &[PathBuf],
 ) -> bool {
-    if depth > max_depth || is_heavy_cargo_build_subdir(canon_repo, dir, depth) {
+    if is_heavy_cargo_build_subdir(canon_repo, dir, depth) {
         return false;
     }
+    if depth > max_depth || *scan_budget == 0 {
+        return true;
+    }
+    *scan_budget -= 1;
     let Ok(entries) = fs::read_dir(dir) else {
-        return false;
+        return true;
     };
     for entry in entries.flatten() {
         let name = entry.file_name().to_string_lossy().into_owned();
@@ -1335,8 +1380,14 @@ fn dir_has_forbidden_descendant(
         };
         if !meta.file_type().is_symlink()
             && meta.file_type().is_dir()
-            && depth < max_depth
-            && dir_has_forbidden_descendant(&path, depth + 1, max_depth, canon_repo, verified_dist)
+            && dir_has_forbidden_descendant(
+                &path,
+                depth + 1,
+                max_depth,
+                scan_budget,
+                canon_repo,
+                verified_dist,
+            )
         {
             return true;
         }
@@ -1358,7 +1409,15 @@ fn add_filtered_repo_tree(
     rules: &mut Vec<Result<landlock::PathBeneath<landlock::PathFd>, landlock::RulesetError>>,
 ) {
     use landlock::{AccessFs, BitFlags};
-    if !dir_has_forbidden_descendant(dir, depth, max_depth, canon_repo, verified_dist) {
+    let mut scan_budget = 4_096usize;
+    if !dir_has_forbidden_descendant(
+        dir,
+        depth,
+        max_depth,
+        &mut scan_budget,
+        canon_repo,
+        verified_dist,
+    ) {
         let acc = if writes_allowed { rw_access } else { ro_access };
         rules.extend(landlock::path_beneath_rules([dir], acc));
         return;
@@ -1397,8 +1456,10 @@ fn add_filtered_repo_tree(
                     rules,
                 );
             } else {
-                let acc = if writes_allowed { rw_access } else { ro_access };
-                rules.extend(landlock::path_beneath_rules([&path], acc));
+                rules.extend(landlock::path_beneath_rules(
+                    [&path],
+                    BitFlags::from(AccessFs::ReadDir),
+                ));
             }
         } else {
             let f_acc = if writes_allowed {
@@ -1993,7 +2054,7 @@ fn apply_linux_landlock(
                 add_filtered_repo_tree(
                     &entry_path,
                     1,
-                    3,
+                    24,
                     opts.writes_allowed,
                     &canon_repo,
                     &verified_dist,
@@ -2325,28 +2386,32 @@ mod tests {
         assert!(dir_has_forbidden_descendant(
             &ws.join("apps"),
             1,
-            3,
+            24,
+            &mut 4096,
             &ws,
             &[]
         ));
         assert!(dir_has_forbidden_descendant(
             &ws.join("apps/web"),
             2,
-            3,
+            24,
+            &mut 4096,
             &ws,
             &[]
         ));
         assert!(!dir_has_forbidden_descendant(
             &ws.join("apps/web/src"),
             3,
-            3,
+            24,
+            &mut 4096,
             &ws,
             &[]
         ));
         assert!(!dir_has_forbidden_descendant(
             &ws.join("apps/api"),
             2,
-            3,
+            24,
+            &mut 4096,
             &ws,
             &[]
         ));

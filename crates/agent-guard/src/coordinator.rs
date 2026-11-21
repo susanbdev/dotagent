@@ -419,7 +419,8 @@ pub fn ensure_coordinator_daemon(repo_root: &Path) -> Result<PathBuf, String> {
     }
 
     let mut cmd = Command::new(bin);
-    cmd.arg("coordinator")
+    cmd.current_dir(&ipc_dir)
+        .arg("coordinator")
         .arg("--repo")
         .arg(&canon_repo)
         .arg("--idle-secs")

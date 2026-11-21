@@ -314,8 +314,91 @@ fn check_session_state_health(repo_root: &Path) -> DoctorCheck {
     }
 }
 
+fn consume_sshsig_once(pem: &str) -> Result<(), crate::sshsig_touch::GuardError> {
+    use crate::sshsig_touch::GuardError;
+    use std::io::Write as _;
+    let digest = crate::crypto::sha256_hex(pem.trim().as_bytes());
+    let dir = crate::feedback::feedback_state_dir().map_err(|e| GuardError::new("SSHSIG_IO", e))?;
+    let log_path = dir.join("consumed_sshsig.log");
+    if fs::symlink_metadata(&log_path).is_ok_and(|m| m.file_type().is_symlink()) {
+        return Err(GuardError::new(
+            "SSHSIG_SYMLINK_TAMPER",
+            "consumed_sshsig.log is symlink",
+        ));
+    }
+    let existing = fs::read_to_string(&log_path).unwrap_or_default();
+    if existing.lines().any(|l| l.trim() == digest) {
+        return Err(GuardError::new(
+            "SSHSIG_REPLAY_DETECTED",
+            "SSHSIG signature was already consumed",
+        ));
+    }
+    let mut f = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+        .map_err(|e| GuardError::new("SSHSIG_IO", e.to_string()))?;
+    writeln!(f, "{digest}").map_err(|e| GuardError::new("SSHSIG_IO", e.to_string()))
+}
+
+pub(crate) fn verify_plugin_human_touch(
+    repo_root: &Path,
+    session_id: &str,
+    tool_name: &str,
+    target_rel_paths: &[String],
+) -> bool {
+    use crate::coordinator::current_hmac_epoch_id;
+    use crate::sshsig_touch::{load_operator_sk_keys_from_home, verify_fido2_sshsig_ed25519};
+    use crate::stop_receipt::derive_portable_repo_id;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let Ok(sig_path_raw) = std::env::var("AGENT_GUARD_PLUGIN_SSHSIG") else {
+        return false;
+    };
+    let sig_path = Path::new(&sig_path_raw);
+    let Ok(meta) = fs::symlink_metadata(sig_path) else {
+        return false;
+    };
+    if meta.file_type().is_symlink() || !meta.file_type().is_file() || meta.len() > 16_384 {
+        return false;
+    }
+    let Ok(pem) = fs::read_to_string(sig_path) else {
+        return false;
+    };
+    let Ok(home_raw) = std::env::var("HOME") else {
+        return false;
+    };
+    let Ok(Some(keys)) = load_operator_sk_keys_from_home(Path::new(&home_raw)) else {
+        return false;
+    };
+    let canon = fs::canonicalize(repo_root).unwrap_or_else(|_| repo_root.to_path_buf());
+    let repo_id = derive_portable_repo_id(&canon);
+    let epoch_id = current_hmac_epoch_id(&canon).unwrap_or(0);
+    let paths_hash = &crate::crypto::sha256_hex(target_rel_paths.join("\0").as_bytes())[..16];
+    let now_s = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let floor_now = (now_s / 60) * 60;
+    let c0 = format!(
+        "dotagent:plugin-touch:v1:{repo_id}:{epoch_id}:{session_id}:{tool_name}:{paths_hash}:{floor_now}"
+    );
+    let c1 = format!(
+        "dotagent:plugin-touch:v1:{repo_id}:{epoch_id}:{session_id}:{tool_name}:{paths_hash}:{}",
+        floor_now.saturating_sub(60)
+    );
+    let verified =
+        verify_fido2_sshsig_ed25519("dotagent-plugin-touch-v1", c0.as_bytes(), &pem, &keys)
+            .or_else(|_| {
+                verify_fido2_sshsig_ed25519("dotagent-plugin-touch-v1", c1.as_bytes(), &pem, &keys)
+            })
+            .is_ok();
+    verified && consume_sshsig_once(&pem).is_ok()
+}
+
 pub(crate) fn verify_operator_sshsig_gate(
     repo_root: &Path,
+    action: &str,
     sshsig_file: Option<&Path>,
 ) -> Result<(), crate::sshsig_touch::GuardError> {
     use crate::coordinator::current_hmac_epoch_id;
@@ -327,9 +410,8 @@ pub(crate) fn verify_operator_sshsig_gate(
     use std::io::Read as _;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    let Ok(home_raw) = std::env::var("HOME") else {
-        return Ok(());
-    };
+    let home_raw = std::env::var("HOME")
+        .map_err(|_| GuardError::new("SSHSIG_CONFIG_INVALID", "HOME is not set"))?;
     let Some(keys) = load_operator_sk_keys_from_home(Path::new(&home_raw))? else {
         return Ok(());
     };
@@ -341,7 +423,7 @@ pub(crate) fn verify_operator_sshsig_gate(
         .map(|d| d.as_secs())
         .unwrap_or(0);
     let floor_now = (now_s / 60) * 60;
-    let c0 = format_operator_challenge(&repo_id, epoch_id, floor_now);
+    let c0 = format_operator_challenge(action, &repo_id, epoch_id, floor_now);
     let pem = if let Some(p) = sshsig_file {
         let m = fs::symlink_metadata(p).map_err(|e| {
             GuardError::new("SSHSIG_REQUIRED", format!("cannot stat --sshsig: {e}"))
@@ -369,12 +451,11 @@ pub(crate) fn verify_operator_sshsig_gate(
             format!("operator_sk_keys configured; pass --sshsig <file> over challenge '{c0}'"),
         ));
     };
-    let c1 = format_operator_challenge(&repo_id, epoch_id, floor_now.saturating_sub(60));
-    verify_fido2_sshsig_ed25519(OPERATOR_SSHSIG_NAMESPACE, c0.as_bytes(), &pem, &keys)
-        .or_else(|_| {
-            verify_fido2_sshsig_ed25519(OPERATOR_SSHSIG_NAMESPACE, c1.as_bytes(), &pem, &keys)
-        })
-        .map(|_| ())
+    let c1 = format_operator_challenge(action, &repo_id, epoch_id, floor_now.saturating_sub(60));
+    verify_fido2_sshsig_ed25519(OPERATOR_SSHSIG_NAMESPACE, c0.as_bytes(), &pem, &keys).or_else(
+        |_| verify_fido2_sshsig_ed25519(OPERATOR_SSHSIG_NAMESPACE, c1.as_bytes(), &pem, &keys),
+    )?;
+    consume_sshsig_once(&pem)
 }
 
 /// Interactive human-TTY-gated circuit breaker reset (`dotagent session-reset [--session <id>] [--sshsig <file>] [--all]`).
@@ -412,7 +493,9 @@ pub fn run_session_reset_cli(args: &[String], cwd: &Path) -> ExitCode {
         }
     }
 
-    if let Err(ge) = verify_operator_sshsig_gate(&repo_root, sshsig_file.as_deref()) {
+    if let Err(ge) =
+        verify_operator_sshsig_gate(&repo_root, "session-reset", sshsig_file.as_deref())
+    {
         eprintln!("[AGENT-GUARD HARD DENY :: {}] {}", ge.code, ge.detail);
         return ExitCode::from(2);
     }
@@ -612,27 +695,36 @@ pub fn run_deactivate_cli(args: &[String], cwd: &Path) -> ExitCode {
         return ExitCode::from(2);
     };
     let home = PathBuf::from(home_raw);
-    let target_ws = workspace.unwrap_or_else(|| home.clone());
-    let repo_root = resolve_repo_root(if target_ws != home { &target_ws } else { cwd });
-
+    for marker in [
+        "CLAUDECODE",
+        "GEMINI_CLI",
+        "ANTIGRAVITY_AGENT",
+        "CURSOR_TRACE_ID",
+        "CODEX_SANDBOX",
+    ] {
+        if std::env::var(marker)
+            .ok()
+            .is_some_and(|v| !v.trim().is_empty())
+        {
+            eprintln!(
+                "[AGENT-GUARD HARD DENY :: DEACTIVATE_DENIED_IN_HARNESS] deactivate cannot be invoked from inside AI agent harness '{marker}'."
+            );
+            return ExitCode::from(2);
+        }
+    }
     if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
         eprintln!(
-            "[AGENT-GUARD HARD DENY :: DEACTIVATE_REQUIRES_HUMAN_TTY] deactivate requires an interactive human TTY."
+            "[AGENT-GUARD HARD DENY :: DEACTIVATE_REQUIRES_HUMAN_TTY] deactivate requires an interactive human terminal (stdin/stdout TTY)."
         );
         return ExitCode::from(2);
     }
-    match crate::sshsig_touch::load_operator_sk_keys_from_home(&home) {
-        Ok(Some(_)) => {
-            if let Err(ge) = verify_operator_sshsig_gate(&repo_root, sshsig_file.as_deref()) {
-                eprintln!("[AGENT-GUARD HARD DENY :: {}] {}", ge.code, ge.detail);
-                return ExitCode::from(2);
-            }
-        }
-        Ok(None) => {}
-        Err(ge) => {
-            eprintln!("[AGENT-GUARD HARD DENY :: {}] {}", ge.code, ge.detail);
-            return ExitCode::from(2);
-        }
+
+    let target_ws = workspace.unwrap_or_else(|| home.clone());
+    let repo_root = resolve_repo_root(if target_ws != home { &target_ws } else { cwd });
+
+    if let Err(ge) = verify_operator_sshsig_gate(&repo_root, "deactivate", sshsig_file.as_deref()) {
+        eprintln!("[AGENT-GUARD HARD DENY :: {}] {}", ge.code, ge.detail);
+        return ExitCode::from(2);
     }
 
     match execute_deactivate(&home, &target_ws, dry_run) {
@@ -1318,7 +1410,11 @@ fn invalidate_or_purge_swarm_state(
     Ok(())
 }
 
-fn execute_deactivate(home: &Path, target_ws: &Path, dry_run: bool) -> Result<Vec<String>, String> {
+pub fn execute_deactivate(
+    home: &Path,
+    target_ws: &Path,
+    dry_run: bool,
+) -> Result<Vec<String>, String> {
     let mut log = Vec::new();
     let mut managed = vec![
         target_ws.join("AGENTS.md"),

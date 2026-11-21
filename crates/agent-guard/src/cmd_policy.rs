@@ -893,6 +893,32 @@ fn check_single_command(
         return Ok(());
     }
 
+    if matches!(bin, "swarm-tool" | "agent-guard" | "dotagent" | "git") {
+        let raw_bin = cmd.argv.first().map(String::as_str).unwrap_or("");
+        if raw_bin.contains('/') {
+            let p = Path::new(raw_bin);
+            let canonical_root =
+                std::fs::canonicalize(repo_root).unwrap_or_else(|_| repo_root.to_path_buf());
+            let canonical_bin = std::fs::canonicalize(p).ok();
+            let untrusted = !p.is_absolute()
+                || raw_bin.contains("..")
+                || p.starts_with(repo_root)
+                || p.starts_with(cwd)
+                || canonical_bin
+                    .as_ref()
+                    .is_some_and(|c| c.starts_with(&canonical_root));
+            if untrusted {
+                return Err(CommandViolation {
+                    code: "SELF_TAMPERING_BLOCKED",
+                    detail: format!(
+                        "Relative or workspace-local binary path `{raw_bin}` is forbidden for `{bin}`; invoke the installed system/user binary."
+                    ),
+                    halt_session: true,
+                });
+            }
+        }
+    }
+
     if bin == "swarm-tool"
         && args.iter().any(|a| {
             a == "--internal-exec-sandbox"
