@@ -1352,6 +1352,18 @@ fn load_or_create_elevated_host_key(dir: &Path) -> Result<[u8; 32], String> {
     let key_path = dir.join("host.key");
     reject_if_symlink(&key_path, "elevated host key")?;
     if key_path.exists() {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let meta = fs::symlink_metadata(&key_path)
+                .map_err(|e| format!("stat elevated host.key: {e}"))?;
+            if !meta.file_type().is_file() || (meta.permissions().mode() & 0o077) != 0 {
+                return Err(
+                    "ELEVATED_KEY_UNSAFE_PERMISSIONS: host.key must be a regular 0600 file"
+                        .to_string(),
+                );
+            }
+        }
         let raw = fs::read(&key_path).map_err(|e| format!("failed reading host.key: {e}"))?;
         if raw.len() == 32 {
             let mut key = [0u8; 32];
@@ -1364,13 +1376,29 @@ fn load_or_create_elevated_host_key(dir: &Path) -> Result<[u8; 32], String> {
         fs::File::open("/dev/urandom").map_err(|e| format!("open /dev/urandom: {e}"))?;
     std::io::Read::read_exact(&mut urandom, &mut key)
         .map_err(|e| format!("read /dev/urandom: {e}"))?;
-    fs::write(&key_path, key).map_err(|e| format!("write host.key: {e}"))?;
+    let mut opts = fs::OpenOptions::new();
+    opts.write(true).create_new(true);
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = fs::set_permissions(&key_path, fs::Permissions::from_mode(0o600));
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
     }
-    Ok(key)
+    match opts.open(&key_path) {
+        Ok(mut kf) => {
+            std::io::Write::write_all(&mut kf, &key).map_err(|e| format!("write host.key: {e}"))?;
+            Ok(key)
+        }
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+            let raw = fs::read(&key_path).map_err(|re| format!("failed reading host.key: {re}"))?;
+            if raw.len() == 32 {
+                key.copy_from_slice(&raw);
+                Ok(key)
+            } else {
+                Err("corrupt elevated host.key".to_string())
+            }
+        }
+        Err(e) => Err(format!("create host.key: {e}")),
+    }
 }
 
 fn compute_elevated_lease_mac(

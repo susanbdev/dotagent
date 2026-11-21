@@ -1354,8 +1354,14 @@ fn is_research_airlock_delegation(
             .is_some_and(is_allowed_airlock_subagent_name)
         }
         "define_subagent" => {
-            extract_first_str(input, &["name", "Name"])
-                .is_some_and(|n| n.trim().eq_ignore_ascii_case("research-airlock"))
+            let explicit_write_disabled = input
+                .get("enable_write_tools")
+                .or_else(|| input.get("enableWriteTools"))
+                .and_then(JsonValue::as_bool)
+                == Some(false);
+            explicit_write_disabled
+                && extract_first_str(input, &["name", "Name"])
+                    .is_some_and(|n| n.trim().eq_ignore_ascii_case("research-airlock"))
                 && extract_first_str(input, &["description", "Description"])
                     .is_some_and(|d| !d.trim().is_empty())
                 && extract_first_str(input, &["system_prompt", "SystemPrompt"])

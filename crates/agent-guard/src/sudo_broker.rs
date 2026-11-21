@@ -202,6 +202,17 @@ fn load_or_create_broker_key(dir: &Path) -> Result<[u8; 32], String> {
     let key_path = dir.join("host.key");
     reject_if_symlink(&key_path, "sudo-broker host.key")?;
     if key_path.exists() {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let meta = fs::symlink_metadata(&key_path)
+                .map_err(|e| format!("stat sudo-broker host.key: {e}"))?;
+            if !meta.file_type().is_file() || (meta.permissions().mode() & 0o077) != 0 {
+                return Err(
+                    "SUDO_KEY_UNSAFE_PERMISSIONS: host.key must be a regular 0600 file".to_string(),
+                );
+            }
+        }
         let raw = fs::read(&key_path).map_err(|e| format!("read host.key: {e}"))?;
         if raw.len() == 32 {
             let mut k = [0u8; 32];
@@ -472,34 +483,43 @@ pub fn parse_and_validate_sudo_request(
                 && meta.file_type().is_file()
             {
                 let canon_f = fs::canonicalize(&candidate).unwrap_or(candidate);
-                if canon_f.starts_with(&canon_repo) {
-                    let bytes = fs::read(&canon_f).map_err(|e| {
-                        (
-                            "FILE_READ_ERROR",
-                            format!("Failed hashing staged file '{}': {e}", canon_f.display()),
-                            false,
-                        )
-                    })?;
-                    if bytes.len() > 262_144 {
-                        return Err((
-                            "FILE_BYTE_BUDGET_EXCEEDED",
-                            format!(
-                                "Staged `sudo-request` file '{}' exceeds 256 KiB cap.",
-                                canon_f.display()
-                            ),
-                            false,
-                        ));
-                    }
-                    let abs_s = canon_f.to_string_lossy().into_owned();
-                    if !pinned_files
-                        .iter()
-                        .any(|p: &PinnedFileDigest| p.abs_path == abs_s)
-                    {
-                        pinned_files.push(PinnedFileDigest {
-                            abs_path: abs_s,
-                            sha256_hex: crate::crypto::sha256_hex(&bytes),
-                        });
-                    }
+                if !Path::new(op).is_absolute() && !canon_f.starts_with(&canon_repo) {
+                    return Err((
+                        "SYMLINK_ESCAPE_BLOCKED",
+                        format!(
+                            "`sudo-request` relative operand '{}' escapes repository root '{}'.",
+                            op,
+                            canon_repo.display()
+                        ),
+                        true,
+                    ));
+                }
+                let bytes = fs::read(&canon_f).map_err(|e| {
+                    (
+                        "FILE_READ_ERROR",
+                        format!("Failed hashing staged file '{}': {e}", canon_f.display()),
+                        false,
+                    )
+                })?;
+                if bytes.len() > 262_144 {
+                    return Err((
+                        "FILE_BYTE_BUDGET_EXCEEDED",
+                        format!(
+                            "Staged `sudo-request` file '{}' exceeds 256 KiB cap.",
+                            canon_f.display()
+                        ),
+                        false,
+                    ));
+                }
+                let abs_s = canon_f.to_string_lossy().into_owned();
+                if !pinned_files
+                    .iter()
+                    .any(|p: &PinnedFileDigest| p.abs_path == abs_s)
+                {
+                    pinned_files.push(PinnedFileDigest {
+                        abs_path: abs_s,
+                        sha256_hex: crate::crypto::sha256_hex(&bytes),
+                    });
                 }
             }
         }
@@ -745,13 +765,59 @@ pub fn verify_and_execute_sudo_ticket(
     verify_and_execute_sudo_ticket_in_dir(&sudo_broker_dir(), req_id, runner_override_for_test)
 }
 
+struct TicketLockGuard {
+    lock_path: PathBuf,
+}
+
+impl Drop for TicketLockGuard {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.lock_path);
+    }
+}
+
+fn acquire_ticket_lock(dir: &Path, valid_id: &str) -> Result<TicketLockGuard, String> {
+    let lock_path = dir.join(format!("{valid_id}.lock"));
+    reject_if_symlink(&lock_path, "sudo ticket lock")?;
+    let mut opts = fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    opts.open(&lock_path).map_err(|e| {
+        if e.kind() == io::ErrorKind::AlreadyExists {
+            format!(
+                "Ticket '{valid_id}' is currently locked by another `dotagent approve` process."
+            )
+        } else {
+            format!("acquire sudo ticket lock: {e}")
+        }
+    })?;
+    Ok(TicketLockGuard { lock_path })
+}
+
+fn compute_result_mac(key: &[u8; 32], req_id: &str, exit_code: i64, output: &str) -> [u8; 32] {
+    let mut buf = Vec::with_capacity(64 + output.len());
+    buf.extend_from_slice(b"dotagent.sudo_result.v1\0");
+    buf.extend_from_slice(key);
+    buf.extend_from_slice(&(req_id.len() as u32).to_be_bytes());
+    buf.extend_from_slice(req_id.as_bytes());
+    buf.extend_from_slice(&exit_code.to_be_bytes());
+    buf.extend_from_slice(&(output.len() as u32).to_be_bytes());
+    buf.extend_from_slice(output.as_bytes());
+    crate::crypto::sha256_bytes(&buf)
+}
+
 pub fn verify_and_execute_sudo_ticket_in_dir(
     dir: &Path,
     req_id: &str,
     runner_override_for_test: Option<&str>,
 ) -> Result<SudoExecutionReceipt, String> {
+    let valid_id = validate_request_id(req_id).map_err(|(_, msg)| msg)?;
     let key = load_or_create_broker_key(dir)?;
-    let mut ticket = load_verified_ticket_in_dir(dir, req_id)?;
+    let _lock = acquire_ticket_lock(dir, valid_id)?;
+    let mut ticket = load_verified_ticket_in_dir(dir, valid_id)?;
     let now = current_unix_secs();
 
     if ticket.status != "pending" {
@@ -842,10 +908,15 @@ pub fn verify_and_execute_sudo_ticket_in_dir(
     ticket.status = "executed".to_string();
     save_signed_ticket(dir, &key, &ticket)?;
 
+    let res_mac = compute_result_mac(&key, &ticket.req_id, exit_code as i64, &safe_output);
     let res_doc = JsonValue::Object(vec![
         ("req_id".to_string(), JsonValue::Str(ticket.req_id.clone())),
         ("exit_code".to_string(), JsonValue::Number(exit_code as f64)),
         ("output".to_string(), JsonValue::Str(safe_output.clone())),
+        (
+            "mac".to_string(),
+            JsonValue::Str(crate::crypto::hex_encode(&res_mac)),
+        ),
     ]);
     let res_path = dir.join(format!("{}.result.json", ticket.req_id));
     reject_if_symlink(&res_path, "sudo result")?;
@@ -895,19 +966,60 @@ pub fn read_sudo_result_banner(req_id: &str) -> Result<String, (&'static str, St
         ));
     }
 
-    let res_path = sudo_broker_dir().join(format!("{valid_id}.result.json"));
+    let dir = sudo_broker_dir();
+    let key = load_or_create_broker_key(&dir).map_err(|e| ("SUDO_RESULT_READ_ERROR", e))?;
+    let res_path = dir.join(format!("{valid_id}.result.json"));
+    reject_if_symlink(&res_path, "sudo result").map_err(|e| ("SUDO_RESULT_READ_ERROR", e))?;
     let raw = fs::read_to_string(&res_path)
         .map_err(|e| ("SUDO_RESULT_READ_ERROR", format!("read result: {e}")))?;
     let parsed = JsonValue::parse(&raw)
         .map_err(|e| ("SUDO_RESULT_READ_ERROR", format!("parse result: {e}")))?;
+    let res_req_id = parsed
+        .get("req_id")
+        .and_then(JsonValue::as_str)
+        .ok_or_else(|| {
+            (
+                "SUDO_RESULT_READ_ERROR",
+                "missing result req_id".to_string(),
+            )
+        })?;
+    if res_req_id != valid_id {
+        return Err((
+            "SUDO_RESULT_READ_ERROR",
+            "result req_id mismatch (fail-closed)".to_string(),
+        ));
+    }
     let code = parsed
         .get("exit_code")
         .and_then(JsonValue::as_i64)
-        .unwrap_or(1);
+        .ok_or_else(|| {
+            (
+                "SUDO_RESULT_READ_ERROR",
+                "missing result exit_code".to_string(),
+            )
+        })?;
     let output = parsed
         .get("output")
         .and_then(JsonValue::as_str)
-        .unwrap_or("");
+        .ok_or_else(|| {
+            (
+                "SUDO_RESULT_READ_ERROR",
+                "missing result output".to_string(),
+            )
+        })?;
+    let mac_hex = parsed
+        .get("mac")
+        .and_then(JsonValue::as_str)
+        .ok_or_else(|| ("SUDO_RESULT_READ_ERROR", "missing result mac".to_string()))?;
+    let stored_mac = crate::crypto::hex_decode_32(mac_hex)
+        .map_err(|e| ("SUDO_RESULT_READ_ERROR", format!("invalid result mac: {e}")))?;
+    let expected_mac = compute_result_mac(&key, valid_id, code, output);
+    if !crate::crypto::constant_time_eq_bytes(&stored_mac, &expected_mac) {
+        return Err((
+            "SUDO_RESULT_READ_ERROR",
+            "FORGED_SUDO_RESULT: result MAC verification failed (fail-closed)".to_string(),
+        ));
+    }
     Ok(format!(
         "[DOTAGENT SUDO-RESULT :: {valid_id}] STATUS=EXECUTED exit_code={code}\n{output}"
     ))
@@ -1097,7 +1209,10 @@ fn prompt_and_handle_ticket(req_id: &str) -> Result<(), String> {
     println!("  Reason:     {}", t.reason);
     println!("  Directory:  {}", t.cwd);
     println!("  Expires in: {}s", t.expires_at_unix.saturating_sub(now));
-    println!("  Exact argv: sudo -- {}", t.argv.join(" "));
+    println!("  Exact argv ({} args):", t.argv.len());
+    for (idx, arg) in t.argv.iter().enumerate() {
+        println!("    argv[{idx}] = {arg:?}");
+    }
     for pf in &t.pinned_files {
         println!("  Pinned SHA: {}  {}", &pf.sha256_hex[..16], pf.abs_path);
     }
