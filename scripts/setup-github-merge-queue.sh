@@ -2,7 +2,6 @@
 # Compatibility entrypoint for repository rulesets and the release promoter App manifest.
 set -euo pipefail
 
-script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 owner=susanbdev
 repo=dotagent
 manifest=false
@@ -25,14 +24,14 @@ while [[ $# -gt 0 ]]; do
         --dry-run|--verify|--apply) args+=("$1"); shift ;;
         --print-app-manifest) manifest=true; shift ;;
         --all-fleet|--apply-org)
-            printf '%s requires the organization entrypoint: python3 scripts/setup-github-rulesets.py --org ORG\n' "$1" >&2
+            printf '%s requires the organization entrypoint: dotagent github-rulesets --org ORG\n' "$1" >&2
             exit 2
             ;;
         -h|--help)
             printf '%s\n' 'Compatibility entrypoint for single-repository rulesets.' \
                 'Use --print-app-manifest to print the release promoter manifest.' \
                 'Native merge-queue provisioning is retired until the required checks support merge_group.'
-            exec python3 "${script_dir}/setup-github-rulesets.py" --help
+            exec dotagent github-rulesets --help
             ;;
         *) printf 'Unknown option %s\n' "$1" >&2; exit 2 ;;
     esac
@@ -57,5 +56,5 @@ MANIFEST
 fi
 
 # The stock macOS Bash handles empty arrays under nounset via the + expansion.
-exec python3 "${script_dir}/setup-github-rulesets.py" --repo "${owner}/${repo}" \
+exec dotagent github-rulesets --repo "${owner}/${repo}" \
     ${args[@]+"${args[@]}"}

@@ -174,14 +174,16 @@ echo "[test-delivery-scripts] ok 7 - empty diff fails closed by default and disa
 # Case 8: Verify the compatible App manifest and ruleset plan.
 MANIFEST_JSON="$(bash "${SETUP_MQ_SCRIPT}" --print-app-manifest)"
 python3 -c 'import json, sys; d = json.loads(sys.argv[1]); sys.exit(d["default_permissions"] != {"contents": "write", "metadata": "read"})' "${MANIFEST_JSON}"
-DRY_OUT="$(bash "${SETUP_MQ_SCRIPT}" --owner susanbdev --repo dotagent --promoter-app-id 123456 --dry-run)"
-CANONICAL_OUT="$(python3 "${SCRIPT_DIR}/setup-github-rulesets.py" --repo susanbdev/dotagent --promoter-app-id 123456 --dry-run)"
+RULESETS_BIN="${DOTAGENT_RULESETS_BIN:-${CARGO_TARGET_DIR:-${REPO_ROOT}/target}/release/dotagent}"
+[[ -x "${RULESETS_BIN}" ]] || fail "build the dotagent release binary or set DOTAGENT_RULESETS_BIN"
+DRY_OUT="$(PATH="$(dirname -- "${RULESETS_BIN}"):${PATH}" bash "${SETUP_MQ_SCRIPT}" --owner susanbdev --repo dotagent --promoter-app-id 123456 --dry-run)"
+CANONICAL_OUT="$("${RULESETS_BIN}" github-rulesets --repo susanbdev/dotagent --promoter-app-id 123456 --dry-run)"
 [[ "${DRY_OUT}" == "${CANONICAL_OUT}" ]] || fail "compatibility dry-run diverged from canonical plan"
 assert_exit_code 2 bash "${SETUP_MQ_SCRIPT}" --all-fleet --apply
 echo "[test-delivery-scripts] ok 8 - promoter App manifest and compatibility ruleset dry-run"
 
-# Case 9: Reconcile mock GitHub rulesets, including refusals and repeated apply.
-python3 -B "${SCRIPT_DIR}/test-github-rulesets.py"
-echo "[test-delivery-scripts] ok 9 - ruleset drift and idempotency"
+ORG_OUT="$("${RULESETS_BIN}" github-rulesets --org susanbdev --include-repo policy-hub)"
+python3 -c 'import json, sys; d = json.loads(sys.argv[1]); sys.exit(d["endpoint"] != "orgs/susanbdev/rulesets" or d["rulesets"][0]["conditions"]["repository_name"]["include"] != ["policy-hub"])' "${ORG_OUT}"
+echo "[test-delivery-scripts] ok 9 - offline organization ruleset scope"
 
 echo "[test-delivery-scripts] ALL TESTS PASSED"

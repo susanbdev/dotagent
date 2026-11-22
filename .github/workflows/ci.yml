@@ -107,6 +107,54 @@ jobs:
           chmod -R u+w target/test-workspaces target/cleanroom-run-* 2>/dev/null || true
           rm -rf target/test-workspaces target/tbench-* target/cleanroom-run-* target/ci.receipt.json || true
 
+      - name: Build and verify macOS universal preview
+        if: runner.os == 'macOS' && github.event_name == 'push' && startsWith(github.ref, 'refs/heads/')
+        shell: bash
+        run: |
+          set -euo pipefail
+          host="$(rustc -vV | sed -n 's/^host: //p')"
+          case "${host}" in
+            aarch64-apple-darwin) other=x86_64-apple-darwin ;;
+            x86_64-apple-darwin) other=aarch64-apple-darwin ;;
+            *) echo "::error::Unexpected macOS Rust host: ${host}"; exit 1 ;;
+          esac
+          rustup target add "${other}"
+          cargo build --release --locked -p agent-guard --bin dotagent --target "${other}"
+
+          preview="${RUNNER_TEMP}/dotagent-macos-preview"
+          mkdir -p "${preview}"
+          lipo -create target/release/dotagent "target/${other}/release/dotagent" -output "${preview}/dotagent"
+          codesign --force --sign - "${preview}/dotagent"
+          codesign --verify --strict --all-architectures "${preview}/dotagent"
+          lipo "${preview}/dotagent" -verify_arch arm64 x86_64
+          file "${preview}/dotagent"
+
+          /usr/bin/sandbox-exec -p '(version 1) (allow default) (deny network*)' \
+            "${preview}/dotagent" github-rulesets --repo susanbdev/dotagent --dry-run > "${preview}/rulesets.json"
+          python3 -B - "${preview}/rulesets.json" <<'PY'
+          import json, sys
+          with open(sys.argv[1], encoding="utf-8") as source:
+              plan = json.load(source)
+          if (plan["endpoint"] != "repos/susanbdev/dotagent/rulesets"
+              or [rule["name"] for rule in plan["rulesets"]] != ["dotagent-zero-trust-main"]):
+              raise SystemExit("unexpected offline ruleset plan")
+          PY
+
+          cd "${preview}"
+          printf 'Commit: %s\nSmoke-test host: %s\nSignature: ad hoc\n' "${GITHUB_SHA}" "${host}" > BUILD.txt
+          shasum -a 256 dotagent > SHA256SUMS
+          tar -czf dotagent-macos-universal.tar.gz dotagent SHA256SUMS BUILD.txt
+          shasum -a 256 dotagent-macos-universal.tar.gz
+
+      - name: Upload macOS universal preview
+        if: runner.os == 'macOS' && github.event_name == 'push' && startsWith(github.ref, 'refs/heads/')
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: dotagent-macos-universal
+          path: ${{ runner.temp }}/dotagent-macos-preview/dotagent-macos-universal.tar.gz
+          if-no-files-found: error
+          retention-days: 7
+
   supply-chain-deny:
     name: Supply-Chain Advisory & License Gate (cargo-deny)
     runs-on: ubuntu-latest
