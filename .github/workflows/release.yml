@@ -520,8 +520,13 @@ jobs:
           VERIFY_DIR="${RUNNER_TEMP}/post-release-verify"
           ASSETS="${VERIFY_DIR}/assets"
           COMPILER="${GITHUB_WORKSPACE}/target/release/dotagent-compiler"
-          mkdir -p "${ASSETS}"
+          mkdir -p "${ASSETS}" "${VERIFY_DIR}/out-of-band"
           gh release download "${TAG}" --repo "${REPO_FULL}" --pattern '*' --dir "${ASSETS}"
+          for oob in "${ASSETS}"/*.sig "${ASSETS}"/*.sshsig "${ASSETS}/SHA256SUMS.macos" "${ASSETS}/dotagent-${TAG}-universal-apple-darwin.pkg"; do
+            if [[ -e "${oob}" ]]; then
+              mv "${oob}" "${VERIFY_DIR}/out-of-band/"
+            fi
+          done
           attest() {
             gh attestation verify "$1" --repo "${REPO_FULL}" --signer-workflow "${SIGNER_WF}" \
               --source-ref "${GITHUB_REF}" --source-digest "${GITHUB_SHA}" \
@@ -854,5 +859,9 @@ jobs:
           cp extra/brew/dotagent.rb tap/Formula/dotagent.rb
           cd tap
           git add Formula/dotagent.rb
-          git commit -m "dotagent ${GITHUB_REF_NAME}"
-          git push origin HEAD
+          if ! git diff --cached --quiet; then
+            git commit -m "dotagent ${GITHUB_REF_NAME}"
+            git push origin HEAD
+          else
+            echo "Formula/dotagent.rb already up to date for ${GITHUB_REF_NAME}"
+          fi

@@ -56,8 +56,6 @@ class ActivateTests(unittest.TestCase):
         result = self.run_activate("--from-prebuilt", self.prebuilt, "--prebuilt-sums", self.write_sums(), self.home)
         self.assertEqual(result.returncode, 0, result.stderr)
         for name in fx.BINARIES:
-            if name == "agent-guard-sh":
-                continue
             self.assertEqual(fx.mode_of(os.path.join(self.home, ".local", "bin", name)), 0o555, name)
         with open(os.path.join(self.home, ".stub.log"), encoding="ascii") as handle:
             log = handle.read()
@@ -100,6 +98,22 @@ class ActivateTests(unittest.TestCase):
         result = self.run_activate("--from-prebuilt", self.prebuilt, "--prebuilt-sums", sums)
         self.assertEqual(result.returncode, 2)
         self.assertFalse(os.path.exists(os.path.join(self.home, ".local", "bin", "dotagent")))
+
+    def test_from_prebuilt_rejects_missing_agent_guard_sh(self):
+        sums = self.write_sums()
+        os.remove(os.path.join(self.prebuilt, "bin", "agent-guard-sh"))
+        result = self.run_activate("--from-prebuilt", self.prebuilt, "--prebuilt-sums", sums)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("agent-guard-sh", result.stderr)
+        self.assertFalse(os.path.exists(os.path.join(self.home, ".local", "bin", "dotagent")))
+
+    def test_rejects_symlinked_local_ancestor(self):
+        decoy = os.path.join(self.scratch, "decoy_local")
+        os.makedirs(decoy)
+        os.symlink(decoy, os.path.join(self.home, ".local"))
+        result = self.run_activate("--from-prebuilt", self.prebuilt, "--prebuilt-sums", self.write_sums())
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("symlink", result.stderr)
 
     def test_unknown_option_is_rejected(self):
         self.assertEqual(self.run_activate("--bogus").returncode, 2)

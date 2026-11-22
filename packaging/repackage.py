@@ -276,7 +276,7 @@ def render_shim(binary, package_map):
         '"use strict";',
         'const { spawnSync } = require("node:child_process");',
         'const path = require("node:path");',
-        "const PACKAGES = %s;" % json.dumps(package_map, sort_keys=True),
+        "const PACKAGES = %s;" % json.dumps(package_map, separators=(",", ":"), sort_keys=True),
         "const key = process.platform + \"-\" + process.arch;",
         "const name = PACKAGES[key];",
         "if (!name) {",
@@ -305,7 +305,7 @@ def render_shim(binary, package_map):
 
 
 def dump_json(value):
-    text = json.dumps(value, indent=2, sort_keys=True) + "\n"
+    text = json.dumps(value, separators=(",", ":"), sort_keys=True) + "\n"
     assert_ascii("package.json", text)
     return text.encode("ascii")
 
@@ -459,11 +459,23 @@ def build_system(out_dir, version, trees, nfpm_path, config_path):
     if not nfpm:
         sys.stderr.write("[repackage] nfpm not found: skipping .deb/.rpm/.apk\n")
         return produced
+    with open(config_path, "r", encoding="ascii") as cfg_handle:
+        config_tpl = cfg_handle.read()
+    assert_ascii("nfpm.yaml", config_tpl)
     for target, spec in sorted(TARGETS.items()):
         if spec["deb"] is None:
             continue
-        stage = os.path.join(out_dir, "stage-" + spec["deb"], "opt", "dotagent")
+        scratch_dir = os.path.join(out_dir, "stage-" + spec["deb"])
+        stage = os.path.abspath(os.path.join(scratch_dir, "opt", "dotagent"))
         stage_system_tree(stage, trees[target])
+        stage_yaml = "'" + stage.replace("'", "''") + "'"
+        rendered_cfg = (
+            config_tpl.replace("${NFPM_VERSION}", version)
+            .replace("${NFPM_ARCH}", spec["deb"])
+            .replace("${NFPM_STAGE}", stage_yaml)
+        )
+        rendered_cfg_path = os.path.join(scratch_dir, "nfpm.yaml")
+        write_file(rendered_cfg_path, rendered_cfg.encode("ascii"), mode=0o444)
         env = dict(os.environ)
         env.update(
             {
@@ -476,7 +488,7 @@ def build_system(out_dir, version, trees, nfpm_path, config_path):
         for packager in ("deb", "rpm", "apk"):
             before = set(os.listdir(out_dir))
             result = subprocess.run(
-                [nfpm, "package", "--packager", packager, "--config", config_path, "--target", out_dir],
+                [nfpm, "package", "--packager", packager, "--config", rendered_cfg_path, "--target", out_dir],
                 env=env,
                 capture_output=True,
             )
@@ -485,7 +497,7 @@ def build_system(out_dir, version, trees, nfpm_path, config_path):
             produced.extend(
                 os.path.join(out_dir, name) for name in sorted(set(os.listdir(out_dir)) - before) if name.endswith("." + packager)
             )
-        remove_tree(os.path.join(out_dir, "stage-" + spec["deb"]))
+        remove_tree(scratch_dir)
     return produced
 
 

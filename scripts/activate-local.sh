@@ -5,8 +5,8 @@
 
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-DOTAGENT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+SCRIPT_DIR="$(cd -P -- "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+DOTAGENT_ROOT="$(cd -P -- "${SCRIPT_DIR}/.." && pwd)"
 BIN_DIR="${HOME}/.local/bin"
 TARGET_WORKSPACE=""
 PREBUILT_DIR=""
@@ -27,7 +27,11 @@ while [[ $# -gt 0 ]]; do
                 echo "[activate-local] usage: --from-prebuilt <dir>" >&2
                 exit 2
             fi
-            PREBUILT_DIR="$(cd "$2" && pwd)"
+            if [[ -L "$2" || ! -d "$2" ]]; then
+                echo "[activate-local] HARD DENY: --from-prebuilt '$2' must be a regular directory" >&2
+                exit 2
+            fi
+            PREBUILT_DIR="$(cd -P -- "$2" && pwd)"
             shift 2
             ;;
         --prebuilt-sums)
@@ -62,7 +66,44 @@ if [[ -z "${PREBUILT_DIR}" && -n "${PREBUILT_SUMS}" ]]; then
     exit 2
 fi
 
+check_nonsymlink_dir_chain() {
+    local target="$1" rest cur="" seg
+    case "${target}" in
+        /*) ;;
+        *)
+            echo "[activate-local] HARD DENY: '${target}' must be an absolute path" >&2
+            exit 2
+            ;;
+    esac
+    rest="${target#/}"
+    while [[ -n "${rest}" ]]; do
+        if [[ "${rest}" == *"/"* ]]; then
+            seg="${rest%%/*}"
+            rest="${rest#*/}"
+        else
+            seg="${rest}"
+            rest=""
+        fi
+        [[ -z "${seg}" ]] && continue
+        if [[ "${seg}" == "." || "${seg}" == ".." ]]; then
+            echo "[activate-local] HARD DENY: '${target}' must not contain '.' or '..' segments" >&2
+            exit 2
+        fi
+        cur="${cur}/${seg}"
+        if [[ -L "${cur}" ]] || [[ -e "${cur}" && ! -d "${cur}" ]]; then
+            echo "[activate-local] HARD DENY: '${cur}' must not be a symlink or non-directory" >&2
+            exit 2
+        fi
+    done
+}
+
+for dir_chk in "${BIN_DIR}" "${HOME}/.local/state/agent-guard/sessions"; do
+    check_nonsymlink_dir_chain "${dir_chk}"
+done
 mkdir -p "${BIN_DIR}" "${HOME}/.local/state/agent-guard/sessions"
+for dir_chk in "${BIN_DIR}" "${HOME}/.local/state/agent-guard/sessions"; do
+    check_nonsymlink_dir_chain "${dir_chk}"
+done
 chmod 700 "${HOME}/.local/state/agent-guard" "${HOME}/.local/state/agent-guard/sessions"
 
 # 0. Pre-build bootstrap audit: reject build-tool RCE traps BEFORE invoking Cargo
@@ -172,16 +213,32 @@ while IFS= read -r env_name; do
     esac
 done < <(compgen -e)
 
+install_sealed_bin() {
+    local src="$1" dst="$2" tmp
+    if [[ -L "${dst}" ]] || [[ -e "${dst}" && ! -f "${dst}" ]]; then
+        echo "[activate-local] HARD DENY: refusing symlink or non-regular target at ${dst}" >&2
+        exit 2
+    fi
+    tmp="${dst%/*}/.${dst##*/}.tmp.$$"
+    rm -f "${tmp}"
+    install -m 0555 "${src}" "${tmp}"
+    mv -f "${tmp}" "${dst}"
+}
+
 # 1. Build static release binaries and install with read-execute-only VFS mode (0555)
 if [[ -n "${PREBUILT_DIR}" ]]; then
     BIN_SRC="${PREBUILT_DIR}/bin"
-    for bin_name in agent-guard dotagent-compiler swarm-tool dotagent dotagent-harness; do
+    if [[ -L "${BIN_SRC}" || ! -d "${BIN_SRC}" ]]; then
+        echo "[activate-local] HARD DENY: '${BIN_SRC}' must be a regular directory" >&2
+        exit 2
+    fi
+    for bin_name in agent-guard agent-guard-sh dotagent-compiler swarm-tool dotagent dotagent-harness; do
         if [[ -L "${BIN_SRC}/${bin_name}" ]]; then
             echo "[activate-local] HARD DENY: prebuilt binary '${bin_name}' is a symlink in ${BIN_SRC}" >&2
             exit 2
         fi
     done
-    for bin_name in agent-guard dotagent-compiler swarm-tool dotagent; do
+    for bin_name in agent-guard agent-guard-sh dotagent-compiler swarm-tool dotagent; do
         if [[ ! -f "${BIN_SRC}/${bin_name}" ]]; then
             echo "[activate-local] HARD DENY: prebuilt binary '${bin_name}' missing in ${BIN_SRC}" >&2
             exit 2
@@ -192,14 +249,16 @@ if [[ -n "${PREBUILT_DIR}" ]]; then
         exit 2
     fi
     verified_count=0
-    for bin_name in agent-guard dotagent-compiler swarm-tool dotagent dotagent-harness; do
+    for bin_name in agent-guard agent-guard-sh dotagent-compiler swarm-tool dotagent dotagent-harness; do
         [[ -f "${BIN_SRC}/${bin_name}" ]] || continue
         if command -v sha256sum >/dev/null 2>&1; then
-            actual_sha="$(sha256sum "${BIN_SRC}/${bin_name}" | cut -d' ' -f1)"
+            actual_sha="$(sha256sum -- "${BIN_SRC}/${bin_name}")"
         else
-            actual_sha="$(shasum -a 256 "${BIN_SRC}/${bin_name}" | cut -d' ' -f1)"
+            actual_sha="$(shasum -a 256 -- "${BIN_SRC}/${bin_name}")"
         fi
-        if ! grep -qx "${actual_sha}  bin/${bin_name}" "${PREBUILT_SUMS}"; then
+        actual_sha="${actual_sha%% *}"
+        actual_sha="${actual_sha#\\}"
+        if ! grep -Fxq "${actual_sha}  bin/${bin_name}" "${PREBUILT_SUMS}"; then
             echo "[activate-local] HARD DENY: SHA-256 of prebuilt '${bin_name}' is not listed in ${PREBUILT_SUMS}" >&2
             exit 2
         fi
@@ -209,33 +268,29 @@ if [[ -n "${PREBUILT_DIR}" ]]; then
 else
     BIN_SRC="${DOTAGENT_ROOT}/target/release"
     (
-        cd -- "${DOTAGENT_ROOT}"
+        cd -P -- "${DOTAGENT_ROOT}"
         cargo build --release --manifest-path "${DOTAGENT_ROOT}/Cargo.toml" --offline 2>/dev/null \
             || cargo build --release --manifest-path "${DOTAGENT_ROOT}/Cargo.toml"
     )
 fi
 for bin_name in agent-guard dotagent-compiler swarm-tool; do
-    if [[ -e "${BIN_DIR}/${bin_name}" ]]; then
-        chmod u+w "${BIN_DIR}/${bin_name}" 2>/dev/null || true
-    fi
-    install -m 0555 "${BIN_SRC}/${bin_name}" "${BIN_DIR}/${bin_name}"
+    install_sealed_bin "${BIN_SRC}/${bin_name}" "${BIN_DIR}/${bin_name}"
 done
+if [[ -f "${BIN_SRC}/agent-guard-sh" ]]; then
+    install_sealed_bin "${BIN_SRC}/agent-guard-sh" "${BIN_DIR}/agent-guard-sh"
+else
+    install_sealed_bin "${BIN_SRC}/agent-guard" "${BIN_DIR}/agent-guard-sh"
+fi
 
 # Install unified `dotagent` CLI (falling back to `agent-guard` multicall binary under minimal test shims)
-if [[ -e "${BIN_DIR}/dotagent" ]]; then
-    chmod u+w "${BIN_DIR}/dotagent" 2>/dev/null || true
-fi
 if [[ -f "${BIN_SRC}/dotagent" ]]; then
-    install -m 0555 "${BIN_SRC}/dotagent" "${BIN_DIR}/dotagent"
+    install_sealed_bin "${BIN_SRC}/dotagent" "${BIN_DIR}/dotagent"
 else
-    install -m 0555 "${BIN_SRC}/agent-guard" "${BIN_DIR}/dotagent"
+    install_sealed_bin "${BIN_SRC}/agent-guard" "${BIN_DIR}/dotagent"
 fi
 
 if [[ -f "${BIN_SRC}/dotagent-harness" ]]; then
-    if [[ -e "${BIN_DIR}/dotagent-harness" ]]; then
-        chmod u+w "${BIN_DIR}/dotagent-harness" 2>/dev/null || true
-    fi
-    install -m 0555 "${BIN_SRC}/dotagent-harness" "${BIN_DIR}/dotagent-harness"
+    install_sealed_bin "${BIN_SRC}/dotagent-harness" "${BIN_DIR}/dotagent-harness"
 fi
 
 # 2. Verify compiled bundles match golden SHA-256 manifest
