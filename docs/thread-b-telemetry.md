@@ -40,6 +40,7 @@ Absent optional fields mean unknown or inapplicable. The encoder accepts ASCII i
 | Producer | Allowed event families | Evidence |
 | --- | --- | --- |
 | `dotagent.baseline` | `EXECUTION_STARTED`, `EXECUTION_FINISHED`, `PREREQUISITE_CHECKED` | Fixed host-mediated prerequisite commands and observed results. |
+| `agent-guard.shell-wrapper` | `EXECUTION_STARTED`, `EXECUTION_FINISHED` | Host launch and OS wait result for the trusted sandbox mediator. |
 | `agent-guard.hook` | `CONTROL_DECISION`, `USAGE_AND_DISPOSITION`, `DETECTION_ASSESSMENT`, `RECOVERY_OR_ESCALATION` | Guard actions, observed boundary measurements and unreviewed derived assessments. |
 | `agent-guard.audit` | `CAPTURE_HEALTH` | Local storage activity. |
 
@@ -47,7 +48,7 @@ The emitter assigns provenance from a closed producer allowlist. Worker input ha
 
 | Event family | Domain fields and interpretation |
 | --- | --- |
-| `EXECUTION_STARTED`, `EXECUTION_FINISHED` | `executable`, `argument_summary`, `subject`, `route`, and status fields describe the fixed mediator invocation. `nested_process_coverage` applies to child commands. Process exit and signal are separate observations. |
+| `EXECUTION_STARTED`, `EXECUTION_FINISHED` | `executable`, `subject`, `route`, and status fields describe the mediator invocation. The baseline producer may include `argument_summary` for its fixed prerequisite commands. `nested_process_coverage` applies to child commands. Process exit and signal are separate observations. |
 | `PREREQUISITE_CHECKED` | `requested_check`, `source_freshness`, `check_expectation` and `observed_status`. Optional fields include `resolved_commit` or `worktree_dirty` with `status_scope`. A failed check and a successful status observation remain separate. |
 | `CONTROL_DECISION` | `boundary`, `control`, `threshold`, `unit` and `threshold_source` where applicable. Decisions, effective limits and routing are evaluated together. |
 | `USAGE_AND_DISPOSITION` | Requested, granted, selected, scanned and emitted counts when observed. Line offsets are one-based. Byte counts use bytes, `continuation_available` is a Boolean, and estimated tokens use `dotagent.bpe-heuristic.v1`. Output records identify sanitizer transformations and dropped bytes attributable to each cap. |
