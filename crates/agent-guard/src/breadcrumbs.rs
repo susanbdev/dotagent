@@ -1480,7 +1480,7 @@ impl ExclusiveFileLockGuard {
         }
 
         let self_pid = std::process::id();
-        let self_proc_tok = proc_instance_token_for_pid(self_pid);
+        let self_proc_tok = current_lock_owner_token();
         let mut registered_want = false;
         loop {
             match OpenOptions::new()
@@ -1489,14 +1489,10 @@ impl ExclusiveFileLockGuard {
                 .open(&lock_path)
             {
                 Ok(mut f) => {
-                    match &self_proc_tok {
-                        Some(tok) => {
-                            let _ = writeln!(f, "pid={self_pid} proc={tok}");
-                        }
-                        None => {
-                            let _ = writeln!(f, "pid={self_pid}");
-                        }
-                    }
+                    writeln!(f, "pid={self_pid} proc={self_proc_tok}").map_err(|e| {
+                        let _ = fs::remove_file(&lock_path);
+                        format!("failed writing exclusive lock owner: {e}")
+                    })?;
                     if registered_want {
                         let _ = fs::remove_file(&want_path);
                     }
@@ -1595,6 +1591,19 @@ fn proc_instance_token_for_pid(pid: u32) -> Option<String> {
     }
 }
 
+fn current_lock_owner_token() -> &'static str {
+    static TOKEN: OnceLock<String> = OnceLock::new();
+    TOKEN.get_or_init(|| {
+        proc_instance_token_for_pid(std::process::id()).unwrap_or_else(|| {
+            let stamp = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos();
+            format!("instance-{stamp:x}")
+        })
+    })
+}
+
 fn is_lock_holder_dead(lock_path: &Path, age: Duration) -> bool {
     let Ok(raw) = fs::read_to_string(lock_path) else {
         return true;
@@ -1609,12 +1618,15 @@ fn is_lock_holder_dead(lock_path: &Path, age: Duration) -> bool {
     let Ok(pid) = pid_str.parse::<u32>() else {
         return true;
     };
-    if pid == 0 || pid == std::process::id() {
-        // Because `acquire_in_proc_fifo` serializes all threads in `std::process::id()`,
-        // seeing our own PID in an on-disk lock file proves a dead PID-namespace/PID-reuse orphan.
+    if pid == 0 {
         return true;
     }
     let recorded_proc = parts.next().and_then(|s| s.strip_prefix("proc="));
+    if pid == std::process::id() {
+        // Independent FIFO registries can contend on the same on-disk marker.
+        // A matching owner token remains live regardless of the marker's age.
+        return recorded_proc != Some(current_lock_owner_token());
+    }
     #[cfg(target_os = "linux")]
     {
         let Some(live_tok) = proc_instance_token_for_pid(pid) else {
@@ -2024,6 +2036,28 @@ fn set_file_0600(path: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn aged_live_lock_cannot_be_reclaimed_by_another_fifo_registry() {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/test-workspaces")
+            .join(format!("live-fifo-owner-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("observation");
+        let held = ExclusiveFileLockGuard::acquire_in(&target, dir.clone(), &AUTHORITY_FIFOS)
+            .expect("acquire the authority-side marker");
+        let age = Duration::from_secs(60);
+        File::open(&held.lock_path)
+            .unwrap()
+            .set_modified(SystemTime::now() - age)
+            .unwrap();
+        assert!(!is_lock_holder_dead(&held.lock_path, age));
+        drop(held);
+        let next = ExclusiveFileLockGuard::acquire_in(&target, dir.clone(), &OBSERVATION_FIFOS)
+            .expect("acquire from the observation registry after release");
+        drop(next);
+        fs::remove_dir(dir).unwrap();
+    }
 
     #[test]
     fn observational_waiters_are_separate_from_authoritative_waiters() {
