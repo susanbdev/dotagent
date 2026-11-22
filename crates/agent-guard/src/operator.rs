@@ -2118,20 +2118,49 @@ fn verify_dist_antigravity_sources(dotagent_root: &Path) -> Result<AntigravityDi
     validate_existing_regular_dir_lstat(&ag_dist, "dist/antigravity directory")?;
     let ag_agents_dist = ag_dist.join("agents");
     validate_existing_regular_dir_lstat(&ag_agents_dist, "dist/antigravity/agents directory")?;
+    let verify_dir = dotagent_root.join("dist-verify");
+    validate_existing_regular_dir_lstat(&verify_dir, "dist-verify directory")?;
 
-    let manifest_path = dotagent_root.join("dist-verify/manifest.sha256");
-    let mut expected_hashes = std::collections::BTreeMap::new();
-    if let Some(_mmeta) =
-        validate_optional_regular_file_lstat(&manifest_path, "dist-verify/manifest.sha256")?
+    let manifest_path = verify_dir.join("manifest.sha256");
+    if validate_optional_regular_file_lstat(&manifest_path, "dist-verify/manifest.sha256")?
+        .is_none()
     {
-        let raw_manifest = fs::read_to_string(&manifest_path)
-            .map_err(|e| format!("failed reading '{}': {e}", manifest_path.display()))?;
-        for line in raw_manifest.lines() {
-            let mut parts = line.split_whitespace();
-            if let (Some(h), Some(rel)) = (parts.next(), parts.next()) {
-                expected_hashes.insert(rel.to_string(), h.to_string());
-            }
+        return Err(
+            "missing required bundle integrity manifest 'dist-verify/manifest.sha256'".to_string(),
+        );
+    }
+    let raw_manifest = fs::read_to_string(&manifest_path)
+        .map_err(|e| format!("failed reading '{}': {e}", manifest_path.display()))?;
+    let mut expected_hashes = std::collections::BTreeMap::new();
+    for (line_idx, line) in raw_manifest.lines().enumerate() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
         }
+        let mut parts = trimmed.split_whitespace();
+        let (Some(h), Some(rel), None) = (parts.next(), parts.next(), parts.next()) else {
+            return Err(format!(
+                "malformed entry at line {} in 'dist-verify/manifest.sha256'",
+                line_idx + 1
+            ));
+        };
+        if h.len() != 64 || !h.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err(format!(
+                "invalid SHA-256 digest for '{rel}' at line {} in 'dist-verify/manifest.sha256'",
+                line_idx + 1
+            ));
+        }
+        if expected_hashes
+            .insert(rel.to_string(), h.to_ascii_lowercase())
+            .is_some()
+        {
+            return Err(format!(
+                "duplicate SHA-256 entry for '{rel}' in 'dist-verify/manifest.sha256'"
+            ));
+        }
+    }
+    if expected_hashes.is_empty() {
+        return Err("bundle integrity manifest 'dist-verify/manifest.sha256' is empty".to_string());
     }
 
     let hooks_rel = "dist/antigravity/hooks.json";
@@ -2139,20 +2168,18 @@ fn verify_dist_antigravity_sources(dotagent_root: &Path) -> Result<AntigravityDi
     if validate_optional_regular_file_lstat(&hooks_path, hooks_rel)?.is_none() {
         return Err(format!("missing bundle artifact '{hooks_rel}'"));
     }
+    let Some(exp_hooks) = expected_hashes.get(hooks_rel) else {
+        return Err(format!(
+            "bundle manifest missing required SHA-256 entry for '{hooks_rel}'"
+        ));
+    };
     let hooks_bytes =
         fs::read(&hooks_path).map_err(|e| format!("failed reading '{hooks_rel}': {e}"))?;
-    if !expected_hashes.is_empty() {
-        let Some(exp) = expected_hashes.get(hooks_rel) else {
-            return Err(format!(
-                "bundle manifest missing required SHA-256 entry for '{hooks_rel}'"
-            ));
-        };
-        let actual = crate::crypto::sha256_hex(&hooks_bytes);
-        if &actual != exp {
-            return Err(format!(
-                "bundle integrity mismatch on '{hooks_rel}': expected {exp}, got {actual}"
-            ));
-        }
+    let actual_hooks = crate::crypto::sha256_hex(&hooks_bytes);
+    if &actual_hooks != exp_hooks {
+        return Err(format!(
+            "bundle integrity mismatch on '{hooks_rel}': expected {exp_hooks}, got {actual_hooks}"
+        ));
     }
     let hooks_tpl =
         String::from_utf8(hooks_bytes).map_err(|_| format!("non-UTF-8 bytes in '{hooks_rel}'"))?;
@@ -2164,19 +2191,17 @@ fn verify_dist_antigravity_sources(dotagent_root: &Path) -> Result<AntigravityDi
         if validate_optional_regular_file_lstat(&p, &rel)?.is_none() {
             return Err(format!("missing bundle artifact '{rel}'"));
         }
+        let Some(exp) = expected_hashes.get(&rel) else {
+            return Err(format!(
+                "bundle manifest missing required SHA-256 entry for '{rel}'"
+            ));
+        };
         let bytes = fs::read(&p).map_err(|e| format!("failed reading '{rel}': {e}"))?;
-        if !expected_hashes.is_empty() {
-            let Some(exp) = expected_hashes.get(&rel) else {
-                return Err(format!(
-                    "bundle manifest missing required SHA-256 entry for '{rel}'"
-                ));
-            };
-            let actual = crate::crypto::sha256_hex(&bytes);
-            if &actual != exp {
-                return Err(format!(
-                    "bundle integrity mismatch on '{rel}': expected {exp}, got {actual}"
-                ));
-            }
+        let actual = crate::crypto::sha256_hex(&bytes);
+        if &actual != exp {
+            return Err(format!(
+                "bundle integrity mismatch on '{rel}': expected {exp}, got {actual}"
+            ));
         }
         agent_blobs.push((af, bytes));
     }
@@ -2402,76 +2427,391 @@ impl RollbackJournal {
     }
 }
 
-fn write_transactional_file_with_backup(
+const ANTIGRAVITY_PROVENANCE_FILE: &str = ".dotagent-manifest.json";
+const ANTIGRAVITY_PROVENANCE_FORMAT: &str = "dotagent.antigravity.provenance.v1";
+
+#[derive(Debug, Clone, PartialEq)]
+struct FileProvenanceEntry {
+    rel_path: String,
+    pre_existing: bool,
+    orig_mode: Option<u32>,
+    orig_sha256: Option<String>,
+    deployed_sha256: String,
+    managed_group: Option<JsonValue>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct AntigravityProvenanceManifest {
+    created_ag_dir: bool,
+    created_agents_dir: bool,
+    entries: Vec<FileProvenanceEntry>,
+}
+
+fn is_valid_sha256_hex(s: &str) -> bool {
+    s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+fn is_valid_manifest_rel_path(rel: &str) -> bool {
+    if rel == "hooks.json" {
+        return true;
+    }
+    if let Some(rest) = rel.strip_prefix("agents/") {
+        return !rest.is_empty()
+            && !rest.contains('/')
+            && !rest.contains('\\')
+            && rest != "."
+            && rest != "..";
+    }
+    false
+}
+
+impl AntigravityProvenanceManifest {
+    fn parse(raw: &str) -> Result<Self, String> {
+        let parsed = JsonValue::parse(raw)
+            .map_err(|e| format!("invalid Antigravity provenance manifest JSON: {e}"))?;
+        if parsed.get("format").and_then(JsonValue::as_str) != Some(ANTIGRAVITY_PROVENANCE_FORMAT) {
+            return Err("unrecognized Antigravity provenance manifest format".to_string());
+        }
+        let created_ag_dir = parsed
+            .get("created_ag_dir")
+            .and_then(JsonValue::as_bool)
+            .ok_or("missing boolean 'created_ag_dir' in provenance manifest")?;
+        let created_agents_dir = parsed
+            .get("created_agents_dir")
+            .and_then(JsonValue::as_bool)
+            .ok_or("missing boolean 'created_agents_dir' in provenance manifest")?;
+        let arr = parsed
+            .get("entries")
+            .and_then(JsonValue::as_array)
+            .ok_or("missing 'entries' array in provenance manifest")?;
+        if arr.is_empty() {
+            return Err("Antigravity provenance manifest 'entries' cannot be empty".to_string());
+        }
+        let mut seen = std::collections::BTreeSet::new();
+        let mut entries = Vec::with_capacity(arr.len());
+        for item in arr {
+            let rel_path = item
+                .get("rel_path")
+                .and_then(JsonValue::as_str)
+                .filter(|s| is_valid_manifest_rel_path(s))
+                .ok_or("invalid 'rel_path' in Antigravity provenance manifest")?
+                .to_string();
+            if !seen.insert(rel_path.clone()) {
+                return Err(format!(
+                    "duplicate provenance entry for '{rel_path}' in manifest"
+                ));
+            }
+            let pre_existing = item
+                .get("pre_existing")
+                .and_then(JsonValue::as_bool)
+                .ok_or("missing boolean 'pre_existing' in provenance manifest")?;
+            let orig_mode = match item.get("orig_mode") {
+                None | Some(JsonValue::Null) => None,
+                Some(v) => {
+                    let m = v
+                        .as_u64()
+                        .filter(|&m| m <= 0o777)
+                        .ok_or("invalid 'orig_mode' in provenance manifest")?;
+                    Some(m as u32)
+                }
+            };
+            let orig_sha256 = match item.get("orig_sha256") {
+                None | Some(JsonValue::Null) => None,
+                Some(v) => {
+                    let s = v
+                        .as_str()
+                        .filter(|s| is_valid_sha256_hex(s))
+                        .ok_or("invalid 'orig_sha256' in provenance manifest")?;
+                    Some(s.to_ascii_lowercase())
+                }
+            };
+            if pre_existing && orig_sha256.is_none() {
+                return Err(format!(
+                    "pre-existing provenance entry '{rel_path}' is missing 'orig_sha256'"
+                ));
+            }
+            let deployed_sha256 = item
+                .get("deployed_sha256")
+                .and_then(JsonValue::as_str)
+                .filter(|s| is_valid_sha256_hex(s))
+                .ok_or("invalid 'deployed_sha256' in provenance manifest")?
+                .to_ascii_lowercase();
+            let managed_group = match item.get("managed_group") {
+                None | Some(JsonValue::Null) => None,
+                Some(v) if v.as_object().is_some() => Some(v.clone()),
+                Some(_) => {
+                    return Err(
+                        "invalid non-object 'managed_group' in provenance manifest".to_string()
+                    );
+                }
+            };
+            if rel_path == "hooks.json" && managed_group.is_none() {
+                return Err(
+                    "provenance entry for 'hooks.json' is missing 'managed_group'".to_string(),
+                );
+            }
+            entries.push(FileProvenanceEntry {
+                rel_path,
+                pre_existing,
+                orig_mode,
+                orig_sha256,
+                deployed_sha256,
+                managed_group,
+            });
+        }
+        Ok(Self {
+            created_ag_dir,
+            created_agents_dir,
+            entries,
+        })
+    }
+
+    fn serialize(&self) -> String {
+        let items: Vec<JsonValue> = self
+            .entries
+            .iter()
+            .map(|e| {
+                JsonValue::Object(vec![
+                    ("rel_path".to_string(), JsonValue::Str(e.rel_path.clone())),
+                    ("pre_existing".to_string(), JsonValue::Bool(e.pre_existing)),
+                    (
+                        "orig_mode".to_string(),
+                        e.orig_mode
+                            .map_or(JsonValue::Null, |m| JsonValue::Uint(u64::from(m))),
+                    ),
+                    (
+                        "orig_sha256".to_string(),
+                        e.orig_sha256
+                            .as_ref()
+                            .map_or(JsonValue::Null, |s| JsonValue::Str(s.clone())),
+                    ),
+                    (
+                        "deployed_sha256".to_string(),
+                        JsonValue::Str(e.deployed_sha256.clone()),
+                    ),
+                    (
+                        "managed_group".to_string(),
+                        e.managed_group.clone().unwrap_or(JsonValue::Null),
+                    ),
+                ])
+            })
+            .collect();
+        let doc = JsonValue::Object(vec![
+            (
+                "format".to_string(),
+                JsonValue::Str(ANTIGRAVITY_PROVENANCE_FORMAT.to_string()),
+            ),
+            (
+                "created_ag_dir".to_string(),
+                JsonValue::Bool(self.created_ag_dir),
+            ),
+            (
+                "created_agents_dir".to_string(),
+                JsonValue::Bool(self.created_agents_dir),
+            ),
+            ("entries".to_string(), JsonValue::Array(items)),
+        ]);
+        let mut out = String::new();
+        format_json_pretty_2space(&doc, 0, &mut out);
+        out.push('\n');
+        out
+    }
+
+    fn entry_for(&self, rel_path: &str) -> Option<&FileProvenanceEntry> {
+        self.entries.iter().find(|e| e.rel_path == rel_path)
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn write_provenance_file_with_backup(
     target: &Path,
+    rel_path: &str,
     new_bytes: &[u8],
+    managed_group: Option<JsonValue>,
+    prior_entry: Option<&FileProvenanceEntry>,
     default_new_mode: u32,
     preserve_existing_mode: bool,
     journal: &mut RollbackJournal,
     log: &mut Vec<String>,
-) -> Result<(), String> {
+) -> Result<FileProvenanceEntry, String> {
     let existing_meta = validate_optional_regular_file_lstat(target, "target file")?;
     let bak = backup_path_for(target);
     let existing_bak = validate_optional_regular_file_lstat(&bak, "backup file")?;
 
     #[cfg(unix)]
-    let orig_mode = existing_meta.as_ref().map(|m| {
+    let current_disk_mode = existing_meta.as_ref().map(|m| {
         use std::os::unix::fs::PermissionsExt;
         m.permissions().mode() & 0o777
     });
     #[cfg(not(unix))]
-    let orig_mode: Option<u32> = None;
+    let current_disk_mode: Option<u32> = None;
+
+    let deployed_sha256 = crate::crypto::sha256_hex(new_bytes);
+
+    if let Some(prior) = prior_entry {
+        if prior.pre_existing && existing_bak.is_none() {
+            return Err(format!(
+                "missing required backup '{}' for pre-existing '{}' during re-activation",
+                bak.display(),
+                target.display()
+            ));
+        }
+        let effective_mode = if prior.pre_existing && preserve_existing_mode {
+            prior
+                .orig_mode
+                .or(current_disk_mode)
+                .map(|m| m | 0o400)
+                .unwrap_or(default_new_mode)
+        } else {
+            default_new_mode
+        };
+
+        if existing_meta.is_some() {
+            let existing_bytes = fs::read(target)
+                .map_err(|e| format!("failed reading '{}': {e}", target.display()))?;
+            let actual_sha = crate::crypto::sha256_hex(&existing_bytes);
+            if rel_path == "hooks.json" {
+                let text = std::str::from_utf8(&existing_bytes)
+                    .map_err(|_| format!("non-UTF-8 bytes in '{}'", target.display()))?;
+                let parsed = JsonValue::parse(text)
+                    .map_err(|e| format!("invalid JSON in '{}': {e}", target.display()))?;
+                let entries = parsed
+                    .as_object()
+                    .ok_or_else(|| format!("non-object JSON in '{}'", target.display()))?;
+                let cur_dg = entries
+                    .iter()
+                    .find(|(k, _)| k == "dotagent-guard")
+                    .map(|(_, v)| v);
+                let Some(cur_dg_val) = cur_dg else {
+                    return Err(format!(
+                        "managed 'dotagent-guard' hook group was removed externally from '{}'; preserving existing backup",
+                        target.display()
+                    ));
+                };
+                if let Some(ref exp_dg) = prior.managed_group
+                    && cur_dg_val != exp_dg
+                {
+                    return Err(format!(
+                        "managed 'dotagent-guard' hook group in '{}' was modified externally; preserving existing backup",
+                        target.display()
+                    ));
+                }
+            } else if actual_sha != prior.deployed_sha256 {
+                return Err(format!(
+                    "managed Antigravity file '{}' was modified externally; deactivate or restore before re-activating",
+                    target.display()
+                ));
+            }
+            journal.overwritten_files.push((
+                target.to_path_buf(),
+                existing_bytes,
+                current_disk_mode,
+            ));
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = fs::set_permissions(target, fs::Permissions::from_mode(0o600));
+            }
+        } else if prior.pre_existing {
+            return Err(format!(
+                "pre-existing managed file '{}' was removed externally; preserving backup '{}'",
+                target.display(),
+                bak.display()
+            ));
+        } else {
+            journal.created_files.push(target.to_path_buf());
+        }
+
+        fs::write(target, new_bytes)
+            .map_err(|e| format!("failed writing '{}': {e}", target.display()))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(target, fs::Permissions::from_mode(effective_mode)).map_err(
+                |e| {
+                    format!(
+                        "failed setting mode {:04o} on '{}': {e}",
+                        effective_mode,
+                        target.display()
+                    )
+                },
+            )?;
+        }
+        log.push(format!(
+            "[deploy] installed '{}' (mode {:04o}, {} bytes)",
+            target.display(),
+            effective_mode,
+            new_bytes.len()
+        ));
+        return Ok(FileProvenanceEntry {
+            rel_path: rel_path.to_string(),
+            pre_existing: prior.pre_existing,
+            orig_mode: prior.orig_mode,
+            orig_sha256: prior.orig_sha256.clone(),
+            deployed_sha256,
+            managed_group,
+        });
+    }
+
+    if existing_bak.is_some() {
+        return Err(format!(
+            "orphaned backup '{}' exists without provenance manifest; refusing to overwrite original backup",
+            bak.display()
+        ));
+    }
 
     let effective_mode = if preserve_existing_mode {
-        orig_mode.map(|m| m | 0o400).unwrap_or(default_new_mode)
+        current_disk_mode
+            .map(|m| m | 0o400)
+            .unwrap_or(default_new_mode)
     } else {
         default_new_mode
     };
 
-    if let Some(_meta) = &existing_meta {
+    let (pre_existing, orig_mode, orig_sha256) = if existing_meta.is_some() {
         let existing_bytes =
             fs::read(target).map_err(|e| format!("failed reading '{}': {e}", target.display()))?;
-        if existing_bytes == new_bytes {
-            return Ok(());
-        }
-        if existing_bak.is_none() {
-            fs::write(&bak, &existing_bytes).map_err(|e| {
+        let orig_sha = crate::crypto::sha256_hex(&existing_bytes);
+        // Always preserve a durable backup and provenance record for pre-existing files,
+        // even when `existing_bytes == new_bytes`, so `deactivate` restores user-owned files
+        // rather than deleting them.
+        fs::write(&bak, &existing_bytes).map_err(|e| {
+            format!(
+                "failed backing up '{}' to '{}': {e}",
+                target.display(),
+                bak.display()
+            )
+        })?;
+        #[cfg(unix)]
+        if let Some(m) = current_disk_mode {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&bak, fs::Permissions::from_mode(m)).map_err(|e| {
                 format!(
-                    "failed backing up '{}' to '{}': {e}",
-                    target.display(),
+                    "failed preserving mode {:04o} on backup '{}': {e}",
+                    m,
                     bak.display()
                 )
             })?;
-            #[cfg(unix)]
-            if let Some(m) = orig_mode {
-                use std::os::unix::fs::PermissionsExt;
-                fs::set_permissions(&bak, fs::Permissions::from_mode(m)).map_err(|e| {
-                    format!(
-                        "failed preserving mode {:04o} on backup '{}': {e}",
-                        m,
-                        bak.display()
-                    )
-                })?;
-            }
-            journal.created_backups.push(bak.clone());
-            log.push(format!(
-                "[backup] saved pre-existing '{}' -> '{}'",
-                target.display(),
-                bak.display()
-            ));
         }
+        journal.created_backups.push(bak.clone());
+        log.push(format!(
+            "[backup] saved pre-existing '{}' -> '{}'",
+            target.display(),
+            bak.display()
+        ));
         journal
             .overwritten_files
-            .push((target.to_path_buf(), existing_bytes, orig_mode));
-
+            .push((target.to_path_buf(), existing_bytes, current_disk_mode));
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
             let _ = fs::set_permissions(target, fs::Permissions::from_mode(0o600));
         }
+        (true, current_disk_mode, Some(orig_sha))
     } else {
         journal.created_files.push(target.to_path_buf());
-    }
+        (false, None, None)
+    };
 
     fs::write(target, new_bytes)
         .map_err(|e| format!("failed writing '{}': {e}", target.display()))?;
@@ -2492,7 +2832,14 @@ fn write_transactional_file_with_backup(
         effective_mode,
         new_bytes.len()
     ));
-    Ok(())
+    Ok(FileProvenanceEntry {
+        rel_path: rel_path.to_string(),
+        pre_existing,
+        orig_mode,
+        orig_sha256,
+        deployed_sha256,
+        managed_group,
+    })
 }
 
 fn deploy_antigravity_workspace_plane(
@@ -2546,6 +2893,26 @@ fn deploy_antigravity_workspace_plane(
     let ag_agents_exists =
         validate_optional_dir_lstat(&ag_agents_dir, "Antigravity agents directory")?;
 
+    let manifest_path = ag_dir.join(ANTIGRAVITY_PROVENANCE_FILE);
+    let prior_manifest_meta =
+        validate_optional_regular_file_lstat(&manifest_path, "Antigravity provenance manifest")?;
+    let prior_manifest_raw_bytes = if prior_manifest_meta.is_some() {
+        Some(
+            fs::read(&manifest_path)
+                .map_err(|e| format!("failed reading '{}': {e}", manifest_path.display()))?,
+        )
+    } else {
+        None
+    };
+    let prior_manifest = match &prior_manifest_raw_bytes {
+        Some(bytes) => {
+            let s = std::str::from_utf8(bytes)
+                .map_err(|_| format!("non-UTF-8 bytes in '{}'", manifest_path.display()))?;
+            Some(AntigravityProvenanceManifest::parse(s)?)
+        }
+        None => None,
+    };
+
     let hooks_dst = ag_dir.join("hooks.json");
     let hooks_bak = backup_path_for(&hooks_dst);
     let existing_hooks_meta =
@@ -2579,6 +2946,12 @@ fn deploy_antigravity_workspace_plane(
         },
         validated_trace.as_deref(),
     )?;
+    let merged_parsed = JsonValue::parse(&merged_hooks)
+        .map_err(|e| format!("merged hooks.json failed internal JSON check: {e}"))?;
+    let managed_guard_group = merged_parsed
+        .get("dotagent-guard")
+        .cloned()
+        .ok_or("merged hooks.json missing 'dotagent-guard' group")?;
 
     if dry_run {
         if !ag_dir_exists {
@@ -2593,11 +2966,7 @@ fn deploy_antigravity_workspace_plane(
                 ag_agents_dir.display()
             ));
         }
-        if existing_hooks_raw
-            .as_deref()
-            .is_some_and(|old| old != merged_hooks)
-            && !hooks_bak.exists()
-        {
+        if existing_hooks_meta.is_some() && prior_manifest.is_none() && !hooks_bak.exists() {
             log.push(format!(
                 "[dry-run] would back up '{}' -> '{}'",
                 hooks_dst.display(),
@@ -2617,6 +2986,10 @@ fn deploy_antigravity_workspace_plane(
                 bytes.len()
             ));
         }
+        log.push(format!(
+            "[dry-run] would record activation provenance '{}'",
+            manifest_path.display()
+        ));
         return Ok(());
     }
 
@@ -2633,25 +3006,81 @@ fn deploy_antigravity_workspace_plane(
             journal.created_dirs.push(ag_agents_dir.clone());
         }
 
-        write_transactional_file_with_backup(
+        let mut prov_entries = Vec::with_capacity(1 + agent_blobs.len());
+        let hooks_prov = write_provenance_file_with_backup(
             &hooks_dst,
+            "hooks.json",
             merged_hooks.as_bytes(),
+            Some(managed_guard_group),
+            prior_manifest
+                .as_ref()
+                .and_then(|m| m.entry_for("hooks.json")),
             default_new_mode,
             true,
             &mut journal,
             log,
         )?;
+        prov_entries.push(hooks_prov);
 
         for &(af, ref bytes) in &agent_blobs {
             let dst = ag_agents_dir.join(af);
-            write_transactional_file_with_backup(
+            let rel = format!("agents/{af}");
+            let agent_prov = write_provenance_file_with_backup(
                 &dst,
+                &rel,
                 bytes,
+                None,
+                prior_manifest.as_ref().and_then(|m| m.entry_for(&rel)),
                 default_new_mode,
                 true,
                 &mut journal,
                 log,
             )?;
+            prov_entries.push(agent_prov);
+        }
+
+        let new_manifest = AntigravityProvenanceManifest {
+            created_ag_dir: prior_manifest
+                .as_ref()
+                .map_or(!ag_dir_exists, |m| m.created_ag_dir),
+            created_agents_dir: prior_manifest
+                .as_ref()
+                .map_or(!ag_agents_exists, |m| m.created_agents_dir),
+            entries: prov_entries,
+        };
+        let serialized_manifest = new_manifest.serialize();
+        if let Some(prev_bytes) = prior_manifest_raw_bytes {
+            #[cfg(unix)]
+            let prev_mode = prior_manifest_meta.as_ref().map(|m| {
+                use std::os::unix::fs::PermissionsExt;
+                m.permissions().mode() & 0o777
+            });
+            #[cfg(not(unix))]
+            let prev_mode: Option<u32> = None;
+            journal
+                .overwritten_files
+                .push((manifest_path.clone(), prev_bytes, prev_mode));
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = fs::set_permissions(&manifest_path, fs::Permissions::from_mode(0o600));
+            }
+        } else {
+            journal.created_files.push(manifest_path.clone());
+        }
+        fs::write(&manifest_path, serialized_manifest.as_bytes())
+            .map_err(|e| format!("failed writing '{}': {e}", manifest_path.display()))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&manifest_path, fs::Permissions::from_mode(default_new_mode))
+                .map_err(|e| {
+                    format!(
+                        "failed setting mode {:04o} on '{}': {e}",
+                        default_new_mode,
+                        manifest_path.display()
+                    )
+                })?;
         }
         Ok(())
     })();
@@ -2667,7 +3096,8 @@ fn deploy_antigravity_workspace_plane(
 /// - Requires ZERO global Git config changes, ZERO shell startup edits, and ZERO `~/.gemini` mutations.
 /// - Verifies `agent-guard` binary integrity & pins its absolute path in `<workspace>/.agents/hooks.json`.
 /// - Preserves unrelated user hooks, creates `.dotagent.bak` backups with preserved permissions,
-///   validates non-symlink object types via `lstat`, and rolls back completely on partial failure.
+///   records explicit ownership provenance in `.dotagent-manifest.json`, validates non-symlink object
+///   types via `lstat`, and rolls back completely on partial failure.
 pub fn execute_antigravity_activate(
     bin_dir: &Path,
     dotagent_root: &Path,
@@ -2751,11 +3181,30 @@ fn activate_workspace_scoped_all(
     Ok(log)
 }
 
+enum PlannedDeactivation {
+    RestoreBackup {
+        target: PathBuf,
+        bak: PathBuf,
+        bytes: Vec<u8>,
+        mode: Option<u32>,
+    },
+    RewriteHooks {
+        target: PathBuf,
+        bak_to_remove: Option<PathBuf>,
+        content: String,
+        mode: Option<u32>,
+        remaining_count: usize,
+    },
+    RemoveCreated {
+        target: PathBuf,
+    },
+}
+
 /// Reversible workspace-scoped Antigravity deactivation:
-/// - Restores `.dotagent.bak` files with original permissions where backups exist.
-/// - Removes only `"dotagent-guard"` if unrelated user hooks exist in `hooks.json` without a backup.
-/// - Removes deployed Antigravity files and cleans empty `.agents/agents` / `.agents` directories
-///   without touching unrelated user files.
+/// - Verifies explicit ownership provenance in `.dotagent-manifest.json` before mutating or removing anything.
+/// - Never deletes user-authored files based on `0444` mode or content markers.
+/// - Preserves `.dotagent.bak` and `.dotagent-manifest.json` fail-closed whenever `hooks.json` or a
+///   managed file was modified externally to remove or alter the managed `dotagent-guard` namespace.
 pub fn execute_antigravity_deactivate(
     target_ws: &Path,
     dry_run: bool,
@@ -2769,202 +3218,388 @@ pub fn execute_antigravity_deactivate(
         )]);
     }
 
-    let mut log = Vec::new();
-    let hooks_path = ag_dir.join("hooks.json");
-    let hooks_bak = backup_path_for(&hooks_path);
-    let hooks_meta = validate_optional_regular_file_lstat(&hooks_path, "Antigravity hooks.json")?;
-    let hooks_bak_meta =
-        validate_optional_regular_file_lstat(&hooks_bak, "Antigravity hooks.json backup")?;
+    let manifest_path = ag_dir.join(ANTIGRAVITY_PROVENANCE_FILE);
+    let manifest_meta =
+        validate_optional_regular_file_lstat(&manifest_path, "Antigravity provenance manifest")?;
 
-    if let Some(bmeta) = hooks_bak_meta {
-        if dry_run {
-            log.push(format!(
-                "[dry-run] would restore '{}' -> '{}'",
+    if manifest_meta.is_none() {
+        let hooks_bak = backup_path_for(&ag_dir.join("hooks.json"));
+        if validate_optional_regular_file_lstat(&hooks_bak, "Antigravity hooks.json backup")?
+            .is_some()
+        {
+            return Err(format!(
+                "Antigravity backup '{}' exists without provenance manifest '{}'; preserving backup and refusing destructive cleanup",
                 hooks_bak.display(),
-                hooks_path.display()
-            ));
-        } else {
-            #[cfg(unix)]
-            if hooks_meta.is_some() {
-                use std::os::unix::fs::PermissionsExt;
-                let _ = fs::set_permissions(&hooks_path, fs::Permissions::from_mode(0o600));
-            }
-            let bytes = fs::read(&hooks_bak)
-                .map_err(|e| format!("failed reading '{}': {e}", hooks_bak.display()))?;
-            fs::write(&hooks_path, bytes)
-                .map_err(|e| format!("failed restoring '{}': {e}", hooks_path.display()))?;
-            #[cfg(unix)]
-            {
-                fs::set_permissions(&hooks_path, bmeta.permissions()).map_err(|e| {
-                    format!(
-                        "failed restoring permissions on '{}': {e}",
-                        hooks_path.display()
-                    )
-                })?;
-            }
-            fs::remove_file(&hooks_bak)
-                .map_err(|e| format!("failed removing backup '{}': {e}", hooks_bak.display()))?;
-            log.push(format!(
-                "[restore] restored pre-existing '{}' from backup",
-                hooks_path.display()
+                manifest_path.display()
             ));
         }
-    } else if let Some(hmeta) = hooks_meta {
-        let raw = fs::read_to_string(&hooks_path)
-            .map_err(|e| format!("failed reading '{}': {e}", hooks_path.display()))?;
-        let parsed = JsonValue::parse(&raw).map_err(|e| {
-            format!(
-                "cannot safely deactivate malformed '{}': {e}",
-                hooks_path.display()
-            )
-        })?;
-        let Some(entries) = parsed.as_object() else {
+        let ag_agents_dir = ag_dir.join("agents");
+        if validate_optional_dir_lstat(&ag_agents_dir, "Antigravity agents directory")? {
+            for af in AGENT_MD_FILES {
+                let bak = backup_path_for(&ag_agents_dir.join(af));
+                if validate_optional_regular_file_lstat(&bak, "Antigravity agent backup")?.is_some()
+                {
+                    return Err(format!(
+                        "Antigravity backup '{}' exists without provenance manifest '{}'; preserving backup and refusing destructive cleanup",
+                        bak.display(),
+                        manifest_path.display()
+                    ));
+                }
+            }
+        }
+        return Ok(vec![format!(
+            "[deactivate] No managed Antigravity deployment provenance in '{}'.",
+            target_ws.display()
+        )]);
+    }
+
+    let raw_manifest = fs::read_to_string(&manifest_path)
+        .map_err(|e| format!("failed reading '{}': {e}", manifest_path.display()))?;
+    let manifest = AntigravityProvenanceManifest::parse(&raw_manifest)?;
+
+    // Phase 1: Validate every provenance entry and backup BEFORE mutating or deleting anything.
+    let mut plan = Vec::with_capacity(manifest.entries.len());
+    for entry in &manifest.entries {
+        let target = ag_dir.join(&entry.rel_path);
+        let Some(tmeta) =
+            validate_optional_regular_file_lstat(&target, "managed Antigravity file")?
+        else {
             return Err(format!(
-                "cannot safely deactivate non-object '{}'",
-                hooks_path.display()
+                "managed Antigravity file '{}' was removed outside deactivation; preserving backups and provenance manifest",
+                target.display()
             ));
         };
-        let has_dotagent = entries.iter().any(|(k, _)| k == "dotagent-guard");
-        if has_dotagent {
+        let current_bytes =
+            fs::read(&target).map_err(|e| format!("failed reading '{}': {e}", target.display()))?;
+        let current_sha = crate::crypto::sha256_hex(&current_bytes);
+
+        #[cfg(unix)]
+        let current_mode = {
+            use std::os::unix::fs::PermissionsExt;
+            Some(tmeta.permissions().mode() & 0o777)
+        };
+        #[cfg(not(unix))]
+        let current_mode: Option<u32> = {
+            let _ = &tmeta;
+            None
+        };
+
+        if entry.rel_path == "hooks.json" {
+            let raw = std::str::from_utf8(&current_bytes).map_err(|_| {
+                format!(
+                    "cannot safely deactivate non-UTF-8 '{}'; preserving backup and provenance manifest",
+                    target.display()
+                )
+            })?;
+            let parsed = JsonValue::parse(raw).map_err(|e| {
+                format!(
+                    "cannot safely deactivate malformed '{}': {e}; preserving backup and provenance manifest",
+                    target.display()
+                )
+            })?;
+            let Some(entries) = parsed.as_object() else {
+                return Err(format!(
+                    "cannot safely deactivate non-object '{}'; preserving backup and provenance manifest",
+                    target.display()
+                ));
+            };
+            let Some((_, cur_dg)) = entries.iter().find(|(k, _)| k == "dotagent-guard") else {
+                return Err(format!(
+                    "managed 'dotagent-guard' hook group is missing from '{}' after external modification; preserving backup and provenance manifest",
+                    target.display()
+                ));
+            };
+            if let Some(ref exp_dg) = entry.managed_group
+                && cur_dg != exp_dg
+            {
+                return Err(format!(
+                    "managed 'dotagent-guard' hook group in '{}' was modified externally; preserving backup and provenance manifest",
+                    target.display()
+                ));
+            }
+
             let remaining: Vec<(String, JsonValue)> = entries
                 .iter()
                 .filter(|(k, _)| k != "dotagent-guard")
                 .cloned()
                 .collect();
-            if remaining.is_empty() {
-                if dry_run {
-                    log.push(format!(
-                        "[dry-run] would remove deployed '{}'",
-                        hooks_path.display()
+
+            if entry.pre_existing {
+                let bak = backup_path_for(&target);
+                let Some(bmeta) =
+                    validate_optional_regular_file_lstat(&bak, "Antigravity hooks.json backup")?
+                else {
+                    return Err(format!(
+                        "missing required backup '{}' for pre-existing '{}'",
+                        bak.display(),
+                        target.display()
                     ));
-                } else {
-                    #[cfg(unix)]
-                    {
-                        use std::os::unix::fs::PermissionsExt;
-                        let _ = fs::set_permissions(&hooks_path, fs::Permissions::from_mode(0o600));
-                    }
-                    fs::remove_file(&hooks_path)
-                        .map_err(|e| format!("failed removing '{}': {e}", hooks_path.display()))?;
-                    log.push(format!(
-                        "[remove] removed deployed '{}'",
-                        hooks_path.display()
+                };
+                let bak_bytes = fs::read(&bak)
+                    .map_err(|e| format!("failed reading '{}': {e}", bak.display()))?;
+                if let Some(ref exp_orig) = entry.orig_sha256
+                    && crate::crypto::sha256_hex(&bak_bytes) != *exp_orig
+                {
+                    return Err(format!(
+                        "backup integrity mismatch on '{}'; refusing destructive restore",
+                        bak.display()
                     ));
                 }
-            } else if dry_run {
-                log.push(format!(
-                    "[dry-run] would remove 'dotagent-guard' entry from '{}' while preserving {} user hook(s)",
-                    hooks_path.display(),
-                    remaining.len()
-                ));
+                #[cfg(unix)]
+                let bak_mode = {
+                    use std::os::unix::fs::PermissionsExt;
+                    Some(bmeta.permissions().mode() & 0o777)
+                };
+                #[cfg(not(unix))]
+                let bak_mode: Option<u32> = {
+                    let _ = &bmeta;
+                    None
+                };
+                let restore_mode = entry.orig_mode.or(bak_mode);
+
+                if current_sha == entry.deployed_sha256 {
+                    plan.push(PlannedDeactivation::RestoreBackup {
+                        target,
+                        bak,
+                        bytes: bak_bytes,
+                        mode: restore_mode,
+                    });
+                } else {
+                    let mut updated = String::new();
+                    format_json_pretty_2space(
+                        &JsonValue::Object(remaining.clone()),
+                        0,
+                        &mut updated,
+                    );
+                    updated.push('\n');
+                    plan.push(PlannedDeactivation::RewriteHooks {
+                        target,
+                        bak_to_remove: Some(bak),
+                        content: updated,
+                        mode: current_mode.or(restore_mode),
+                        remaining_count: remaining.len(),
+                    });
+                }
+            } else if remaining.is_empty() {
+                plan.push(PlannedDeactivation::RemoveCreated { target });
             } else {
                 let mut updated = String::new();
-                format_json_pretty_2space(&JsonValue::Object(remaining), 0, &mut updated);
+                format_json_pretty_2space(&JsonValue::Object(remaining.clone()), 0, &mut updated);
                 updated.push('\n');
-                #[cfg(unix)]
-                let orig_perms = hmeta.permissions();
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::PermissionsExt;
-                    let _ = fs::set_permissions(&hooks_path, fs::Permissions::from_mode(0o600));
-                }
-                fs::write(&hooks_path, updated)
-                    .map_err(|e| format!("failed updating '{}': {e}", hooks_path.display()))?;
-                #[cfg(unix)]
-                {
-                    let _ = fs::set_permissions(&hooks_path, orig_perms);
-                }
-                log.push(format!(
-                    "[update] removed 'dotagent-guard' from '{}' while preserving unrelated user hooks",
-                    hooks_path.display()
+                let mode = match current_mode {
+                    Some(0o444) | None => Some(0o644),
+                    other => other,
+                };
+                plan.push(PlannedDeactivation::RewriteHooks {
+                    target,
+                    bak_to_remove: None,
+                    content: updated,
+                    mode,
+                    remaining_count: remaining.len(),
+                });
+            }
+        } else {
+            if current_sha != entry.deployed_sha256 {
+                return Err(format!(
+                    "managed Antigravity file '{}' was modified externally; preserving backups and provenance manifest",
+                    target.display()
                 ));
+            }
+            if entry.pre_existing {
+                let bak = backup_path_for(&target);
+                let Some(bmeta) =
+                    validate_optional_regular_file_lstat(&bak, "Antigravity agent backup")?
+                else {
+                    return Err(format!(
+                        "missing required backup '{}' for pre-existing '{}'",
+                        bak.display(),
+                        target.display()
+                    ));
+                };
+                let bak_bytes = fs::read(&bak)
+                    .map_err(|e| format!("failed reading '{}': {e}", bak.display()))?;
+                if let Some(ref exp_orig) = entry.orig_sha256
+                    && crate::crypto::sha256_hex(&bak_bytes) != *exp_orig
+                {
+                    return Err(format!(
+                        "backup integrity mismatch on '{}'; refusing destructive restore",
+                        bak.display()
+                    ));
+                }
+                #[cfg(unix)]
+                let bak_mode = {
+                    use std::os::unix::fs::PermissionsExt;
+                    Some(bmeta.permissions().mode() & 0o777)
+                };
+                #[cfg(not(unix))]
+                let bak_mode: Option<u32> = {
+                    let _ = &bmeta;
+                    None
+                };
+                plan.push(PlannedDeactivation::RestoreBackup {
+                    target,
+                    bak,
+                    bytes: bak_bytes,
+                    mode: entry.orig_mode.or(bak_mode),
+                });
+            } else {
+                plan.push(PlannedDeactivation::RemoveCreated { target });
             }
         }
     }
 
-    let ag_agents_dir = ag_dir.join("agents");
-    if validate_optional_dir_lstat(&ag_agents_dir, "Antigravity agents directory")? {
-        for af in AGENT_MD_FILES {
-            let target = ag_agents_dir.join(af);
-            let bak = backup_path_for(&target);
-            let tmeta = validate_optional_regular_file_lstat(&target, "Antigravity agent file")?;
-            let bmeta = validate_optional_regular_file_lstat(&bak, "Antigravity agent backup")?;
-
-            if let Some(bm) = bmeta {
-                if dry_run {
+    // Phase 2: Execute validated plan (or report dry-run without touching disk).
+    let mut log = Vec::new();
+    if dry_run {
+        for action in &plan {
+            match action {
+                PlannedDeactivation::RestoreBackup { target, bak, .. } => {
                     log.push(format!(
                         "[dry-run] would restore '{}' -> '{}'",
                         bak.display(),
                         target.display()
                     ));
-                } else {
-                    #[cfg(unix)]
-                    if tmeta.is_some() {
-                        use std::os::unix::fs::PermissionsExt;
-                        let _ = fs::set_permissions(&target, fs::Permissions::from_mode(0o600));
-                    }
-                    let bytes = fs::read(&bak)
-                        .map_err(|e| format!("failed reading '{}': {e}", bak.display()))?;
-                    fs::write(&target, bytes)
-                        .map_err(|e| format!("failed restoring '{}': {e}", target.display()))?;
-                    #[cfg(unix)]
-                    {
-                        let _ = fs::set_permissions(&target, bm.permissions());
-                    }
-                    let _ = fs::remove_file(&bak);
+                }
+                PlannedDeactivation::RewriteHooks {
+                    target,
+                    remaining_count,
+                    ..
+                } => {
                     log.push(format!(
-                        "[restore] restored pre-existing '{}' from backup",
+                        "[dry-run] would remove 'dotagent-guard' entry from '{}' while preserving {} user hook(s)",
+                        target.display(),
+                        remaining_count
+                    ));
+                }
+                PlannedDeactivation::RemoveCreated { target } => {
+                    log.push(format!(
+                        "[dry-run] would remove deployed '{}'",
                         target.display()
                     ));
                 }
-            } else if let Some(tm) = tmeta {
-                #[cfg(unix)]
-                let is_ro = {
-                    use std::os::unix::fs::PermissionsExt;
-                    (tm.permissions().mode() & 0o777) == 0o444
-                };
-                #[cfg(not(unix))]
-                let is_ro = {
-                    let _ = tm;
-                    true
-                };
-                let is_managed_agent = fs::read_to_string(&target)
-                    .map(|s| {
-                        s.contains("enable_subagent_tools: false")
-                            && s.contains("workspace: inherit")
-                    })
-                    .unwrap_or(false);
-                if is_ro || is_managed_agent {
-                    if dry_run {
-                        log.push(format!(
-                            "[dry-run] would remove deployed '{}'",
-                            target.display()
-                        ));
-                    } else {
-                        #[cfg(unix)]
-                        {
-                            use std::os::unix::fs::PermissionsExt;
-                            let _ = fs::set_permissions(&target, fs::Permissions::from_mode(0o600));
-                        }
-                        fs::remove_file(&target)
-                            .map_err(|e| format!("failed removing '{}': {e}", target.display()))?;
-                        log.push(format!("[remove] removed deployed '{}'", target.display()));
-                    }
-                }
             }
         }
-        if !dry_run
-            && fs::read_dir(&ag_agents_dir)
-                .map(|mut it| it.next().is_none())
-                .unwrap_or(false)
-        {
-            let _ = fs::remove_dir(&ag_agents_dir);
+        log.push(format!(
+            "[dry-run] would remove provenance manifest '{}'",
+            manifest_path.display()
+        ));
+        return Ok(log);
+    }
+
+    for action in plan {
+        match action {
+            PlannedDeactivation::RestoreBackup {
+                target,
+                bak,
+                bytes,
+                mode,
+            } => {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    let _ = fs::set_permissions(&target, fs::Permissions::from_mode(0o600));
+                }
+                fs::write(&target, bytes)
+                    .map_err(|e| format!("failed restoring '{}': {e}", target.display()))?;
+                #[cfg(unix)]
+                if let Some(m) = mode {
+                    use std::os::unix::fs::PermissionsExt;
+                    fs::set_permissions(&target, fs::Permissions::from_mode(m)).map_err(|e| {
+                        format!(
+                            "failed restoring permissions {:04o} on '{}': {e}",
+                            m,
+                            target.display()
+                        )
+                    })?;
+                }
+                #[cfg(not(unix))]
+                let _ = mode;
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    let _ = fs::set_permissions(&bak, fs::Permissions::from_mode(0o600));
+                }
+                fs::remove_file(&bak)
+                    .map_err(|e| format!("failed removing backup '{}': {e}", bak.display()))?;
+                log.push(format!(
+                    "[restore] restored pre-existing '{}' from backup",
+                    target.display()
+                ));
+            }
+            PlannedDeactivation::RewriteHooks {
+                target,
+                bak_to_remove,
+                content,
+                mode,
+                ..
+            } => {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    let _ = fs::set_permissions(&target, fs::Permissions::from_mode(0o600));
+                }
+                fs::write(&target, content)
+                    .map_err(|e| format!("failed updating '{}': {e}", target.display()))?;
+                #[cfg(unix)]
+                if let Some(m) = mode {
+                    use std::os::unix::fs::PermissionsExt;
+                    fs::set_permissions(&target, fs::Permissions::from_mode(m)).map_err(|e| {
+                        format!(
+                            "failed setting permissions {:04o} on '{}': {e}",
+                            m,
+                            target.display()
+                        )
+                    })?;
+                }
+                #[cfg(not(unix))]
+                let _ = mode;
+                if let Some(bak) = bak_to_remove {
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::PermissionsExt;
+                        let _ = fs::set_permissions(&bak, fs::Permissions::from_mode(0o600));
+                    }
+                    fs::remove_file(&bak)
+                        .map_err(|e| format!("failed removing backup '{}': {e}", bak.display()))?;
+                }
+                log.push(format!(
+                    "[update] removed 'dotagent-guard' from '{}' while preserving unrelated user hooks",
+                    target.display()
+                ));
+            }
+            PlannedDeactivation::RemoveCreated { target } => {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    let _ = fs::set_permissions(&target, fs::Permissions::from_mode(0o600));
+                }
+                fs::remove_file(&target)
+                    .map_err(|e| format!("failed removing '{}': {e}", target.display()))?;
+                log.push(format!("[remove] removed deployed '{}'", target.display()));
+            }
         }
     }
 
-    if !dry_run
-        && fs::read_dir(&ag_dir)
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(&manifest_path, fs::Permissions::from_mode(0o600));
+    }
+    fs::remove_file(&manifest_path)
+        .map_err(|e| format!("failed removing '{}': {e}", manifest_path.display()))?;
+
+    let ag_agents_dir = ag_dir.join("agents");
+    if validate_optional_dir_lstat(&ag_agents_dir, "Antigravity agents directory")?
+        && fs::read_dir(&ag_agents_dir)
             .map(|mut it| it.next().is_none())
             .unwrap_or(false)
+    {
+        let _ = fs::remove_dir(&ag_agents_dir);
+    }
+
+    if fs::read_dir(&ag_dir)
+        .map(|mut it| it.next().is_none())
+        .unwrap_or(false)
     {
         let _ = fs::remove_dir(&ag_dir);
     }

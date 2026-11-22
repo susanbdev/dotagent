@@ -1544,3 +1544,335 @@ fn test_24_deployed_config_and_direct_replay_never_self_certify_mandatory_protec
         Some("unverified")
     );
 }
+
+#[test]
+fn test_23_missing_empty_and_incomplete_bundle_manifests_rejected_fail_closed() {
+    let ws = IsolatedWorkspace::create("manifest_mandatory");
+    let dotagent_root = repo_root_of_dotagent();
+    let bin_dir = agent_guard_bin_path()
+        .parent()
+        .expect("bin parent")
+        .to_path_buf();
+
+    let stage_bundle = |name: &str| -> PathBuf {
+        let b = ws.base.join(name);
+        fs::create_dir_all(b.join("dist/antigravity/agents")).expect("mkdir dist");
+        fs::create_dir_all(b.join("dist-verify")).expect("mkdir dist-verify");
+        fs::copy(
+            dotagent_root.join("dist/antigravity/hooks.json"),
+            b.join("dist/antigravity/hooks.json"),
+        )
+        .expect("copy hooks.json");
+        for entry in fs::read_dir(dotagent_root.join("dist/antigravity/agents")).expect("agents") {
+            let ent = entry.expect("ent");
+            fs::copy(
+                ent.path(),
+                b.join("dist/antigravity/agents").join(ent.file_name()),
+            )
+            .expect("copy agent");
+        }
+        b
+    };
+
+    // 23a: Missing `dist-verify/manifest.sha256` -> hard error, zero workspace files written
+    let b_missing = stage_bundle("bundle_missing_manifest");
+    let err_missing = execute_antigravity_activate(&bin_dir, &b_missing, &ws.repo_dir, false)
+        .expect_err("missing manifest.sha256 must fail closed");
+    assert!(
+        err_missing.contains("manifest.sha256"),
+        "unexpected error: {err_missing}"
+    );
+    assert!(!ws.repo_dir.join(".agents").exists());
+
+    // 23b: Empty `dist-verify/manifest.sha256` -> hard error, zero workspace files written
+    let b_empty = stage_bundle("bundle_empty_manifest");
+    fs::write(b_empty.join("dist-verify/manifest.sha256"), "\n   \n").expect("write empty");
+    let err_empty = execute_antigravity_activate(&bin_dir, &b_empty, &ws.repo_dir, false)
+        .expect_err("empty manifest.sha256 must fail closed");
+    assert!(
+        err_empty.contains("empty"),
+        "unexpected empty manifest error: {err_empty}"
+    );
+    assert!(!ws.repo_dir.join(".agents").exists());
+
+    // 23c: Incomplete `dist-verify/manifest.sha256` (has hooks.json, missing an agent entry) -> hard error
+    let b_incomplete = stage_bundle("bundle_incomplete_manifest");
+    let full_manifest =
+        fs::read_to_string(dotagent_root.join("dist-verify/manifest.sha256")).expect("read full");
+    let partial_manifest: String = full_manifest
+        .lines()
+        .filter(|l| !l.contains("dist/antigravity/agents/research-airlock.md"))
+        .map(|l| format!("{l}\n"))
+        .collect();
+    fs::write(
+        b_incomplete.join("dist-verify/manifest.sha256"),
+        partial_manifest,
+    )
+    .expect("write partial");
+    let err_inc = execute_antigravity_activate(&bin_dir, &b_incomplete, &ws.repo_dir, false)
+        .expect_err("incomplete manifest missing agent entry must fail closed");
+    assert!(
+        err_inc.contains("missing required SHA-256 entry"),
+        "unexpected incomplete manifest error: {err_inc}"
+    );
+    assert!(!ws.repo_dir.join(".agents").exists());
+}
+
+#[test]
+fn test_24_byte_identical_pre_existing_files_record_backup_and_restore_on_deactivate() {
+    let ws = IsolatedWorkspace::create("byte_identical_preexisting");
+    let dotagent_root = repo_root_of_dotagent();
+    let bin_dir = agent_guard_bin_path()
+        .parent()
+        .expect("bin parent")
+        .to_path_buf();
+
+    // First activate in a throwaway workspace to obtain the exact generated `hooks.json` bytes
+    let ws_ref = IsolatedWorkspace::create("byte_identical_ref");
+    execute_antigravity_activate(&bin_dir, &dotagent_root, &ws_ref.repo_dir, false)
+        .expect("ref activate");
+    let exact_agent_bytes =
+        fs::read(dotagent_root.join("dist/antigravity/agents/research-airlock.md"))
+            .expect("read template agent");
+
+    // Pre-populate `ws` with a user-owned `agents/research-airlock.md` (mode 0640) that is
+    // BYTE-FOR-BYTE IDENTICAL to the generated artifact, plus a pre-existing `hooks.json`
+    // that matches what `ws` will generate!
+    let ag_agents = ws.repo_dir.join(".agents/agents");
+    fs::create_dir_all(&ag_agents).expect("mkdir .agents/agents");
+    let pre_agent = ag_agents.join("research-airlock.md");
+    fs::write(&pre_agent, &exact_agent_bytes).expect("write byte-identical pre-existing agent");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&pre_agent, fs::Permissions::from_mode(0o640))
+            .expect("chmod 0640 pre_agent");
+    }
+
+    let tpl_hooks =
+        fs::read_to_string(dotagent_root.join("dist/antigravity/hooks.json")).expect("tpl hooks");
+    let exact_ws_hooks = agent_guard::operator::merge_antigravity_hooks_json(
+        None,
+        &tpl_hooks,
+        Some(&agent_guard_bin_path()),
+        Some(&ws.repo_dir),
+    )
+    .expect("exact ws hooks");
+    let pre_hooks = ws.repo_dir.join(".agents/hooks.json");
+    fs::write(&pre_hooks, &exact_ws_hooks).expect("write byte-identical pre-existing hooks.json");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&pre_hooks, fs::Permissions::from_mode(0o600))
+            .expect("chmod 0600 pre_hooks");
+    }
+
+    // Activate (and re-activate idempotently!)
+    execute_antigravity_activate(&bin_dir, &dotagent_root, &ws.repo_dir, false)
+        .expect("activate 1");
+    assert!(
+        ws.repo_dir
+            .join(".agents/.dotagent-manifest.json")
+            .is_file(),
+        "provenance manifest must be written"
+    );
+    assert!(
+        ws.repo_dir
+            .join(".agents/hooks.json.dotagent.bak")
+            .is_file(),
+        "byte-identical pre-existing hooks.json must still create backup"
+    );
+    assert!(
+        ag_agents.join("research-airlock.md.dotagent.bak").is_file(),
+        "byte-identical pre-existing agent must still create backup"
+    );
+    execute_antigravity_activate(&bin_dir, &dotagent_root, &ws.repo_dir, false)
+        .expect("idempotent activate 2");
+
+    // Deactivate MUST restore both pre-existing user files (NOT delete them!) with original modes!
+    execute_antigravity_deactivate(&ws.repo_dir, false).expect("deactivate");
+    assert!(
+        pre_hooks.is_file(),
+        "pre-existing byte-identical hooks.json must be preserved on deactivate"
+    );
+    assert!(
+        pre_agent.is_file(),
+        "pre-existing byte-identical research-airlock.md must be preserved on deactivate"
+    );
+    assert_eq!(
+        fs::read(&pre_agent).expect("agent bytes"),
+        exact_agent_bytes
+    );
+    assert_eq!(
+        fs::read_to_string(&pre_hooks).expect("hooks text"),
+        exact_ws_hooks
+    );
+    assert!(
+        !ag_agents.join("swarm-grunt.md").exists(),
+        "dotagent-created files must be removed"
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            fs::metadata(&pre_agent).expect("meta").permissions().mode() & 0o777,
+            0o640
+        );
+        assert_eq!(
+            fs::metadata(&pre_hooks).expect("meta").permissions().mode() & 0o777,
+            0o600
+        );
+    }
+}
+
+#[test]
+fn test_25_user_owned_readonly_or_marker_matching_agents_never_deleted_without_provenance() {
+    let ws = IsolatedWorkspace::create("user_owned_0444");
+    let dotagent_root = repo_root_of_dotagent();
+    let bin_dir = agent_guard_bin_path()
+        .parent()
+        .expect("bin parent")
+        .to_path_buf();
+
+    // 25a: Workspace never activated by dotagent has mode-0444 and marker-matching files
+    // (including a file named `research-airlock.md`!) -> `deactivate` must NOT delete any of them!
+    let ag_agents = ws.repo_dir.join(".agents/agents");
+    fs::create_dir_all(&ag_agents).expect("mkdir .agents/agents");
+    let user_body = "---\nenable_subagent_tools: false\nworkspace: inherit\n---\nUser authored!\n";
+    let user_named_same = ag_agents.join("research-airlock.md");
+    let user_custom = ag_agents.join("custom-auditor.md");
+    fs::write(&user_named_same, user_body).expect("write user research-airlock.md");
+    fs::write(&user_custom, user_body).expect("write user custom-auditor.md");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&user_named_same, fs::Permissions::from_mode(0o444))
+            .expect("chmod 0444");
+        fs::set_permissions(&user_custom, fs::Permissions::from_mode(0o444)).expect("chmod 0444");
+    }
+
+    let lines =
+        execute_antigravity_deactivate(&ws.repo_dir, false).expect("deactivate unactivated ws");
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.contains("No managed Antigravity deployment provenance")),
+        "expected no-provenance message: {lines:?}"
+    );
+    assert!(
+        user_named_same.is_file(),
+        "user 0444 research-airlock.md without provenance must NEVER be deleted"
+    );
+    assert!(
+        user_custom.is_file(),
+        "user 0444 custom-auditor.md must NEVER be deleted"
+    );
+
+    // 25b: Activate on top, then deactivate -> BOTH user 0444 files remain intact!
+    execute_antigravity_activate(&bin_dir, &dotagent_root, &ws.repo_dir, false)
+        .expect("activate over user 0444 files");
+    execute_antigravity_deactivate(&ws.repo_dir, false).expect("deactivate after activate");
+    assert_eq!(
+        fs::read_to_string(&user_named_same).expect("restored user research-airlock.md"),
+        user_body
+    );
+    assert_eq!(
+        fs::read_to_string(&user_custom).expect("preserved custom-auditor.md"),
+        user_body
+    );
+}
+
+#[test]
+fn test_26_external_hook_modification_preserves_backup_while_sibling_additions_survive() {
+    let ws = IsolatedWorkspace::create("external_hook_edit_preserves_bak");
+    let dotagent_root = repo_root_of_dotagent();
+    let bin_dir = agent_guard_bin_path()
+        .parent()
+        .expect("bin parent")
+        .to_path_buf();
+
+    let ag_dir = ws.repo_dir.join(".agents");
+    fs::create_dir_all(&ag_dir).expect("mkdir .agents");
+    let orig_hooks = "{\n  \"team-hook\": {\n    \"Stop\": []\n  }\n}\n";
+    let hooks_path = ag_dir.join("hooks.json");
+    let hooks_bak = ag_dir.join("hooks.json.dotagent.bak");
+    let manifest_path = ag_dir.join(".dotagent-manifest.json");
+    fs::write(&hooks_path, orig_hooks).expect("write orig hooks");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&hooks_path, fs::Permissions::from_mode(0o600)).expect("chmod 0600");
+    }
+
+    execute_antigravity_activate(&bin_dir, &dotagent_root, &ws.repo_dir, false).expect("activate");
+    let deployed_hooks = fs::read_to_string(&hooks_path).expect("read deployed hooks");
+
+    // 26a: External edit removes `dotagent-guard` from `hooks.json` (even replacing with original bytes!)
+    // -> `deactivate` MUST error AND preserve `hooks.json.dotagent.bak` and `.dotagent-manifest.json`!
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&hooks_path, fs::Permissions::from_mode(0o600)).expect("chmod 0600");
+    }
+    fs::write(&hooks_path, "{\"external-replacement\":{\"Stop\":[]}}\n")
+        .expect("external edit removing dotagent-guard");
+    let err_missing_ns = execute_antigravity_deactivate(&ws.repo_dir, false)
+        .expect_err("external removal of dotagent-guard must refuse backup deletion");
+    assert!(
+        err_missing_ns.contains("missing") && err_missing_ns.contains("preserving backup"),
+        "unexpected error: {err_missing_ns}"
+    );
+    assert!(
+        hooks_bak.is_file(),
+        "hooks.json.dotagent.bak MUST be preserved when dotagent-guard is missing"
+    );
+    assert!(
+        manifest_path.is_file(),
+        ".dotagent-manifest.json MUST be preserved when dotagent-guard is missing"
+    );
+    assert_eq!(
+        fs::read_to_string(&hooks_bak).expect("original backup intact"),
+        orig_hooks
+    );
+
+    // Same check when externally replaced with exact `orig_hooks` bytes: still refuses to silently discard backup!
+    fs::write(&hooks_path, orig_hooks).expect("external overwrite with orig_hooks");
+    let err_reverted = execute_antigravity_deactivate(&ws.repo_dir, false)
+        .expect_err("external revert without dotagent-guard must still preserve backup");
+    assert!(err_reverted.contains("preserving backup"));
+    assert!(hooks_bak.is_file());
+
+    // 26b: Restore valid deployed hooks + add a NEW unrelated sibling hook (`post-install-hook`)
+    // -> `deactivate` cleanly removes `dotagent-guard` while preserving BOTH `team-hook` and `post-install-hook`!
+    let mut parsed_deployed = JsonValue::parse(&deployed_hooks).expect("parse deployed");
+    if let JsonValue::Object(ref mut entries) = parsed_deployed {
+        entries.push((
+            "post-install-hook".to_string(),
+            JsonValue::Object(vec![("Stop".to_string(), JsonValue::Array(vec![]))]),
+        ));
+    }
+    fs::write(
+        &hooks_path,
+        format!("{}\n", parsed_deployed.to_json_string()),
+    )
+    .expect("write deployed + sibling hook");
+
+    execute_antigravity_deactivate(&ws.repo_dir, false)
+        .expect("deactivate with added sibling hook must succeed");
+    let after_raw = fs::read_to_string(&hooks_path).expect("read hooks after deactivate");
+    let after_json = JsonValue::parse(&after_raw).expect("parse hooks after deactivate");
+    assert!(
+        after_json.get("dotagent-guard").is_none(),
+        "dotagent-guard must be removed"
+    );
+    assert!(
+        after_json.get("team-hook").is_some(),
+        "original team-hook must be preserved"
+    );
+    assert!(
+        after_json.get("post-install-hook").is_some(),
+        "newly added post-install-hook must be preserved"
+    );
+    assert!(!hooks_bak.exists());
+    assert!(!manifest_path.exists());
+}
