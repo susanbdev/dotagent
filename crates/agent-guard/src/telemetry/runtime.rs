@@ -483,7 +483,10 @@ impl Drop for HostTelemetry {
         #[cfg(unix)]
         if let Some(child) = &mut self.child {
             drop(child.stdin.take());
-            let _ = child.try_wait();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+            while matches!(child.try_wait(), Ok(None)) && std::time::Instant::now() < deadline {
+                std::thread::park_timeout(std::time::Duration::from_millis(5));
+            }
         }
     }
 }
