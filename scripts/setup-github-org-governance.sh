@@ -7,7 +7,7 @@
 #   2. Linear squash-only PR merges + automatic head-branch cleanup
 #   3. Active `dotagent-zero-trust-main` branch rulesets (`bypass_actors: []`, block
 #      force-push/delete, require review-thread resolution, Copilot review on push, and
-#      all 7 required status checks including `Ring-0 & Copilot Gate`)
+#      all 9 required status checks including `Ring-0 & Copilot Gate`)
 #   4. Standardized `dotagent-friction` & AgentPI risk-telemetry labels
 #
 # Usage:
@@ -150,8 +150,38 @@ if [[ ${#OWNERS[@]} -eq 0 ]]; then
     OWNERS=("susanbdev")
 fi
 
-DOTAGENT_BIN="${DOTAGENT_ROOT}/target/release/dotagent"
-cargo build --release --locked --manifest-path "${DOTAGENT_ROOT}/Cargo.toml" --bin dotagent
+trusted_install() {
+    local path="$1" parent mode resolved
+    [[ -f "${path}" && -x "${path}" && ! -L "${path}" ]] || return 1
+    parent="$(cd -P -- "$(dirname -- "${path}")" && pwd)" || return 1
+    case "${parent}/" in
+        "${DOTAGENT_ROOT}/"*) return 1 ;;
+    esac
+    resolved="${parent}/${path##*/}"
+    path="${resolved}"
+    while :; do
+        mode="$(stat -L -c '%a' "${path}" 2>/dev/null || stat -L -f '%Lp' "${path}")" || return 1
+        [[ "${mode}" =~ ^[0-7]{3,4}$ ]] || return 1
+        (( (8#${mode} & 8#022) == 0 )) || return 1
+        [[ "${path}" == / ]] && break
+        path="$(dirname -- "${path}")"
+    done
+    printf '%s\n' "${resolved}"
+}
+
+DOTAGENT_BIN=""
+for candidate in /usr/local/bin/dotagent /usr/bin/dotagent; do
+    if DOTAGENT_BIN="$(trusted_install "${candidate}")"; then
+        break
+    fi
+done
+if [[ -z "${DOTAGENT_BIN}" && -n "${HOME:-}" ]]; then
+    DOTAGENT_BIN="$(trusted_install "${HOME}/.local/bin/dotagent")" || DOTAGENT_BIN=""
+fi
+if [[ -z "${DOTAGENT_BIN}" ]]; then
+    echo "[setup-github-org-governance] HARD DENY: install a trusted dotagent release before configuring GitHub" >&2
+    exit 2
+fi
 
 OVERALL_RC=0
 for owner in "${OWNERS[@]}"; do

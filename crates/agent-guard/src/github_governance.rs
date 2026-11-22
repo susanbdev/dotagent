@@ -23,7 +23,7 @@
 //!      blocks deletion and force-pushes (`non_fast_forward`), requires linear history, requires PRs
 //!      with `allowed_merge_methods: ["squash"]`, `required_review_thread_resolution: true`,
 //!      `dismiss_stale_reviews_on_push: true`, `copilot_code_review: { review_on_push: true }`, and
-//!      **all 7 required status checks** on `dotagent` (6 CI jobs + `Ring-0 & Copilot Gate`).
+//!      the Guardrail CI jobs and the exact-head `Ring-0 & Copilot Gate` on `dotagent`.
 
 use std::io::Write;
 use std::path::Path;
@@ -34,14 +34,19 @@ use crate::json::JsonValue;
 
 pub const RULESET_NAME: &str = "dotagent-zero-trust-main";
 
+pub(crate) const RATCHET_CHECK_RUN: &str = "Ring-0 Constitutional Ratchet";
+pub(crate) const COPILOT_GATE_CONTEXT: &str = "Ring-0 & Copilot Gate";
+
 pub const DOTAGENT_REQUIRED_CHECKS: &[&str] = &[
     "Security Kernel & Harness (ubuntu-latest)",
     "Security Kernel & Harness (macos-latest)",
     "Supply-Chain Advisory & License Gate (cargo-deny)",
+    "Container Cleanroom Matrix",
+    "Dual-Directory Reproducibility Proof",
     "Kani Bounded Model Checking Proofs",
     "MSRV 1.88.0 Compatibility Gate",
-    "Ring-0 Constitutional Ratchet",
-    "Ring-0 & Copilot Gate",
+    RATCHET_CHECK_RUN,
+    COPILOT_GATE_CONTEXT,
 ];
 
 pub const GOVERNANCE_LABELS: &[(&str, &str, &str)] = &[
@@ -229,7 +234,6 @@ pub fn build_repo_merge_settings_payload() -> JsonValue {
     ])
 }
 
-const COPILOT_GATE_CONTEXT: &str = "Ring-0 & Copilot Gate";
 /// GitHub App id of GitHub Actions; required checks are pinned to it so that a token holding
 /// `statuses: write` cannot forge a green context from outside Actions.
 pub const GITHUB_ACTIONS_INTEGRATION_ID: u64 = 15368;
@@ -1301,12 +1305,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn builds_seven_check_non_bypass_ruleset_and_validates_identifiers() {
+    fn builds_required_check_non_bypass_ruleset_and_validates_identifiers() {
         let checks: Vec<String> = DOTAGENT_REQUIRED_CHECKS
             .iter()
             .map(|s| (*s).to_string())
             .collect();
-        assert_eq!(checks.len(), 7);
+        assert_eq!(checks.len(), 9);
         let payload = build_main_ruleset_payload(&checks, true);
         let s = payload.to_json_string();
         assert!(s.contains(RULESET_NAME));
@@ -1319,7 +1323,7 @@ mod tests {
         let empty_fb = build_main_ruleset_payload(&[], false).to_json_string();
         assert!(empty_fb.contains("\"required_approving_review_count\":1"));
         // CI checks without any review gate still require a human approval.
-        let ci_only = build_main_ruleset_payload(&checks[..6], false).to_json_string();
+        let ci_only = build_main_ruleset_payload(&checks[..8], false).to_json_string();
         assert!(ci_only.contains("\"required_approving_review_count\":1"));
         // The native Copilot rule alone never lowers the human approval floor.
         let copilot_only = build_main_ruleset_payload(&[], true).to_json_string();

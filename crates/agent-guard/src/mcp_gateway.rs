@@ -954,7 +954,12 @@ fn dispatch_mediated_tool_call(tool_name: &str, args: &JsonValue, cwd: &Path) ->
                 return mcp_tool_error(code, &reason);
             }
             if !profile.enable_write_tools {
-                let _lock = SessionLedger::acquire_lock(&repo_root, &sid);
+                let Some(_lock) = SessionLedger::acquire_lock(&repo_root, &sid) else {
+                    return mcp_tool_error(
+                        "FEEDBACK_QUOTA_STATE_UNAVAILABLE",
+                        "could not lock the session feedback quota",
+                    );
+                };
                 let mut l = SessionLedger::load_or_create(&repo_root, &sid);
                 if l.mcp_readonly_feedback_calls >= 5 {
                     return mcp_tool_error(
@@ -963,7 +968,12 @@ fn dispatch_mediated_tool_call(tool_name: &str, args: &JsonValue, cwd: &Path) ->
                     );
                 }
                 l.mcp_readonly_feedback_calls = l.mcp_readonly_feedback_calls.saturating_add(1);
-                let _ = l.save_locked(&repo_root);
+                if l.save_locked(&repo_root).is_err() {
+                    return mcp_tool_error(
+                        "FEEDBACK_QUOTA_STATE_UNAVAILABLE",
+                        "could not persist the session feedback quota",
+                    );
+                }
             }
             let Some(cat_str) = args.get("category").and_then(JsonValue::as_str) else {
                 return mcp_tool_error(
@@ -979,10 +989,17 @@ fn dispatch_mediated_tool_call(tool_name: &str, args: &JsonValue, cwd: &Path) ->
                     ),
                 );
             };
-            let denial_id = args
+            let Some(denial_id) = args
                 .get("denial_id")
                 .and_then(JsonValue::as_str)
-                .map(String::from);
+                .map(str::trim)
+                .filter(|id| !id.is_empty())
+            else {
+                return mcp_tool_error(
+                    "INVALID_FEEDBACK_BALLOT",
+                    "dotagent_submit_friction requires a non-empty 'denial_id' string",
+                );
+            };
             let reason_code = args
                 .get("reason_code")
                 .and_then(JsonValue::as_str)
@@ -1005,7 +1022,7 @@ fn dispatch_mediated_tool_call(tool_name: &str, args: &JsonValue, cwd: &Path) ->
                 std::env::var("AGENT_GUARD_ROLE").unwrap_or_else(|_| "coding-agent".to_string());
             let task_id = std::env::var("DOTAGENT_TASK_ID").ok();
             let req = crate::feedback::BallotRequest {
-                denial_id,
+                denial_id: Some(denial_id.to_string()),
                 category,
                 reason_code,
                 note_ascii,

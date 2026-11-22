@@ -26,6 +26,7 @@ use crate::budget_guard::load_active_profile;
 use crate::crypto::{
     constant_time_eq_bytes, hex_decode_32, hex_decode_bytes, sha256_bytes, sha256_hex,
 };
+use crate::github_governance::{COPILOT_GATE_CONTEXT, DOTAGENT_REQUIRED_CHECKS, RATCHET_CHECK_RUN};
 use crate::json::JsonValue;
 use crate::{audit_repository, resolve_repo_root};
 
@@ -600,14 +601,19 @@ fn verify_bundle_rollout_provenance(bundle_root: &Path) -> Result<(), String> {
     }
     for (name, (_, status, concl)) in &latest {
         // The Ring-0 ratchet job is intentionally skipped on main pushes (enforced at PR time).
-        let skipped_ok = name == "Ring-0 Constitutional Ratchet" && concl == "skipped";
+        let skipped_ok = name == RATCHET_CHECK_RUN && concl == "skipped";
         if status != "completed" || (concl != "success" && !skipped_ok) {
             return Err(format!(
                 "HEAD '{head_oid}' check-run '{name}' is {status}/{concl} (all must be green)"
             ));
         }
     }
-    for &req in MAIN_PUSH_REQUIRED_CHECK_RUNS {
+    // Both review gates run on the PR head. Require all remaining checks on the main push.
+    for req in DOTAGENT_REQUIRED_CHECKS
+        .iter()
+        .copied()
+        .filter(|name| !matches!(*name, RATCHET_CHECK_RUN | COPILOT_GATE_CONTEXT))
+    {
         match latest.get(req) {
             Some((_, st, c)) if st == "completed" && c == "success" => {}
             _ => {
@@ -619,17 +625,6 @@ fn verify_bundle_rollout_provenance(bundle_root: &Path) -> Result<(), String> {
     }
     Ok(())
 }
-
-/// CI check-runs that execute on every `main` push (the remaining two of the 7 required gates,
-/// `Ring-0 Constitutional Ratchet` and the `Ring-0 & Copilot Gate` status, are PR-head-only and
-/// are implied by main ancestry under the org ruleset).
-const MAIN_PUSH_REQUIRED_CHECK_RUNS: &[&str] = &[
-    "Security Kernel & Harness (ubuntu-latest)",
-    "Security Kernel & Harness (macos-latest)",
-    "Supply-Chain Advisory & License Gate (cargo-deny)",
-    "Kani Bounded Model Checking Proofs",
-    "MSRV 1.88.0 Compatibility Gate",
-];
 
 /// CLI entrypoint: `dotagent fleet <audit|doctor|sync|build-image> ...`
 pub fn run_fleet_cli(args: &[String], cwd: &Path) -> ExitCode {

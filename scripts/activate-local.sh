@@ -66,19 +66,56 @@ mkdir -p "${BIN_DIR}" "${HOME}/.local/state/agent-guard/sessions"
 chmod 700 "${HOME}/.local/state/agent-guard" "${HOME}/.local/state/agent-guard/sessions"
 
 # 0. Pre-build bootstrap audit: reject build-tool RCE traps BEFORE invoking Cargo
+audit_cargo_config() {
+    local config_path="$1" directives="$2" grep_status=0
+    if [[ -L "${config_path}" ]]; then
+        echo "[activate-local] HARD DENY: symlinked Cargo config at ${config_path}" >&2
+        exit 2
+    fi
+    if [[ -f "${config_path}" ]]; then
+        grep -Eiq -- "${directives}" "${config_path}" || grep_status=$?
+        case "${grep_status}" in
+            0)
+                echo "[activate-local] HARD DENY: dangerous Cargo directive in ${config_path}" >&2
+                exit 2
+                ;;
+            1) ;;
+            *)
+                echo "[activate-local] HARD DENY: failed to inspect Cargo config at ${config_path}" >&2
+                exit 2
+                ;;
+        esac
+    fi
+}
+
 audit_prebuild_traps() {
-    local scan_dir="${DOTAGENT_ROOT}"
+    local scan_dir="${DOTAGENT_ROOT}" cargo_cfg tc_cfg
+    local directives='rustc-wrapper|workspace-wrapper|linker[[:space:]]*=|runner[[:space:]]*=|(^|[^[:alnum:]_-])rustc[[:space:]]*='
+    if [[ -z "${PREBUILT_DIR}" ]]; then
+        directives="${directives}|rustc_wrapper|rustflags|rustdocflags|credential-provider"
+        directives="${directives}|^[[:space:]]*\[+[[:space:]]*[\"']?(alias|env|target)[\"']?[[:space:]]*(\.|\])"
+        directives="${directives}|^[[:space:]]*[\"']?(alias|env|target)[\"']?[[:space:]]*\."
+    fi
     while true; do
+        if [[ -L "${scan_dir}/.cargo" ]]; then
+            echo "[activate-local] HARD DENY: symlinked Cargo configuration directory at ${scan_dir}/.cargo" >&2
+            exit 2
+        fi
         for cargo_cfg in "${scan_dir}/.cargo/config" "${scan_dir}/.cargo/config.toml"; do
-            if [[ -L "${cargo_cfg}" || -L "${scan_dir}/.cargo" ]]; then
-                echo "[activate-local] HARD DENY: symlinked .cargo config at ${cargo_cfg}" >&2
-                exit 2
-            fi
-            if [[ -f "${cargo_cfg}" ]] && grep -Eiq '(rustc-wrapper|workspace-wrapper|linker\s*=|runner\s*=|\brustc\s*=)' "${cargo_cfg}"; then
-                echo "[activate-local] HARD DENY: dangerous Cargo wrapper/linker/runner in ${cargo_cfg}" >&2
-                exit 2
-            fi
+            audit_cargo_config "${cargo_cfg}" "${directives}"
         done
+        if [[ -z "${PREBUILT_DIR}" ]]; then
+            for tc_cfg in "${scan_dir}/rust-toolchain" "${scan_dir}/rust-toolchain.toml"; do
+                if [[ -L "${tc_cfg}" ]]; then
+                    echo "[activate-local] HARD DENY: symlinked rust-toolchain at ${tc_cfg}" >&2
+                    exit 2
+                fi
+                if [[ "${scan_dir}" == "${DOTAGENT_ROOT}" && -f "${tc_cfg}" ]]; then
+                    echo "[activate-local] HARD DENY: repo rust-toolchain override at ${tc_cfg}" >&2
+                    exit 2
+                fi
+            done
+        fi
         if [[ "${scan_dir}" == "/" || "${scan_dir}" == "${HOME}" ]]; then
             break
         fi
@@ -89,6 +126,20 @@ audit_prebuild_traps() {
         fi
         scan_dir="${parent_dir}"
     done
+
+    if [[ -z "${PREBUILT_DIR}" ]]; then
+        local cargo_home="${CARGO_HOME:-${HOME}/.cargo}"
+        if [[ "${cargo_home}" != /* ]]; then
+            cargo_home="${DOTAGENT_ROOT}/${cargo_home}"
+        fi
+        if [[ -L "${cargo_home}" ]]; then
+            echo "[activate-local] HARD DENY: symlinked CARGO_HOME at ${cargo_home}" >&2
+            exit 2
+        fi
+        for cargo_cfg in "${cargo_home}/config" "${cargo_home}/config.toml"; do
+            audit_cargo_config "${cargo_cfg}" "${directives}"
+        done
+    fi
 
     if [[ -L "${DOTAGENT_ROOT}/AGENTS.md" ]]; then
         echo "[activate-local] HARD DENY: root AGENTS.md must not be a symlink" >&2
@@ -157,8 +208,11 @@ if [[ -n "${PREBUILT_DIR}" ]]; then
     echo "[activate-local] verified ${verified_count} prebuilt binaries against ${PREBUILT_SUMS}" >&2
 else
     BIN_SRC="${DOTAGENT_ROOT}/target/release"
-    cargo build --release --manifest-path "${DOTAGENT_ROOT}/Cargo.toml" --offline 2>/dev/null \
-        || cargo build --release --manifest-path "${DOTAGENT_ROOT}/Cargo.toml"
+    (
+        cd -- "${DOTAGENT_ROOT}"
+        cargo build --release --manifest-path "${DOTAGENT_ROOT}/Cargo.toml" --offline 2>/dev/null \
+            || cargo build --release --manifest-path "${DOTAGENT_ROOT}/Cargo.toml"
+    )
 fi
 for bin_name in agent-guard dotagent-compiler swarm-tool; do
     if [[ -e "${BIN_DIR}/${bin_name}" ]]; then
