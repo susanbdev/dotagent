@@ -76,9 +76,15 @@ pub(crate) fn append(record: &JsonValue, durability: Durability) -> Result<Recei
 }
 
 fn count(counter: &AtomicU64, amount: u64) {
-    let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |old| {
-        Some(old.saturating_add(amount))
-    });
+    let mut current = counter.load(Ordering::Relaxed);
+    while let Err(observed) = counter.compare_exchange_weak(
+        current,
+        current.saturating_add(amount),
+        Ordering::Relaxed,
+        Ordering::Relaxed,
+    ) {
+        current = observed;
+    }
 }
 
 fn charge(value: &JsonValue, remaining: &mut usize, depth: usize) -> Option<()> {
