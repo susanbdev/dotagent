@@ -9,9 +9,10 @@
 //! kernel VFS + network confinement for harnesses lacking native `PreToolUse` hooks.
 
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitCode};
+use std::process::{Command, ExitCode, Stdio};
 
 use crate::json::JsonValue;
+use crate::telemetry::observations::ShellMediatorObservation;
 use crate::{Decision, handle_pre_tool_hook};
 
 /// Entrypoint for `agent-guard-sh` (`-c <cmd>`, `-lc <cmd>`, or `<script_file> [args...]`).
@@ -84,7 +85,7 @@ pub fn run_shell_wrapper_with_args(args: &[String], cwd: &Path) -> ExitCode {
             } else {
                 parsed_inv.exec_cmd
             };
-            execute_inside_sandbox(&final_exec, cwd)
+            execute_inside_sandbox(&final_exec, cwd, &repo_root)
         }
         Decision::Deny { code, reason, .. } => {
             eprintln!("[agent-guard-sh HARD DENY :: {code}] {reason}");
@@ -350,43 +351,64 @@ fn status_to_exit_code(status: std::process::ExitStatus) -> ExitCode {
     ExitCode::from(1)
 }
 
-fn execute_inside_sandbox(cmd_str: &str, cwd: &Path) -> ExitCode {
-    if let Some(bin) = resolve_trusted_agent_guard_exe() {
-        match Command::new(bin)
-            .current_dir(cwd)
-            .arg("exec-sandbox")
-            .arg("--sanitize-stream")
-            .arg("--cwd")
-            .arg(cwd)
-            .arg("--")
-            .arg(cmd_str)
-            .output()
-        {
-            Ok(out) => {
-                let mut combined = String::from_utf8_lossy(&out.stdout).into_owned();
-                let err_txt = String::from_utf8_lossy(&out.stderr);
-                if !err_txt.is_empty() {
-                    if !combined.is_empty() && !combined.ends_with('\n') {
-                        combined.push('\n');
-                    }
-                    combined.push_str(&err_txt);
-                }
-                if let Err(deny_exit) = emit_post_tool_filtered_output(&combined, cwd) {
-                    return deny_exit;
-                }
-                status_to_exit_code(out.status)
-            }
-            Err(e) => {
-                eprintln!("[agent-guard-sh] failed spawning exec-sandbox: {e}");
-                ExitCode::from(126)
-            }
-        }
-    } else {
+fn execute_inside_sandbox(cmd_str: &str, cwd: &Path, repo_root: &Path) -> ExitCode {
+    let Some(bin) = resolve_trusted_agent_guard_exe() else {
         eprintln!(
             "[agent-guard-sh HARD DENY :: SANDBOX_BINARY_UNAVAILABLE] Trusted sibling agent-guard/dotagent binary is required to enforce kernel VFS/network isolation; refusing unsandboxed fallback execution."
         );
-        ExitCode::from(2)
+        return ExitCode::from(2);
+    };
+
+    let mut observation = ShellMediatorObservation::new(repo_root);
+    let child = match Command::new(bin)
+        .current_dir(cwd)
+        .arg("exec-sandbox")
+        .arg("--sanitize-stream")
+        .arg("--cwd")
+        .arg(cwd)
+        .arg("--")
+        .arg(cmd_str)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(e) => {
+            if let Some(observation) = observation {
+                observation.finished(None);
+            }
+            eprintln!("[agent-guard-sh] failed spawning exec-sandbox: {e}");
+            return ExitCode::from(126);
+        }
+    };
+    if let Some(observation) = &mut observation {
+        observation.started();
     }
+    let output = child.wait_with_output();
+    if let Some(observation) = observation {
+        observation.finished(output.as_ref().ok().map(|out| out.status));
+    }
+    let out = match output {
+        Ok(out) => out,
+        Err(e) => {
+            eprintln!("[agent-guard-sh] failed waiting for exec-sandbox: {e}");
+            return ExitCode::from(126);
+        }
+    };
+
+    let mut combined = String::from_utf8_lossy(&out.stdout).into_owned();
+    let err_txt = String::from_utf8_lossy(&out.stderr);
+    if !err_txt.is_empty() {
+        if !combined.is_empty() && !combined.ends_with('\n') {
+            combined.push('\n');
+        }
+        combined.push_str(&err_txt);
+    }
+    if let Err(deny_exit) = emit_post_tool_filtered_output(&combined, cwd) {
+        return deny_exit;
+    }
+    status_to_exit_code(out.status)
 }
 
 fn resolve_trusted_agent_guard_exe() -> Option<PathBuf> {

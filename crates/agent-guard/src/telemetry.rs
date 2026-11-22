@@ -27,7 +27,7 @@ use crate::path_policy::{PathAccess, check_forbidden_zones_lexical, validate_pat
 pub(crate) mod capture;
 pub(crate) mod controls;
 mod diagnostics;
-mod observations;
+pub(crate) mod observations;
 pub(crate) mod store;
 
 pub(crate) const AGENT_SANDBOX_AND_HARNESS_MARKERS: &[&str] = &[

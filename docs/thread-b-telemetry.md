@@ -2,7 +2,7 @@
 
 ## Baseline and ownership
 
-Thread B is based on `3eb6ce4282fa0437f3cbb3c0ae2263db2eb35964` from `origin/feat/swarm-v2-bootstrap-and-live-gates`. The checkout was clean before work and the Phase 0 integration branch was confirmed by a fresh remote ref listing. Its first parent is `bf2ed1840ace66720a37e1ca2603559da7eb6a46`. Its second parent and merge base with local `main` is `2ae1b1e4045fa53041711474619b9c0688e463a8`.
+The verified starting revision is `main@2ae1b1e4045fa53041711474619b9c0688e463a8`, which includes PR #17. The final Phase 0 integration base is pending PR #19. The original local Thread B implementation used `3eb6ce4282fa0437f3cbb3c0ae2263db2eb35964` from the swarm integration branch as a provisional base. Its first parent is `bf2ed1840ace66720a37e1ca2603559da7eb6a46` and its second parent is the verified `main` revision. The Thread B checkout was clean at handoff and compatibility work uses a separate worktree.
 
 | Observation | Source | Result |
 | --- | --- | --- |
@@ -160,3 +160,13 @@ The latency fixture used one writer on Linux x86-64 and a Rust 1.88.0 debug buil
 | --- | ---: | ---: | ---: | ---: |
 | Buffered | 192 | 138,368 ns | 253,871 ns | 156,486 bytes |
 | Required sync | 192 | 451,538 ns | 604,418 ns | 156,486 bytes |
+
+## Thread A integration candidate
+
+The local integration branch `codex/thread-ab-integration` starts at the fetched PR #19 tip `ef4d40d06f25212276af80c7723ff2dfd709a2f3`. That tip adds five commits after the provisional base, `01c1d88`, `b3ba693`, `7164e4b`, `d50c5e1`, and `ef4d40d`. It is a local compatibility preview while PR #19 is pending. The only shared source path was `budget_guard.rs`. The integration retains both the webfont test and measured read boundary. The original Thread B commits are `cf2fbe9` and `1302264`. Their copies on the integration branch are `45907b9` and `c19ea3c`.
+
+The host shell wrapper records successful launch and observed termination of the trusted `exec-sandbox` mediator. The producer is `agent-guard.shell-wrapper`, the route is `shell_wrapper_mediator`, and the execution ID connects the two records. Exit codes and signals are recorded from the outer process status. The payload marks nested execution coverage as unavailable and excludes command text and streams. Storage sits on the host side of the existing kernel boundary. Coordinator allocations, checkpoint stages and supervisor outcomes require their own trusted producers.
+
+The fixed baseline command observes the existing Git policy. In a linked worktree, the policy can return `CONFIG_STAT_ERROR` when it checks `.git/config` because linked worktrees have a `.git` file. The prerequisite is unavailable on that route. The policy fixture uses standalone repository metadata to exercise the fixed commands. Live operator-gated capture, kernel checkpoint execution and Antigravity acceptance require native run evidence. The local writer benchmark remains the single-writer measurement recorded above.
+
+On the compatibility preview, 31 focused telemetry tests passed, along with the checkpoint identity, checkpoint scratch, and webfont fixtures. The workspace check and format check passed and compiler verification matched all 58 artifacts. With Rust 1.88.0, strict Clippy reported the same 13 error locations on the clean PR #19 tip and the combined revision.

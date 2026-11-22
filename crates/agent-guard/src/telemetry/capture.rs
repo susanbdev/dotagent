@@ -70,6 +70,7 @@ impl Completeness {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Producer {
     Baseline,
+    ExecutionMediator,
     Guard,
     Capture,
 }
@@ -79,6 +80,12 @@ impl Producer {
         match self {
             Self::Baseline => (
                 "dotagent.baseline",
+                "trusted_execution_mediator",
+                "observed_execution",
+                "local_observation",
+            ),
+            Self::ExecutionMediator => (
+                "agent-guard.shell-wrapper",
                 "trusted_execution_mediator",
                 "observed_execution",
                 "local_observation",
@@ -119,6 +126,10 @@ impl Producer {
                 EventType::ExecutionStarted
                     | EventType::ExecutionFinished
                     | EventType::PrerequisiteChecked
+            ),
+            Self::ExecutionMediator => matches!(
+                kind,
+                EventType::ExecutionStarted | EventType::ExecutionFinished
             ),
             Self::Guard => matches!(
                 kind,
@@ -242,11 +253,14 @@ pub(crate) fn record_guard(context: &Context, payload: Payload) {
     let _ = record_guard_event(context, payload);
 }
 
-fn record_guard_event(context: &Context, payload: Payload) -> Option<String> {
+pub(crate) fn host_capture_allowed() -> bool {
     // A sandboxed process cannot opt in to host recording with hook input.
-    if std::env::var("AGENT_GUARD_IN_SANDBOX").as_deref() == Ok("1")
-        || std::env::var("AGENT_GUARD_WORKER_LOCK").as_deref() == Ok("1")
-    {
+    std::env::var("AGENT_GUARD_IN_SANDBOX").as_deref() != Ok("1")
+        && std::env::var("AGENT_GUARD_WORKER_LOCK").as_deref() != Ok("1")
+}
+
+fn record_guard_event(context: &Context, payload: Payload) -> Option<String> {
+    if !host_capture_allowed() {
         return None;
     }
     match emit(Producer::Guard, context, payload) {
@@ -657,12 +671,20 @@ mod tests {
             (EventType::RecoveryOrEscalation, Producer::Guard),
             (EventType::CaptureHealth, Producer::Capture),
         ] {
-            for producer in [Producer::Baseline, Producer::Guard, Producer::Capture] {
+            for producer in [
+                Producer::Baseline,
+                Producer::ExecutionMediator,
+                Producer::Guard,
+                Producer::Capture,
+            ] {
                 let payload = Payload::new(kind, Completeness::Complete, object([]));
-                assert_eq!(
-                    encode(producer, &context, payload).is_ok(),
-                    producer == allowed
-                );
+                let allowed = producer == allowed
+                    || (producer == Producer::ExecutionMediator
+                        && matches!(
+                            kind,
+                            EventType::ExecutionStarted | EventType::ExecutionFinished
+                        ));
+                assert_eq!(encode(producer, &context, payload).is_ok(), allowed);
             }
         }
     }

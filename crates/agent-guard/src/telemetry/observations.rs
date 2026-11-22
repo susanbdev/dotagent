@@ -8,11 +8,12 @@ use std::time::Instant;
 use crate::json::JsonValue;
 
 use super::capture::{
-    Completeness, Context, EmitResult, EventType, Payload, Producer, emit_required, next_local_id,
-    report_failure, unix_time_ms,
+    Completeness, Context, EmitResult, EventType, Payload, Producer, emit, emit_required,
+    host_capture_allowed, next_local_id, report_failure, unix_time_ms,
 };
 
 const BASELINE_ROUTE: &str = "repo_baseline_mediator";
+const SHELL_WRAPPER_ROUTE: &str = "shell_wrapper_mediator";
 const MAX_CHECK_OUTPUT: usize = 128;
 const BASE_REFS: [Check; 3] = [Check::Head, Check::LocalMain, Check::CachedOriginMain];
 
@@ -146,21 +147,26 @@ fn string_field(name: &str, value: &str) -> (String, JsonValue) {
 }
 
 fn baseline_execution_fields(check: Check) -> Vec<(String, JsonValue)> {
+    let mut fields = mediator_execution_fields(BASELINE_ROUTE);
+    fields.push(string_field("argument_summary", check.identity()));
+    fields
+}
+
+fn mediator_execution_fields(route: &'static str) -> Vec<(String, JsonValue)> {
     vec![
-        string_field("route", BASELINE_ROUTE),
+        string_field("route", route),
         string_field("executable", "dotagent_guard"),
         string_field("subject", "mediator_process"),
-        string_field("argument_summary", check.identity()),
         string_field("nested_process_coverage", "unavailable"),
         string_field("duration_scope", "mediator_observation"),
     ]
 }
 
-fn execution_started(check: Check) -> Payload {
+fn execution_started(fields: Vec<(String, JsonValue)>) -> Payload {
     Payload::new(
         EventType::ExecutionStarted,
         Completeness::Partial,
-        JsonValue::Object(baseline_execution_fields(check)),
+        JsonValue::Object(fields),
     )
     .with_result("launch", "MEDIATOR_STARTED", "started")
 }
@@ -209,8 +215,11 @@ pub(crate) fn process_result_fields(
     fields
 }
 
-fn execution_finished(check: Check, status: Option<ExitStatus>, launched: bool) -> Payload {
-    let mut fields = baseline_execution_fields(check);
+fn execution_finished(
+    mut fields: Vec<(String, JsonValue)>,
+    status: Option<ExitStatus>,
+    launched: bool,
+) -> Payload {
     if launched {
         fields.extend(process_result_fields(status, false, None));
     } else {
@@ -234,6 +243,58 @@ fn execution_finished(check: Check, status: Option<ExitStatus>, launched: bool) 
         JsonValue::Object(fields),
     )
     .with_result("finish", reason, disposition)
+}
+
+/// An observation owned by the host shell wrapper. The child is the trusted sandbox
+/// executable, and any processes inside that executable are outside this boundary.
+pub(crate) struct ShellMediatorObservation {
+    context: Context,
+    started_at: Option<Instant>,
+}
+
+impl ShellMediatorObservation {
+    pub(crate) fn new(repo_root: &Path) -> Option<Self> {
+        if !host_capture_allowed() {
+            return None;
+        }
+        let mut context = Context::for_repo(repo_root);
+        context.trace_id = Some(next_local_id());
+        context.execution_id = Some(next_local_id());
+        Some(Self {
+            context,
+            started_at: None,
+        })
+    }
+
+    pub(crate) fn started(&mut self) {
+        self.started_at = Some(Instant::now());
+        self.context.occurred_at_unix_ms = unix_time_ms();
+        self.context.parent_event_id = self.emit(execution_started(mediator_execution_fields(
+            SHELL_WRAPPER_ROUTE,
+        )));
+    }
+
+    pub(crate) fn finished(mut self, status: Option<ExitStatus>) {
+        self.context.occurred_at_unix_ms = unix_time_ms();
+        self.context.duration_ns = self
+            .started_at
+            .and_then(|start| u64::try_from(start.elapsed().as_nanos()).ok());
+        let _ = self.emit(execution_finished(
+            mediator_execution_fields(SHELL_WRAPPER_ROUTE),
+            status,
+            self.started_at.is_some(),
+        ));
+    }
+
+    fn emit(&self, payload: Payload) -> Option<String> {
+        match emit(Producer::ExecutionMediator, &self.context, payload) {
+            EmitResult::Persisted(receipt) => Some(receipt.event_id),
+            EmitResult::DroppedNoncritical(reason) | EmitResult::FailedRequiredEvidence(reason) => {
+                report_failure(reason);
+                None
+            }
+        }
+    }
 }
 
 fn record(context: &Context, payload: Payload, persisted: &mut bool) -> Option<String> {
@@ -299,10 +360,18 @@ fn capture_check(repo_root: &Path, check: Check, mut context: Context) -> bool {
 
     // Keep the existing command policy in the path. A refusal supplies neither a launch
     // observation nor evidence that the requested ref was absent.
-    if !crate::cmd_policy::evaluate_shell_command(check.script(), repo_root, repo_root, false)
-        .is_ok_and(|plan| plan.rewritten_command.is_none() && plan.write_files.is_empty())
-    {
-        let observation = CheckObservation::Unavailable("BASELINE_POLICY_DENIED");
+    let refusal = match crate::cmd_policy::evaluate_shell_command(
+        check.script(),
+        repo_root,
+        repo_root,
+        false,
+    ) {
+        Ok(plan) if plan.rewritten_command.is_none() && plan.write_files.is_empty() => None,
+        Ok(_) => Some("BASELINE_POLICY_PLAN_UNEXPECTED"),
+        Err(denial) => Some(denial.code),
+    };
+    if let Some(reason) = refusal {
+        let observation = CheckObservation::Unavailable(reason);
         context.occurred_at_unix_ms = unix_time_ms();
         record(&context, observation.payload(check), &mut persisted);
         print_observation(check, &observation, persisted);
@@ -313,7 +382,11 @@ fn capture_check(repo_root: &Path, check: Check, mut context: Context) -> bool {
     let (status, observation, launched) = match launch_baseline_check(repo_root, check) {
         Ok(mut child) => {
             context.occurred_at_unix_ms = unix_time_ms();
-            context.parent_event_id = record(&context, execution_started(check), &mut persisted);
+            context.parent_event_id = record(
+                &context,
+                execution_started(baseline_execution_fields(check)),
+                &mut persisted,
+            );
             let output = child
                 .stdout
                 .take()
@@ -341,7 +414,7 @@ fn capture_check(repo_root: &Path, check: Check, mut context: Context) -> bool {
     context.duration_ns = u64::try_from(started_at.elapsed().as_nanos()).ok();
     context.parent_event_id = record(
         &context,
-        execution_finished(check, status, launched),
+        execution_finished(baseline_execution_fields(check), status, launched),
         &mut persisted,
     );
     context.duration_ns = None;
@@ -406,7 +479,11 @@ mod tests {
 
     #[test]
     fn fixed_baseline_commands_pass_the_existing_readonly_policy() {
-        let repo = crate::resolve_repo_root(Path::new(env!("CARGO_MANIFEST_DIR")));
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/dotagent-telemetry-fixtures")
+            .join(next_local_id());
+        std::fs::create_dir_all(fixture.join(".git")).expect("isolated Git directory fixture");
+        let repo = fixture.canonicalize().expect("canonical fixture directory");
         for check in baseline_checks(true) {
             let plan =
                 crate::cmd_policy::evaluate_shell_command(check.script(), &repo, &repo, false)
@@ -414,6 +491,69 @@ mod tests {
             assert!(plan.rewritten_command.is_none());
             assert!(plan.write_files.is_empty());
         }
+        std::fs::remove_dir_all(fixture).expect("clean isolated policy fixture");
+    }
+
+    #[test]
+    fn host_shell_mediator_records_wait_status_without_command_data() {
+        use super::super::capture::encode;
+
+        let mut context = Context::default();
+        let (event_id, _) = encode(
+            Producer::ExecutionMediator,
+            &context,
+            execution_started(mediator_execution_fields(SHELL_WRAPPER_ROUTE)),
+        )
+        .expect("mediator start record");
+        context.parent_event_id = Some(event_id.clone());
+        let (_, finished) = encode(
+            Producer::ExecutionMediator,
+            &context,
+            execution_finished(
+                mediator_execution_fields(SHELL_WRAPPER_ROUTE),
+                Some(exit(137)),
+                true,
+            ),
+        )
+        .expect("mediator finish record");
+        let payload = finished.get("payload").expect("typed payload");
+        assert_eq!(
+            payload.get("route").and_then(JsonValue::as_str),
+            Some(SHELL_WRAPPER_ROUTE)
+        );
+        assert_eq!(
+            payload.get("exit_code").and_then(JsonValue::as_i64),
+            Some(137)
+        );
+        assert!(payload.get("signal").is_none());
+        assert!(payload.get("argument_summary").is_none());
+        assert_eq!(
+            payload
+                .get("nested_process_coverage")
+                .and_then(JsonValue::as_str),
+            Some("unavailable")
+        );
+        assert_eq!(
+            finished
+                .get("correlation")
+                .and_then(|value| value.get("parent_event_id"))
+                .and_then(JsonValue::as_str),
+            Some(event_id.as_str())
+        );
+
+        let (_, wait_failure) = encode(
+            Producer::ExecutionMediator,
+            &context,
+            execution_finished(mediator_execution_fields(SHELL_WRAPPER_ROUTE), None, true),
+        )
+        .expect("mediator wait failure record");
+        assert_eq!(
+            wait_failure
+                .get("payload")
+                .and_then(|value| value.get("termination"))
+                .and_then(JsonValue::as_str),
+            Some("termination_unobserved")
+        );
     }
 
     #[test]
