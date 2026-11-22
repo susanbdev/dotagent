@@ -33,7 +33,6 @@ use sha2::Sha256;
 use crate::crypto::{ZeroizingKey, constant_time_eq_bytes, hex_decode_32, hex_encode, sha256_hex};
 use crate::exec_sandbox::{
     KernelSandboxMode, probe_host_sandbox_mode, probe_host_seccomp_verified,
-    probe_linux_unshare_netns,
 };
 use crate::json::JsonValue;
 use crate::operator::detect_antigravity_workspace_dir;
@@ -82,11 +81,15 @@ pub struct ProbeSnapshot {
 impl ProbeSnapshot {
     pub fn probe_live(mode_override: Option<&str>) -> Result<Self, String> {
         let execution_mode = detect_execution_mode(mode_override)?;
+        #[cfg(target_os = "linux")]
+        let netns_unshare = crate::exec_sandbox::probe_linux_unshare_netns();
+        #[cfg(not(target_os = "linux"))]
+        let netns_unshare = false;
         Ok(Self {
             execution_mode,
             kernel_fs_mode: probe_host_sandbox_mode(),
             seccomp_net: probe_host_seccomp_verified(),
-            netns_unshare: probe_linux_unshare_netns(),
+            netns_unshare,
             binary_version_override: None,
         })
     }
