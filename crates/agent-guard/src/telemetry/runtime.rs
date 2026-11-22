@@ -398,10 +398,12 @@ impl Runtime {
         )
     }
 
-    pub(super) fn finish(&self) {
+    pub(super) fn finish(&self, timeout: Duration) {
         self.close();
-        while self.audit.state.running.load(Ordering::Acquire)
-            || self.export.state.running.load(Ordering::Acquire)
+        let deadline = Instant::now() + timeout;
+        while (self.audit.state.running.load(Ordering::Acquire)
+            || self.export.state.running.load(Ordering::Acquire))
+            && Instant::now() < deadline
         {
             thread::park_timeout(POLL_INTERVAL);
         }
@@ -483,12 +485,13 @@ impl Drop for HostTelemetry {
         #[cfg(unix)]
         if let Some(child) = &mut self.child {
             drop(child.stdin.take());
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(1200);
             loop {
                 if !matches!(child.try_wait(), Ok(None)) {
                     break;
                 }
                 if std::time::Instant::now() >= deadline {
+                    super::transport::kill_process_group(child.id());
                     let _ = child.kill();
                     let _ = child.wait();
                     break;

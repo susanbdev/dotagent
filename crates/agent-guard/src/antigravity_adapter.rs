@@ -1290,7 +1290,6 @@ fn eval_pre_tool_authoritative(norm_payload: &str, workspace_cwd: &Path) -> Deci
             return dec;
         }
     }
-    let _telemetry = crate::telemetry::runtime::start_host();
     handle_pre_tool_hook(norm_payload, workspace_cwd)
 }
 

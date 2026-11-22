@@ -69,71 +69,251 @@ fn private_dir(owner: u32, create: bool) -> io::Result<PathBuf> {
     Ok(dir)
 }
 
-fn socket_at<T>(dir: &Path, f: impl FnOnce(&Path) -> io::Result<T>) -> io::Result<T> {
-    if O_NOFOLLOW_FLAG == 0 {
-        return Err(io::Error::from(io::ErrorKind::Unsupported));
-    }
-    let path = dir.join(SOCKET);
-    if path.as_os_str().len() <= 95 {
-        return f(&path);
-    }
-    #[cfg(target_os = "linux")]
-    {
+struct PinnedDir {
+    _fd: File,
+    #[cfg(not(target_os = "linux"))]
+    base: PathBuf,
+    #[cfg(not(target_os = "linux"))]
+    dir_id: (u64, u64),
+    owner: u32,
+}
+
+impl PinnedDir {
+    fn open(dir: &Path, owner: u32, pin_cwd_non_linux: bool) -> io::Result<Self> {
+        if O_NOFOLLOW_FLAG == 0 {
+            return Err(io::Error::from(io::ErrorKind::Unsupported));
+        }
         let fd = OpenOptions::new()
             .read(true)
             .custom_flags(O_NOFOLLOW_FLAG)
             .open(dir)?;
-        f(&PathBuf::from(format!(
-            "/proc/self/fd/{}/{SOCKET}",
-            fd.as_raw_fd()
-        )))
+        let meta = fd.metadata()?;
+        if !meta.is_dir() || meta.uid() != owner || meta.mode() & 0o777 != 0o700 {
+            return Err(invalid());
+        }
+        #[cfg(target_os = "linux")]
+        {
+            let _ = pin_cwd_non_linux;
+            Ok(Self { _fd: fd, owner })
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let dir_id = (meta.dev(), meta.ino());
+            let base = if pin_cwd_non_linux {
+                std::env::set_current_dir(dir)?;
+                let dot = fs::symlink_metadata(".")?;
+                if !dot.is_dir() || (dot.dev(), dot.ino()) != dir_id {
+                    return Err(invalid());
+                }
+                PathBuf::from(".")
+            } else {
+                dir.to_path_buf()
+            };
+            Ok(Self {
+                _fd: fd,
+                base,
+                dir_id,
+                owner,
+            })
+        }
     }
-    #[cfg(not(target_os = "linux"))]
-    f(&crate::coordinator::shorten_unix_socket_via_cwd(&path))
-}
 
-fn identity(dir: &Path, owner: u32) -> io::Result<[u8; 16]> {
-    let meta = fs::symlink_metadata(dir.join(SOCKET))?;
-    if !meta.file_type().is_socket() || meta.uid() != owner || meta.mode() & 0o777 != 0o600 {
-        return Err(invalid());
+    fn entry_path(&self, name: &str) -> io::Result<PathBuf> {
+        #[cfg(target_os = "linux")]
+        {
+            Ok(PathBuf::from(format!(
+                "/proc/self/fd/{}/{name}",
+                self._fd.as_raw_fd()
+            )))
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let dm = fs::symlink_metadata(&self.base)?;
+            if dm.file_type().is_symlink() || !dm.is_dir() || (dm.dev(), dm.ino()) != self.dir_id {
+                return Err(invalid());
+            }
+            Ok(self.base.join(name))
+        }
     }
-    let mut id = [0; 16];
-    id[..8].copy_from_slice(&meta.dev().to_be_bytes());
-    id[8..].copy_from_slice(&meta.ino().to_be_bytes());
-    Ok(id)
-}
 
-fn route(dir: &Path, owner: u32) -> io::Result<[u8; ROUTE_BYTES]> {
-    let path = dir.join(ROUTE);
-    let before = fs::symlink_metadata(&path)?;
-    let valid = |m: &fs::Metadata| {
-        m.is_file()
-            && m.uid() == owner
-            && m.nlink() == 1
-            && m.mode() & 0o777 == 0o600
-            && m.len() == ROUTE_BYTES as u64
-    };
-    if !valid(&before) {
-        return Err(invalid());
+    fn verify_unchanged(&self) -> io::Result<()> {
+        #[cfg(target_os = "linux")]
+        {
+            let m = self._fd.metadata()?;
+            if !m.is_dir() || m.uid() != self.owner || m.mode() & 0o777 != 0o700 {
+                return Err(invalid());
+            }
+            Ok(())
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let reopen = OpenOptions::new()
+                .read(true)
+                .custom_flags(O_NOFOLLOW_FLAG)
+                .open(&self.base)?;
+            let m = reopen.metadata()?;
+            if !m.is_dir()
+                || m.uid() != self.owner
+                || m.mode() & 0o777 != 0o700
+                || (m.dev(), m.ino()) != self.dir_id
+            {
+                return Err(invalid());
+            }
+            Ok(())
+        }
     }
-    #[cfg(target_os = "linux")]
-    const NONBLOCK: i32 = 0o4000;
-    #[cfg(not(target_os = "linux"))]
-    const NONBLOCK: i32 = 4;
-    if O_NOFOLLOW_FLAG == 0 {
-        return Err(io::Error::from(io::ErrorKind::Unsupported));
+
+    fn socket_path(&self) -> io::Result<PathBuf> {
+        let p = self.entry_path(SOCKET)?;
+        #[cfg(not(target_os = "linux"))]
+        if p.as_os_str().len() > 95 {
+            return Ok(crate::coordinator::shorten_unix_socket_via_cwd(&p));
+        }
+        Ok(p)
     }
-    let mut file = OpenOptions::new()
-        .read(true)
-        .custom_flags(O_NOFOLLOW_FLAG | NONBLOCK)
-        .open(path)?;
-    let after = file.metadata()?;
-    if !valid(&after) || (before.dev(), before.ino()) != (after.dev(), after.ino()) {
-        return Err(invalid());
+
+    fn connect_socket(&self, sock: &UnixDatagram) -> io::Result<()> {
+        let p = self.socket_path()?;
+        sock.connect(p)?;
+        self.verify_unchanged()
     }
-    let mut bytes = [0; ROUTE_BYTES];
-    file.read_exact(&mut bytes)?;
-    Ok(bytes)
+
+    fn bind_socket_0600(&self) -> io::Result<UnixDatagram> {
+        let p = self.socket_path()?;
+        let socket = UnixDatagram::bind(&p)?;
+        #[cfg(target_os = "linux")]
+        {
+            const O_PATH_LINUX: i32 = 0o10000000;
+            let sock_fd = OpenOptions::new()
+                .read(true)
+                .custom_flags(O_PATH_LINUX | O_NOFOLLOW_FLAG)
+                .open(self.entry_path(SOCKET)?)?;
+            let fd_path = PathBuf::from(format!("/proc/self/fd/{}", sock_fd.as_raw_fd()));
+            let sm = fs::metadata(&fd_path)?;
+            if !sm.file_type().is_socket() || sm.uid() != self.owner {
+                let _ = fs::remove_file(self.entry_path(SOCKET)?);
+                return Err(invalid());
+            }
+            fs::set_permissions(&fd_path, fs::Permissions::from_mode(0o600))?;
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            if let Ok(cloned) = socket.try_clone() {
+                let fd: OwnedFd = cloned.into();
+                let _ = File::from(fd).set_permissions(fs::Permissions::from_mode(0o600));
+            }
+            let entry = self.entry_path(SOCKET)?;
+            let before = fs::symlink_metadata(&entry)?;
+            if before.file_type().is_symlink()
+                || !before.file_type().is_socket()
+                || before.uid() != self.owner
+            {
+                return Err(invalid());
+            }
+            if before.mode() & 0o777 != 0o600 {
+                fs::set_permissions(&entry, fs::Permissions::from_mode(0o600))?;
+                let after = fs::symlink_metadata(&entry)?;
+                if after.file_type().is_symlink()
+                    || !after.file_type().is_socket()
+                    || (before.dev(), before.ino()) != (after.dev(), after.ino())
+                {
+                    return Err(invalid());
+                }
+            }
+            self.verify_unchanged()?;
+        }
+        Ok(socket)
+    }
+
+    fn identity(&self) -> io::Result<[u8; 16]> {
+        let meta = fs::symlink_metadata(self.entry_path(SOCKET)?)?;
+        if meta.file_type().is_symlink()
+            || !meta.file_type().is_socket()
+            || meta.uid() != self.owner
+            || meta.mode() & 0o777 != 0o600
+        {
+            return Err(invalid());
+        }
+        let mut id = [0; 16];
+        id[..8].copy_from_slice(&meta.dev().to_be_bytes());
+        id[8..].copy_from_slice(&meta.ino().to_be_bytes());
+        Ok(id)
+    }
+
+    fn read_route(&self) -> io::Result<[u8; ROUTE_BYTES]> {
+        let path = self.entry_path(ROUTE)?;
+        let before = fs::symlink_metadata(&path)?;
+        let valid = |m: &fs::Metadata| {
+            m.is_file()
+                && m.uid() == self.owner
+                && m.nlink() == 1
+                && m.mode() & 0o777 == 0o600
+                && m.len() == ROUTE_BYTES as u64
+        };
+        if !valid(&before) {
+            return Err(invalid());
+        }
+        #[cfg(target_os = "linux")]
+        const NONBLOCK: i32 = 0o4000;
+        #[cfg(not(target_os = "linux"))]
+        const NONBLOCK: i32 = 4;
+        let mut file = OpenOptions::new()
+            .read(true)
+            .custom_flags(O_NOFOLLOW_FLAG | NONBLOCK)
+            .open(path)?;
+        let after = file.metadata()?;
+        if !valid(&after) || (before.dev(), before.ino()) != (after.dev(), after.ino()) {
+            return Err(invalid());
+        }
+        let mut bytes = [0; ROUTE_BYTES];
+        file.read_exact(&mut bytes)?;
+        self.verify_unchanged()?;
+        Ok(bytes)
+    }
+
+    fn publish_atomic(&self, stage_name: &str, final_name: &str, data: &[u8]) -> io::Result<()> {
+        let stage = self.entry_path(stage_name)?;
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .custom_flags(O_NOFOLLOW_FLAG)
+            .mode(0o600)
+            .open(&stage)?;
+        let dst = self.entry_path(final_name)?;
+        if fs::symlink_metadata(&dst).is_ok_and(|m| m.file_type().is_symlink()) {
+            let _ = fs::remove_file(&stage);
+            return Err(invalid());
+        }
+        let res = file
+            .write_all(data)
+            .and_then(|()| self.verify_unchanged())
+            .and_then(|()| fs::rename(&stage, &dst));
+        if res.is_err() {
+            let _ = fs::remove_file(&stage);
+        }
+        res
+    }
+
+    fn unlink_socket(&self) -> io::Result<()> {
+        let p = self.entry_path(SOCKET)?;
+        let m = fs::symlink_metadata(&p)?;
+        if m.file_type().is_symlink() || !m.file_type().is_socket() || m.uid() != self.owner {
+            return Err(invalid());
+        }
+        fs::remove_file(p)
+    }
+
+    fn cleanup_endpoint(&self, expected_id: [u8; 16]) {
+        if self.verify_unchanged().is_ok() && self.identity().ok() == Some(expected_id) {
+            if let Ok(route_p) = self.entry_path(ROUTE)
+                && fs::symlink_metadata(&route_p)
+                    .is_ok_and(|m| !m.file_type().is_symlink() && m.is_file())
+            {
+                let _ = fs::remove_file(route_p);
+            }
+            let _ = self.unlink_socket();
+        }
+    }
 }
 
 struct Peer {
@@ -147,12 +327,13 @@ impl Peer {
         socket.set_nonblocking(true)?;
         let owner = uid(&socket)?;
         let dir = private_dir(owner, false)?;
-        let route = route(&dir, owner)?;
-        if identity(&dir, owner)? != route[..16] {
+        let pinned = PinnedDir::open(&dir, owner, false)?;
+        let route = pinned.read_route()?;
+        if pinned.identity()? != route[..16] {
             return Err(invalid());
         }
-        socket_at(&dir, |path| socket.connect(path))?;
-        if identity(&dir, owner)? != route[..16] {
+        pinned.connect_socket(&socket)?;
+        if pinned.identity()? != route[..16] {
             return Err(invalid());
         }
         Ok(Self {
@@ -258,8 +439,20 @@ pub(super) fn send<T>(build: impl FnOnce() -> Option<(Record, T)>) -> Result<T, 
     }
 }
 
-fn child_command(role: &str) -> io::Result<Command> {
-    let mut command = Command::new(std::env::current_exe()?);
+fn child_command(role: &str, new_pgroup: bool) -> io::Result<Command> {
+    use std::os::unix::process::CommandExt;
+    let current = std::env::current_exe()?;
+    #[cfg(target_os = "linux")]
+    let mut command = {
+        let mut c = Command::new("/proc/self/exe");
+        c.arg0(&current);
+        c
+    };
+    #[cfg(not(target_os = "linux"))]
+    let mut command = Command::new(current);
+    if new_pgroup {
+        command.process_group(0);
+    }
     command.arg(role).arg("--owned").env_clear();
     for name in ["HOME", "AGENT_GUARD_STATE_DIR"] {
         if let Some(value) = std::env::var_os(name) {
@@ -273,12 +466,42 @@ fn child_command(role: &str) -> io::Result<Command> {
     Ok(command)
 }
 
+pub(super) fn kill_process_group(pgid: u32) {
+    if pgid <= 1 {
+        return;
+    }
+    let neg_pgid = format!("-{pgid}");
+    let ok = Command::new("/bin/kill")
+        .args(["-s", "KILL", "--", &neg_pgid])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success());
+    if !ok {
+        let _ = Command::new("/bin/sh")
+            .args([
+                "-c",
+                "kill -s KILL -\"$1\" 2>/dev/null || true",
+                "sh",
+                &pgid.to_string(),
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+}
+
 #[cfg(not(test))]
 pub(super) fn launch() -> Option<Child> {
     if !enabled() {
         return None;
     }
-    child_command("supervise-observations").ok()?.spawn().ok()
+    child_command("supervise-observations", true)
+        .ok()?
+        .spawn()
+        .ok()
 }
 
 /// Owns the child and its restart budget outside the guard's panic and scheduling domain.
@@ -307,10 +530,10 @@ pub(crate) fn supervise() -> io::Result<()> {
         }
         if child.is_none() && starts.len() < 3 && Peer::open().is_err() {
             starts.push_back(now + Duration::from_secs(60));
-            child = child_command("collect-observations")?.spawn().ok();
+            child = child_command("collect-observations", false)?.spawn().ok();
         }
         if !matches!(
-            owner.recv_timeout(Duration::from_millis(250)),
+            owner.recv_timeout(Duration::from_millis(50)),
             Err(std::sync::mpsc::RecvTimeoutError::Timeout)
         ) {
             break;
@@ -318,14 +541,14 @@ pub(crate) fn supervise() -> io::Result<()> {
     }
     if let Some(mut child) = child {
         drop(child.stdin.take());
-        let deadline = Instant::now() + Duration::from_secs(3);
+        let deadline = Instant::now() + Duration::from_millis(350);
         while child.try_wait()?.is_none() {
             if Instant::now() >= deadline {
                 let _ = child.kill();
                 let _ = child.wait();
                 break;
             }
-            std::thread::park_timeout(Duration::from_millis(20));
+            std::thread::park_timeout(Duration::from_millis(5));
         }
     }
     Ok(())
@@ -333,8 +556,7 @@ pub(crate) fn supervise() -> io::Result<()> {
 
 struct Endpoint {
     socket: UnixDatagram,
-    dir: PathBuf,
-    owner: u32,
+    pinned: PinnedDir,
     id: [u8; 16],
     key: [u8; 32],
 }
@@ -345,12 +567,14 @@ impl Endpoint {
         probe.set_nonblocking(true)?;
         let owner = uid(&probe)?;
         let dir = private_dir(owner, true)?;
-        let path = dir.join(SOCKET);
-        let _lock = ExclusiveFileLockGuard::acquire_observation(&path).map_err(io::Error::other)?;
-        match identity(&dir, owner) {
-            Ok(_) => match socket_at(&dir, |p| probe.connect(p)) {
+        let lock_target = dir.join(SOCKET);
+        let _lock =
+            ExclusiveFileLockGuard::acquire_observation(&lock_target).map_err(io::Error::other)?;
+        let pinned = PinnedDir::open(&dir, owner, true)?;
+        match pinned.identity() {
+            Ok(_) => match pinned.connect_socket(&probe) {
                 Ok(()) => return Ok(None),
-                Err(e) if e.kind() == io::ErrorKind::ConnectionRefused => fs::remove_file(&path)?,
+                Err(e) if e.kind() == io::ErrorKind::ConnectionRefused => pinned.unlink_socket()?,
                 Err(e) => return Err(e),
             },
             Err(e) if e.kind() == io::ErrorKind::NotFound => (),
@@ -358,34 +582,23 @@ impl Endpoint {
         }
         let mut key = [0; 32];
         File::open("/dev/urandom")?.read_exact(&mut key)?;
-        let socket = socket_at(&dir, |p| UnixDatagram::bind(p))?;
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
-        let id = identity(&dir, owner)?;
-        let endpoint = Self {
+        let socket = pinned.bind_socket_0600()?;
+        let id = pinned.identity()?;
+        let mut route_bytes = [0u8; ROUTE_BYTES];
+        route_bytes[..16].copy_from_slice(&id);
+        route_bytes[16..].copy_from_slice(&key);
+        let stage_name = format!("route-{}", std::process::id());
+        if let Err(err) = pinned.publish_atomic(&stage_name, ROUTE, &route_bytes) {
+            let _ = pinned.unlink_socket();
+            return Err(err);
+        }
+        socket.set_read_timeout(Some(Duration::from_millis(100)))?;
+        Ok(Some(Self {
             socket,
-            dir,
-            owner,
+            pinned,
             id,
             key,
-        };
-        let staging = endpoint.dir.join(format!("route-{}", std::process::id()));
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&staging)?;
-        let publish = file
-            .write_all(&id)
-            .and_then(|()| file.write_all(&key))
-            .and_then(|()| fs::rename(&staging, endpoint.dir.join(ROUTE)));
-        if let Err(error) = publish {
-            let _ = fs::remove_file(staging);
-            return Err(error);
-        }
-        endpoint
-            .socket
-            .set_read_timeout(Some(Duration::from_millis(100)))?;
-        Ok(Some(endpoint))
+        }))
     }
 }
 
@@ -396,12 +609,6 @@ impl Endpoint {
         closing: bool,
         last_producer: &crate::json::JsonValue,
     ) -> io::Result<()> {
-        let stage = self.dir.join(format!("health-{}", std::process::id()));
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&stage)?;
         let mut status = super::runtime_health::status(counts.0, counts.1, closing);
         if let crate::json::JsonValue::Object(fields) = &mut status {
             fields.push(("last_producer_before_handoff".into(), last_producer.clone()));
@@ -415,22 +622,15 @@ impl Endpoint {
             ));
         }
         let status = status.to_json_string();
-        let result = file
-            .write_all(status.as_bytes())
-            .and_then(|()| fs::rename(&stage, self.dir.join("health")));
-        if result.is_err() {
-            let _ = fs::remove_file(stage);
-        }
-        result
+        let stage_name = format!("health-{}", std::process::id());
+        self.pinned
+            .publish_atomic(&stage_name, "health", status.as_bytes())
     }
 }
 
 impl Drop for Endpoint {
     fn drop(&mut self) {
-        if identity(&self.dir, self.owner).ok() == Some(self.id) {
-            let _ = fs::remove_file(self.dir.join(ROUTE));
-            let _ = fs::remove_file(self.dir.join(SOCKET));
-        }
+        self.pinned.cleanup_endpoint(self.id);
     }
 }
 
@@ -574,7 +774,7 @@ pub(crate) fn collect(owned: bool) -> io::Result<()> {
             Err(e) => return Err(e),
         }
     }
-    runtime.finish();
+    runtime.finish(Duration::from_millis(200));
     let _ = endpoint.report(runtime.counts(), true, &last_producer);
     Ok(())
 }

@@ -35,6 +35,11 @@ pub(super) fn before_store(frame: &[u8]) -> io::Result<()> {
             let mut byte = [0];
             std::io::Read::read_exact(&mut io::stdin(), &mut byte)
         }
+        7 => {
+            writeln!(io::stdout().lock(), "DEADLOCKED")?;
+            std::thread::sleep(std::time::Duration::from_secs(60));
+            Ok(())
+        }
         _ => Ok(()),
     }
 }
@@ -133,17 +138,18 @@ pub fn run() -> ExitCode {
     let result = if mode == "producer" {
         producer()
     } else {
-        let fault = match mode.as_str() {
-            "panic" => 1,
-            "permission" => 2,
-            "enospc" => 3,
-            "exit-handoff" => 4,
-            "blocked-store" => 5,
-            "fd-exhausted" => 6,
+        let (fault, owned) = match mode.as_str() {
+            "panic" => (1, false),
+            "permission" => (2, false),
+            "enospc" => (3, false),
+            "exit-handoff" => (4, false),
+            "blocked-store" => (5, false),
+            "fd-exhausted" => (6, false),
+            "deadlocked-owned" => (7, true),
             _ => return ExitCode::FAILURE,
         };
         FAULT.store(fault, Ordering::Relaxed);
-        super::transport::collect(false)
+        super::transport::collect(owned)
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
