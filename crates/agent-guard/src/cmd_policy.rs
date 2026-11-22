@@ -8,7 +8,7 @@
 //! zero-trust path, depth<=2, git-hook/config, package-script, and anti-confused-deputy rules.
 
 use std::collections::BTreeSet;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::path_policy::{PathAccess, check_forbidden_zones_lexical, validate_path};
 use crate::unicode_guard::{ScanMode, scan_unicode};
@@ -2349,7 +2349,7 @@ fn check_cargo_command(
     let canonical_repo =
         std::fs::canonicalize(repo_root).unwrap_or_else(|_| repo_root.to_path_buf());
     let canonical_cwd = std::fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
-    let mut config_roots = BTreeSet::from([canonical_repo.clone(), canonical_cwd]);
+    let mut config_roots = BTreeSet::from([canonical_repo, canonical_cwd]);
     let mut sub = "";
     let mut i = 0usize;
     while i < args.len() {
@@ -2444,29 +2444,43 @@ fn check_cargo_command(
         });
     }
 
-    let mut checked = BTreeSet::new();
+    let mut config_dirs = BTreeSet::new();
     for root in &config_roots {
-        for dir in root
-            .ancestors()
-            .take_while(|dir| dir.starts_with(&canonical_repo))
+        config_dirs.extend(root.ancestors().map(|dir| dir.join(".cargo")));
+        if let Some(home) = cargo_home_for_directory(root) {
+            config_dirs.insert(home);
+        }
+    }
+    for dir in config_dirs {
+        inspect_cargo_config_dir(&dir)?;
+    }
+    Ok(())
+}
+
+pub(crate) fn cargo_home_for_directory(cwd: &Path) -> Option<PathBuf> {
+    std::env::var_os("CARGO_HOME")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| std::env::home_dir().map(|home| home.join(".cargo")))
+        .map(|home| cwd.join(home))
+}
+
+pub(crate) fn inspect_cargo_config_dir(dir: &Path) -> Result<(), CommandViolation> {
+    // Anchor the walk at the filesystem root so it checks the directory and its ancestors.
+    let root = dir.ancestors().last().unwrap_or(dir);
+    let relative_dir = dir.strip_prefix(root).unwrap_or(dir);
+    for name in ["config.toml", "config"] {
+        if let Some(keys) = read_bounded_nonsymlink_config_keys(root, relative_dir.join(name))?
+            && let Some(directive) = cargo_config_traps(&keys).next()
         {
-            if !checked.insert(dir) {
-                break;
-            }
-            for rel in [".cargo/config.toml", ".cargo/config"] {
-                if let Some(keys) = read_bounded_nonsymlink_config_keys(dir, rel)?
-                    && let Some(directive) = cargo_config_traps(&keys).next()
-                {
-                    return Err(CommandViolation {
-                        code: "CARGO_CONFIG_EXEC_TRAP",
-                        detail: format!(
-                            "Cargo config '{}' contains dangerous execution directive '{directive}'.",
-                            dir.join(rel).display()
-                        ),
-                        halt_session: true,
-                    });
-                }
-            }
+            return Err(CommandViolation {
+                code: "CARGO_CONFIG_EXEC_TRAP",
+                detail: format!(
+                    "Cargo config '{}' contains dangerous execution directive '{directive}'.",
+                    dir.join(name).display()
+                ),
+                halt_session: true,
+            });
         }
     }
     Ok(())
@@ -2482,6 +2496,7 @@ fn cargo_config_traps(keys: &[String]) -> impl Iterator<Item = &'static str> + '
         "alias",
         "env",
         "target",
+        "target-dir",
         "rustflags",
         "rustdocflags",
         "credential-provider",
@@ -2512,7 +2527,7 @@ fn cargo_config_traps(keys: &[String]) -> impl Iterator<Item = &'static str> + '
 /// RHS values so credentials/tokens inside `.npmrc`/`.yarnrc*` are never retained in memory).
 fn read_bounded_nonsymlink_config_keys(
     base_dir: &Path,
-    rel: &str,
+    rel: impl AsRef<Path>,
 ) -> Result<Option<Vec<String>>, CommandViolation> {
     let raw_opt = read_bounded_nonsymlink_raw(base_dir, rel, 16_384)?;
     let Some(raw) = raw_opt else {
@@ -2551,15 +2566,17 @@ fn read_bounded_nonsymlink_config_keys(
 
 fn read_bounded_nonsymlink_raw(
     base_dir: &Path,
-    rel: &str,
+    rel: impl AsRef<Path>,
     max_bytes: u64,
 ) -> Result<Option<String>, CommandViolation> {
     use std::io::Read;
     let mut cur = base_dir.to_path_buf();
-    let parts: Vec<&str> = rel.split('/').filter(|s| !s.is_empty()).collect();
-    for (idx, seg) in parts.iter().enumerate() {
+    let rel = rel.as_ref();
+    let mut parts = rel.iter().peekable();
+    let rel = rel.display();
+    while let Some(seg) = parts.next() {
         cur.push(seg);
-        let is_last = idx + 1 == parts.len();
+        let is_last = parts.peek().is_none();
         match std::fs::symlink_metadata(&cur) {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(e) => {
@@ -5589,7 +5606,7 @@ pub const fn scan_shell_brace_and_quote_bytes(bytes: &[u8]) -> Result<usize, She
 
 #[cfg(test)]
 mod tests {
-    use super::{check_cargo_command, evaluate_shell_command};
+    use super::{check_cargo_command, evaluate_shell_command, inspect_cargo_config_dir};
 
     #[test]
     fn cargo_checks_cwd_and_manifest_ancestors() {
@@ -5608,7 +5625,7 @@ mod tests {
             .join(format!("cargo-config-policy-{}", std::process::id()));
         fs::create_dir(&root).expect("new scratch directory");
         let scratch = Scratch(root);
-        let repo = &scratch.0;
+        let repo = scratch.0.join("checkout");
         let nested = repo.join("apps/service");
         fs::create_dir_all(&nested).expect("service directory");
         fs::create_dir(repo.join("apps/.cargo")).expect("config directory");
@@ -5629,11 +5646,37 @@ mod tests {
         ] {
             let args: Vec<_> = args.into_iter().map(str::to_string).collect();
             let violation =
-                check_cargo_command(&args, repo, cwd).expect_err("config must be checked");
+                check_cargo_command(&args, &repo, cwd).expect_err("config must be checked");
             assert_eq!(violation.code, "CARGO_CONFIG_EXEC_TRAP");
             assert!(violation.detail.contains("'env'"));
         }
-        assert!(check_cargo_command(&["check".to_string()], repo, repo).is_ok());
+        let args = ["check".to_string()];
+        assert!(check_cargo_command(&args, &repo, &repo).is_ok());
+
+        let cargo_config = scratch.0.join(".cargo");
+        fs::create_dir(&cargo_config).expect("ancestor config directory");
+        fs::write(cargo_config.join("config"), "[env]\n").expect("ancestor config fixture");
+        let violation =
+            check_cargo_command(&args, &repo, &repo).expect_err("ancestor config must be checked");
+        assert_eq!(violation.code, "CARGO_CONFIG_EXEC_TRAP");
+
+        let cargo_home = scratch.0.join("cargo-home");
+        fs::create_dir(&cargo_home).expect("Cargo home");
+        fs::write(cargo_home.join("config.toml"), "[net]\noffline = true\n")
+            .expect("benign Cargo home fixture");
+        assert!(inspect_cargo_config_dir(&cargo_home).is_ok());
+        fs::write(cargo_home.join("config"), "[env]\n").expect("legacy Cargo home fixture");
+        let violation =
+            inspect_cargo_config_dir(&cargo_home).expect_err("legacy config must be checked");
+        assert_eq!(violation.code, "CARGO_CONFIG_EXEC_TRAP");
+
+        #[cfg(unix)]
+        {
+            let alias = scratch.0.join("cargo-home-alias");
+            std::os::unix::fs::symlink(&cargo_home, &alias).expect("Cargo home symlink");
+            let violation = inspect_cargo_config_dir(&alias).expect_err("symlink must be denied");
+            assert_eq!(violation.code, "SYMLINKED_BUILD_CONFIG_BLOCKED");
+        }
     }
 
     #[test]

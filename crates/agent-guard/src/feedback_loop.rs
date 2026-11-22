@@ -2788,16 +2788,12 @@ fn audit_cargo_config_hierarchy(wt_dir: &Path) -> Result<(), String> {
         }
     }
     // 2. Ancestor directories and CARGO_HOME are walked by Cargo config discovery.
-    let mut dirs: Vec<PathBuf> = wt_dir.ancestors().skip(1).map(Path::to_path_buf).collect();
-    if let Ok(ch) = std::env::var("CARGO_HOME") {
-        dirs.push(PathBuf::from(ch).join("__cargo_home_marker__"));
+    if let Some(home) = crate::cmd_policy::cargo_home_for_directory(wt_dir) {
+        crate::cmd_policy::inspect_cargo_config_dir(&home)
+            .map_err(|error| format!("PREBUILD_TRAP_BLOCKED: {}", error.detail))?;
     }
-    for d in dirs {
-        let base = if d.ends_with("__cargo_home_marker__") {
-            d.parent().map(Path::to_path_buf).unwrap_or_default()
-        } else {
-            d.join(".cargo")
-        };
+    for d in wt_dir.ancestors().skip(1) {
+        let base = d.join(".cargo");
         for name in ["config", "config.toml"] {
             let p = base.join(name);
             let Ok(meta) = fs::symlink_metadata(&p) else {
