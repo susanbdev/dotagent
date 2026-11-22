@@ -1,6 +1,7 @@
 """Independent spawn-through-exit report. No cross-runner latency thresholds."""
 
 import contextlib
+import hashlib
 import json
 import math
 import os
@@ -72,7 +73,12 @@ def run(mode, builds):
                     session = f"bench-{mode}-{operation}-{cycle}-{label}"
                     if payload is not None:
                         data = json.dumps({**payload, "session_id": session}).encode()
-                    run_env = {**env, "AGENT_GUARD_SESSION_ID": session}
+                    if payload is None or operation == "read-safe":
+                        # These CLI routes have no hook envelope; reset only the synthetic default ledger.
+                        framed = f"v2:{len(os.fsencode(repo))}:{repo}:7:default".encode()
+                        name = hashlib.sha256(framed).hexdigest()[:32] + ".json"
+                        (state / name).unlink(missing_ok=True)
+                    run_env = env
                     start = time.perf_counter_ns()
                     child = subprocess.run(args, input=data, cwd=repo, env=run_env,
                                            stdout=subprocess.PIPE, stderr=subprocess.PIPE,

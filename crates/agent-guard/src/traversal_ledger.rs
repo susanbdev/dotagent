@@ -1537,7 +1537,7 @@ pub fn append_audit_jsonl(
     let has_detail = !detail.is_empty();
     let _ = submit_record(Kind::Legacy, || {
         let session_hash = compute_session_key_hash(repo_root, session_id);
-        let (safe_tool, _) = crate::feedback::scrub_high_entropy_and_secrets(tool, 64);
+        let safe_tool = crate::telemetry::protocol::tool_class(tool).to_owned();
         JsonValue::Object(vec![
             (
                 "ts".into(),

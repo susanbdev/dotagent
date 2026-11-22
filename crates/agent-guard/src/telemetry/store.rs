@@ -16,12 +16,20 @@ pub(crate) const DEFAULT_MAX_BYTES: u64 = 10 * 1024 * 1024;
 pub(crate) const DEFAULT_KEEP: usize = 5;
 pub(crate) const MAX_ARCHIVES: usize = 20;
 
+static PERMISSION_FAILURES: AtomicU64 = AtomicU64::new(0);
+static SPACE_FAILURES: AtomicU64 = AtomicU64::new(0);
+
+pub(super) fn storage_failures() -> (u64, u64) {
+    (PERMISSION_FAILURES.load(Ordering::Relaxed), SPACE_FAILURES.load(Ordering::Relaxed))
+}
+
 static FAILED_APPENDS: AtomicU64 = AtomicU64::new(0);
 static EXPIRED_ARCHIVES: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Copy)]
 pub(crate) enum Durability {
     /// A complete frame was handed to the operating system.
+    #[cfg(test)]
     Buffered,
     /// The frame was synced and new directory entries were synced if applicable.
     Required,
@@ -69,8 +77,15 @@ pub(crate) fn append(record: &JsonValue, durability: Durability) -> Result<Recei
         DEFAULT_MAX_BYTES,
         DEFAULT_KEEP,
     );
-    if result.is_err() {
+    if let Err(error) = &result {
         count(&FAILED_APPENDS, 1);
+        match error {
+            CaptureError::Io(io::ErrorKind::PermissionDenied) => count(&PERMISSION_FAILURES, 1),
+            CaptureError::Io(io::ErrorKind::StorageFull) => count(&SPACE_FAILURES, 1),
+            _ => (),
+        }
+        #[cfg(all(unix, feature = "collector-fixture"))]
+        super::release_probe::store_error(error);
     }
     result
 }
@@ -355,6 +370,10 @@ fn append_at(
     }
     let durable = matches!(durability, Durability::Required);
     let recovered = write_health(path, &mut file, torn)?;
+    #[cfg(all(unix, feature = "collector-fixture"))]
+    if record.get("event_type").and_then(JsonValue::as_str) != Some("CAPTURE_HEALTH") {
+        super::release_probe::before_store(&frame)?;
+    }
     file.write_all(&frame)?;
     if durable {
         file.sync_data()?;

@@ -1111,6 +1111,13 @@ fn append_bounded_rotated_jsonl(
     let _guard = acquire_lock(&lock_path)?;
 
     if let Ok(meta) = fs::symlink_metadata(path) {
+        #[cfg(unix)]
+        if sync_mirror {
+            use std::os::unix::fs::MetadataExt;
+            if !meta.is_file() || meta.nlink() != 1 || meta.mode() & 0o777 != 0o600 {
+                return Err("invalid mirror destination".into());
+            }
+        }
         if meta.file_type().is_symlink() {
             return Err(format!(
                 "SPOOL_SYMLINK_REJECTED: refusing symlinked spool '{}'",
@@ -1152,7 +1159,8 @@ fn append_bounded_rotated_jsonl(
     ))]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        opts.custom_flags(O_NOFOLLOW_FLAG);
+        let nonblocking = if cfg!(target_os = "linux") { 0o4000 } else { 4 };
+        opts.custom_flags(O_NOFOLLOW_FLAG | if sync_mirror { nonblocking } else { 0 });
     }
     let mut f = opts
         .open(path)
@@ -1225,7 +1233,7 @@ pub fn record_guard_denial_agentpi_signal(
         guard_denial_agentpi_event(
             repo_root,
             session_id,
-            tool,
+            crate::telemetry::protocol::tool_class(tool),
             code,
             if detail.is_empty() { "" } else { "[redacted]" },
             halted,
@@ -1636,7 +1644,19 @@ pub fn commit_ballot_on_host_redacted(
     let agentpi_ev = rec.to_agentpi_event_json();
     publish_agentpi_result(&agentpi_ev, sink);
     // The signed ballot journal already bounds the source fields of this projection.
-    let _ = submit_record(Kind::Ballot, || agentpi_ev.clone());
+    let _ = submit_record(Kind::Ballot, || {
+        let mut projection = agentpi_ev.clone();
+        if let JsonValue::Object(fields) = &mut projection {
+            for (key, value) in fields {
+                if key == "canonical_shape" {
+                    *value = JsonValue::Str("[redacted]".into());
+                } else if key == "target_bin_or_tool" {
+                    *value = JsonValue::Str(crate::telemetry::protocol::tool_class(value.as_str().unwrap_or("")).into());
+                }
+            }
+        }
+        projection
+    });
     Ok(agentpi_ev)
 }
 

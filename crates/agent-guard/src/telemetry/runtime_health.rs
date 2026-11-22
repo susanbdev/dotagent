@@ -83,11 +83,17 @@ fn snapshot_payload(audit: JsonValue, export: JsonValue, phase: JsonValue) -> Js
 }
 
 pub(super) fn status(audit: Counters, export: Counters, closing: bool) -> JsonValue {
-    snapshot_payload(
+    let mut value = snapshot_payload(
         encode_counters(audit, true),
         encode_counters(export, true),
         JsonValue::Str(if closing { "closing" } else { "active" }.to_owned()),
-    )
+    );
+    if let JsonValue::Object(fields) = &mut value {
+        let (permission, full) = store::storage_failures();
+        fields.push(("storage_permission_denied".into(), JsonValue::Uint(permission)));
+        fields.push(("storage_full".into(), JsonValue::Uint(full)));
+    }
+    value
 }
 
 pub(super) fn read(payload: &JsonValue) -> Option<JsonValue> {

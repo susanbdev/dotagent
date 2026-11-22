@@ -206,6 +206,15 @@ pub(super) fn active() -> bool {
             .is_ok_and(|mut client| client.ready().is_ok())
 }
 
+/// The explicit operator baseline may wait for its new collector before running its checks.
+pub(super) fn prepare_baseline() {
+    if !enabled() { return; }
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while !active() && Instant::now() < deadline {
+        std::thread::park_timeout(Duration::from_millis(20));
+    }
+}
+
 fn enabled() -> bool {
     capture::host_capture_allowed()
         && std::env::var_os("DOTAGENT_TELEMETRY").as_deref() != Some(std::ffi::OsStr::new("0"))
@@ -376,6 +385,7 @@ impl Endpoint {
         &self,
         counts: (super::runtime::Counters, super::runtime::Counters),
         closing: bool,
+        last_producer: &crate::json::JsonValue,
     ) -> io::Result<()> {
         let stage = self.dir.join(format!("health-{}", std::process::id()));
         let mut file = OpenOptions::new()
@@ -385,6 +395,7 @@ impl Endpoint {
             .open(&stage)?;
         let mut status = super::runtime_health::status(counts.0, counts.1, closing);
         if let crate::json::JsonValue::Object(fields) = &mut status {
+            fields.push(("last_producer_before_handoff".into(), last_producer.clone()));
             fields.push((
                 "collector_pid".into(),
                 crate::json::JsonValue::Uint(u64::from(std::process::id())),
@@ -428,7 +439,21 @@ pub(super) fn delivery_status() -> io::Result<crate::json::JsonValue> {
         return Err(invalid());
     }
     let snapshot = JsonValue::parse(&data).map_err(io::Error::other)?;
-    let clean = super::runtime_health::read(&snapshot).ok_or_else(invalid)?;
+    let mut clean = super::runtime_health::read(&snapshot).ok_or_else(invalid)?;
+    if let JsonValue::Object(fields) = &mut clean {
+        for name in ["collector_pid", "storage_permission_denied", "storage_full"] {
+            if let Some(n) = snapshot.get(name).and_then(JsonValue::as_u64) {
+                fields.push((name.into(), JsonValue::Uint(n)));
+            }
+        }
+        if let Some(last) = snapshot.get("last_producer_before_handoff") {
+            let mut counts = Vec::new();
+            for name in ["pid","frame_sequence","accepted","capacity","contended","unavailable","invalid","transport","closed"] {
+                if let Some(n) = last.get(name).and_then(JsonValue::as_u64) { counts.push((name.into(), JsonValue::Uint(n))); }
+            }
+            fields.push(("last_producer_before_handoff".into(), JsonValue::Object(counts)));
+        }
+    }
     Ok(JsonValue::Object(vec![
         (
             "collector_available".into(),
@@ -456,16 +481,19 @@ pub(crate) fn collect(owned: bool) -> io::Result<()> {
     }
     let runtime = Runtime::start(super::runtime::QUEUE_CAPACITY, true);
     writeln!(io::stdout().lock(), "READY")?;
+    #[cfg(feature = "collector-fixture")]
+    let _held = super::release_probe::exhaust_fds();
     let mut buf = [0; MAX_FRAME + 1];
     let mut seen = BTreeSet::new();
     let mut expiry = VecDeque::new();
     let mut last_report = None;
+    let mut last_producer = crate::json::JsonValue::Null;
     let mut next_report = Instant::now();
     let mut drain_left = super::runtime::QUEUE_CAPACITY;
     loop {
         if Instant::now() >= next_report {
             let counts = runtime.counts();
-            if Some(counts) != last_report && endpoint.report(counts, false).is_ok() {
+            if Some(counts) != last_report && endpoint.report(counts, false, &last_producer).is_ok() {
                 last_report = Some(counts);
             }
             next_report = Instant::now() + Duration::from_millis(100);
@@ -482,8 +510,8 @@ pub(crate) fn collect(owned: bool) -> io::Result<()> {
                 let Some(now) = capture::unix_time_ms() else {
                     continue;
                 };
-                let Some((record, tag)) = Record::parse(&buf[..n], &endpoint.key, now) else {
-                    runtime.rejected();
+                let Some(received) = Record::parse(&buf[..n], &endpoint.key, now) else {
+                    runtime.rejected(DropReason::Invalid);
                     continue;
                 };
                 let tick = Instant::now();
@@ -492,14 +520,20 @@ pub(crate) fn collect(owned: bool) -> io::Result<()> {
                         seen.remove(&old);
                     }
                 }
-                if seen.len() == REPLAY_LIMIT || !seen.insert(tag) {
-                    runtime.rejected();
+                let tag = received.tag;
+                if seen.len() == REPLAY_LIMIT {
+                    runtime.rejected(DropReason::Full);
+                    continue;
+                }
+                if !seen.insert(tag) {
+                    runtime.rejected(DropReason::Invalid);
                     continue;
                 }
                 expiry.push_back((tick + Duration::from_secs(61), tag));
                 #[cfg(feature = "collector-fixture")]
                 super::release_probe::after_receive();
-                runtime.receive(record);
+                last_producer = received.diagnostic();
+                runtime.receive(received.record);
             }
             Err(e)
                 if matches!(
@@ -516,6 +550,6 @@ pub(crate) fn collect(owned: bool) -> io::Result<()> {
         }
     }
     runtime.finish();
-    let _ = endpoint.report(runtime.counts(), true);
+    let _ = endpoint.report(runtime.counts(), true, &last_producer);
     Ok(())
 }

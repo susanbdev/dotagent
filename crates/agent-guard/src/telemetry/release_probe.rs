@@ -10,17 +10,19 @@ use super::runtime;
 static FAULT: AtomicU8 = AtomicU8::new(0);
 
 #[allow(clippy::panic)]
-pub(super) fn before_store() -> io::Result<()> {
+pub(super) fn before_store(frame: &[u8]) -> io::Result<()> {
     match FAULT.load(Ordering::Relaxed) {
         1 => panic!("injected release collector panic"),
-        2 => Err(io::Error::from(io::ErrorKind::PermissionDenied)),
+        2 => std::fs::OpenOptions::new().write(true)
+            .open(crate::traversal_ledger::observation_state_root_dir().join("write-denied"))?
+            .write_all(frame),
         3 => {
             #[cfg(target_os = "linux")]
             {
                 std::fs::OpenOptions::new()
                     .write(true)
                     .open("/dev/full")?
-                    .write_all(b"x")
+                    .write_all(frame)
             }
             #[cfg(not(target_os = "linux"))]
             {
@@ -33,6 +35,29 @@ pub(super) fn before_store() -> io::Result<()> {
             std::io::Read::read_exact(&mut io::stdin(), &mut byte)
         }
         _ => Ok(()),
+    }
+}
+
+pub(super) fn exhaust_fds() -> Vec<std::fs::File> {
+    let mut held = Vec::new();
+    if FAULT.load(Ordering::Relaxed) == 6 {
+        for _ in 0..64 {
+            match std::fs::File::open("/dev/null") {
+                Ok(file) => held.push(file),
+                Err(e) if e.raw_os_error() == Some(24) => {
+                    let _ = writeln!(io::stdout().lock(), "EXHAUSTED");
+                    break;
+                }
+                Err(_) => break,
+            }
+        }
+    }
+    held
+}
+
+pub(super) fn store_error(error: &super::store::CaptureError) {
+    if FAULT.load(Ordering::Relaxed) == 6 {
+        let _ = writeln!(io::stdout().lock(), "STORE_ERROR {error:?}");
     }
 }
 
@@ -113,6 +138,7 @@ pub fn run() -> ExitCode {
             "enospc" => 3,
             "exit-handoff" => 4,
             "blocked-store" => 5,
+            "fd-exhausted" => 6,
             _ => return ExitCode::FAILURE,
         };
         FAULT.store(fault, Ordering::Relaxed);

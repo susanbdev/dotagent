@@ -158,10 +158,6 @@ enum Job {
 
 impl Job {
     fn run(self) -> bool {
-        #[cfg(all(unix, feature = "collector-fixture"))]
-        if super::release_probe::before_store().is_err() {
-            return false;
-        }
         match self {
             Self::Record(record) if record.kind.mirror() => {
                 crate::feedback::write_agentpi_mirror(&record.body)
@@ -391,8 +387,8 @@ impl Runtime {
         }
     }
 
-    pub(super) fn rejected(&self) {
-        self.audit.state.counters.note_drop(DropReason::Invalid);
+    pub(super) fn rejected(&self, reason: DropReason) {
+        self.audit.state.counters.note_drop(reason);
     }
 
     pub(super) fn counts(&self) -> (Counters, Counters) {
@@ -593,6 +589,15 @@ pub(crate) fn submit_record(kind: Kind, build: impl FnOnce() -> JsonValue) -> Su
         Ok(()) => Submission::Queued,
         Err(reason) => Submission::Dropped(reason),
     }
+}
+
+pub(super) fn handoff_counts() -> [u64; 7] {
+    let a = AUDIT_OFFLINE.snapshot();
+    let b = EXPORT_OFFLINE.snapshot();
+    [a.queued.saturating_add(b.queued), a.full.saturating_add(b.full),
+        a.contended.saturating_add(b.contended), a.unavailable.saturating_add(b.unavailable),
+        a.invalid.saturating_add(b.invalid), a.transport.saturating_add(b.transport),
+        a.closed.saturating_add(b.closed)]
 }
 
 pub(crate) fn note_invalid_audit() {

@@ -67,8 +67,12 @@ def limit_core():
 
 @contextlib.contextmanager
 def process(args, repo, env, ready=True):
+    def limits():
+        limit_core()
+        if args[-1] == "fd-exhausted":
+            resource.setrlimit(resource.RLIMIT_NOFILE, (32, 32))
     child = subprocess.Popen(args, cwd=repo, env=env, stdin=subprocess.PIPE,
-                             stdout=subprocess.PIPE, bufsize=0, preexec_fn=limit_core)
+                             stdout=subprocess.PIPE, bufsize=0, preexec_fn=limits)
     try:
         if ready:
             assert line(child) == "READY"
@@ -121,7 +125,11 @@ def exercise(mode, bins):
             assert_authority(producer)
             assert not (state / "observations").exists()
             return
-        injected = mode in {"panic", "exit-handoff", "enospc", "permission", "blocked-store"}
+        if mode == "permission":
+            file = state / "write-denied"
+            file.write_bytes(b"")
+            file.chmod(0o400)
+        injected = mode in {"panic", "exit-handoff", "enospc", "permission", "blocked-store", "fd-exhausted"}
         receiver = spawn([probe, mode] if injected else [cli, "collect-observations", "--owned"])
         if mode in {"panic", "exit-handoff"}:
             accepted = submitted(producer)
@@ -156,7 +164,13 @@ def exercise(mode, bins):
             assert accepted
             until(lambda: health(state).get("audit_queue", {}).get("failed", 0) > 0)
             assert health(state)["audit_queue"]["persisted"] == 0
+            counter = "storage_full" if mode == "enospc" else "storage_permission_denied"
+            assert health(state)[counter] >= 1
             assert all(r.get("event_id") != accepted for r in observed(state))
+        elif mode == "fd-exhausted":
+            assert line(receiver) == "EXHAUSTED"
+            assert submitted(producer)
+            assert line(receiver).startswith("STORE_ERROR ")
         elif mode == "stopped":
             stop_reading(receiver)
             until(lambda: ask(producer, "observe") == "Full")
@@ -219,11 +233,69 @@ def shipped_host(bins):
         assert host.poll() is None
 
 
+def boundaries(bins):
+    cli = bins / "dotagent"
+    probe = bins / "examples/observation-probe"
+    with workspace() as (repo, state, env), contextlib.ExitStack() as stack:
+        collector = stack.enter_context(process([cli, "collect-observations", "--owned"], repo, env))
+        endpoint = state / "observations/in"
+        directory = endpoint.parent
+        assert directory.stat().st_mode & 0o777 == 0o700
+        assert endpoint.stat().st_mode & 0o777 == 0o600
+        assert (directory / "route").stat().st_mode & 0o777 == 0o600
+        with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as client:
+            client.settimeout(WATCHDOG)
+            client.connect(os.path.relpath(endpoint))
+            for frame in (b"", b"DOBS", b"DOBS\x02" + bytes(100), bytes(256)):
+                client.send(frame)
+        until(lambda: health(state).get("audit_queue", {}).get("invalid", 0) >= 4)
+        assert not [r for r in observed(state) if r.get("event_type") != "CAPTURE_HEALTH"]
+        original = directory / "original"
+        endpoint.rename(original)
+        with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as substitute:
+            substitute.bind(os.path.relpath(endpoint))
+            endpoint.chmod(0o600)
+            with process([probe, "producer"], repo, env) as producer:
+                assert ask(producer, "observe") == "Transport"
+                assert_authority(producer)
+            with selectors.DefaultSelector() as selector:
+                selector.register(substitute, selectors.EVENT_READ)
+                assert not selector.select(0)
+        endpoint.unlink()
+        endpoint.symlink_to(original.name)
+        with process([probe, "producer"], repo, env) as producer:
+            assert ask(producer, "observe") == "Transport"
+        endpoint.unlink()
+        original.rename(endpoint)
+        (directory / "route").chmod(0o644)
+        with process([probe, "producer"], repo, env) as producer:
+            assert ask(producer, "observe") == "Transport"
+        (directory / "route").chmod(0o600)
+        expected = {}
+        for sid, size in (("session-first", 41), ("session-second", 53)):
+            payload = json.dumps({"session_id": sid, "tool_name": "Read", "tool_response": "x" * size})
+            completed = subprocess.run([cli, "post-tool"], cwd=repo, env=env, input=payload.encode(),
+                                       capture_output=True, check=True, timeout=WATCHDOG)
+            assert completed.returncode == 0
+            framed = f"v2:{len(os.fsencode(repo))}:{repo}:{len(sid)}:{sid}".encode()
+            expected[hashlib.sha256(framed).hexdigest()] = size
+        def sessions():
+            results = {r["work"]["session_id"]: r["payload"]["requested_bytes"]
+                       for r in observed(state) if r.get("event_type") == "USAGE_AND_DISPOSITION"
+                       and r.get("work", {}).get("session_id") in expected
+                       and "requested_bytes" in r["payload"]}
+            return results == expected
+        until(sessions)
+        assert collector.poll() is None
+
+
 if __name__ == "__main__":
     binaries = Path(sys.argv[1]).resolve()
     for scenario in ("healthy", "absent", "panic", "kill", "exit-handoff", "stale",
-                     "stopped", "blocked-store", "permission", "enospc", "restart"):
+                     "stopped", "blocked-store", "permission", "enospc", "fd-exhausted", "restart"):
         exercise(scenario, binaries)
         print("PASS", scenario, flush=True)
     shipped_host(binaries)
     print("PASS production hook daemon and automatic collector", flush=True)
+    boundaries(binaries)
+    print("PASS local endpoint authentication, protocol rejection and session correlation", flush=True)

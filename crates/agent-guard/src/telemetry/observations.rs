@@ -606,6 +606,8 @@ pub(super) fn run_baseline_cli(args: &[String], repo_root: &Path) -> ExitCode {
         }
     };
     let _telemetry = super::runtime::start_host();
+    #[cfg(unix)]
+    super::transport::prepare_baseline();
     let mut context = Context::for_repo(repo_root);
     context.trace_id = Some(next_local_id());
     let mut complete = true;
