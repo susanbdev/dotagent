@@ -1176,7 +1176,8 @@ fn append_bounded_rotated_jsonl(
     f.write_all(framed.as_bytes())
         .map_err(|e| format!("failed appending spool '{}': {e}", path.display()))?;
     if sync_mirror {
-        f.sync_all().and_then(|()| fs::File::open(parent)?.sync_all())
+        f.sync_all()
+            .and_then(|()| fs::File::open(parent)?.sync_all())
             .map_err(|e| e.to_string())?;
     }
     Ok(())

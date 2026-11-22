@@ -1,0 +1,48 @@
+name: Local telemetry
+
+on: pull_request
+
+permissions:
+  contents: read
+
+jobs:
+  release:
+    name: Release collector isolation (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - run: cargo build --locked --release -p agent-guard --bins
+      - run: cargo build --locked --release -p agent-guard --example observation-probe --features collector-fixture
+      - run: python3 -B tests/telemetry/release.py target/release
+      - if: runner.os == 'Linux'
+        run: |
+          for pass in 1 2 3 4 5; do
+            cargo test --locked -p agent-guard --lib telemetry::runtime::tests::post_tool_hook_preserves_allow_and_deny_across_audit_conditions -- --exact
+          done
+
+  latency:
+    name: Cold CLI latency report
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          path: baseline
+          persist-credentials: false
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          path: candidate
+          persist-credentials: false
+      - run: cargo build --locked --release -p agent-guard --bins
+        working-directory: baseline
+      - run: cargo build --locked --release -p agent-guard --bins
+        working-directory: candidate
+      - run: python3 -B candidate/tests/telemetry/latency.py baseline/target/release candidate/target/release

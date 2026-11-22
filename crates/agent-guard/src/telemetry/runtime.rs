@@ -158,6 +158,8 @@ enum Job {
 
 impl Job {
     fn run(self) -> bool {
+        #[cfg(all(unix, feature = "collector-fixture"))]
+        if super::release_probe::before_store().is_err() { return false; }
         match self {
             Self::Record(record) if record.kind.mirror() => {
                 crate::feedback::write_agentpi_mirror(&record.body)
@@ -376,6 +378,10 @@ impl Runtime {
         self.audit.state.counters.note_drop(DropReason::Invalid);
     }
 
+    pub(super) fn counts(&self) -> (Counters, Counters) {
+        (self.audit.state.counters.snapshot(), self.export.state.counters.snapshot())
+    }
+
     pub(super) fn finish(&self) {
         self.close();
         while self.audit.state.running.load(Ordering::Acquire)
@@ -527,6 +533,14 @@ pub(crate) fn submit_event(
     context: &Context,
     payload: Payload,
 ) -> Option<EventIdentity> {
+    try_event(producer, context, payload).ok()
+}
+
+pub(super) fn try_event(
+    producer: Producer,
+    context: &Context,
+    payload: Payload,
+) -> Result<EventIdentity, DropReason> {
     #[cfg(test)]
     if let Some(runtime) = GLOBAL.get() {
         return runtime
@@ -534,8 +548,7 @@ pub(crate) fn submit_event(
             .admit(|| {
                 let (identity, event) = EventDescriptor::new(producer, context, payload).ok()?;
                 Some((Job::Audit(event), identity))
-            })
-            .ok();
+            });
     }
     handoff(false, || {
         let (id, event) = EventDescriptor::new(producer, context, payload).ok()?;
@@ -547,7 +560,6 @@ pub(crate) fn submit_event(
             id,
         ))
     })
-    .ok()
 }
 
 pub(crate) fn submit_record(kind: Kind, build: impl FnOnce() -> JsonValue) -> Submission {

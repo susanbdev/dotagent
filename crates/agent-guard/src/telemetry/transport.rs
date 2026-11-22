@@ -158,6 +158,12 @@ impl Peer {
 }
 
 fn failure(error: &io::Error) -> DropReason {
+    #[cfg(target_os = "linux")]
+    let (no_buffers, oversized) = (105, 90);
+    #[cfg(not(target_os = "linux"))]
+    let (no_buffers, oversized) = (55, 40);
+    if error.raw_os_error() == Some(no_buffers) { return DropReason::Full; }
+    if error.raw_os_error() == Some(oversized) { return DropReason::Invalid; }
     match error.kind() {
         io::ErrorKind::WouldBlock => DropReason::Full,
         io::ErrorKind::NotFound
@@ -293,7 +299,7 @@ impl Endpoint {
         };
         let staging = endpoint
             .dir
-            .join(format!("route-{}", crate::crypto::hex_encode(&key[..8])));
+            .join(format!("route-{}", std::process::id()));
         let mut file = OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -311,6 +317,17 @@ impl Endpoint {
             .socket
             .set_read_timeout(Some(Duration::from_millis(100)))?;
         Ok(Some(endpoint))
+    }
+}
+
+impl Endpoint {
+    fn report(&self, counts: (super::runtime::Counters, super::runtime::Counters), closing: bool) -> io::Result<()> {
+        let stage = self.dir.join(format!("health-{}", std::process::id()));
+        let mut file = OpenOptions::new().write(true).create_new(true).mode(0o600).open(&stage)?;
+        let status = super::runtime_health::status(counts.0, counts.1, closing).to_json_string();
+        let result = file.write_all(status.as_bytes()).and_then(|()| fs::rename(&stage, self.dir.join("health")));
+        if result.is_err() { let _ = fs::remove_file(stage); }
+        result
     }
 }
 
@@ -338,15 +355,26 @@ pub(crate) fn collect(owned: bool) -> io::Result<()> {
                 let _ = io::stdin().read(&mut [0]);
                 CLOSING.store(true, Ordering::Release);
             })?;
-    } else {
-        writeln!(io::stdout().lock(), "READY")?;
     }
     let runtime = Runtime::start(super::runtime::QUEUE_CAPACITY, true);
+    writeln!(io::stdout().lock(), "READY")?;
     let mut buf = [0; MAX_FRAME + 1];
     let mut seen = BTreeSet::new();
     let mut expiry = VecDeque::new();
+    let mut last_report = None;
+    let mut next_report = Instant::now();
+    let mut drain_left = super::runtime::QUEUE_CAPACITY;
     loop {
+        if Instant::now() >= next_report {
+            let counts = runtime.counts();
+            if Some(counts) != last_report && endpoint.report(counts, false).is_ok() {
+                last_report = Some(counts);
+            }
+            next_report = Instant::now() + Duration::from_millis(100);
+        }
         if CLOSING.load(Ordering::Acquire) {
+            if drain_left == 0 { break; }
+            drain_left -= 1;
             endpoint.socket.set_nonblocking(true)?;
         }
         match endpoint.socket.recv(&mut buf) {
@@ -369,6 +397,8 @@ pub(crate) fn collect(owned: bool) -> io::Result<()> {
                     continue;
                 }
                 expiry.push_back((tick + Duration::from_secs(61), tag));
+                #[cfg(feature = "collector-fixture")]
+                super::release_probe::after_receive();
                 runtime.receive(record);
             }
             Err(e)
@@ -386,5 +416,6 @@ pub(crate) fn collect(owned: bool) -> io::Result<()> {
         }
     }
     runtime.finish();
+    let _ = endpoint.report(runtime.counts(), true);
     Ok(())
 }

@@ -2630,7 +2630,10 @@ fn run_worktree_adversarial_copilot_and_merge(
                             JsonValue::Str("loop_merge".to_string()),
                         ),
                         ("severity".to_string(), JsonValue::Str("INFO".to_string())),
-                        ("cluster_key".to_string(), JsonValue::Str(spec.cluster_key.clone())),
+                        (
+                            "cluster_key".to_string(),
+                            JsonValue::Str(spec.cluster_key.clone()),
+                        ),
                         ("issue_number".to_string(), JsonValue::Uint(issue_number)),
                         ("pr_number".to_string(), JsonValue::Uint(pr_number)),
                         ("head_sha".to_string(), JsonValue::Str(status.head_sha)),

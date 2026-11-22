@@ -82,6 +82,14 @@ fn snapshot_payload(audit: JsonValue, export: JsonValue, phase: JsonValue) -> Js
     ])
 }
 
+pub(super) fn status(audit: Counters, export: Counters, closing: bool) -> JsonValue {
+    snapshot_payload(
+        encode_counters(audit, true),
+        encode_counters(export, true),
+        JsonValue::Str(if closing { "closing" } else { "active" }.to_owned()),
+    )
+}
+
 pub(super) fn read(payload: &JsonValue) -> Option<JsonValue> {
     if payload.get("scope")?.as_str()? != "process" {
         return None;
@@ -110,11 +118,7 @@ pub(super) fn publish(audit: Counters, export: Counters, closing: bool) -> bool 
     let payload = Payload::new(
         EventType::CaptureHealth,
         Completeness::Partial,
-        snapshot_payload(
-            encode_counters(audit, true),
-            encode_counters(export, true),
-            JsonValue::Str(if closing { "closing" } else { "active" }.to_owned()),
-        ),
+        status(audit, export, closing),
     )
     .with_result("observe", REASON, "observed");
     capture::encode(Producer::Capture, &context, payload)

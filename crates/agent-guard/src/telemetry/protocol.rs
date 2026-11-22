@@ -23,7 +23,10 @@ pub(crate) enum Kind {
 
 impl Kind {
     pub(super) fn mirror(self) -> bool {
-        matches!(self, Self::Denial | Self::Ballot | Self::Signal | Self::Merge)
+        matches!(
+            self,
+            Self::Denial | Self::Ballot | Self::Signal | Self::Merge
+        )
     }
 
     fn decode(byte: u8) -> Option<Self> {
@@ -92,8 +95,18 @@ impl Record {
                     && field("event_type") == Some("PLUGIN_LATTICE_SIGNAL")
             }
             Kind::Merge => {
-                only(body, &["schema", "event_type", "severity", "cluster_key", "issue_number", "pr_number", "head_sha"])
-                    && field("event_type") == Some("loop_merge")
+                only(
+                    body,
+                    &[
+                        "schema",
+                        "event_type",
+                        "severity",
+                        "cluster_key",
+                        "issue_number",
+                        "pr_number",
+                        "head_sha",
+                    ],
+                ) && field("event_type") == Some("loop_merge")
             }
             Kind::Event => {
                 only(

@@ -29,6 +29,9 @@ pub(crate) mod controls;
 mod diagnostics;
 pub(crate) mod observations;
 pub(crate) mod protocol;
+#[cfg(all(unix, feature = "collector-fixture"))]
+#[doc(hidden)]
+pub mod release_probe;
 pub(crate) mod runtime;
 mod runtime_health;
 pub(crate) mod store;
