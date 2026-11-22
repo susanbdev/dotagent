@@ -74,7 +74,10 @@ pub fn run_cli_entrypoint() -> ExitCode {
             };
             match crate::telemetry::transport::collect(owned) {
                 Ok(()) => ExitCode::SUCCESS,
-                Err(e) => { eprintln!("observation collector: {e}"); ExitCode::FAILURE }
+                Err(e) => {
+                    eprintln!("observation collector: {e}");
+                    ExitCode::FAILURE
+                }
             }
         }
         "swarm" => exec_sibling_tool("swarm-tool", &args[1..]),

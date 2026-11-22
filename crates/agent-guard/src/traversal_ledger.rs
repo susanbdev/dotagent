@@ -1539,13 +1539,25 @@ pub fn append_audit_jsonl(
         let session_hash = compute_session_key_hash(repo_root, session_id);
         let (safe_tool, _) = crate::feedback::scrub_high_entropy_and_secrets(tool, 64);
         JsonValue::Object(vec![
-            ("ts".into(), ts_secs.map_or(JsonValue::Null, JsonValue::Uint)),
-            ("repo".into(), JsonValue::Str(sha256_hex(repo_root.as_os_str().as_encoded_bytes()))),
-            ("session_hash".into(), JsonValue::Str(session_hash[..16].to_string())),
+            (
+                "ts".into(),
+                ts_secs.map_or(JsonValue::Null, JsonValue::Uint),
+            ),
+            (
+                "repo".into(),
+                JsonValue::Str(sha256_hex(repo_root.as_os_str().as_encoded_bytes())),
+            ),
+            (
+                "session_hash".into(),
+                JsonValue::Str(session_hash[..16].to_string()),
+            ),
             ("tool".into(), JsonValue::Str(safe_tool)),
             ("code".into(), JsonValue::Str(audit_ascii(code, 128))),
             ("halted".into(), JsonValue::Bool(halted)),
-            ("detail".into(), JsonValue::Str(if has_detail { "[redacted]" } else { "" }.into())),
+            (
+                "detail".into(),
+                JsonValue::Str(if has_detail { "[redacted]" } else { "" }.into()),
+            ),
         ])
     });
 }

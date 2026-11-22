@@ -3,9 +3,9 @@
 use std::collections::{BTreeSet, VecDeque};
 use std::fs::{self, DirBuilder, File, OpenOptions};
 use std::io::{self, Read, Write};
-use std::os::fd::OwnedFd;
 #[cfg(target_os = "linux")]
 use std::os::fd::AsRawFd;
+use std::os::fd::OwnedFd;
 use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::UnixDatagram;
 use std::path::{Path, PathBuf};
@@ -26,7 +26,11 @@ const SOCKET: &str = "in";
 const RETRY_INTERVAL: Duration = Duration::from_millis(100);
 const ROUTE_BYTES: usize = 48;
 const REPLAY_LIMIT: usize = 16384;
-static CLIENT: Mutex<Client> = Mutex::new(Client { peer: None, retry: None, sequence: 0 });
+static CLIENT: Mutex<Client> = Mutex::new(Client {
+    peer: None,
+    retry: None,
+    sequence: 0,
+});
 
 fn invalid() -> io::Error {
     io::Error::from(io::ErrorKind::PermissionDenied)
@@ -73,8 +77,14 @@ fn socket_at<T>(dir: &Path, f: impl FnOnce(&Path) -> io::Result<T>) -> io::Resul
     }
     #[cfg(target_os = "linux")]
     {
-        let fd = OpenOptions::new().read(true).custom_flags(O_NOFOLLOW_FLAG).open(dir)?;
-        f(&PathBuf::from(format!("/proc/self/fd/{}/{SOCKET}", fd.as_raw_fd())))
+        let fd = OpenOptions::new()
+            .read(true)
+            .custom_flags(O_NOFOLLOW_FLAG)
+            .open(dir)?;
+        f(&PathBuf::from(format!(
+            "/proc/self/fd/{}/{SOCKET}",
+            fd.as_raw_fd()
+        )))
     }
     #[cfg(not(target_os = "linux"))]
     f(&crate::coordinator::shorten_unix_socket_via_cwd(&path))
@@ -95,8 +105,11 @@ fn route(dir: &Path, owner: u32) -> io::Result<[u8; ROUTE_BYTES]> {
     let path = dir.join(ROUTE);
     let before = fs::symlink_metadata(&path)?;
     let valid = |m: &fs::Metadata| {
-        m.is_file() && m.uid() == owner && m.nlink() == 1
-            && m.mode() & 0o777 == 0o600 && m.len() == ROUTE_BYTES as u64
+        m.is_file()
+            && m.uid() == owner
+            && m.nlink() == 1
+            && m.mode() & 0o777 == 0o600
+            && m.len() == ROUTE_BYTES as u64
     };
     if !valid(&before) {
         return Err(invalid());
@@ -105,7 +118,10 @@ fn route(dir: &Path, owner: u32) -> io::Result<[u8; ROUTE_BYTES]> {
     const NONBLOCK: i32 = 0o4000;
     #[cfg(not(target_os = "linux"))]
     const NONBLOCK: i32 = 4;
-    let mut file = OpenOptions::new().read(true).custom_flags(O_NOFOLLOW_FLAG | NONBLOCK).open(path)?;
+    let mut file = OpenOptions::new()
+        .read(true)
+        .custom_flags(O_NOFOLLOW_FLAG | NONBLOCK)
+        .open(path)?;
     let after = file.metadata()?;
     if !valid(&after) || (before.dev(), before.ino()) != (after.dev(), after.ino()) {
         return Err(invalid());
@@ -134,15 +150,21 @@ impl Peer {
         if identity(&dir, owner)? != route[..16] {
             return Err(invalid());
         }
-        Ok(Self { socket, key: route[16..].try_into().map_err(|_| invalid())? })
+        Ok(Self {
+            socket,
+            key: route[16..].try_into().map_err(|_| invalid())?,
+        })
     }
 }
 
 fn failure(error: &io::Error) -> DropReason {
     match error.kind() {
         io::ErrorKind::WouldBlock => DropReason::Full,
-        io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused | io::ErrorKind::NotConnected
-        | io::ErrorKind::BrokenPipe | io::ErrorKind::ConnectionReset => DropReason::Unavailable,
+        io::ErrorKind::NotFound
+        | io::ErrorKind::ConnectionRefused
+        | io::ErrorKind::NotConnected
+        | io::ErrorKind::BrokenPipe
+        | io::ErrorKind::ConnectionReset => DropReason::Unavailable,
         _ => DropReason::Transport,
     }
 }
@@ -169,7 +191,10 @@ impl Client {
 }
 
 pub(super) fn active() -> bool {
-    enabled() && CLIENT.try_lock().is_ok_and(|mut client| client.ready().is_ok())
+    enabled()
+        && CLIENT
+            .try_lock()
+            .is_ok_and(|mut client| client.ready().is_ok())
 }
 
 fn enabled() -> bool {
@@ -186,7 +211,12 @@ pub(super) fn send<T>(build: impl FnOnce() -> Option<(Record, T)>) -> Result<T, 
     let (record, receipt) = build().ok_or(DropReason::Invalid)?;
     client.sequence = client.sequence.checked_add(1).ok_or(DropReason::Closed)?;
     let peer = client.peer.as_ref().ok_or(DropReason::Unavailable)?;
-    let frame = record.frame(&peer.key, client.sequence, capture::unix_time_ms().ok_or(DropReason::Invalid)?)
+    let frame = record
+        .frame(
+            &peer.key,
+            client.sequence,
+            capture::unix_time_ms().ok_or(DropReason::Invalid)?,
+        )
         .ok_or(DropReason::Invalid)?;
     match peer.socket.send(&frame) {
         Ok(n) if n == frame.len() => Ok(receipt),
@@ -207,13 +237,21 @@ pub(super) fn launch() -> Option<Child> {
         return None;
     }
     let mut command = Command::new(std::env::current_exe().ok()?);
-    command.arg("collect-observations").arg("--owned").env_clear();
+    command
+        .arg("collect-observations")
+        .arg("--owned")
+        .env_clear();
     for name in ["HOME", "AGENT_GUARD_STATE_DIR"] {
         if let Some(value) = std::env::var_os(name) {
             command.env(name, value);
         }
     }
-    command.stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::null()).spawn().ok()
+    command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()
 }
 
 struct Endpoint {
@@ -246,16 +284,32 @@ impl Endpoint {
         let socket = socket_at(&dir, |p| UnixDatagram::bind(p))?;
         fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
         let id = identity(&dir, owner)?;
-        let endpoint = Self { socket, dir, owner, id, key };
-        let staging = endpoint.dir.join(format!("route-{}", crate::crypto::hex_encode(&key[..8])));
-        let mut file = OpenOptions::new().write(true).create_new(true).mode(0o600).open(&staging)?;
-        let publish = file.write_all(&id).and_then(|()| file.write_all(&key))
+        let endpoint = Self {
+            socket,
+            dir,
+            owner,
+            id,
+            key,
+        };
+        let staging = endpoint
+            .dir
+            .join(format!("route-{}", crate::crypto::hex_encode(&key[..8])));
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&staging)?;
+        let publish = file
+            .write_all(&id)
+            .and_then(|()| file.write_all(&key))
             .and_then(|()| fs::rename(&staging, endpoint.dir.join(ROUTE)));
         if let Err(error) = publish {
             let _ = fs::remove_file(staging);
             return Err(error);
         }
-        endpoint.socket.set_read_timeout(Some(Duration::from_millis(100)))?;
+        endpoint
+            .socket
+            .set_read_timeout(Some(Duration::from_millis(100)))?;
         Ok(Some(endpoint))
     }
 }
@@ -278,10 +332,12 @@ pub(crate) fn collect(owned: bool) -> io::Result<()> {
     };
     static CLOSING: AtomicBool = AtomicBool::new(false);
     if owned {
-        std::thread::Builder::new().name("collector-owner".into()).spawn(|| {
-            let _ = io::stdin().read(&mut [0]);
-            CLOSING.store(true, Ordering::Release);
-        })?;
+        std::thread::Builder::new()
+            .name("collector-owner".into())
+            .spawn(|| {
+                let _ = io::stdin().read(&mut [0]);
+                CLOSING.store(true, Ordering::Release);
+            })?;
     } else {
         writeln!(io::stdout().lock(), "READY")?;
     }
@@ -295,7 +351,9 @@ pub(crate) fn collect(owned: bool) -> io::Result<()> {
         }
         match endpoint.socket.recv(&mut buf) {
             Ok(n) => {
-                let Some(now) = capture::unix_time_ms() else { continue };
+                let Some(now) = capture::unix_time_ms() else {
+                    continue;
+                };
                 let Some((record, tag)) = Record::parse(&buf[..n], &endpoint.key, now) else {
                     runtime.rejected();
                     continue;
@@ -313,8 +371,15 @@ pub(crate) fn collect(owned: bool) -> io::Result<()> {
                 expiry.push_back((tick + Duration::from_secs(61), tag));
                 runtime.receive(record);
             }
-            Err(e) if matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut) => {
-                if CLOSING.load(Ordering::Acquire) { break; }
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                ) =>
+            {
+                if CLOSING.load(Ordering::Acquire) {
+                    break;
+                }
             }
             Err(e) if e.kind() == io::ErrorKind::Interrupted => (),
             Err(e) => return Err(e),

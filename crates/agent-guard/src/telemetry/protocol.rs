@@ -17,11 +17,13 @@ pub(crate) enum Kind {
     Legacy = 2,
     Denial = 3,
     Ballot = 4,
+    Signal = 5,
+    Merge = 6,
 }
 
 impl Kind {
     pub(super) fn mirror(self) -> bool {
-        matches!(self, Self::Denial | Self::Ballot)
+        matches!(self, Self::Denial | Self::Ballot | Self::Signal | Self::Merge)
     }
 
     fn decode(byte: u8) -> Option<Self> {
@@ -30,6 +32,8 @@ impl Kind {
             2 => Some(Self::Legacy),
             3 => Some(Self::Denial),
             4 => Some(Self::Ballot),
+            5 => Some(Self::Signal),
+            6 => Some(Self::Merge),
             _ => None,
         }
     }
@@ -49,7 +53,9 @@ fn only(value: &JsonValue, keys: &[&str]) -> bool {
 fn token(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= 128
-        && value.bytes().all(|c| c.is_ascii_alphanumeric() || b"._-:/".contains(&c))
+        && value
+            .bytes()
+            .all(|c| c.is_ascii_alphanumeric() || b"._-:/".contains(&c))
 }
 
 fn scalar_tree(value: &JsonValue, depth: usize, budget: &mut usize) -> bool {
@@ -58,11 +64,15 @@ fn scalar_tree(value: &JsonValue, depth: usize, budget: &mut usize) -> bool {
     }
     *budget -= 1;
     match value {
-        JsonValue::Object(fields) => fields.len() <= 48 && fields.iter().all(|(k, v)| {
-            token(k) && scalar_tree(v, depth + 1, budget)
-        }),
-        JsonValue::Array(values) => values.len() <= 16
-            && values.iter().all(|v| scalar_tree(v, depth + 1, budget)),
+        JsonValue::Object(fields) => {
+            fields.len() <= 48
+                && fields
+                    .iter()
+                    .all(|(k, v)| token(k) && scalar_tree(v, depth + 1, budget))
+        }
+        JsonValue::Array(values) => {
+            values.len() <= 16 && values.iter().all(|v| scalar_tree(v, depth + 1, budget))
+        }
         JsonValue::Str(s) => token(s) || s.is_empty() || s == "[redacted]",
         JsonValue::Number(n) => n.is_finite(),
         _ => true,
@@ -77,29 +87,118 @@ impl Record {
             return false;
         }
         match self.kind {
-            Kind::Event => {
-                only(body, &["schema_version", "event_id", "event_type", "producer", "timing",
-                    "correlation", "work", "configuration", "trust", "result", "payload"])
-                    && body.get("schema_version").and_then(JsonValue::as_u64) == Some(1)
-                    && matches!(field("event_type"), Some("EXECUTION_STARTED" | "EXECUTION_FINISHED"
-                        | "PREREQUISITE_CHECKED" | "CONTROL_DECISION" | "USAGE_AND_DISPOSITION"
-                        | "DETECTION_ASSESSMENT" | "RECOVERY_OR_ESCALATION"))
-                    && field("event_id").is_some_and(token)
-                    && ["producer", "timing", "correlation", "work", "configuration", "trust",
-                        "result", "payload"].iter().all(|k| body.get(k).and_then(JsonValue::as_object).is_some())
+            Kind::Signal => {
+                only(body, &["schema", "event_type", "risk_level", "tool_name"])
+                    && field("event_type") == Some("PLUGIN_LATTICE_SIGNAL")
             }
-            Kind::Legacy => only(body, &["ts", "repo", "session_hash", "tool", "code", "halted", "detail"])
-                && field("session_hash").is_some_and(|s| s.len() == 16 && s.bytes().all(|b| b.is_ascii_hexdigit()))
-                && matches!(field("detail"), Some("" | "[redacted]")),
-            Kind::Denial => only(body, &["schema", "event_type", "severity", "repo_id", "session_hash", "tool",
-                    "code", "halted", "detail", "ts_unix"])
-                && field("event_type") == Some("guard_denial")
-                && matches!(field("detail"), Some("" | "[redacted]")),
-            Kind::Ballot => only(body, &["schema", "event_type", "severity", "ballot_id", "cluster_key",
-                "category", "deny_code", "target_bin_or_tool", "canonical_shape", "session_hash",
-                "role", "session_tainted", "grounded", "vote_counted", "deduplicated_retry",
-                "quarantined", "session_cluster_submissions", "session_total_submissions",
-                "risk_flags", "ts_unix"]) && field("event_type") == Some("friction_ballot"),
+            Kind::Merge => {
+                only(body, &["schema", "event_type", "severity", "cluster_key", "issue_number", "pr_number", "head_sha"])
+                    && field("event_type") == Some("loop_merge")
+            }
+            Kind::Event => {
+                only(
+                    body,
+                    &[
+                        "schema_version",
+                        "event_id",
+                        "event_type",
+                        "producer",
+                        "timing",
+                        "correlation",
+                        "work",
+                        "configuration",
+                        "trust",
+                        "result",
+                        "payload",
+                    ],
+                ) && body.get("schema_version").and_then(JsonValue::as_u64) == Some(1)
+                    && matches!(
+                        field("event_type"),
+                        Some(
+                            "EXECUTION_STARTED"
+                                | "EXECUTION_FINISHED"
+                                | "PREREQUISITE_CHECKED"
+                                | "CONTROL_DECISION"
+                                | "USAGE_AND_DISPOSITION"
+                                | "DETECTION_ASSESSMENT"
+                                | "RECOVERY_OR_ESCALATION"
+                        )
+                    )
+                    && field("event_id").is_some_and(token)
+                    && [
+                        "producer",
+                        "timing",
+                        "correlation",
+                        "work",
+                        "configuration",
+                        "trust",
+                        "result",
+                        "payload",
+                    ]
+                    .iter()
+                    .all(|k| body.get(k).and_then(JsonValue::as_object).is_some())
+            }
+            Kind::Legacy => {
+                only(
+                    body,
+                    &[
+                        "ts",
+                        "repo",
+                        "session_hash",
+                        "tool",
+                        "code",
+                        "halted",
+                        "detail",
+                    ],
+                ) && field("session_hash")
+                    .is_some_and(|s| s.len() == 16 && s.bytes().all(|b| b.is_ascii_hexdigit()))
+                    && matches!(field("detail"), Some("" | "[redacted]"))
+            }
+            Kind::Denial => {
+                only(
+                    body,
+                    &[
+                        "schema",
+                        "event_type",
+                        "severity",
+                        "repo_id",
+                        "session_hash",
+                        "tool",
+                        "code",
+                        "halted",
+                        "detail",
+                        "ts_unix",
+                    ],
+                ) && field("event_type") == Some("guard_denial")
+                    && matches!(field("detail"), Some("" | "[redacted]"))
+            }
+            Kind::Ballot => {
+                only(
+                    body,
+                    &[
+                        "schema",
+                        "event_type",
+                        "severity",
+                        "ballot_id",
+                        "cluster_key",
+                        "category",
+                        "deny_code",
+                        "target_bin_or_tool",
+                        "canonical_shape",
+                        "session_hash",
+                        "role",
+                        "session_tainted",
+                        "grounded",
+                        "vote_counted",
+                        "deduplicated_retry",
+                        "quarantined",
+                        "session_cluster_submissions",
+                        "session_total_submissions",
+                        "risk_flags",
+                        "ts_unix",
+                    ],
+                ) && field("event_type") == Some("friction_ballot")
+            }
         }
     }
 

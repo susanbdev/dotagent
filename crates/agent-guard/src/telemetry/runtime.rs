@@ -4,10 +4,10 @@
 //! bounds queue occupancy, and never waits for a worker, sink, or acknowledgement.
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, TryLockError};
 #[cfg(test)]
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, TryLockError};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -159,8 +159,12 @@ enum Job {
 impl Job {
     fn run(self) -> bool {
         match self {
-            Self::Record(record) if record.kind.mirror() => crate::feedback::write_agentpi_mirror(&record.body),
-            Self::Record(record) => store::append(&record.body, store::Durability::Required).is_ok(),
+            Self::Record(record) if record.kind.mirror() => {
+                crate::feedback::write_agentpi_mirror(&record.body)
+            }
+            Self::Record(record) => {
+                store::append(&record.body, store::Durability::Required).is_ok()
+            }
             #[cfg(test)]
             Self::Audit(event) => event
                 .encode()
@@ -360,7 +364,11 @@ impl Runtime {
     }
 
     pub(super) fn receive(&self, record: Record) {
-        let lane = if record.kind.mirror() { &self.export } else { &self.audit };
+        let lane = if record.kind.mirror() {
+            &self.export
+        } else {
+            &self.audit
+        };
         let _ = lane.admit(|| Some((Job::Record(record), ())));
     }
 
@@ -370,7 +378,9 @@ impl Runtime {
 
     pub(super) fn finish(&self) {
         self.close();
-        while self.audit.state.running.load(Ordering::Acquire) || self.export.state.running.load(Ordering::Acquire) {
+        while self.audit.state.running.load(Ordering::Acquire)
+            || self.export.state.running.load(Ordering::Acquire)
+        {
             thread::park_timeout(POLL_INTERVAL);
         }
     }
@@ -445,7 +455,9 @@ pub(crate) struct HostTelemetry {
 impl Drop for HostTelemetry {
     fn drop(&mut self) {
         #[cfg(test)]
-        if self.local { close_global(); }
+        if self.local {
+            close_global();
+        }
         #[cfg(unix)]
         if let Some(child) = &mut self.child {
             drop(child.stdin.take());
@@ -472,50 +484,93 @@ pub(crate) fn audit_active() -> bool {
             && runtime.audit.state.running.load(Ordering::Acquire);
     }
     #[cfg(unix)]
-    { super::transport::active() }
+    {
+        super::transport::active()
+    }
     #[cfg(not(unix))]
-    { false }
+    {
+        false
+    }
 }
 
 fn handoff<T>(mirror: bool, build: impl FnOnce() -> Option<(Record, T)>) -> Result<T, DropReason> {
-    let counters = if mirror { &EXPORT_OFFLINE } else { &AUDIT_OFFLINE };
+    let counters = if mirror {
+        &EXPORT_OFFLINE
+    } else {
+        &AUDIT_OFFLINE
+    };
     #[cfg(test)]
     if let Some(runtime) = GLOBAL.get() {
-        let lane = if mirror { &runtime.export } else { &runtime.audit };
+        let lane = if mirror {
+            &runtime.export
+        } else {
+            &runtime.audit
+        };
         return lane.admit(|| build().map(|(record, receipt)| (Job::Record(record), receipt)));
     }
     #[cfg(unix)]
     let result = super::transport::send(build);
     #[cfg(not(unix))]
-    let result = { let _ = build; Err(DropReason::Unavailable) };
-    result.inspect_err(|reason| counters.note_drop(*reason)).inspect(|_| {
-        counters.queued.fetch_add(1, Ordering::Relaxed);
-    })
+    let result = {
+        let _ = build;
+        Err(DropReason::Unavailable)
+    };
+    result
+        .inspect_err(|reason| counters.note_drop(*reason))
+        .inspect(|_| {
+            counters.queued.fetch_add(1, Ordering::Relaxed);
+        })
 }
 
-pub(crate) fn submit_event(producer: Producer, context: &Context, payload: Payload) -> Option<EventIdentity> {
+pub(crate) fn submit_event(
+    producer: Producer,
+    context: &Context,
+    payload: Payload,
+) -> Option<EventIdentity> {
     #[cfg(test)]
     if let Some(runtime) = GLOBAL.get() {
-        return runtime.audit.admit(|| {
-            let (identity, event) = EventDescriptor::new(producer, context, payload).ok()?;
-            Some((Job::Audit(event), identity))
-        }).ok();
+        return runtime
+            .audit
+            .admit(|| {
+                let (identity, event) = EventDescriptor::new(producer, context, payload).ok()?;
+                Some((Job::Audit(event), identity))
+            })
+            .ok();
     }
     handoff(false, || {
         let (id, event) = EventDescriptor::new(producer, context, payload).ok()?;
-        Some((Record { kind: Kind::Event, body: event.encode().ok()? }, id))
-    }).ok()
+        Some((
+            Record {
+                kind: Kind::Event,
+                body: event.encode().ok()?,
+            },
+            id,
+        ))
+    })
+    .ok()
 }
 
 pub(crate) fn submit_record(kind: Kind, build: impl FnOnce() -> JsonValue) -> Submission {
-    match handoff(kind.mirror(), || Some((Record { kind, body: build() }, ()))) {
+    match handoff(kind.mirror(), || {
+        Some((
+            Record {
+                kind,
+                body: build(),
+            },
+            (),
+        ))
+    }) {
         Ok(()) => Submission::Queued,
         Err(reason) => Submission::Dropped(reason),
     }
 }
 
-pub(crate) fn note_invalid_audit() { AUDIT_OFFLINE.note_drop(DropReason::Invalid); }
-pub(crate) fn note_invalid_export() { EXPORT_OFFLINE.note_drop(DropReason::Invalid); }
+pub(crate) fn note_invalid_audit() {
+    AUDIT_OFFLINE.note_drop(DropReason::Invalid);
+}
+pub(crate) fn note_invalid_export() {
+    EXPORT_OFFLINE.note_drop(DropReason::Invalid);
+}
 
 #[cfg(test)]
 pub(crate) fn wait_idle(deadline: Instant) -> bool {

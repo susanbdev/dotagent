@@ -1095,6 +1095,7 @@ fn append_bounded_rotated_jsonl(
     path: &Path,
     line_json: &str,
     acquire_lock: fn(&Path) -> Result<ExclusiveFileLockGuard, String>,
+    sync_mirror: bool,
 ) -> Result<(), String> {
     if line_json.len() + 1 > MAX_JSONL_RECORD_BYTES {
         return Err(format!(
@@ -1156,11 +1157,29 @@ fn append_bounded_rotated_jsonl(
     let mut f = opts
         .open(path)
         .map_err(|e| format!("failed opening spool '{}': {e}", path.display()))?;
+    if sync_mirror {
+        let meta = f.metadata().map_err(|e| e.to_string())?;
+        if !meta.is_file() {
+            return Err("invalid mirror file".into());
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            if meta.nlink() != 1 || meta.mode() & 0o777 != 0o600 {
+                return Err("invalid mirror file permissions or link count".into());
+            }
+        }
+    }
     let mut framed = String::with_capacity(line_json.len() + 1);
     framed.push_str(line_json);
     framed.push('\n');
     f.write_all(framed.as_bytes())
-        .map_err(|e| format!("failed appending spool '{}': {e}", path.display()))
+        .map_err(|e| format!("failed appending spool '{}': {e}", path.display()))?;
+    if sync_mirror {
+        f.sync_all().and_then(|()| fs::File::open(parent)?.sync_all())
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(())
 }
 
 pub(crate) fn write_agentpi_mirror(event_json: &JsonValue) -> bool {
@@ -1171,6 +1190,7 @@ pub(crate) fn write_agentpi_mirror(event_json: &JsonValue) -> bool {
                 &dir.join("agentpi_events.jsonl"),
                 &encoded,
                 ExclusiveFileLockGuard::acquire_observation,
+                true,
             )
         })
         .is_ok()
@@ -1201,7 +1221,15 @@ pub fn record_guard_denial_agentpi_signal(
         return;
     }
     let _ = submit_record(Kind::Denial, || {
-        guard_denial_agentpi_event(repo_root, session_id, tool, code, if detail.is_empty() { "" } else { "[redacted]" }, halted, ts_unix)
+        guard_denial_agentpi_event(
+            repo_root,
+            session_id,
+            tool,
+            code,
+            if detail.is_empty() { "" } else { "[redacted]" },
+            halted,
+            ts_unix,
+        )
     });
 }
 
@@ -1600,6 +1628,7 @@ pub fn commit_ballot_on_host_redacted(
         &target_spool,
         &rec.to_json_value().to_json_string(),
         ExclusiveFileLockGuard::acquire,
+        false,
     )
     .map_err(FeedbackSubmitError::InvalidBallot)?;
 

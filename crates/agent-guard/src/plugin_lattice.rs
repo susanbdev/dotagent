@@ -10,11 +10,12 @@ use crate::Decision;
 pub use crate::breadcrumbs::{count_verified_quorum_approvals, record_quorum_approval_breadcrumb};
 pub use crate::budget_guard::MAX_PLUGIN_FILE_BYTES;
 use crate::budget_guard::{RuntimeProfile, load_verified_profile_plugins, parse_plugin_str_list};
-use crate::feedback::{AGENTPI_EVENT_SCHEMA, MAX_AGENTPI_EXPORT_INPUT_BYTES, write_agentpi_mirror};
+use crate::feedback::{AGENTPI_EVENT_SCHEMA, MAX_AGENTPI_EXPORT_INPUT_BYTES};
 use crate::json::JsonValue;
 use crate::operator::verify_plugin_human_touch;
 pub use crate::path_policy::glob_match_path;
-use crate::telemetry::runtime::{note_invalid_export, submit_export};
+use crate::telemetry::protocol::Kind;
+use crate::telemetry::runtime::{note_invalid_export, submit_record};
 
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -310,23 +311,19 @@ pub fn apply_pre_tool_plugin_lattice(
         VerdictLevel::Allow => ring0_decision,
         VerdictLevel::EmitSignal => {
             if snap.tool_name.len() <= MAX_AGENTPI_EXPORT_INPUT_BYTES {
-                let _ = submit_export(|| {
-                    let tool_name = snap.tool_name;
-                    move || {
-                        let event = JsonValue::Object(vec![
-                            (
-                                "schema".to_string(),
-                                JsonValue::Str(AGENTPI_EVENT_SCHEMA.to_string()),
-                            ),
-                            (
-                                "event_type".to_string(),
-                                JsonValue::Str("PLUGIN_LATTICE_SIGNAL".to_string()),
-                            ),
-                            ("risk_level".to_string(), JsonValue::Str("low".to_string())),
-                            ("tool_name".to_string(), JsonValue::Str(tool_name)),
-                        ]);
-                        write_agentpi_mirror(&event)
-                    }
+                let _ = submit_record(Kind::Signal, || {
+                    JsonValue::Object(vec![
+                        (
+                            "schema".to_string(),
+                            JsonValue::Str(AGENTPI_EVENT_SCHEMA.to_string()),
+                        ),
+                        (
+                            "event_type".to_string(),
+                            JsonValue::Str("PLUGIN_LATTICE_SIGNAL".to_string()),
+                        ),
+                        ("risk_level".to_string(), JsonValue::Str("low".to_string())),
+                        ("tool_name".to_string(), JsonValue::Str(snap.tool_name)),
+                    ])
                 });
             } else {
                 note_invalid_export();
