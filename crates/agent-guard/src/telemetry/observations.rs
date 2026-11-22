@@ -1,8 +1,19 @@
 //! Typed local prerequisite checks and process observations.
 
+#[cfg(unix)]
 use std::io::{self, Read};
+#[cfg(unix)]
+use std::net::Shutdown;
+#[cfg(unix)]
+use std::os::fd::OwnedFd;
+#[cfg(unix)]
+use std::os::unix::{net::UnixStream, process::CommandExt};
 use std::path::Path;
-use std::process::{Command, ExitCode, ExitStatus, Stdio};
+#[cfg(unix)]
+use std::process::{Child, Command, Stdio};
+use std::process::{ExitCode, ExitStatus};
+#[cfg(unix)]
+use std::time::Duration;
 use std::time::Instant;
 
 use crate::json::JsonValue;
@@ -14,6 +25,14 @@ use super::capture::{
 
 const BASELINE_ROUTE: &str = "repo_baseline_mediator";
 const SHELL_WRAPPER_ROUTE: &str = "shell_wrapper_mediator";
+const BASELINE_DEADLINE_MS: u64 = 10_000;
+#[cfg(unix)]
+const POLL_INTERVAL: Duration = Duration::from_millis(5);
+#[cfg(unix)]
+const REAP_GRACE: Duration = Duration::from_secs(1);
+#[cfg(unix)]
+const GROUP_SIGNAL_GRACE: Duration = Duration::from_millis(100);
+#[cfg(unix)]
 const MAX_CHECK_OUTPUT: usize = 128;
 const BASE_REFS: [Check; 3] = [Check::Head, Check::LocalMain, Check::CachedOriginMain];
 
@@ -149,6 +168,10 @@ fn string_field(name: &str, value: &str) -> (String, JsonValue) {
 fn baseline_execution_fields(check: Check) -> Vec<(String, JsonValue)> {
     let mut fields = mediator_execution_fields(BASELINE_ROUTE);
     fields.push(string_field("argument_summary", check.identity()));
+    fields.push((
+        "deadline_ms".to_string(),
+        JsonValue::Uint(BASELINE_DEADLINE_MS),
+    ));
     fields
 }
 
@@ -215,34 +238,76 @@ pub(crate) fn process_result_fields(
     fields
 }
 
-fn execution_finished(
-    mut fields: Vec<(String, JsonValue)>,
-    status: Option<ExitStatus>,
-    launched: bool,
-) -> Payload {
-    if launched {
-        fields.extend(process_result_fields(status, false, None));
-    } else {
-        fields.push(string_field("termination", "launch_failed"));
-    }
-    let (completeness, reason, disposition) = match (status, launched) {
-        (Some(status), _) if status.success() => {
-            (Completeness::Partial, "MEDIATOR_COMPLETED", "finished")
+#[derive(Clone, Copy, Debug)]
+enum MediatorResult {
+    Waited(ExitStatus),
+    LaunchFailed,
+    WaitFailed,
+    #[cfg(unix)]
+    TimedOut(Option<ExitStatus>),
+    #[cfg(not(unix))]
+    Unavailable,
+}
+
+impl MediatorResult {
+    fn reason(self) -> &'static str {
+        match self {
+            Self::Waited(status) if status.success() => "MEDIATOR_COMPLETED",
+            Self::Waited(_) => "MEDIATOR_UNSUCCESSFUL",
+            Self::LaunchFailed => "MEDIATOR_LAUNCH_FAILED",
+            Self::WaitFailed => "MEDIATOR_WAIT_FAILED",
+            #[cfg(unix)]
+            Self::TimedOut(_) => "MEDIATOR_TIMEOUT",
+            #[cfg(not(unix))]
+            Self::Unavailable => "BASELINE_PLATFORM_UNAVAILABLE",
         }
-        (Some(_), _) => (Completeness::Partial, "MEDIATOR_UNSUCCESSFUL", "failed"),
-        (None, true) => (Completeness::Unavailable, "MEDIATOR_WAIT_FAILED", "unknown"),
-        (None, false) => (
-            Completeness::Unavailable,
-            "MEDIATOR_LAUNCH_FAILED",
-            "failed",
-        ),
+    }
+}
+
+fn execution_finished(mut fields: Vec<(String, JsonValue)>, result: MediatorResult) -> Payload {
+    let (completeness, disposition) = match result {
+        MediatorResult::Waited(status) => {
+            fields.extend(process_result_fields(Some(status), false, None));
+            let disposition = if status.success() {
+                "finished"
+            } else {
+                "failed"
+            };
+            (Completeness::Partial, disposition)
+        }
+        MediatorResult::LaunchFailed => {
+            fields.push(string_field("termination", "launch_failed"));
+            (Completeness::Unavailable, "failed")
+        }
+        MediatorResult::WaitFailed => {
+            fields.extend(process_result_fields(None, false, None));
+            (Completeness::Unavailable, "unknown")
+        }
+        #[cfg(unix)]
+        MediatorResult::TimedOut(status) => {
+            fields.extend(process_result_fields(status, true, None));
+            fields.push(string_field(
+                "cleanup_scope",
+                "outer_mediator_process_group",
+            ));
+            fields.push((
+                "mediator_reaped".to_string(),
+                JsonValue::Bool(status.is_some()),
+            ));
+            (Completeness::Partial, "timed_out")
+        }
+        #[cfg(not(unix))]
+        MediatorResult::Unavailable => {
+            fields.push(string_field("termination", "unavailable"));
+            (Completeness::Unavailable, "unavailable")
+        }
     };
     Payload::new(
         EventType::ExecutionFinished,
         completeness,
         JsonValue::Object(fields),
     )
-    .with_result("finish", reason, disposition)
+    .with_result("finish", result.reason(), disposition)
 }
 
 /// An observation owned by the host shell wrapper. The child is the trusted sandbox
@@ -279,10 +344,14 @@ impl ShellMediatorObservation {
         self.context.duration_ns = self
             .started_at
             .and_then(|start| u64::try_from(start.elapsed().as_nanos()).ok());
+        let result = match status {
+            Some(status) => MediatorResult::Waited(status),
+            None if self.started_at.is_some() => MediatorResult::WaitFailed,
+            None => MediatorResult::LaunchFailed,
+        };
         let _ = self.emit(execution_finished(
             mediator_execution_fields(SHELL_WRAPPER_ROUTE),
-            status,
-            self.started_at.is_some(),
+            result,
         ));
     }
 
@@ -309,7 +378,8 @@ fn record(context: &Context, payload: Payload, persisted: &mut bool) -> Option<S
     None
 }
 
-fn launch_baseline_check(repo_root: &Path, check: Check) -> std::io::Result<std::process::Child> {
+#[cfg(unix)]
+fn launch_baseline_check(repo_root: &Path, check: Check) -> io::Result<BaselineMediator> {
     let mut command = Command::new(std::env::current_exe()?);
     command
         .current_dir(repo_root)
@@ -334,24 +404,137 @@ fn launch_baseline_check(repo_root: &Path, check: Check) -> std::io::Result<std:
             "--",
             check.script(),
         ])
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
+        .stderr(Stdio::null());
+    BaselineMediator::spawn(command)
 }
 
-fn bounded_check_output(mut stdout: impl Read) -> io::Result<Option<Vec<u8>>> {
-    let mut output = Vec::with_capacity(MAX_CHECK_OUTPUT + 1);
-    stdout
-        .by_ref()
-        .take((MAX_CHECK_OUTPUT + 1) as u64)
-        .read_to_end(&mut output)?;
-    if output.len() <= MAX_CHECK_OUTPUT {
-        return Ok(Some(output));
+#[cfg(unix)]
+struct BaselineMediator {
+    child: Child,
+    output: UnixStream,
+}
+
+#[cfg(unix)]
+impl BaselineMediator {
+    fn spawn(command: Command) -> io::Result<Self> {
+        let (reader, writer) = UnixStream::pair()?;
+        Self::spawn_with_output(command, reader, writer)
     }
-    // Continue draining the existing mediator's output so it can finish, with no further retention.
-    io::copy(&mut stdout, &mut io::sink())?;
+
+    fn spawn_with_output(
+        mut command: Command,
+        reader: UnixStream,
+        writer: UnixStream,
+    ) -> io::Result<Self> {
+        reader.set_nonblocking(true)?;
+        reader.shutdown(Shutdown::Write)?;
+        writer.shutdown(Shutdown::Read)?;
+        let child = command
+            .stdin(Stdio::null())
+            .stdout(Stdio::from(OwnedFd::from(writer)))
+            .process_group(0)
+            .spawn()?;
+        drop(command);
+        Ok(Self {
+            child,
+            output: reader,
+        })
+    }
+
+    fn collect(self, deadline: Instant) -> (MediatorResult, Option<Vec<u8>>) {
+        let Self {
+            mut child,
+            mut output,
+        } = self;
+        let captured = read_mediator_output(&mut output, deadline);
+        drop(output);
+        // Until the pipe reaches EOF, leave the group leader unreaped so its PGID cannot be
+        // reused before timeout cleanup. An inherited writer can outlive that leader.
+        if let OutputCapture::Finished(bytes) = captured {
+            match wait_until(&mut child, deadline) {
+                Ok(Some(status)) => return (MediatorResult::Waited(status), bytes),
+                // A failed wait may mean the OS no longer recognizes the child as ours.
+                Err(_) => return (MediatorResult::WaitFailed, None),
+                Ok(None) => {}
+            }
+        }
+        (MediatorResult::TimedOut(terminate_mediator(child)), None)
+    }
+}
+
+#[cfg(unix)]
+enum OutputCapture {
+    Finished(Option<Vec<u8>>),
+    TimedOut,
+}
+
+#[cfg(unix)]
+fn read_mediator_output(output: &mut UnixStream, deadline: Instant) -> OutputCapture {
+    let mut retained = Vec::with_capacity(MAX_CHECK_OUTPUT);
+    let mut chunk = [0; 1_024];
+    let mut oversized = false;
+    while Instant::now() < deadline {
+        match output.read(&mut chunk) {
+            Ok(0) => return OutputCapture::Finished((!oversized).then_some(retained)),
+            Ok(count) => {
+                let keep = count.min(MAX_CHECK_OUTPUT - retained.len());
+                retained.extend_from_slice(&chunk[..keep]);
+                oversized |= keep < count;
+            }
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => pause_until(deadline),
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(_) => return OutputCapture::Finished(None),
+        }
+    }
+    OutputCapture::TimedOut
+}
+
+#[cfg(unix)]
+fn wait_until(child: &mut Child, deadline: Instant) -> io::Result<Option<ExitStatus>> {
+    while Instant::now() < deadline {
+        match child.try_wait() {
+            Ok(None) => pause_until(deadline),
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            result => return result,
+        }
+    }
     Ok(None)
+}
+
+#[cfg(unix)]
+fn pause_until(deadline: Instant) {
+    std::thread::sleep(POLL_INTERVAL.min(deadline.saturating_duration_since(Instant::now())));
+}
+
+#[cfg(unix)]
+fn terminate_mediator(mut child: Child) -> Option<ExitStatus> {
+    let pid = child.id();
+    if pid > 1
+        && let Some(kill) = ["/bin/kill", "/usr/bin/kill"]
+            .into_iter()
+            .find(|path| Path::new(path).is_file())
+        && let Ok(mut signal) = Command::new(kill)
+            .args(["-s", "KILL", "--", &format!("-{pid}")])
+            .env_clear()
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+    {
+        if matches!(
+            wait_until(&mut signal, Instant::now() + GROUP_SIGNAL_GRACE),
+            Ok(None)
+        ) {
+            let _ = signal.kill();
+            let _ = wait_until(&mut signal, Instant::now() + GROUP_SIGNAL_GRACE);
+        }
+    }
+    // Cover an unavailable group utility or a failed group signal. The direct child is our only
+    // waitable process, and the sandbox's own descendant process groups are outside this scope.
+    let _ = child.kill();
+    wait_until(&mut child, Instant::now() + REAP_GRACE)
+        .ok()
+        .flatten()
 }
 
 fn capture_check(repo_root: &Path, check: Check, mut context: Context) -> bool {
@@ -379,42 +562,31 @@ fn capture_check(repo_root: &Path, check: Check, mut context: Context) -> bool {
     }
 
     let started_at = Instant::now();
-    let (status, observation, launched) = match launch_baseline_check(repo_root, check) {
-        Ok(mut child) => {
+    #[cfg(unix)]
+    let (termination, output) = match launch_baseline_check(repo_root, check) {
+        Ok(mediator) => {
             context.occurred_at_unix_ms = unix_time_ms();
             context.parent_event_id = record(
                 &context,
                 execution_started(baseline_execution_fields(check)),
                 &mut persisted,
             );
-            let output = child
-                .stdout
-                .take()
-                .and_then(|stdout| bounded_check_output(stdout).ok().flatten());
-            match child.wait() {
-                Ok(status) => (
-                    Some(status),
-                    check.observation(status, output.as_deref()),
-                    true,
-                ),
-                Err(_) => (
-                    None,
-                    CheckObservation::Unavailable("MEDIATOR_WAIT_FAILED"),
-                    true,
-                ),
-            }
+            mediator.collect(started_at + Duration::from_millis(BASELINE_DEADLINE_MS))
         }
-        Err(_) => (
-            None,
-            CheckObservation::Unavailable("MEDIATOR_LAUNCH_FAILED"),
-            false,
-        ),
+        Err(_) => (MediatorResult::LaunchFailed, None),
+    };
+    #[cfg(not(unix))]
+    let (termination, output): (MediatorResult, Option<Vec<u8>>) =
+        (MediatorResult::Unavailable, None);
+    let observation = match termination {
+        MediatorResult::Waited(status) => check.observation(status, output.as_deref()),
+        _ => CheckObservation::Unavailable(termination.reason()),
     };
     context.occurred_at_unix_ms = unix_time_ms();
     context.duration_ns = u64::try_from(started_at.elapsed().as_nanos()).ok();
     context.parent_event_id = record(
         &context,
-        execution_finished(baseline_execution_fields(check), status, launched),
+        execution_finished(baseline_execution_fields(check), termination),
         &mut persisted,
     );
     context.duration_ns = None;
@@ -511,8 +683,7 @@ mod tests {
             &context,
             execution_finished(
                 mediator_execution_fields(SHELL_WRAPPER_ROUTE),
-                Some(exit(137)),
-                true,
+                MediatorResult::Waited(exit(137)),
             ),
         )
         .expect("mediator finish record");
@@ -544,7 +715,10 @@ mod tests {
         let (_, wait_failure) = encode(
             Producer::ExecutionMediator,
             &context,
-            execution_finished(mediator_execution_fields(SHELL_WRAPPER_ROUTE), None, true),
+            execution_finished(
+                mediator_execution_fields(SHELL_WRAPPER_ROUTE),
+                MediatorResult::WaitFailed,
+            ),
         )
         .expect("mediator wait failure record");
         assert_eq!(
@@ -644,8 +818,63 @@ mod tests {
 
     #[test]
     fn oversized_mediator_output_is_drained_without_becoming_evidence() {
-        let mut stdout = io::Cursor::new(vec![b'x'; MAX_CHECK_OUTPUT * 4]);
-        assert_eq!(bounded_check_output(&mut stdout).unwrap(), None);
-        assert_eq!(stdout.position(), (MAX_CHECK_OUTPUT * 4) as u64);
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", "printf '%0512d' 0"]);
+        let mediator = BaselineMediator::spawn(command).expect("spawn benign output fixture");
+        let (result, output) = mediator.collect(Instant::now() + Duration::from_secs(3));
+        assert!(matches!(result, MediatorResult::Waited(status) if status.success()));
+        assert_eq!(output, None);
+    }
+
+    #[test]
+    fn baseline_deadline_covers_stdout_retained_outside_the_mediator_group() {
+        use super::super::capture::encode;
+
+        let (reader, writer) = UnixStream::pair().expect("stdout fixture");
+        let outside_group_holder = writer.try_clone().expect("keep stdout open");
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", "printf '0\\n'"]);
+        let mediator = BaselineMediator::spawn_with_output(command, reader, writer)
+            .expect("spawn benign mediator fixture");
+        let start = Instant::now();
+        let (result, output) = mediator.collect(start + Duration::from_millis(150));
+        drop(outside_group_holder);
+        assert!(start.elapsed() < Duration::from_secs(3));
+        assert!(matches!(result, MediatorResult::TimedOut(Some(_))));
+        assert_eq!(output, None);
+
+        let (_, record) = encode(
+            Producer::Baseline,
+            &Context::default(),
+            execution_finished(baseline_execution_fields(Check::WorktreeStatus), result),
+        )
+        .expect("timeout event stays distinct from wait status");
+        let payload = record.get("payload").expect("typed payload");
+        assert_eq!(
+            payload.get("termination").and_then(JsonValue::as_str),
+            Some("timed_out")
+        );
+        assert_eq!(
+            payload.get("mediator_reaped").and_then(JsonValue::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            payload.get("cleanup_scope").and_then(JsonValue::as_str),
+            Some("outer_mediator_process_group")
+        );
+    }
+
+    #[test]
+    fn baseline_deadline_covers_wait_after_stdout_closes() {
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", "exec 1>&-; exec /bin/sleep 10"]);
+        let mediator = BaselineMediator::spawn(command).expect("spawn benign waiting fixture");
+        let start = Instant::now();
+        let (result, output) = mediator.collect(start + Duration::from_millis(150));
+        assert!(start.elapsed() < Duration::from_secs(3));
+        assert!(
+            matches!(result, MediatorResult::TimedOut(Some(status)) if status.signal().is_some())
+        );
+        assert_eq!(output, None);
     }
 }
