@@ -1748,31 +1748,67 @@ fn test_17_phase2_multi_harness_sandbox_probe_and_witness_regressions() {
         }
     ));
 
-    // Non-ELF/Mach-O shell script masquerading as `agent-guard` fails `InstallState` (`BINARY_INVALID_FORMAT`)
-    let fake_bin_dir = sb.base.join("fake_bin");
-    fs::create_dir_all(&fake_bin_dir).expect("mkdir fake_bin");
-    let fake_guard = fake_bin_dir.join("agent-guard");
-    fs::write(&fake_guard, b"#!/bin/sh\nexit 0\n").expect("write fake script");
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&fake_guard, fs::Permissions::from_mode(0o555)).expect("chmod 0555");
-    }
-    let rep_fake_bin = evaluate_enforcement_report(
-        &sb.repo_dir,
-        &fake_bin_dir,
-        "antigravity",
-        None,
-        None,
-        &snap,
-    );
+    fs::write(
+        apos_ws.join(".codex/config.toml"),
+        format!(
+            "sandbox_mode = \"workspace-write\"\nnotify = [\"{}\", \"on-stop\"]\nunrelated = [\n[sandbox_workspace_write]\nnetwork_access = false\n",
+            apos_bin.join("agent-guard").display()
+        ),
+    )
+    .expect("write unclosed unknown toml key");
+    let cfg_codex_unknown_bad =
+        agent_guard::enforcement_state::evaluate_config_state(&apos_ws, "codex", &cached_inst);
     assert!(matches!(
-        rep_fake_bin.installed,
-        InstallState::IntegrityFailed {
-            reason_code: "BINARY_INVALID_FORMAT",
+        cfg_codex_unknown_bad,
+        ConfigState::Invalid {
+            reason_code: "CONFIG_MALFORMED_TOML",
             ..
         }
     ));
+
+    // Shell script, 4-byte ELF stub, and wrong-OS executable headers fail `InstallState` (`BINARY_INVALID_FORMAT`)
+    let fake_bin_dir = sb.base.join("fake_bin");
+    fs::create_dir_all(&fake_bin_dir).expect("mkdir fake_bin");
+    let fake_guard = fake_bin_dir.join("agent-guard");
+    let wrong_os_bytes: &[u8] = if cfg!(target_os = "linux") {
+        &[0xcf, 0xfa, 0xed, 0xfe, 0x07, 0x00, 0x00, 0x01]
+    } else {
+        b"\x7fELF\x02\x01\x01\x00"
+    };
+    for bad_bytes in [
+        b"#!/bin/sh\nexit 0\n".as_slice(),
+        b"\x7fELF",
+        wrong_os_bytes,
+    ] {
+        #[cfg(unix)]
+        if fake_guard.exists() {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&fake_guard, fs::Permissions::from_mode(0o755))
+                .expect("chmod writable");
+        }
+        fs::write(&fake_guard, bad_bytes).expect("write bad binary");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&fake_guard, fs::Permissions::from_mode(0o555))
+                .expect("chmod 0555");
+        }
+        let rep_fake_bin = evaluate_enforcement_report(
+            &sb.repo_dir,
+            &fake_bin_dir,
+            "antigravity",
+            None,
+            None,
+            &snap,
+        );
+        assert!(matches!(
+            rep_fake_bin.installed,
+            InstallState::IntegrityFailed {
+                reason_code: "BINARY_INVALID_FORMAT",
+                ..
+            }
+        ));
+    }
 
     // 17c: Ancestor rogue `agent-guard` executable above `current_exe` is NEVER executed by sandbox probes!
     let probe_tree = sb.base.join("probe_anc");
@@ -1943,6 +1979,132 @@ fn test_17_phase2_multi_harness_sandbox_probe_and_witness_regressions() {
     assert_eq!(
         JsonValue::parse(sm_out.trim())
             .expect("sm json")
+            .get("code")
+            .and_then(JsonValue::as_str),
+        Some("HOOK_NOT_INVOKED")
+    );
+
+    // 17e: Cross-workspace `cwd` payload spoofing AND missing/wrong event discriminator under `--adapter claude` must NOT mint a witness!
+    fs::create_dir_all(sb.repo_dir.join(".claude")).expect("mkdir .claude");
+    let gbin_d = sb.bin_dir.join("agent-guard").display().to_string();
+    let claude_cfg = format!(
+        concat!(
+            "{{\"hooks\":{{",
+            "\"UserPromptSubmit\":[{{\"hooks\":[{{\"type\":\"command\",\"command\":\"'{0}' user-prompt --adapter claude\"}}]}}],",
+            "\"PreToolUse\":[{{\"matcher\":\"*\",\"hooks\":[{{\"type\":\"command\",\"command\":\"'{0}' pre-tool --adapter claude\"}}]}}],",
+            "\"PostToolUse\":[{{\"matcher\":\"*\",\"hooks\":[{{\"type\":\"command\",\"command\":\"'{0}' post-tool --adapter claude\"}}]}}],",
+            "\"PreCompact\":[{{\"hooks\":[{{\"type\":\"command\",\"command\":\"'{0}' pre-compact --adapter claude\"}}]}}],",
+            "\"Stop\":[{{\"hooks\":[{{\"type\":\"command\",\"command\":\"'{0}' on-stop --adapter claude\"}}]}}]",
+            "}}}}\n"
+        ),
+        gbin_d
+    );
+    fs::write(sb.repo_dir.join(".claude/settings.json"), claude_cfg)
+        .expect("write claude settings");
+    let (cl_b_c, cl_b_out, cl_b_err) = sb.run_cli(
+        &[
+            "verify-enforcement",
+            "begin",
+            "--json",
+            "--adapter",
+            "claude",
+            "--execution-mode",
+            "local",
+            "--observer-pubkey",
+            &obs_pk,
+            "--bin-dir",
+            &sb.bin_dir.to_string_lossy(),
+            &sb.repo_dir.to_string_lossy(),
+        ],
+        b"",
+        &[],
+    );
+    assert_eq!(cl_b_c, 0, "claude begin failed: {cl_b_err}");
+    let cl_b_j = JsonValue::parse(cl_b_out.trim()).expect("cl_b json");
+    let cl_cid = cl_b_j
+        .get("challenge_id")
+        .and_then(JsonValue::as_str)
+        .expect("cl cid");
+    let cl_canary = cl_b_j
+        .get("canary_rel_path")
+        .and_then(JsonValue::as_str)
+        .expect("cl canary");
+
+    // Attempt 1: Invoke `pre-tool --adapter claude` from `other_ws` while claiming `cwd = sb.repo_dir`
+    let cross_cwd_payload = format!(
+        r#"{{"session_id":"cross_ws","hook_event_name":"PreToolUse","cwd":{},"tool_name":"Write","tool_input":{{"file_path":"{}/{}"}}}}"#,
+        sb.ws_json(),
+        sb.repo_dir.display(),
+        cl_canary
+    );
+    let mut cross_child = Command::new(sb.bin_dir.join("agent-guard"))
+        .current_dir(&other_ws)
+        .args(["pre-tool", "--adapter", "claude"])
+        .env("AGENT_GUARD_STATE_DIR", &sb.state_dir)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn cross-ws pre-tool");
+    if let Some(mut sin) = cross_child.stdin.take() {
+        let _ = sin.write_all(cross_cwd_payload.as_bytes());
+    }
+    let _ = cross_child.wait_with_output().expect("wait cross-ws");
+
+    // Attempt 2: Invoke `pre-tool --adapter claude` inside `sb.repo_dir` with `PostToolUse` or missing `hook_event_name`
+    for bad_ev_payload in [
+        format!(
+            r#"{{"session_id":"no_ev","tool_name":"Write","tool_input":{{"file_path":"{}/{}"}}}}"#,
+            sb.repo_dir.display(),
+            cl_canary
+        ),
+        format!(
+            r#"{{"session_id":"post_ev","hook_event_name":"PostToolUse","tool_name":"Write","tool_input":{{"file_path":"{}/{}"}}}}"#,
+            sb.repo_dir.display(),
+            cl_canary
+        ),
+    ] {
+        let _ = sb.run_cli(
+            &["pre-tool", "--adapter", "claude"],
+            bad_ev_payload.as_bytes(),
+            &[],
+        );
+    }
+
+    let cl_sig = agent_guard::enforcement_state::sign_observer_verdict(
+        &obs_seed,
+        cl_cid,
+        "claude",
+        &sb.repo_dir,
+        cl_canary,
+        true,
+    );
+    let (cl_bad_c, cl_bad_out, _) = sb.run_cli(
+        &[
+            "verify-enforcement",
+            "complete",
+            "--json",
+            "--adapter",
+            "claude",
+            "--execution-mode",
+            "local",
+            "--bin-dir",
+            &sb.bin_dir.to_string_lossy(),
+            "--challenge",
+            cl_cid,
+            "--host-prevented-execution",
+            "true",
+            "--observer-sig",
+            &cl_sig,
+            &sb.repo_dir.to_string_lossy(),
+        ],
+        b"",
+        &[],
+    );
+    assert_eq!(cl_bad_c, 2);
+    assert_eq!(
+        JsonValue::parse(cl_bad_out.trim())
+            .expect("cl_bad json")
             .get("code")
             .and_then(JsonValue::as_str),
         Some("HOOK_NOT_INVOKED")

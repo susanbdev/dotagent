@@ -308,12 +308,9 @@ fn current_euid_egid() -> Option<(u32, u32)> {
 }
 
 #[cfg(target_os = "linux")]
-pub fn is_trusted_probe_exe_file(path: &Path, my_uid: u32, my_gid: u32) -> bool {
+fn is_trusted_probe_exe_meta(meta: &fs::Metadata, my_uid: u32, my_gid: u32) -> bool {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
-    let Ok(meta) = fs::symlink_metadata(path) else {
-        return false;
-    };
-    if meta.file_type().is_symlink() || !meta.file_type().is_file() {
+    if !meta.file_type().is_file() {
         return false;
     }
     let mode = meta.permissions().mode();
@@ -330,42 +327,44 @@ pub fn is_trusted_probe_exe_file(path: &Path, my_uid: u32, my_gid: u32) -> bool 
 }
 
 #[cfg(target_os = "linux")]
-fn resolve_trusted_probe_exe() -> Option<PathBuf> {
-    let exe = env::current_exe().ok()?;
+pub fn is_trusted_probe_exe_file(path: &Path, my_uid: u32, my_gid: u32) -> bool {
+    let Ok(meta) = fs::symlink_metadata(path) else {
+        return false;
+    };
+    if meta.file_type().is_symlink() {
+        return false;
+    }
+    is_trusted_probe_exe_meta(&meta, my_uid, my_gid)
+}
+
+#[cfg(target_os = "linux")]
+fn is_known_self_probe_binary() -> bool {
+    env::current_exe()
+        .ok()
+        .and_then(|exe| exe.file_name().map(|n| n.to_os_string()))
+        .and_then(|n| n.into_string().ok())
+        .is_some_and(|raw| {
+            let name = raw.strip_suffix(" (deleted)").unwrap_or(raw.as_str());
+            matches!(name, "agent-guard" | "dotagent" | "dotagent-harness")
+        })
+}
+
+#[cfg(target_os = "linux")]
+fn resolve_self_probe_exe() -> Option<PathBuf> {
+    if !is_known_self_probe_binary() {
+        return None;
+    }
     let (my_uid, my_gid) = current_euid_egid()?;
-    let is_guard_exe = exe
-        .file_name()
-        .and_then(|n| n.to_str())
-        .is_some_and(|n| matches!(n, "agent-guard" | "dotagent"));
-    if is_guard_exe {
-        return is_trusted_probe_exe_file(&exe, my_uid, my_gid).then_some(exe);
-    }
-    let parent = exe.parent()?;
-    let sibling = parent.join("agent-guard");
-    if is_trusted_probe_exe_file(&sibling, my_uid, my_gid) {
-        return Some(sibling);
-    }
-    for anc in exe.ancestors().skip(1).take(6) {
-        if anc
-            .parent()
-            .and_then(|p| p.file_name())
-            .and_then(|n| n.to_str())
-            == Some("target")
-        {
-            let profile_bin = anc.join("agent-guard");
-            if is_trusted_probe_exe_file(&profile_bin, my_uid, my_gid) {
-                return Some(profile_bin);
-            }
-        }
-    }
-    None
+    let self_exe = Path::new("/proc/self/exe");
+    let meta = fs::metadata(self_exe).ok()?;
+    is_trusted_probe_exe_meta(&meta, my_uid, my_gid).then(|| self_exe.to_path_buf())
 }
 
 /// Probes host OS kernel sandbox enforcement without mutating the current process.
 pub fn probe_host_sandbox_mode() -> KernelSandboxMode {
     #[cfg(target_os = "linux")]
     {
-        if let Some(bin) = resolve_trusted_probe_exe() {
+        if let Some(bin) = resolve_self_probe_exe() {
             if let Ok(out) = Command::new(bin).arg("--probe-landlock-child").output()
                 && out.status.success()
             {
@@ -382,13 +381,19 @@ pub fn probe_host_sandbox_mode() -> KernelSandboxMode {
             }
             return KernelSandboxMode::FallbackEnvAndAstOnly;
         }
-        let is_guard_exe = env::current_exe()
-            .ok()
-            .and_then(|p| p.file_name().map(|n| n.to_os_string()))
-            .and_then(|n| n.into_string().ok())
-            .is_some_and(|n| matches!(n.as_str(), "agent-guard" | "dotagent"));
-        if !is_guard_exe {
-            use landlock::{ABI, Access, AccessFs, CompatLevel, Compatible, Ruleset, RulesetAttr};
+        if !is_known_self_probe_binary() {
+            use landlock::{
+                ABI, Access, AccessFs, AccessNet, CompatLevel, Compatible, Ruleset, RulesetAttr,
+            };
+            if Ruleset::default()
+                .set_compatibility(CompatLevel::HardRequirement)
+                .handle_access(AccessFs::from_all(ABI::V5))
+                .and_then(|r| r.handle_access(AccessNet::from_all(ABI::V5)))
+                .and_then(|r| r.create())
+                .is_ok()
+            {
+                return KernelSandboxMode::LinuxLandlockEnforced;
+            }
             if Ruleset::default()
                 .set_compatibility(CompatLevel::HardRequirement)
                 .handle_access(AccessFs::from_all(ABI::V1))
@@ -437,7 +442,7 @@ pub fn run_sandbox_status_cli() -> ExitCode {
 pub fn probe_host_seccomp_verified() -> Option<bool> {
     #[cfg(target_os = "linux")]
     {
-        let Some(exe) = resolve_trusted_probe_exe() else {
+        let Some(exe) = resolve_self_probe_exe() else {
             return Some(false);
         };
         if let Ok(out) = Command::new(&exe).arg("--probe-seccomp-child").output()

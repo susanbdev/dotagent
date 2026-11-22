@@ -28,6 +28,12 @@ Options:\n\
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.first().map(String::as_str) == Some("--probe-landlock-child") {
+        return agent_guard::exec_sandbox::run_probe_landlock_child();
+    }
+    if args.first().map(String::as_str) == Some("--probe-seccomp-child") {
+        return agent_guard::exec_sandbox::run_probe_seccomp_child();
+    }
     let mut cfg = HarnessConfig::for_workspace(discover_workspace_root());
     let mut format = ReportFormat::Text;
     let mut list_only = false;

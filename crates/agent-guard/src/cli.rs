@@ -129,10 +129,11 @@ pub fn run_cli_entrypoint() -> ExitCode {
                 handle_pre_tool_hook(&payload, &cwd)
             });
             if let Decision::Deny { code, .. } = &decision
+                && !matches!(*code, "CROSS_REPO_CWD_SPOOF" | "INVALID_HOOK_JSON")
                 && let Some(adapter_id) =
                     resolve_pre_tool_witness_adapter(explicit_adapter, &payload)
             {
-                let ws_root = resolve_hook_workspace_root(&payload, &cwd);
+                let ws_root = resolve_repo_root(&cwd);
                 crate::enforcement_state::record_denial_witness(
                     &ws_root,
                     adapter_id,
@@ -527,28 +528,6 @@ fn run_read_safe(raw_path: &str, extra: &[String], cwd: &Path) -> ExitCode {
     }
 }
 
-fn resolve_hook_workspace_root(raw_payload: &str, fallback_cwd: &Path) -> PathBuf {
-    if let Ok(parsed) = crate::json::JsonValue::parse(raw_payload) {
-        if let Some(cwd_s) = parsed.get("cwd").and_then(crate::json::JsonValue::as_str) {
-            let p = Path::new(cwd_s.trim());
-            if p.is_absolute() && p.is_dir() {
-                return resolve_repo_root(p);
-            }
-        }
-        if let Some(roots) = parsed
-            .get("workspace_roots")
-            .and_then(crate::json::JsonValue::as_array)
-            && let Some(first) = roots.first().and_then(crate::json::JsonValue::as_str)
-        {
-            let p = Path::new(first.trim());
-            if p.is_absolute() && p.is_dir() {
-                return resolve_repo_root(p);
-            }
-        }
-    }
-    resolve_repo_root(fallback_cwd)
-}
-
 fn infer_single_pre_tool_adapter(raw_payload: &str) -> Option<&'static str> {
     let parsed = crate::json::JsonValue::parse(raw_payload).ok()?;
     let has_cursor =
@@ -558,10 +537,20 @@ fn infer_single_pre_tool_adapter(raw_payload: &str) -> Option<&'static str> {
         .and_then(crate::json::JsonValue::as_str);
     let is_gemini = ev == Some("BeforeTool");
     let is_claude = ev == Some("PreToolUse");
-    match (has_cursor, is_gemini, is_claude) {
-        (true, false, false) => Some("cursor"),
-        (false, true, false) => Some("gemini"),
-        (false, false, true) => Some("claude"),
+    let is_cursor_pre = has_cursor
+        && matches!(
+            ev,
+            None | Some(
+                "beforeShellExecution"
+                    | "beforeMCPExecution"
+                    | "beforeReadFile"
+                    | "beforeSubmitPrompt"
+            )
+        );
+    match (is_cursor_pre, is_gemini, is_claude, has_cursor) {
+        (true, false, false, true) => Some("cursor"),
+        (false, true, false, false) => Some("gemini"),
+        (false, false, true, false) => Some("claude"),
         _ => None,
     }
 }
@@ -570,24 +559,11 @@ fn resolve_pre_tool_witness_adapter(
     explicit_adapter: Option<&'static str>,
     raw_payload: &str,
 ) -> Option<&'static str> {
-    if let Some(exp) = explicit_adapter {
-        let Ok(parsed) = crate::json::JsonValue::parse(raw_payload) else {
-            return None;
-        };
-        let has_cursor =
-            parsed.get("cursor_version").is_some() || parsed.get("workspace_roots").is_some();
-        let ev = parsed
-            .get("hook_event_name")
-            .and_then(crate::json::JsonValue::as_str);
-        let compatible = match exp {
-            "claude" => !has_cursor && !matches!(ev, Some("BeforeTool")),
-            "gemini" => !has_cursor && !matches!(ev, Some("PreToolUse")),
-            "cursor" => !matches!(ev, Some("BeforeTool" | "PreToolUse")),
-            _ => false,
-        };
-        return compatible.then_some(exp);
+    let inferred = infer_single_pre_tool_adapter(raw_payload)?;
+    match explicit_adapter {
+        Some(exp) => (inferred == exp).then_some(exp),
+        None => Some(inferred),
     }
-    infer_single_pre_tool_adapter(raw_payload)
 }
 
 fn read_hook_args_and_stdin(
