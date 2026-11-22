@@ -294,6 +294,63 @@ pub fn inspect_file_budget_with_limits(
     max_raw_bytes: u64,
     max_unsliced_lines: usize,
 ) -> Result<(String, ContentMetrics), BudgetViolation> {
+    inspect_file_budget_inner(
+        path,
+        offset_line,
+        limit_lines,
+        max_slice_lines,
+        max_raw_bytes,
+        max_unsliced_lines,
+        None,
+    )
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct ReadObservation {
+    pub source_bytes_at_stat: Option<u64>,
+    pub read_bytes: Option<usize>,
+    pub source_lines: Option<usize>,
+    pub selected_offset_line: Option<usize>,
+    pub selected_lines: Option<usize>,
+    pub selected_bytes: Option<usize>,
+    pub selected_max_line_bytes: Option<usize>,
+    pub continuation_available: Option<bool>,
+    pub duration_ns: Option<u64>,
+}
+
+pub(crate) fn inspect_file_budget_with_observation(
+    path: &Path,
+    offset_line: Option<usize>,
+    limit_lines: Option<usize>,
+    max_slice_lines: usize,
+    max_raw_bytes: u64,
+    max_unsliced_lines: usize,
+    observation: &mut ReadObservation,
+) -> Result<(String, ContentMetrics), BudgetViolation> {
+    *observation = ReadObservation::default();
+    let started = std::time::Instant::now();
+    let result = inspect_file_budget_inner(
+        path,
+        offset_line,
+        limit_lines,
+        max_slice_lines,
+        max_raw_bytes,
+        max_unsliced_lines,
+        Some(observation),
+    );
+    observation.duration_ns = u64::try_from(started.elapsed().as_nanos()).ok();
+    result
+}
+
+fn inspect_file_budget_inner(
+    path: &Path,
+    offset_line: Option<usize>,
+    limit_lines: Option<usize>,
+    max_slice_lines: usize,
+    max_raw_bytes: u64,
+    max_unsliced_lines: usize,
+    mut observation: Option<&mut ReadObservation>,
+) -> Result<(String, ContentMetrics), BudgetViolation> {
     let meta = std::fs::symlink_metadata(path).map_err(|e| BudgetViolation {
         code: "FILE_STAT_ERROR",
         detail: format!("Cannot stat '{}': {e}", path.display()),
@@ -310,6 +367,9 @@ pub fn inspect_file_budget_with_limits(
     }
 
     let file_len = meta.len();
+    if let Some(observed) = observation.as_deref_mut() {
+        observed.source_bytes_at_stat = Some(file_len);
+    }
     let has_bounded_slice = limit_lines.is_some_and(|l| l > 0 && l <= max_slice_lines);
 
     if !has_bounded_slice && file_len > max_raw_bytes {
@@ -346,6 +406,11 @@ pub fn inspect_file_budget_with_limits(
             detail: format!("Cannot read '{}': {e}", path.display()),
         })?;
 
+    let reached_eof = raw.len() < cap;
+    if let Some(observed) = observation.as_deref_mut() {
+        observed.read_bytes = Some(raw.len());
+    }
+
     if raw.contains(&0u8) {
         return Err(BudgetViolation {
             code: "BINARY_FILE_BLOCKED",
@@ -364,8 +429,15 @@ pub fn inspect_file_budget_with_limits(
         ),
     })?;
 
+    let selected_start = if has_bounded_slice {
+        offset_line.unwrap_or(1).max(1)
+    } else {
+        1
+    };
+    let source_line_count = observation.as_ref().map(|_| full_text.lines().count());
+
     let inspected_text = if has_bounded_slice {
-        let start = offset_line.unwrap_or(1).saturating_sub(1);
+        let start = selected_start - 1;
         let count = limit_lines.unwrap_or(max_slice_lines);
         let mut sliced = String::new();
         for (idx, line) in full_text.lines().skip(start).take(count).enumerate() {
@@ -378,6 +450,30 @@ pub fn inspect_file_budget_with_limits(
     } else {
         full_text
     };
+
+    if let (Some(observed), Some(source_line_count)) = (observation, source_line_count) {
+        let selected_lines = if has_bounded_slice {
+            source_line_count
+                .saturating_sub(selected_start - 1)
+                .min(limit_lines.unwrap_or(max_slice_lines))
+        } else {
+            source_line_count
+        };
+        let has_more = selected_start
+            .saturating_sub(1)
+            .saturating_add(selected_lines)
+            < source_line_count;
+        observed.source_lines = reached_eof.then_some(source_line_count);
+        observed.selected_offset_line = Some(selected_start);
+        observed.selected_lines = Some(selected_lines);
+        observed.selected_bytes = Some(inspected_text.len());
+        observed.selected_max_line_bytes = inspected_text.split('\n').map(str::len).max();
+        observed.continuation_available = if has_more || reached_eof {
+            Some(has_more)
+        } else {
+            None
+        };
+    }
 
     let metrics = analyze_text_budget_with_limits(
         &inspected_text,

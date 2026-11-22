@@ -1,0 +1,33 @@
+{
+  "schema_version": 1,
+  "event_id": "fixture-sims-1",
+  "event_type": "USAGE_AND_DISPOSITION",
+  "producer": {
+    "component": "sims.fixture",
+    "instance_id": "fixture",
+    "sequence": 1
+  },
+  "timing": {
+    "clock": "fixture"
+  },
+  "correlation": {},
+  "work": {},
+  "configuration": {},
+  "trust": {
+    "origin": "fixture",
+    "authentication": "none",
+    "evidence": "synthetic",
+    "verification": "fixture_only"
+  },
+  "result": {
+    "action": "observe",
+    "reason_code": "FIXTURE",
+    "disposition": "observed",
+    "completeness": "complete"
+  },
+  "payload": {
+    "namespace": "sims",
+    "simulation_case": "bounded_read",
+    "sample_count": 16
+  }
+}

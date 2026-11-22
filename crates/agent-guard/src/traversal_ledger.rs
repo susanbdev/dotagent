@@ -1491,7 +1491,7 @@ pub fn atomic_write_nonsymlink_state_file_opts(
     })
 }
 
-/// Appends a single pure-ASCII JSONL record (`0600`) to `audit.jsonl` without following symlinks.
+/// Appends the legacy audit fields through the protected local audit writer.
 pub fn append_audit_jsonl(
     repo_root: &Path,
     session_id: &str,
@@ -1500,35 +1500,23 @@ pub fn append_audit_jsonl(
     detail: &str,
     halted: bool,
 ) {
-    let path = audit_log_path();
-    let Some(parent) = path.parent() else {
-        return;
-    };
-    if ensure_nonsymlink_state_dir(parent).is_err() {
-        return;
-    }
+    use crate::telemetry::store::{Durability, append};
 
     let ts_secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    let ascii_detail: String = detail
-        .chars()
-        .map(|c| {
-            if c.is_ascii() && !c.is_ascii_control() {
-                c
-            } else {
-                '?'
-            }
-        })
-        .take(240)
-        .collect();
+        .ok()
+        .map(|d| d.as_secs());
     let session_hash = compute_session_key_hash(repo_root, session_id);
+    let (safe_tool, _) = crate::feedback::scrub_high_entropy_and_secrets(tool, 64);
+    let code = audit_ascii(code, 128);
     let record = JsonValue::Object(vec![
-        ("ts".to_string(), JsonValue::Number(ts_secs as f64)),
+        (
+            "ts".to_string(),
+            ts_secs.map_or(JsonValue::Null, JsonValue::Uint),
+        ),
         (
             "repo".to_string(),
-            JsonValue::Str(repo_root.to_string_lossy().into_owned()),
+            JsonValue::Str(audit_ascii(&repo_root.to_string_lossy(), 4096)),
         ),
         (
             "session_id".to_string(),
@@ -1538,136 +1526,121 @@ pub fn append_audit_jsonl(
             "session_hash".to_string(),
             JsonValue::Str(session_hash[..16].to_string()),
         ),
-        ("tool".to_string(), JsonValue::Str(tool.to_string())),
-        ("code".to_string(), JsonValue::Str(code.to_string())),
+        ("tool".to_string(), JsonValue::Str(safe_tool)),
+        ("code".to_string(), JsonValue::Str(code.clone())),
         ("halted".to_string(), JsonValue::Bool(halted)),
-        ("detail".to_string(), JsonValue::Str(ascii_detail.clone())),
+        (
+            "detail".to_string(),
+            JsonValue::Str(if detail.is_empty() { "" } else { "[redacted]" }.to_string()),
+        ),
     ]);
-
-    let _audit_lock = ExclusiveFileLockGuard::acquire(&path);
-    let file_opt = match fs::symlink_metadata(&path) {
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            let mut opts = OpenOptions::new();
-            opts.write(true).create_new(true).append(true);
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::OpenOptionsExt;
-                opts.mode(0o600);
-            }
-            opts.open(&path).ok()
+    if let Err(error) = append(&record, Durability::Buffered) {
+        static REPORTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if !REPORTED.swap(true, Ordering::Relaxed) {
+            eprintln!("[DOTAGENT TELEMETRY] Local audit unavailable: {error}");
         }
-        Ok(meta) if !meta.file_type().is_symlink() && meta.file_type().is_file() => {
-            let mut opts = OpenOptions::new();
-            opts.write(true).append(true);
-            #[cfg(any(
-                all(
-                    target_os = "linux",
-                    any(target_arch = "x86_64", target_arch = "aarch64")
-                ),
-                target_os = "macos"
-            ))]
-            {
-                use std::os::unix::fs::OpenOptionsExt;
-                opts.custom_flags(O_NOFOLLOW_FLAG);
-            }
-            opts.open(&path).ok().filter(|f| {
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::MetadataExt;
-                    f.metadata()
-                        .map(|fm| fm.dev() == meta.dev() && fm.ino() == meta.ino())
-                        .unwrap_or(false)
-                }
-                #[cfg(not(unix))]
-                {
-                    let _ = f;
-                    true
-                }
-            })
-        }
-        _ => None,
-    };
-
-    if let Some(mut file) = file_opt {
-        let _ = writeln!(file, "{}", record.to_json_string());
     }
 
-    crate::feedback::record_guard_denial_agentpi_signal(
-        repo_root,
-        &session_hash[..16],
-        tool,
-        code,
-        &ascii_detail,
-        halted,
-        ts_secs,
-    );
+    // Existing separately gated feedback behavior remains compatible with legacy callers.
+    if let Some(ts_secs) = ts_secs {
+        crate::feedback::record_guard_denial_agentpi_signal(
+            repo_root,
+            &session_hash[..16],
+            tool,
+            &code,
+            &audit_ascii(detail, 240),
+            halted,
+            ts_secs,
+        );
+    }
 }
 
-/// Host/coordinator-only check verifying whether `(repo_root, session_id)` actually experienced
-/// `expected_code` in `audit.jsonl` (never exposed to agents; preserves `GUARD_SELF_BLINDNESS`).
+fn audit_ascii(raw: &str, max: usize) -> String {
+    raw.chars()
+        .take(max)
+        .map(|c| {
+            if c.is_ascii() && !c.is_ascii_control() {
+                c
+            } else {
+                '?'
+            }
+        })
+        .collect()
+}
+
+/// Host/coordinator-only check for a recent legacy denial in the active audit file.
+/// Typed observations, incomplete frames, and rotated history cannot satisfy this check.
 pub fn audit_log_has_session_denial(
     repo_root: &Path,
     session_id: &str,
     expected_code: &str,
 ) -> bool {
     use std::io::{Seek, SeekFrom};
+
+    use crate::telemetry::store::{MAX_RECORD_BYTES, open_audit_read};
+
     let norm_code = expected_code.trim().to_ascii_uppercase();
     if norm_code.is_empty() {
         return false;
     }
     let path = audit_log_path();
-    let Ok(meta) = fs::symlink_metadata(&path) else {
+    let Ok(_lock) = ExclusiveFileLockGuard::acquire(&path) else {
         return false;
     };
-    if meta.file_type().is_symlink() || !meta.file_type().is_file() {
-        return false;
-    }
-    let mut opts = OpenOptions::new();
-    opts.read(true);
-    #[cfg(any(
-        all(
-            target_os = "linux",
-            any(target_arch = "x86_64", target_arch = "aarch64")
-        ),
-        target_os = "macos"
-    ))]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        opts.custom_flags(O_NOFOLLOW_FLAG);
-    }
-    let Ok(mut file) = opts.open(&path) else {
+    let Ok(Some(mut file)) = open_audit_read(&path) else {
         return false;
     };
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        let Ok(fm) = file.metadata() else {
+    let Ok(meta) = file.metadata() else {
+        return false;
+    };
+    let span = meta.len().min(2 * 1024 * 1024);
+    if file.seek(SeekFrom::Start(meta.len() - span)).is_err() {
+        return false;
+    }
+    let mut buffer = Vec::new();
+    if file.take(span).read_to_end(&mut buffer).is_err() {
+        return false;
+    }
+    let complete = if meta.len() > span {
+        let Some(first_delimiter) = buffer.iter().position(|byte| *byte == b'\n') else {
             return false;
         };
-        if fm.dev() != meta.dev() || fm.ino() != meta.ino() {
-            return false;
-        }
-    }
-    if meta.len() > 262_144 {
-        let _ = file.seek(SeekFrom::End(-262_144));
-    }
-    let mut buf = Vec::new();
-    if file.take(262_144).read_to_end(&mut buf).is_err() {
-        return false;
-    }
-    let raw = String::from_utf8_lossy(&buf);
+        &buffer[first_delimiter + 1..]
+    } else {
+        &buffer
+    };
     let expected_hash = compute_session_key_hash(repo_root, session_id);
     let prefix = &expected_hash[..16];
-    for line in raw.lines().rev().take(512) {
-        if let Ok(v) = JsonValue::parse(line) {
-            let sh = v
-                .get("session_hash")
-                .and_then(JsonValue::as_str)
-                .unwrap_or("");
-            let c = v.get("code").and_then(JsonValue::as_str).unwrap_or("");
-            if sh == prefix && c.eq_ignore_ascii_case(&norm_code) {
-                return true;
-            }
+    let mut legacy_bytes_left = 256 * 1024;
+    let mut lines_left = 512;
+    // The rightmost segment is either the empty segment after a newline or an incomplete tail.
+    for frame in complete.rsplit(|byte| *byte == b'\n').skip(1) {
+        if frame.len() > MAX_RECORD_BYTES {
+            continue;
+        }
+        let Some(entry) = std::str::from_utf8(frame)
+            .ok()
+            .and_then(|line| JsonValue::parse(line).ok())
+        else {
+            continue;
+        };
+        if entry.get("schema_version").is_some() || entry.get("event_type").is_some() {
+            continue;
+        }
+        let Some(session_hash) = entry.get("session_hash").and_then(JsonValue::as_str) else {
+            continue;
+        };
+        let Some(code) = entry.get("code").and_then(JsonValue::as_str) else {
+            continue;
+        };
+        let frame_bytes = frame.len() + 1;
+        if lines_left == 0 || legacy_bytes_left < frame_bytes {
+            return false;
+        }
+        lines_left -= 1;
+        legacy_bytes_left -= frame_bytes;
+        if session_hash == prefix && code.eq_ignore_ascii_case(&norm_code) {
+            return true;
         }
     }
     false
