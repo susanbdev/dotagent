@@ -354,13 +354,11 @@ fn read_rows(reader: &mut impl BufRead) -> io::Result<Window> {
     let mut aliases = BTreeMap::new();
     let mut line = Vec::new();
     let mut rows = Vec::new();
-    for record in 0..MAX_RECORDS {
-        if record == MAX_RECORDS - 1 {
-            coverage.record_limit = true;
-        }
+    let mut exhausted_records = true;
+    for _ in 0..MAX_RECORDS {
         match read_line(&mut reader, &mut line)? {
             Line::End => {
-                coverage.record_limit = false;
+                exhausted_records = false;
                 break;
             }
             Line::Invalid => {
@@ -395,7 +393,13 @@ fn read_rows(reader: &mut impl BufRead) -> io::Result<Window> {
         }
         rows.push(row);
     }
-    coverage.byte_limit = reader.limit() == 0;
+    if reader.limit() == 0 {
+        // Take reports an empty buffer at its artificial EOF. Check the underlying
+        // buffer without consuming an extra byte from outside the scan window.
+        coverage.byte_limit = !reader.get_mut().fill_buf()?.is_empty();
+    } else if exhausted_records {
+        coverage.record_limit = !reader.fill_buf()?.is_empty();
+    }
     Ok(Window {
         rows,
         aliases,
@@ -988,6 +992,46 @@ mod tests {
             node = node.get(key).unwrap_or_else(|| panic!("missing {key}"));
         }
         node
+    }
+
+    #[test]
+    fn record_limit_reports_omitted_input_only_when_more_bytes_follow() {
+        let frame = b"{}\n";
+        let mut raw = frame.repeat(MAX_RECORDS);
+        let exact = read_rows(&mut Cursor::new(&raw)).unwrap();
+        assert_eq!(exact.coverage.legacy, MAX_RECORDS as u64);
+        assert!(!exact.coverage.record_limit);
+        assert!(!exact.coverage.byte_limit);
+
+        let consumed = raw.len() as u64;
+        raw.extend_from_slice(frame);
+        let mut reader = Cursor::new(&raw);
+        let over = read_rows(&mut reader).unwrap();
+        assert_eq!(over.coverage.legacy, MAX_RECORDS as u64);
+        assert!(over.coverage.record_limit);
+        assert!(!over.coverage.byte_limit);
+        assert_eq!(reader.position(), consumed);
+    }
+
+    #[test]
+    fn byte_limit_checks_actual_eof_at_the_shared_byte_and_record_boundary() {
+        let mut frame = vec![b' '; MAX_BYTES_READ as usize / MAX_RECORDS];
+        frame[..2].copy_from_slice(b"{}");
+        *frame.last_mut().unwrap() = b'\n';
+        let mut raw = frame.repeat(MAX_RECORDS);
+        assert_eq!(raw.len() as u64, MAX_BYTES_READ);
+        let exact = read_rows(&mut Cursor::new(&raw)).unwrap();
+        assert_eq!(exact.coverage.legacy, MAX_RECORDS as u64);
+        assert!(!exact.coverage.record_limit);
+        assert!(!exact.coverage.byte_limit);
+
+        raw.extend_from_slice(b"{}\n");
+        let mut reader = Cursor::new(&raw);
+        let over = read_rows(&mut reader).unwrap();
+        assert_eq!(over.coverage.legacy, MAX_RECORDS as u64);
+        assert!(!over.coverage.record_limit);
+        assert!(over.coverage.byte_limit);
+        assert_eq!(reader.position(), MAX_BYTES_READ);
     }
 
     #[test]
