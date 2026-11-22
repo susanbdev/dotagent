@@ -244,37 +244,59 @@ fn child_command(role: &str) -> io::Result<Command> {
     let mut command = Command::new(std::env::current_exe()?);
     command.arg(role).arg("--owned").env_clear();
     for name in ["HOME", "AGENT_GUARD_STATE_DIR"] {
-        if let Some(value) = std::env::var_os(name) { command.env(name, value); }
+        if let Some(value) = std::env::var_os(name) {
+            command.env(name, value);
+        }
     }
-    command.stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::null());
+    command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
     Ok(command)
 }
 
 #[cfg(not(test))]
 pub(super) fn launch() -> Option<Child> {
-    if !enabled() { return None; }
+    if !enabled() {
+        return None;
+    }
     child_command("supervise-observations").ok()?.spawn().ok()
 }
 
 /// Owns the child and its restart budget outside the guard's panic and scheduling domain.
 pub(crate) fn supervise() -> io::Result<()> {
-    if !enabled() { return Err(invalid()); }
+    if !enabled() {
+        return Err(invalid());
+    }
     let (closed, owner) = std::sync::mpsc::sync_channel(1);
-    std::thread::Builder::new().name("observation-owner".into()).spawn(move || {
-        let _ = io::stdin().read(&mut [0]);
-        let _ = closed.send(());
-    })?;
+    std::thread::Builder::new()
+        .name("observation-owner".into())
+        .spawn(move || {
+            let _ = io::stdin().read(&mut [0]);
+            let _ = closed.send(());
+        })?;
     let mut child: Option<Child> = None;
     let mut starts = VecDeque::with_capacity(3);
     loop {
-        if let Some(process) = &mut child && process.try_wait()?.is_some() { child = None; }
+        if let Some(process) = &mut child
+            && process.try_wait()?.is_some()
+        {
+            child = None;
+        }
         let now = Instant::now();
-        while starts.front().is_some_and(|tick| *tick <= now) { starts.pop_front(); }
+        while starts.front().is_some_and(|tick| *tick <= now) {
+            starts.pop_front();
+        }
         if child.is_none() && starts.len() < 3 && Peer::open().is_err() {
             starts.push_back(now + Duration::from_secs(60));
             child = child_command("collect-observations")?.spawn().ok();
         }
-        if !matches!(owner.recv_timeout(Duration::from_millis(250)), Err(std::sync::mpsc::RecvTimeoutError::Timeout)) { break; }
+        if !matches!(
+            owner.recv_timeout(Duration::from_millis(250)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        ) {
+            break;
+        }
     }
     if let Some(mut child) = child {
         drop(child.stdin.take());
@@ -363,8 +385,14 @@ impl Endpoint {
             .open(&stage)?;
         let mut status = super::runtime_health::status(counts.0, counts.1, closing);
         if let crate::json::JsonValue::Object(fields) = &mut status {
-            fields.push(("collector_pid".into(), crate::json::JsonValue::Uint(u64::from(std::process::id()))));
-            fields.push(("generation".into(), crate::json::JsonValue::Str(crate::crypto::hex_encode(&self.id))));
+            fields.push((
+                "collector_pid".into(),
+                crate::json::JsonValue::Uint(u64::from(std::process::id())),
+            ));
+            fields.push((
+                "generation".into(),
+                crate::json::JsonValue::Str(crate::crypto::hex_encode(&self.id)),
+            ));
         }
         let status = status.to_json_string();
         let result = file
@@ -391,13 +419,21 @@ pub(super) fn delivery_status() -> io::Result<crate::json::JsonValue> {
     let socket = UnixDatagram::unbound()?;
     let dir = private_dir(uid(&socket)?, false)?;
     let mut data = String::new();
-    super::store::open_audit_read(&dir.join("health")).map_err(|e| io::Error::other(e.to_string()))?
-        .ok_or(io::ErrorKind::NotFound)?.take(8193).read_to_string(&mut data)?;
-    if data.len() > 8192 { return Err(invalid()); }
+    super::store::open_audit_read(&dir.join("health"))
+        .map_err(|e| io::Error::other(e.to_string()))?
+        .ok_or(io::ErrorKind::NotFound)?
+        .take(8193)
+        .read_to_string(&mut data)?;
+    if data.len() > 8192 {
+        return Err(invalid());
+    }
     let snapshot = JsonValue::parse(&data).map_err(io::Error::other)?;
     let clean = super::runtime_health::read(&snapshot).ok_or_else(invalid)?;
     Ok(JsonValue::Object(vec![
-        ("collector_available".into(), JsonValue::Bool(Peer::open().is_ok())),
+        (
+            "collector_available".into(),
+            JsonValue::Bool(Peer::open().is_ok()),
+        ),
         ("last_collector_snapshot".into(), clean),
     ]))
 }

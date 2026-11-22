@@ -1512,7 +1512,9 @@ impl ExclusiveFileLockGuard {
                         registered_want = true;
                     }
                     let observation = std::ptr::eq(registry, &OBSERVATION_FIFOS);
-                    let min_reclaim_age = if cfg!(target_os = "linux") || (cfg!(target_os = "macos") && observation) {
+                    let min_reclaim_age = if cfg!(target_os = "linux")
+                        || (cfg!(target_os = "macos") && observation)
+                    {
                         Duration::from_millis(250)
                     } else {
                         Duration::from_secs(30)
@@ -1614,13 +1616,23 @@ fn lock_owner_gone(path: &Path, age: Duration, observation: bool) -> bool {
     #[cfg(target_os = "macos")]
     if observation {
         let raw = fs::read_to_string(path).unwrap_or_default();
-        if let Some(pid) = raw.split_whitespace().next().and_then(|p| p.strip_prefix("pid="))
+        if let Some(pid) = raw
+            .split_whitespace()
+            .next()
+            .and_then(|p| p.strip_prefix("pid="))
             .and_then(|p| p.parse::<u32>().ok())
-            && pid != 0 && pid != std::process::id() {
+            && pid != 0
+            && pid != std::process::id()
+        {
             // macOS has no procfs. ps returns one for an empty PID selection.
             // Ambiguous failures leave the marker intact. This is collector-only.
-            return Command::new("/bin/ps").env_clear().args(["-p", &pid.to_string(), "-o", "pid="])
-                .output().is_ok_and(|out| out.status.code() == Some(1) && out.stdout.is_empty() && out.stderr.is_empty());
+            return Command::new("/bin/ps")
+                .env_clear()
+                .args(["-p", &pid.to_string(), "-o", "pid="])
+                .output()
+                .is_ok_and(|out| {
+                    out.status.code() == Some(1) && out.stdout.is_empty() && out.stderr.is_empty()
+                });
         }
     }
     let _ = observation;

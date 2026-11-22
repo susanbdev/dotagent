@@ -66,8 +66,14 @@ pub fn run_cli_entrypoint() -> ExitCode {
         .then(crate::telemetry::runtime::start_host);
     match sub {
         #[cfg(unix)]
-        "supervise-observations" if args.get(1).map(String::as_str) == Some("--owned") && args.len() == 2 => {
-            if crate::telemetry::transport::supervise().is_ok() { ExitCode::SUCCESS } else { ExitCode::FAILURE }
+        "supervise-observations"
+            if args.get(1).map(String::as_str) == Some("--owned") && args.len() == 2 =>
+        {
+            if crate::telemetry::transport::supervise().is_ok() {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::FAILURE
+            }
         }
         #[cfg(unix)]
         "collect-observations" => {

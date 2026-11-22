@@ -561,23 +561,47 @@ pub(super) fn valid_wire_provenance(record: &JsonValue) -> bool {
         Some("dotagent.baseline") => Producer::Baseline,
         _ => return false,
     };
-    let Some(kind) = [EventType::ExecutionStarted, EventType::ExecutionFinished,
-        EventType::PrerequisiteChecked, EventType::ControlDecision, EventType::UsageAndDisposition,
-        EventType::DetectionAssessment, EventType::RecoveryOrEscalation]
-        .into_iter().find(|k| Some(k.as_str()) == event && source.can_emit(*k)) else { return false };
+    let Some(kind) = [
+        EventType::ExecutionStarted,
+        EventType::ExecutionFinished,
+        EventType::PrerequisiteChecked,
+        EventType::ControlDecision,
+        EventType::UsageAndDisposition,
+        EventType::DetectionAssessment,
+        EventType::RecoveryOrEscalation,
+    ]
+    .into_iter()
+    .find(|k| Some(k.as_str()) == event && source.can_emit(*k)) else {
+        return false;
+    };
     let (_, origin, evidence, verification) = source.metadata(kind);
     let trust = record.get("trust").unwrap_or(&JsonValue::Null);
     let expected = [
-        ("origin", origin), ("authentication", "local_host_callsite"),
-        ("evidence", evidence), ("verification", verification),
-        ("correlation_scope", if source == Producer::Guard { "local_trace_and_reported_session" } else { "local_trace" })
+        ("origin", origin),
+        ("authentication", "local_host_callsite"),
+        ("evidence", evidence),
+        ("verification", verification),
+        (
+            "correlation_scope",
+            if source == Producer::Guard {
+                "local_trace_and_reported_session"
+            } else {
+                "local_trace"
+            },
+        ),
     ];
-    let Some(instance) = producer.get("instance_id").and_then(JsonValue::as_str) else { return false };
-    let Some(sequence) = producer.get("sequence").and_then(JsonValue::as_u64) else { return false };
+    let Some(instance) = producer.get("instance_id").and_then(JsonValue::as_str) else {
+        return false;
+    };
+    let Some(sequence) = producer.get("sequence").and_then(JsonValue::as_u64) else {
+        return false;
+    };
     let id = format!("{instance}-{sequence:x}");
     record.get("event_id").and_then(JsonValue::as_str) == Some(id.as_str())
         && trust.as_object().is_some_and(|f| f.len() == expected.len())
-        && expected.iter().all(|(k,v)| trust.get(k).and_then(JsonValue::as_str) == Some(*v))
+        && expected
+            .iter()
+            .all(|(k, v)| trust.get(k).and_then(JsonValue::as_str) == Some(*v))
 }
 
 fn encode_descriptor(descriptor: EventDescriptor) -> Result<JsonValue, &'static str> {
