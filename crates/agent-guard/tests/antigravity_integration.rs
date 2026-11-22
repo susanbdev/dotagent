@@ -1546,7 +1546,7 @@ fn test_24_deployed_config_and_direct_replay_never_self_certify_mandatory_protec
 }
 
 #[test]
-fn test_23_missing_empty_and_incomplete_bundle_manifests_rejected_fail_closed() {
+fn test_25_missing_empty_and_incomplete_bundle_manifests_rejected_fail_closed() {
     let ws = IsolatedWorkspace::create("manifest_mandatory");
     let dotagent_root = repo_root_of_dotagent();
     let bin_dir = agent_guard_bin_path()
@@ -1619,7 +1619,7 @@ fn test_23_missing_empty_and_incomplete_bundle_manifests_rejected_fail_closed() 
 }
 
 #[test]
-fn test_24_byte_identical_pre_existing_files_record_backup_and_restore_on_deactivate() {
+fn test_26_byte_identical_pre_existing_files_record_backup_and_restore_on_deactivate() {
     let ws = IsolatedWorkspace::create("byte_identical_preexisting");
     let dotagent_root = repo_root_of_dotagent();
     let bin_dir = agent_guard_bin_path()
@@ -1726,7 +1726,7 @@ fn test_24_byte_identical_pre_existing_files_record_backup_and_restore_on_deacti
 }
 
 #[test]
-fn test_25_user_owned_readonly_or_marker_matching_agents_never_deleted_without_provenance() {
+fn test_27_user_owned_readonly_or_marker_matching_agents_never_deleted_without_provenance() {
     let ws = IsolatedWorkspace::create("user_owned_0444");
     let dotagent_root = repo_root_of_dotagent();
     let bin_dir = agent_guard_bin_path()
@@ -1783,7 +1783,7 @@ fn test_25_user_owned_readonly_or_marker_matching_agents_never_deleted_without_p
 }
 
 #[test]
-fn test_26_external_hook_modification_preserves_backup_while_sibling_additions_survive() {
+fn test_28_external_hook_modification_preserves_backup_while_sibling_additions_survive() {
     let ws = IsolatedWorkspace::create("external_hook_edit_preserves_bak");
     let dotagent_root = repo_root_of_dotagent();
     let bin_dir = agent_guard_bin_path()
