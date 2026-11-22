@@ -20,6 +20,7 @@ fn encode_counters(counters: Counters, lifecycle_reported: bool) -> JsonValue {
         ("unavailable", counters.unavailable),
         ("closed", counters.closed),
         ("invalid", counters.invalid),
+        ("transport", counters.transport),
         ("pending", counters.pending()),
     ];
     let lifecycle_counter = |count| {
@@ -65,6 +66,7 @@ fn bounded_counters(value: &JsonValue) -> Option<JsonValue> {
         unavailable: count("unavailable")?,
         closed: count("closed")?,
         invalid: count("invalid")?,
+        transport: count("transport").unwrap_or(0),
         worker_exits,
         worker_panics,
     };

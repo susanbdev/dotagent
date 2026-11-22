@@ -30,6 +30,9 @@ mod diagnostics;
 pub(crate) mod observations;
 pub(crate) mod runtime;
 mod runtime_health;
+pub(crate) mod protocol;
+#[cfg(unix)]
+pub(crate) mod transport;
 pub(crate) mod store;
 
 pub(crate) const AGENT_SANDBOX_AND_HARNESS_MARKERS: &[&str] = &[

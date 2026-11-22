@@ -135,7 +135,7 @@ pub fn coordinator_socket_path(repo_root: &Path) -> Result<PathBuf, String> {
 }
 
 #[cfg(all(unix, not(target_os = "linux")))]
-fn shorten_unix_socket_via_cwd(sock_path: &Path) -> PathBuf {
+pub(crate) fn shorten_unix_socket_via_cwd(sock_path: &Path) -> PathBuf {
     let Ok(cwd) = std::env::current_dir() else {
         return sock_path.to_path_buf();
     };

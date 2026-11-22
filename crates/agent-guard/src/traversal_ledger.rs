@@ -1510,8 +1510,8 @@ pub fn append_audit_jsonl(
     detail: &str,
     halted: bool,
 ) {
-    use crate::telemetry::runtime::{note_invalid_audit, note_invalid_export, submit_audit_task};
-    use crate::telemetry::store::{Durability, append};
+    use crate::telemetry::protocol::Kind;
+    use crate::telemetry::runtime::{note_invalid_audit, note_invalid_export, submit_record};
 
     const MAX_LEGACY_INPUT_BYTES: usize = 4096;
     if repo_root.as_os_str().len() > MAX_LEGACY_INPUT_BYTES
@@ -1535,41 +1535,18 @@ pub fn append_audit_jsonl(
     }
 
     let has_detail = !detail.is_empty();
-    let _ = submit_audit_task(|| {
-        let repo_root = repo_root.to_path_buf();
-        let session_id = session_id.to_owned();
-        let tool = tool.to_owned();
-        let code = code.to_owned();
-        move || {
-            let session_hash = compute_session_key_hash(&repo_root, &session_id);
-            let (safe_tool, _) = crate::feedback::scrub_high_entropy_and_secrets(&tool, 64);
-            let record = JsonValue::Object(vec![
-                (
-                    "ts".to_string(),
-                    ts_secs.map_or(JsonValue::Null, JsonValue::Uint),
-                ),
-                (
-                    "repo".to_string(),
-                    JsonValue::Str(audit_ascii(&repo_root.to_string_lossy(), 4096)),
-                ),
-                (
-                    "session_id".to_string(),
-                    JsonValue::Str(sanitize_session_id(&session_id)),
-                ),
-                (
-                    "session_hash".to_string(),
-                    JsonValue::Str(session_hash[..16].to_string()),
-                ),
-                ("tool".to_string(), JsonValue::Str(safe_tool)),
-                ("code".to_string(), JsonValue::Str(audit_ascii(&code, 128))),
-                ("halted".to_string(), JsonValue::Bool(halted)),
-                (
-                    "detail".to_string(),
-                    JsonValue::Str(if has_detail { "[redacted]" } else { "" }.to_string()),
-                ),
-            ]);
-            append(&record, Durability::Buffered).is_ok()
-        }
+    let _ = submit_record(Kind::Legacy, || {
+        let session_hash = compute_session_key_hash(repo_root, session_id);
+        let (safe_tool, _) = crate::feedback::scrub_high_entropy_and_secrets(tool, 64);
+        JsonValue::Object(vec![
+            ("ts".into(), ts_secs.map_or(JsonValue::Null, JsonValue::Uint)),
+            ("repo".into(), JsonValue::Str(sha256_hex(repo_root.as_os_str().as_encoded_bytes()))),
+            ("session_hash".into(), JsonValue::Str(session_hash[..16].to_string())),
+            ("tool".into(), JsonValue::Str(safe_tool)),
+            ("code".into(), JsonValue::Str(audit_ascii(code, 128))),
+            ("halted".into(), JsonValue::Bool(halted)),
+            ("detail".into(), JsonValue::Str(if has_detail { "[redacted]" } else { "" }.into())),
+        ])
     });
 }
 

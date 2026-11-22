@@ -44,7 +44,8 @@ use crate::injection_scan::scan_untrusted_content;
 use crate::json::JsonValue;
 use crate::resolve_repo_root;
 use crate::sanitizer::neuter_to_clean_ascii;
-use crate::telemetry::runtime::{note_invalid_export, submit_export};
+use crate::telemetry::protocol::Kind;
+use crate::telemetry::runtime::{note_invalid_export, submit_record};
 use crate::traversal_ledger::{
     O_NOFOLLOW_FLAG, SessionLedger, compute_session_key_hash, ensure_nonsymlink_state_dir,
 };
@@ -1199,21 +1200,8 @@ pub fn record_guard_denial_agentpi_signal(
         note_invalid_export();
         return;
     }
-    let _ = submit_export(|| {
-        let repo_root = repo_root.to_path_buf();
-        let [session_id, tool, code, detail] = [session_id, tool, code, detail].map(str::to_owned);
-        move || {
-            let event = guard_denial_agentpi_event(
-                &repo_root,
-                &session_id,
-                &tool,
-                &code,
-                &detail,
-                halted,
-                ts_unix,
-            );
-            write_agentpi_mirror(&event)
-        }
+    let _ = submit_record(Kind::Denial, || {
+        guard_denial_agentpi_event(repo_root, session_id, tool, code, if detail.is_empty() { "" } else { "[redacted]" }, halted, ts_unix)
     });
 }
 
@@ -1618,10 +1606,7 @@ pub fn commit_ballot_on_host_redacted(
     let agentpi_ev = rec.to_agentpi_event_json();
     publish_agentpi_result(&agentpi_ev, sink);
     // The signed ballot journal already bounds the source fields of this projection.
-    let _ = submit_export(|| {
-        let event = agentpi_ev.clone();
-        move || write_agentpi_mirror(&event)
-    });
+    let _ = submit_record(Kind::Ballot, || agentpi_ev.clone());
     Ok(agentpi_ev)
 }
 

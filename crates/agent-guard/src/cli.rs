@@ -65,6 +65,18 @@ pub fn run_cli_entrypoint() -> ExitCode {
     let _telemetry = matches!(sub, "coordinator" | "hook-daemon" | "mcp-gateway")
         .then(crate::telemetry::runtime::start_host);
     match sub {
+        #[cfg(unix)]
+        "collect-observations" => {
+            let owned = match &args[1..] {
+                [] => false,
+                [flag] if flag == "--owned" => true,
+                _ => return ExitCode::from(2),
+            };
+            match crate::telemetry::transport::collect(owned) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(e) => { eprintln!("observation collector: {e}"); ExitCode::FAILURE }
+            }
+        }
         "swarm" => exec_sibling_tool("swarm-tool", &args[1..]),
         "compile" | "compiler" => exec_sibling_tool("dotagent-compiler", &args[1..]),
         "harness" => exec_sibling_tool("dotagent-harness", &args[1..]),
