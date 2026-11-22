@@ -621,6 +621,7 @@ pub fn run_activate_cli(args: &[String], cwd: &Path) -> ExitCode {
     let mut workspace: Option<PathBuf> = None;
     let mut dotagent_root: Option<PathBuf> = None;
     let mut bin_dir: Option<PathBuf> = None;
+    let mut trace_log: Option<PathBuf> = None;
     let mut dry_run = false;
     let mut antigravity_only = false;
     let mut workspace_only = false;
@@ -650,6 +651,14 @@ pub fn run_activate_cli(args: &[String], cwd: &Path) -> ExitCode {
                     return ExitCode::from(2);
                 };
                 bin_dir = Some(PathBuf::from(v));
+                i += 2;
+            }
+            "--trace-log" => {
+                let Some(v) = args.get(i + 1) else {
+                    eprintln!("[activate] missing path after --trace-log");
+                    return ExitCode::from(2);
+                };
+                trace_log = Some(PathBuf::from(v));
                 i += 2;
             }
             "--antigravity" => {
@@ -731,10 +740,11 @@ pub fn run_activate_cli(args: &[String], cwd: &Path) -> ExitCode {
                 .unwrap_or_else(|_| PathBuf::from(".local/bin")),
         };
         let target_ws = workspace.unwrap_or_else(|| resolve_repo_root(cwd));
-        return match execute_antigravity_activate(
+        return match execute_antigravity_activate_with_trace(
             &resolved_bin_dir,
             &resolved_dotagent,
             &target_ws,
+            trace_log.as_deref(),
             dry_run,
         ) {
             Ok(summary) => {
@@ -1357,6 +1367,7 @@ fn deploy_workspace_bundle(
             dotagent_root,
             target_root,
             abs_guard_bin,
+            None,
             mode,
             dry_run,
             log,
@@ -2086,6 +2097,7 @@ fn pin_antigravity_command_tree(
     val: &JsonValue,
     abs_guard_bin: Option<&Path>,
     abs_workspace: Option<&Path>,
+    abs_trace_log: Option<&Path>,
 ) -> JsonValue {
     let Some(bin) = abs_guard_bin else {
         return val.clone();
@@ -2093,17 +2105,24 @@ fn pin_antigravity_command_tree(
     let bin_s = bin.to_string_lossy();
     if !is_safe_unquoted_path_str(&bin_s) {
         return val.clone();
-    }
+    };
     let ws_suffix = abs_workspace
         .map(|w| w.to_string_lossy().into_owned())
         .filter(|s| is_safe_unquoted_path_str(s))
         .map(|s| format!(" --workspace {s}"))
         .unwrap_or_default();
+    let trace_suffix = abs_trace_log
+        .map(|t| t.to_string_lossy().into_owned())
+        .filter(|s| is_safe_unquoted_path_str(s))
+        .map(|s| format!(" --trace-log {s}"))
+        .unwrap_or_default();
 
     match val {
         JsonValue::Str(s) => {
             if let Some(rest) = s.strip_prefix("agent-guard antigravity-hook ") {
-                JsonValue::Str(format!("{bin_s} antigravity-hook {rest}{ws_suffix}"))
+                JsonValue::Str(format!(
+                    "{bin_s} antigravity-hook {rest}{ws_suffix}{trace_suffix}"
+                ))
             } else if let Some(rest) = s.strip_prefix("agent-guard ") {
                 JsonValue::Str(format!("{bin_s} {rest}"))
             } else if s == "agent-guard" {
@@ -2115,7 +2134,9 @@ fn pin_antigravity_command_tree(
         JsonValue::Array(items) => JsonValue::Array(
             items
                 .iter()
-                .map(|v| pin_antigravity_command_tree(v, abs_guard_bin, abs_workspace))
+                .map(|v| {
+                    pin_antigravity_command_tree(v, abs_guard_bin, abs_workspace, abs_trace_log)
+                })
                 .collect(),
         ),
         JsonValue::Object(entries) => JsonValue::Object(
@@ -2124,7 +2145,12 @@ fn pin_antigravity_command_tree(
                 .map(|(k, v)| {
                     (
                         k.clone(),
-                        pin_antigravity_command_tree(v, abs_guard_bin, abs_workspace),
+                        pin_antigravity_command_tree(
+                            v,
+                            abs_guard_bin,
+                            abs_workspace,
+                            abs_trace_log,
+                        ),
                     )
                 })
                 .collect(),
@@ -2141,10 +2167,30 @@ pub fn merge_antigravity_hooks_json(
     abs_guard_bin: Option<&Path>,
     abs_workspace: Option<&Path>,
 ) -> Result<String, String> {
+    merge_antigravity_hooks_json_with_trace(
+        existing_raw,
+        template_raw,
+        abs_guard_bin,
+        abs_workspace,
+        None,
+    )
+}
+
+pub fn merge_antigravity_hooks_json_with_trace(
+    existing_raw: Option<&str>,
+    template_raw: &str,
+    abs_guard_bin: Option<&Path>,
+    abs_workspace: Option<&Path>,
+    abs_trace_log: Option<&Path>,
+) -> Result<String, String> {
     let template_parsed = JsonValue::parse(template_raw)
         .map_err(|e| format!("invalid dist/antigravity/hooks.json template: {e}"))?;
-    let pinned_template =
-        pin_antigravity_command_tree(&template_parsed, abs_guard_bin, abs_workspace);
+    let pinned_template = pin_antigravity_command_tree(
+        &template_parsed,
+        abs_guard_bin,
+        abs_workspace,
+        abs_trace_log,
+    );
     let Some(template_obj) = pinned_template.as_object() else {
         return Err("dist/antigravity/hooks.json root must be a JSON object".to_string());
     };
@@ -2318,6 +2364,7 @@ fn deploy_antigravity_workspace_plane(
     dotagent_root: &Path,
     target_ws: &Path,
     abs_guard_bin: Option<&Path>,
+    trace_log: Option<&Path>,
     default_new_mode: u32,
     dry_run: bool,
     log: &mut Vec<String>,
@@ -2333,6 +2380,29 @@ fn deploy_antigravity_workspace_plane(
         std::env::current_dir()
             .map_err(|e| format!("cannot resolve current_dir: {e}"))?
             .join(target_ws)
+    };
+    let validated_trace = match trace_log {
+        Some(tp) => {
+            if !tp.is_absolute() {
+                return Err(format!(
+                    "--trace-log '{}' must be an absolute path",
+                    tp.display()
+                ));
+            }
+            let tp_s = tp.to_string_lossy();
+            if !is_safe_unquoted_path_str(&tp_s) {
+                return Err(format!(
+                    "--trace-log '{}' contains unsafe shell characters",
+                    tp.display()
+                ));
+            }
+            if let Some(parent) = tp.parent() {
+                validate_existing_regular_dir_lstat(parent, "--trace-log parent directory")?;
+            }
+            let _ = validate_optional_regular_file_lstat(tp, "--trace-log target file")?;
+            Some(tp.to_path_buf())
+        }
+        None => None,
     };
 
     let ag_dir = detect_antigravity_workspace_dir(&abs_ws)?;
@@ -2363,7 +2433,7 @@ fn deploy_antigravity_workspace_plane(
         None
     };
 
-    let merged_hooks = merge_antigravity_hooks_json(
+    let merged_hooks = merge_antigravity_hooks_json_with_trace(
         existing_hooks_raw.as_deref(),
         &hooks_tpl,
         verified_bin.as_deref(),
@@ -2372,6 +2442,7 @@ fn deploy_antigravity_workspace_plane(
         } else {
             None
         },
+        validated_trace.as_deref(),
     )?;
 
     if dry_run {
@@ -2468,6 +2539,16 @@ pub fn execute_antigravity_activate(
     target_ws: &Path,
     dry_run: bool,
 ) -> Result<Vec<String>, String> {
+    execute_antigravity_activate_with_trace(bin_dir, dotagent_root, target_ws, None, dry_run)
+}
+
+pub fn execute_antigravity_activate_with_trace(
+    bin_dir: &Path,
+    dotagent_root: &Path,
+    target_ws: &Path,
+    trace_log: Option<&Path>,
+    dry_run: bool,
+) -> Result<Vec<String>, String> {
     validate_existing_regular_dir_lstat(target_ws, "target workspace")?;
     let verified_guard = resolve_verified_guard_binary(bin_dir)?;
 
@@ -2485,6 +2566,7 @@ pub fn execute_antigravity_activate(
         dotagent_root,
         target_ws,
         Some(verified_guard.as_path()),
+        trace_log,
         0o444,
         dry_run,
         &mut log,

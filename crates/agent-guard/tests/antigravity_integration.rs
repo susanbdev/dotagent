@@ -1058,3 +1058,351 @@ fn test_20_bundle_and_generated_config_integrity_verification() {
     assert!(tamper_err.contains("bundle integrity mismatch"));
     assert!(!ws.repo_dir.join(".agents/hooks.json").exists());
 }
+
+#[test]
+fn test_21_multi_workspace_unmounted_sibling_and_fail_closed_resolution() {
+    let ws = IsolatedWorkspace::create("unmounted_sibling");
+    let unmounted_sibling = ws.base.join("unmounted_project_resource");
+    assert!(!unmounted_sibling.exists());
+
+    // 21a: Pinned `--workspace` succeeds when an unrelated sibling entry in `workspacePaths` is unmounted on disk
+    let payload = format!(
+        r#"{{"conversationId":"conv_um_1","workspacePaths":["{}","{}","{}"],"toolCall":{{"name":"view_file","args":{{"AbsolutePath":"{}/src/lib.rs","StartLine":1,"EndLine":5}}}},"stepIdx":0}}"#,
+        ws.base.display(),
+        ws.repo_dir.display(),
+        unmounted_sibling.display(),
+        ws.repo_dir.display()
+    );
+    let out_pinned = evaluate_antigravity_hook_bytes(
+        "PreToolUse",
+        payload.as_bytes(),
+        &ws.base,
+        Some(&ws.repo_dir),
+    );
+    assert_eq!(out_pinned.exit_code, 0);
+    let pinned_json = JsonValue::parse(out_pinned.stdout_json.as_deref().expect("stdout"))
+        .expect("valid pinned json");
+    assert_eq!(
+        pinned_json.get("decision").and_then(JsonValue::as_str),
+        Some("allow")
+    );
+
+    // 21b: Unpinned succeeds when OS fallback_cwd uniquely resides inside the mounted repo
+    let out_cwd =
+        evaluate_antigravity_hook_bytes("PreToolUse", payload.as_bytes(), &ws.repo_dir, None);
+    assert_eq!(out_cwd.exit_code, 0);
+    let cwd_json =
+        JsonValue::parse(out_cwd.stdout_json.as_deref().expect("stdout")).expect("valid cwd json");
+    assert_eq!(
+        cwd_json.get("decision").and_then(JsonValue::as_str),
+        Some("allow")
+    );
+
+    // 21c: Unpinned `[mounted_repo, unmounted_sibling]` with external unrelated fallback_cwd fails closed!
+    let external_cwd = ws.base.join("external_unrelated");
+    fs::create_dir_all(&external_cwd).expect("mkdir external_cwd");
+    let ambig_payload = format!(
+        r#"{{"conversationId":"conv_um_2","workspacePaths":["{}","{}"],"toolCall":{{"name":"view_file","args":{{"AbsolutePath":"{}/src/lib.rs","StartLine":1,"EndLine":5}}}},"stepIdx":0}}"#,
+        ws.repo_dir.display(),
+        unmounted_sibling.display(),
+        ws.repo_dir.display()
+    );
+    let out_ambig = evaluate_antigravity_hook_bytes(
+        "PreToolUse",
+        ambig_payload.as_bytes(),
+        &external_cwd,
+        None,
+    );
+    assert_eq!(out_ambig.exit_code, 0);
+    let ambig_json = JsonValue::parse(out_ambig.stdout_json.as_deref().expect("stdout"))
+        .expect("valid ambig json");
+    assert_eq!(
+        ambig_json.get("decision").and_then(JsonValue::as_str),
+        Some("deny")
+    );
+    assert!(
+        ambig_json
+            .get("reason")
+            .and_then(JsonValue::as_str)
+            .unwrap_or("")
+            .contains("AMBIGUOUS_WORKSPACE_IDENTITY")
+    );
+
+    // 21d: Forbidden-zone entry in `workspacePaths` is still hard-denied even if unmounted!
+    let forbidden_payload = format!(
+        r#"{{"conversationId":"conv_um_3","workspacePaths":["/tmp/unmounted_forbidden_ws","{}"],"toolCall":{{"name":"view_file","args":{{"AbsolutePath":"{}/src/lib.rs","StartLine":1,"EndLine":5}}}},"stepIdx":0}}"#,
+        ws.repo_dir.display(),
+        ws.repo_dir.display()
+    );
+    let out_forb = evaluate_antigravity_hook_bytes(
+        "PreToolUse",
+        forbidden_payload.as_bytes(),
+        &ws.repo_dir,
+        Some(&ws.repo_dir),
+    );
+    let forb_json = JsonValue::parse(out_forb.stdout_json.as_deref().expect("stdout"))
+        .expect("valid forbidden json");
+    assert_eq!(
+        forb_json.get("decision").and_then(JsonValue::as_str),
+        Some("deny")
+    );
+    assert!(
+        forb_json
+            .get("reason")
+            .and_then(JsonValue::as_str)
+            .unwrap_or("")
+            .contains("FORBIDDEN_ZONE_WORKSPACE")
+    );
+}
+
+#[test]
+fn test_22_bounded_trace_log_non_sensitive_and_never_alters_decisions() {
+    let ws = IsolatedWorkspace::create("trace_log");
+    let trace_dir = ws.base.join("diag");
+    fs::create_dir_all(&trace_dir).expect("mkdir diag");
+    let trace_file = trace_dir.join("invocations.jsonl");
+
+    let secret_marker = "DO_NOT_LOG_THIS_ARG_VALUE_9981";
+    let allow_payload = format!(
+        r#"{{"conversationId":"conv_tr_1","lastUserInput":"PROMPT_DO_NOT_LOG_7712","workspacePaths":[{}],"toolCall":{{"name":"view_file","args":{{"AbsolutePath":"{}/src/lib.rs","StartLine":1,"EndLine":5,"Note":"{}"}}}},"stepIdx":0}}"#,
+        ws.ws_json(),
+        ws.repo_dir.display(),
+        secret_marker
+    );
+    let (c_allow, out_allow, _) = invoke_guard_cli(
+        &ws,
+        &[
+            "antigravity-hook",
+            "PreToolUse",
+            "--workspace",
+            &ws.repo_dir.to_string_lossy(),
+            "--trace-log",
+            &trace_file.to_string_lossy(),
+        ],
+        allow_payload.as_bytes(),
+        &[("SUPER_SECRET_ENV_PROBE", "ENV_DO_NOT_LOG_4419")],
+    );
+    assert_eq!(c_allow, 0);
+    assert_eq!(
+        JsonValue::parse(out_allow.trim())
+            .expect("json")
+            .get("decision")
+            .and_then(JsonValue::as_str),
+        Some("allow")
+    );
+
+    let deny_payload = format!(
+        r#"{{"conversationId":"conv_tr_1","workspacePaths":[{}],"toolCall":{{"name":"view_file","args":{{"AbsolutePath":"{}/.env"}}}},"stepIdx":1}}"#,
+        ws.ws_json(),
+        ws.repo_dir.display()
+    );
+    let (c_deny, out_deny, _) = invoke_guard_cli(
+        &ws,
+        &[
+            "antigravity-hook",
+            "PreToolUse",
+            "--workspace",
+            &ws.repo_dir.to_string_lossy(),
+            "--trace-log",
+            &trace_file.to_string_lossy(),
+        ],
+        deny_payload.as_bytes(),
+        &[],
+    );
+    assert_eq!(c_deny, 0);
+    assert_eq!(
+        JsonValue::parse(out_deny.trim())
+            .expect("json")
+            .get("decision")
+            .and_then(JsonValue::as_str),
+        Some("deny")
+    );
+
+    let trace_raw = fs::read_to_string(&trace_file).expect("read trace_file");
+    assert!(!trace_raw.contains(secret_marker));
+    assert!(!trace_raw.contains("PROMPT_DO_NOT_LOG_7712"));
+    assert!(!trace_raw.contains("ENV_DO_NOT_LOG_4419"));
+    assert!(!trace_raw.contains(".env"));
+    assert!(!trace_raw.contains("lib.rs"));
+
+    let lines: Vec<&str> = trace_raw.lines().collect();
+    assert_eq!(lines.len(), 2);
+    let rec0 = JsonValue::parse(lines[0]).expect("rec0 json");
+    assert_eq!(
+        rec0.get("adapter_entry").and_then(JsonValue::as_bool),
+        Some(true)
+    );
+    assert_eq!(
+        rec0.get("event").and_then(JsonValue::as_str),
+        Some("PreToolUse")
+    );
+    assert_eq!(
+        rec0.get("tool_name").and_then(JsonValue::as_str),
+        Some("view_file")
+    );
+    assert_eq!(
+        rec0.get("guard_decision").and_then(JsonValue::as_str),
+        Some("allow")
+    );
+    assert_eq!(
+        rec0.get("response_serialized").and_then(JsonValue::as_bool),
+        Some(true)
+    );
+    assert_eq!(rec0.get("exit_code").and_then(JsonValue::as_u64), Some(0));
+
+    let rec1 = JsonValue::parse(lines[1]).expect("rec1 json");
+    assert_eq!(
+        rec1.get("guard_decision").and_then(JsonValue::as_str),
+        Some("deny")
+    );
+    assert_eq!(rec1.get("exit_code").and_then(JsonValue::as_u64), Some(0));
+
+    // Unwritable / nonexistent trace path never alters authoritative guard decision!
+    let bad_trace = ws.base.join("missing_parent/trace.jsonl");
+    let (c_bad, out_bad, _) = invoke_guard_cli(
+        &ws,
+        &[
+            "antigravity-hook",
+            "PreToolUse",
+            "--workspace",
+            &ws.repo_dir.to_string_lossy(),
+            "--trace-log",
+            &bad_trace.to_string_lossy(),
+        ],
+        deny_payload.as_bytes(),
+        &[],
+    );
+    assert_eq!(c_bad, 0);
+    assert_eq!(
+        JsonValue::parse(out_bad.trim())
+            .expect("json")
+            .get("decision")
+            .and_then(JsonValue::as_str),
+        Some("deny")
+    );
+}
+
+#[test]
+fn test_23_authoritative_plugin_lattice_exact_match_denial_for_shell_and_file_tools() {
+    let ws = IsolatedWorkspace::create("canary_plugin_lattice");
+    let canary_dir = ws.repo_dir.join("ag-live-canary");
+    fs::create_dir_all(&canary_dir).expect("mkdir ag-live-canary");
+    fs::write(canary_dir.join("allow-read.txt"), "ALLOW_READ_V1\n").expect("write allow-read");
+    fs::write(canary_dir.join("deny-read.txt"), "DENY_READ_V1\n").expect("write deny-read");
+
+    let plugin_src = concat!(
+        "[[rule]]\n",
+        "id = \"antigravity-canary-exact-deny\"\n",
+        "path_globs = [\"ag-live-canary/deny-canary.txt\", \"ag-live-canary/deny-read.txt\", \"ag-live-canary/deny-write.txt\"]\n",
+        "verdict = \"deny\"\n",
+        "reason = \"ANTIGRAVITY_CANARY_EXACT_DENY\"\n",
+    );
+    let plugin_sha = agent_guard::crypto::sha256_hex(plugin_src.as_bytes());
+    fs::create_dir_all(ws.repo_dir.join("profiles/plugins")).expect("mkdir profiles/plugins");
+    fs::write(
+        ws.repo_dir.join("profiles/plugins/canary-deny.toml"),
+        plugin_src,
+    )
+    .expect("write canary-deny.toml");
+
+    let base_profile =
+        fs::read_to_string(repo_root_of_dotagent().join("profiles/coding-agent.toml"))
+            .expect("read canonical coding-agent.toml");
+    let pinned_profile =
+        format!("{base_profile}\n[plugins]\n\"canary-deny.toml\" = \"{plugin_sha}\"\n");
+    fs::write(
+        ws.repo_dir.join("profiles/coding-agent.toml"),
+        pinned_profile,
+    )
+    .expect("write pinned coding-agent.toml");
+
+    let cases = [
+        (
+            "shell_allow",
+            format!(
+                r#"{{"conversationId":"conv_pl_1","workspacePaths":[{}],"toolCall":{{"name":"run_command","args":{{"CommandLine":"printf 'ALLOW_CANARY' > {}/ag-live-canary/allow-canary.txt","Cwd":"{}"}}}},"stepIdx":0}}"#,
+                ws.ws_json(),
+                ws.repo_dir.display(),
+                ws.repo_dir.display()
+            ),
+            "allow",
+        ),
+        (
+            "shell_deny",
+            format!(
+                r#"{{"conversationId":"conv_pl_1","workspacePaths":[{}],"toolCall":{{"name":"run_command","args":{{"CommandLine":"printf 'DENY_CANARY' > {}/ag-live-canary/deny-canary.txt","Cwd":"{}"}}}},"stepIdx":1}}"#,
+                ws.ws_json(),
+                ws.repo_dir.display(),
+                ws.repo_dir.display()
+            ),
+            "deny",
+        ),
+        (
+            "read_allow",
+            format!(
+                r#"{{"conversationId":"conv_pl_1","workspacePaths":[{}],"toolCall":{{"name":"view_file","args":{{"AbsolutePath":"{}/ag-live-canary/allow-read.txt","StartLine":1,"EndLine":5}}}},"stepIdx":2}}"#,
+                ws.ws_json(),
+                ws.repo_dir.display()
+            ),
+            "allow",
+        ),
+        (
+            "read_deny",
+            format!(
+                r#"{{"conversationId":"conv_pl_1","workspacePaths":[{}],"toolCall":{{"name":"view_file","args":{{"AbsolutePath":"{}/ag-live-canary/deny-read.txt","StartLine":1,"EndLine":5}}}},"stepIdx":3}}"#,
+                ws.ws_json(),
+                ws.repo_dir.display()
+            ),
+            "deny",
+        ),
+        (
+            "write_allow",
+            format!(
+                r#"{{"conversationId":"conv_pl_1","workspacePaths":[{}],"toolCall":{{"name":"write_to_file","args":{{"TargetFile":"{}/ag-live-canary/allow-write.txt","CodeContent":"ALLOW_WRITE_V1\n","Overwrite":true}}}},"stepIdx":4}}"#,
+                ws.ws_json(),
+                ws.repo_dir.display()
+            ),
+            "allow",
+        ),
+        (
+            "write_deny",
+            format!(
+                r#"{{"conversationId":"conv_pl_1","workspacePaths":[{}],"toolCall":{{"name":"write_to_file","args":{{"TargetFile":"{}/ag-live-canary/deny-write.txt","CodeContent":"DENY_WRITE_V1\n","Overwrite":true}}}},"stepIdx":5}}"#,
+                ws.ws_json(),
+                ws.repo_dir.display()
+            ),
+            "deny",
+        ),
+    ];
+
+    for (label, payload, expected_dec) in cases {
+        let (code, stdout, stderr) = invoke_guard_cli(
+            &ws,
+            &[
+                "antigravity-hook",
+                "PreToolUse",
+                "--workspace",
+                &ws.repo_dir.to_string_lossy(),
+            ],
+            payload.as_bytes(),
+            &[],
+        );
+        assert_eq!(code, 0, "{label} must exit 0 (stderr={stderr})");
+        let parsed = JsonValue::parse(stdout.trim()).expect("valid decision json");
+        assert_eq!(
+            parsed.get("decision").and_then(JsonValue::as_str),
+            Some(expected_dec),
+            "unexpected decision on {label}: stdout={stdout} stderr={stderr}"
+        );
+        if expected_dec == "deny" {
+            assert!(
+                parsed
+                    .get("reason")
+                    .and_then(JsonValue::as_str)
+                    .unwrap_or("")
+                    .contains("ANTIGRAVITY_CANARY_EXACT_DENY"),
+                "expected exact plugin denial reason on {label}: {stdout}"
+            );
+        }
+    }
+}

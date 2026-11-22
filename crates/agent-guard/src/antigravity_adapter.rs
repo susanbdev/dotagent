@@ -20,7 +20,7 @@
 //!   non-zero subprocess exit as a failed hook. Diagnostics are written exclusively to `stderr`.
 
 use std::fs;
-use std::io::{self, Read};
+use std::io::{self, Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::process::ExitCode;
 
@@ -38,6 +38,9 @@ use crate::{
 
 /// Maximum raw byte size accepted on stdin for an Antigravity hook payload (256 KiB).
 pub const MAX_ANTIGRAVITY_STDIN_BYTES: usize = 262_144;
+
+/// Maximum byte size of an opt-in bounded non-sensitive invocation trace log (256 KiB).
+const MAX_TRACE_LOG_BYTES: u64 = 262_144;
 
 /// Documented Antigravity lifecycle events (`https://antigravity.google/docs/hooks/`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -148,16 +151,17 @@ impl AdapterRejection {
     }
 }
 
-/// CLI entrypoint for `agent-guard antigravity-hook <Event> [--workspace <dir>] [--json <payload>]`.
+/// CLI entrypoint for `agent-guard antigravity-hook <Event> [--workspace <dir>] [--trace-log <path>] [--json <payload>]`.
 pub fn run_antigravity_hook_cli(args: &[String], fallback_cwd: &Path) -> ExitCode {
     let Some(event_raw) = args.first().map(String::as_str) else {
         eprintln!(
-            "[AGENT-GUARD HARD DENY :: MISSING_LIFECYCLE_EVENT] usage: agent-guard antigravity-hook <SessionStart|PreInvocation|PreToolUse|PostToolUse|PostInvocation|Stop> [--workspace <dir>] [--json <payload>]"
+            "[AGENT-GUARD HARD DENY :: MISSING_LIFECYCLE_EVENT] usage: agent-guard antigravity-hook <SessionStart|PreInvocation|PreToolUse|PostToolUse|PostInvocation|Stop> [--workspace <dir>] [--trace-log <path>] [--json <payload>]"
         );
         return ExitCode::from(2);
     };
 
     let mut explicit_ws: Option<PathBuf> = None;
+    let mut trace_log: Option<PathBuf> = None;
     let mut inline_json: Option<Vec<u8>> = None;
     let mut i = 1usize;
     while i < args.len() {
@@ -170,6 +174,16 @@ pub fn run_antigravity_hook_cli(args: &[String], fallback_cwd: &Path) -> ExitCod
                     return ExitCode::from(2);
                 };
                 explicit_ws = Some(PathBuf::from(w));
+                i += 2;
+            }
+            "--trace-log" => {
+                let Some(tp) = args.get(i + 1) else {
+                    eprintln!(
+                        "[AGENT-GUARD HARD DENY :: INVALID_CLI_ARGS] missing path after --trace-log"
+                    );
+                    return ExitCode::from(2);
+                };
+                trace_log = Some(PathBuf::from(tp));
                 i += 2;
             }
             "--json" => {
@@ -196,14 +210,24 @@ pub fn run_antigravity_hook_cli(args: &[String], fallback_cwd: &Path) -> ExitCod
         None => match read_bounded_stdin_bytes() {
             Ok(b) => b,
             Err(io_err) => {
-                let Some(ev) = AntigravityEvent::parse(event_raw) else {
-                    eprintln!(
-                        "[AGENT-GUARD HARD DENY :: UNSUPPORTED_LIFECYCLE_EVENT] unsupported Antigravity lifecycle event '{event_raw}'"
-                    );
-                    return ExitCode::from(2);
+                let outcome = match AntigravityEvent::parse(event_raw) {
+                    Some(ev) => reject_for_event(
+                        ev,
+                        &AdapterRejection::new("HOOK_STDIN_READ_ERROR", io_err),
+                    ),
+                    None => AntigravityOutcome {
+                        event: None,
+                        enforcement: None,
+                        stdout_json: None,
+                        stderr_diagnostic: Some(format!(
+                            "[AGENT-GUARD HARD DENY :: UNSUPPORTED_LIFECYCLE_EVENT] unsupported Antigravity lifecycle event '{event_raw}'"
+                        )),
+                        exit_code: 2,
+                    },
                 };
-                let outcome =
-                    reject_for_event(ev, &AdapterRejection::new("HOOK_STDIN_READ_ERROR", io_err));
+                if let Some(ref tp) = trace_log {
+                    record_bounded_invocation_trace(tp, event_raw, &[], &outcome);
+                }
                 return emit_outcome(outcome);
             }
         },
@@ -215,7 +239,176 @@ pub fn run_antigravity_hook_cli(args: &[String], fallback_cwd: &Path) -> ExitCod
         fallback_cwd,
         explicit_ws.as_deref(),
     );
+    if let Some(ref tp) = trace_log {
+        record_bounded_invocation_trace(tp, event_raw, &raw_bytes, &outcome);
+    }
     emit_outcome(outcome)
+}
+
+fn sanitize_trace_tool_name(raw_input: &[u8]) -> Option<String> {
+    if raw_input.is_empty() || raw_input.len() > MAX_ANTIGRAVITY_STDIN_BYTES {
+        return None;
+    }
+    let raw_str = std::str::from_utf8(raw_input).ok()?;
+    let parsed = JsonValue::parse(raw_str).ok()?;
+    let name = parsed
+        .get("toolCall")
+        .and_then(|tc| tc.get("name"))
+        .and_then(JsonValue::as_str)?
+        .trim();
+    if name.is_empty() || name.len() > 64 {
+        return None;
+    }
+    if name
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b':' | b'.'))
+    {
+        Some(name.to_string())
+    } else {
+        None
+    }
+}
+
+fn classify_trace_decision(outcome: &AntigravityOutcome) -> (&'static str, bool) {
+    if outcome.exit_code != 0 {
+        return ("protocol_error", outcome.stdout_json.is_none());
+    }
+    let Some(ref raw_out) = outcome.stdout_json else {
+        return ("protocol_error", false);
+    };
+    let Ok(parsed) = JsonValue::parse(raw_out) else {
+        return ("protocol_error", false);
+    };
+    if let Some(dec) = parsed.get("decision").and_then(JsonValue::as_str) {
+        return match dec {
+            "deny" => ("deny", true),
+            "block" => ("terminate_or_block", true),
+            "allow" if parsed.get("overwrite").is_some() => ("allow_overwrite", true),
+            "allow" => ("allow", true),
+            _ => ("protocol_error", true),
+        };
+    }
+    if parsed
+        .get("terminationBehavior")
+        .and_then(JsonValue::as_str)
+        == Some("terminate")
+    {
+        return ("terminate_or_block", true);
+    }
+    ("allow", true)
+}
+
+/// Appends a single bounded, non-sensitive JSONL trace entry when `--trace-log <path>` is configured.
+/// Never logs tool arguments, prompts, environment variables, file contents, paths, or secrets, and
+/// ignores all I/O errors so authoritative guard decisions and exit codes are never altered.
+pub fn record_bounded_invocation_trace(
+    trace_path: &Path,
+    event_raw: &str,
+    raw_input: &[u8],
+    outcome: &AntigravityOutcome,
+) {
+    if !trace_path.is_absolute() {
+        return;
+    }
+    if trace_path
+        .components()
+        .any(|c| matches!(c, Component::ParentDir))
+    {
+        return;
+    }
+    let trace_str = trace_path.to_string_lossy();
+    if is_forbidden_workspace_root(&trace_str) {
+        return;
+    }
+    let Some(parent) = trace_path.parent() else {
+        return;
+    };
+    for anc in parent.ancestors() {
+        let Ok(meta) = fs::symlink_metadata(anc) else {
+            return;
+        };
+        if meta.file_type().is_symlink() || !meta.file_type().is_dir() {
+            return;
+        }
+    }
+    if let Ok(canon_parent) = fs::canonicalize(parent)
+        && is_forbidden_workspace_root(&canon_parent.to_string_lossy())
+    {
+        return;
+    }
+    match fs::symlink_metadata(trace_path) {
+        Ok(meta) => {
+            if meta.file_type().is_symlink()
+                || !meta.file_type().is_file()
+                || meta.len() >= MAX_TRACE_LOG_BYTES
+            {
+                return;
+            }
+        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(_) => return,
+    }
+
+    let now_dur = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    let ts_unix = now_dur.as_secs();
+    let ts_nanos = now_dur.as_nanos();
+    let pid = std::process::id();
+    let mut seed = Vec::with_capacity(64);
+    seed.extend_from_slice(b"dotagent.ag.inv.v1\0");
+    seed.extend_from_slice(&ts_nanos.to_le_bytes());
+    seed.extend_from_slice(&pid.to_le_bytes());
+    seed.extend_from_slice(&(raw_input.len() as u64).to_le_bytes());
+    seed.extend_from_slice(event_raw.as_bytes());
+    let inv_hex = crate::crypto::sha256_hex(&seed);
+    let invocation_id = format!("inv_{}", &inv_hex[..16]);
+
+    let event_label = outcome
+        .event
+        .map(AntigravityEvent::canonical_name)
+        .unwrap_or("invalid");
+    let tool_val = match sanitize_trace_tool_name(raw_input) {
+        Some(t) => JsonValue::Str(t),
+        None => JsonValue::Null,
+    };
+    let (guard_decision, response_serialized) = classify_trace_decision(outcome);
+
+    let line_json = JsonValue::Object(vec![
+        (
+            "schema".to_string(),
+            JsonValue::Str("dotagent.antigravity.invocation.v1".to_string()),
+        ),
+        ("ts_unix".to_string(), JsonValue::Uint(ts_unix)),
+        ("invocation_id".to_string(), JsonValue::Str(invocation_id)),
+        ("adapter_entry".to_string(), JsonValue::Bool(true)),
+        ("event".to_string(), JsonValue::Str(event_label.to_string())),
+        ("tool_name".to_string(), tool_val),
+        (
+            "guard_decision".to_string(),
+            JsonValue::Str(guard_decision.to_string()),
+        ),
+        (
+            "response_serialized".to_string(),
+            JsonValue::Bool(response_serialized),
+        ),
+        (
+            "exit_code".to_string(),
+            JsonValue::Uint(u64::from(outcome.exit_code)),
+        ),
+    ])
+    .to_json_string();
+
+    let mut opts = fs::OpenOptions::new();
+    opts.create(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    if let Ok(mut f) = opts.open(trace_path) {
+        let _ = writeln!(f, "{line_json}");
+    }
 }
 
 fn emit_outcome(outcome: AntigravityOutcome) -> ExitCode {
@@ -467,10 +660,10 @@ fn is_forbidden_workspace_root(path_str: &str) -> bool {
     false
 }
 
-fn validate_nonsymlink_existing_dir(
+fn validate_workspace_path_candidate(
     raw_path: &Path,
     label: &str,
-) -> Result<PathBuf, AdapterRejection> {
+) -> Result<Option<PathBuf>, AdapterRejection> {
     if !raw_path.is_absolute() {
         return Err(AdapterRejection::new(
             "INVALID_WORKSPACE_IDENTITY",
@@ -488,12 +681,50 @@ fn validate_nonsymlink_existing_dir(
             ));
         }
     }
-    let meta = fs::symlink_metadata(raw_path).map_err(|e| {
-        AdapterRejection::new(
-            "INVALID_WORKSPACE_IDENTITY",
-            format!("{label} '{}' does not exist: {e}", raw_path.display()),
-        )
-    })?;
+    let raw_s = raw_path.to_string_lossy();
+    if is_forbidden_workspace_root(&raw_s) {
+        return Err(AdapterRejection::new(
+            "FORBIDDEN_ZONE_WORKSPACE",
+            format!(
+                "{label} '{}' resides inside a forbidden zone.",
+                raw_path.display()
+            ),
+        ));
+    }
+    let meta = match fs::symlink_metadata(raw_path) {
+        Ok(m) => m,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            if let Some(parent) = raw_path.parent() {
+                if fs::symlink_metadata(parent).is_ok_and(|pm| pm.file_type().is_symlink()) {
+                    return Err(AdapterRejection::new(
+                        "INVALID_WORKSPACE_IDENTITY",
+                        format!(
+                            "{label} '{}' parent must not be a symlink.",
+                            raw_path.display()
+                        ),
+                    ));
+                }
+                if fs::canonicalize(parent)
+                    .is_ok_and(|cp| is_forbidden_workspace_root(&cp.to_string_lossy()))
+                {
+                    return Err(AdapterRejection::new(
+                        "FORBIDDEN_ZONE_WORKSPACE",
+                        format!(
+                            "{label} '{}' resides inside a forbidden zone.",
+                            raw_path.display()
+                        ),
+                    ));
+                }
+            }
+            return Ok(None);
+        }
+        Err(e) => {
+            return Err(AdapterRejection::new(
+                "INVALID_WORKSPACE_IDENTITY",
+                format!("{label} '{}' does not exist: {e}", raw_path.display()),
+            ));
+        }
+    };
     if meta.file_type().is_symlink() {
         return Err(AdapterRejection::new(
             "INVALID_WORKSPACE_IDENTITY",
@@ -515,9 +746,8 @@ fn validate_nonsymlink_existing_dir(
             ),
         )
     })?;
-    let raw_s = raw_path.to_string_lossy();
     let canon_s = canon.to_string_lossy();
-    if is_forbidden_workspace_root(&raw_s) || is_forbidden_workspace_root(&canon_s) {
+    if is_forbidden_workspace_root(&canon_s) {
         return Err(AdapterRejection::new(
             "FORBIDDEN_ZONE_WORKSPACE",
             format!(
@@ -526,7 +756,20 @@ fn validate_nonsymlink_existing_dir(
             ),
         ));
     }
-    Ok(canon)
+    Ok(Some(canon))
+}
+
+fn validate_nonsymlink_existing_dir(
+    raw_path: &Path,
+    label: &str,
+) -> Result<PathBuf, AdapterRejection> {
+    match validate_workspace_path_candidate(raw_path, label)? {
+        Some(canon) => Ok(canon),
+        None => Err(AdapterRejection::new(
+            "INVALID_WORKSPACE_IDENTITY",
+            format!("{label} '{}' does not exist.", raw_path.display()),
+        )),
+    }
 }
 
 fn parse_and_verify_common_envelope(
@@ -636,6 +879,7 @@ fn parse_and_verify_common_envelope(
     }
 
     let mut canon_workspaces: Vec<PathBuf> = Vec::with_capacity(ws_arr.len());
+    let mut had_unmounted_sibling = false;
     for entry in ws_arr {
         let Some(raw_ws) = entry.as_str() else {
             return Err(AdapterRejection::new(
@@ -650,14 +894,30 @@ fn parse_and_verify_common_envelope(
             "MISSING_WORKSPACE_IDENTITY",
             "INVALID_WORKSPACE_IDENTITY",
         )?;
-        let canon = validate_nonsymlink_existing_dir(Path::new(raw_ws), "workspacePaths entry")?;
-        if !canon_workspaces.contains(&canon) {
-            canon_workspaces.push(canon);
+        match validate_workspace_path_candidate(Path::new(raw_ws), "workspacePaths entry")? {
+            Some(canon) => {
+                if !canon_workspaces.contains(&canon) {
+                    canon_workspaces.push(canon);
+                }
+            }
+            None => {
+                had_unmounted_sibling = true;
+            }
         }
     }
+    if canon_workspaces.is_empty() {
+        return Err(AdapterRejection::new(
+            "INVALID_WORKSPACE_IDENTITY",
+            "No existing workspace directory found in Antigravity 'workspacePaths'.",
+        ));
+    }
 
-    let selected_workspace =
-        resolve_authoritative_workspace(&canon_workspaces, fallback_cwd, explicit_workspace)?;
+    let selected_workspace = resolve_authoritative_workspace(
+        &canon_workspaces,
+        had_unmounted_sibling,
+        fallback_cwd,
+        explicit_workspace,
+    )?;
     let repo_root = resolve_repo_root(&selected_workspace);
 
     Ok(CommonEnvelope {
@@ -670,6 +930,7 @@ fn parse_and_verify_common_envelope(
 
 fn resolve_authoritative_workspace(
     canon_workspaces: &[PathBuf],
+    had_unmounted_sibling: bool,
     fallback_cwd: &Path,
     explicit_workspace: Option<&Path>,
 ) -> Result<PathBuf, AdapterRejection> {
@@ -690,7 +951,7 @@ fn resolve_authoritative_workspace(
     let fallback_canon =
         fs::canonicalize(fallback_cwd).unwrap_or_else(|_| lexical_normalize(fallback_cwd));
 
-    if canon_workspaces.len() == 1 {
+    if canon_workspaces.len() == 1 && !had_unmounted_sibling {
         let only = &canon_workspaces[0];
         let ws_repo = resolve_repo_root(only);
         let cwd_git = discover_git_root_from_canon(&fallback_canon);
@@ -736,7 +997,7 @@ fn resolve_authoritative_workspace(
         .iter()
         .filter(|w| w.join(".git").exists())
         .collect();
-    if git_workspaces.len() == 1 {
+    if !had_unmounted_sibling && git_workspaces.len() == 1 {
         let sole_git = git_workspaces[0];
         let all_others_are_non_git_ancestors = canon_workspaces
             .iter()
