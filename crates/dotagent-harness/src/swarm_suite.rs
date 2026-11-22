@@ -374,6 +374,18 @@ fn case_six_role_e2e(workspace_root: &Path, bins: &WorkspaceBinaries) -> Result<
         None,
         None,
     )?;
+    if !agent_guard::exec_sandbox::probe_host_sandbox_mode().is_kernel_enforced() {
+        let stderr = String::from_utf8_lossy(&cp.stderr);
+        if cp.status.success() || !stderr.contains("KERNEL_SANDBOX_UNAVAILABLE") {
+            return Err(format!(
+                "expected fail-closed KERNEL_SANDBOX_UNAVAILABLE on checkpoint-green without host VFS sandbox, got: {stderr}"
+            ));
+        }
+        return Ok(
+            "Swarm 6-role pre-checkpoint delegation verified and checkpoint-green failed closed with KERNEL_SANDBOX_UNAVAILABLE"
+                .to_string(),
+        );
+    }
     if !cp.status.success() {
         return Err(format!(
             "grunt checkpoint-green failed: {}",
@@ -512,10 +524,16 @@ fn case_da01_master_escalation(
             "CRITICAL-DA-01a regression: sandboxed AGENT_GUARD_ROLE=master succeeded!".to_string(),
         );
     }
-    if !String::from_utf8_lossy(&sb_out.stderr).contains("ROLE_CAPABILITY_MISMATCH") {
+    let sb_stderr = String::from_utf8_lossy(&sb_out.stderr);
+    if agent_guard::exec_sandbox::probe_host_sandbox_mode().is_kernel_enforced() {
+        if !sb_stderr.contains("ROLE_CAPABILITY_MISMATCH") {
+            return Err(format!(
+                "expected ROLE_CAPABILITY_MISMATCH inside sandbox, got: {sb_stderr}"
+            ));
+        }
+    } else if !sb_stderr.contains("KERNEL_SANDBOX_UNAVAILABLE") {
         return Err(format!(
-            "expected ROLE_CAPABILITY_MISMATCH inside sandbox, got: {}",
-            String::from_utf8_lossy(&sb_out.stderr)
+            "expected fail-closed KERNEL_SANDBOX_UNAVAILABLE when worker capability active without host VFS sandbox, got: {sb_stderr}"
         ));
     }
 
@@ -731,7 +749,7 @@ fn case_da02a_review_ledger_and_rounds(
         None,
         None,
     )?;
-    let _ = run_swarm_cmd(
+    let cp2 = run_swarm_cmd(
         bins,
         &sb,
         &[
@@ -750,6 +768,18 @@ fn case_da02a_review_ledger_and_rounds(
         None,
         None,
     )?;
+    if !agent_guard::exec_sandbox::probe_host_sandbox_mode().is_kernel_enforced() {
+        let stderr = String::from_utf8_lossy(&cp2.stderr);
+        if cp2.status.success() || !stderr.contains("KERNEL_SANDBOX_UNAVAILABLE") {
+            return Err(format!(
+                "expected KERNEL_SANDBOX_UNAVAILABLE on DA-02a checkpoint-green without host VFS sandbox, got: {stderr}"
+            ));
+        }
+        return Ok(
+            "DA-02a missing-ledger block, round replay block, and fail-closed KERNEL_SANDBOX_UNAVAILABLE verified"
+                .to_string(),
+        );
+    }
     let _ = run_swarm_cmd(
         bins,
         &sb,
@@ -963,7 +993,7 @@ fn case_da04b_hash_chained_ledger(
             None,
             None,
         )?;
-        let _ = run_swarm_cmd(
+        let cp = run_swarm_cmd(
             bins,
             &sb,
             &[
@@ -982,6 +1012,18 @@ fn case_da04b_hash_chained_ledger(
             None,
             None,
         )?;
+        if !agent_guard::exec_sandbox::probe_host_sandbox_mode().is_kernel_enforced() {
+            let stderr = String::from_utf8_lossy(&cp.stderr);
+            if cp.status.success() || !stderr.contains("KERNEL_SANDBOX_UNAVAILABLE") {
+                return Err(format!(
+                    "expected KERNEL_SANDBOX_UNAVAILABLE on DA-04b checkpoint-green without host VFS sandbox, got: {stderr}"
+                ));
+            }
+            return Ok(
+                "DA-04b constant-time MAC check and fail-closed KERNEL_SANDBOX_UNAVAILABLE verified"
+                    .to_string(),
+            );
+        }
         let led = run_swarm_cmd(
             bins,
             &sb,
@@ -1616,12 +1658,25 @@ fn case_v2_bootstrap_concurrent_scope(
     let sbx_out = sbx_cmd
         .output()
         .map_err(|e| format!("exec-sandbox precreate test failed: {e}"))?;
-    if !sbx_out.status.success() || !sb.repo_dir.join("newdir/created.rs").is_file() {
-        return Err(format!(
-            "exec-sandbox failed writing capability-authorized newdir/created.rs: status={:?} stderr={}",
-            sbx_out.status.code(),
-            String::from_utf8_lossy(&sbx_out.stderr)
-        ));
+    if agent_guard::exec_sandbox::probe_host_sandbox_mode().is_kernel_enforced() {
+        if !sbx_out.status.success() || !sb.repo_dir.join("newdir/created.rs").is_file() {
+            return Err(format!(
+                "exec-sandbox failed writing capability-authorized newdir/created.rs: status={:?} stderr={}",
+                sbx_out.status.code(),
+                String::from_utf8_lossy(&sbx_out.stderr)
+            ));
+        }
+    } else {
+        let stderr = String::from_utf8_lossy(&sbx_out.stderr);
+        if sbx_out.status.success()
+            || !stderr.contains("KERNEL_SANDBOX_UNAVAILABLE")
+            || sb.repo_dir.join("newdir/created.rs").exists()
+        {
+            return Err(format!(
+                "expected fail-closed KERNEL_SANDBOX_UNAVAILABLE without side effect when host VFS sandbox is unavailable, got status={:?} stderr={stderr}",
+                sbx_out.status.code()
+            ));
+        }
     }
 
     // 3c. Vetted `.woff2` magic-byte check + raw SHA-256 breadcrumb in `post-edit`:
@@ -1868,6 +1923,18 @@ fn case_v2_anti_stub_and_live_contracts(
         None,
         None,
     )?;
+    if !agent_guard::exec_sandbox::probe_host_sandbox_mode().is_kernel_enforced() {
+        let stderr = String::from_utf8_lossy(&cp_a1.stderr);
+        if cp_a1.status.success() || !stderr.contains("KERNEL_SANDBOX_UNAVAILABLE") {
+            return Err(format!(
+                "expected KERNEL_SANDBOX_UNAVAILABLE on checkpoint-green a1 without host VFS sandbox, got: {stderr}"
+            ));
+        }
+        return Ok(
+            "QA live integration contract gate and fail-closed KERNEL_SANDBOX_UNAVAILABLE verified"
+                .to_string(),
+        );
+    }
     if !cp_a1.status.success() {
         return Err(format!(
             "grunt checkpoint-green a1 failed: {}",

@@ -1261,6 +1261,14 @@ pub fn evaluate_install_state(bin_dir: &Path, version_str: &str) -> InstallState
             detail: "agent-guard binary is 0 bytes".to_string(),
         };
     }
+    if !is_valid_host_native_executable(&bytes) {
+        return InstallState::IntegrityFailed {
+            binary_path: canon.display().to_string(),
+            reason_code: "BINARY_INVALID_FORMAT",
+            detail: "agent-guard binary is not a valid native executable for this host OS/arch"
+                .to_string(),
+        };
+    }
     let digest = sha256_hex(&bytes);
     InstallState::Verified {
         binary_path: canon.display().to_string(),
@@ -1269,10 +1277,228 @@ pub fn evaluate_install_state(bin_dir: &Path, version_str: &str) -> InstallState
     }
 }
 
+pub fn is_valid_host_native_executable(bytes: &[u8]) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        is_valid_host_elf(bytes)
+    }
+    #[cfg(target_os = "macos")]
+    {
+        is_valid_host_macho(bytes)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        bytes.len() >= 4
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn expected_elf_machine() -> Option<u16> {
+    #[cfg(target_arch = "x86_64")]
+    {
+        Some(62)
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        Some(183)
+    }
+    #[cfg(target_arch = "riscv64")]
+    {
+        Some(243)
+    }
+    #[cfg(target_arch = "x86")]
+    {
+        Some(3)
+    }
+    #[cfg(target_arch = "arm")]
+    {
+        Some(40)
+    }
+    #[cfg(not(any(
+        target_arch = "x86_64",
+        target_arch = "aarch64",
+        target_arch = "riscv64",
+        target_arch = "x86",
+        target_arch = "arm"
+    )))]
+    {
+        None
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn is_valid_host_elf(bytes: &[u8]) -> bool {
+    let expected_class: u8 = if cfg!(target_pointer_width = "64") {
+        2
+    } else {
+        1
+    };
+    let expected_data: u8 = if cfg!(target_endian = "little") { 1 } else { 2 };
+    let min_hdr = if expected_class == 2 {
+        64usize
+    } else {
+        52usize
+    };
+    if bytes.len() < min_hdr || &bytes[0..4] != b"\x7fELF" {
+        return false;
+    }
+    if bytes[4] != expected_class || bytes[5] != expected_data || bytes[6] != 1 {
+        return false;
+    }
+    let e_type = u16::from_ne_bytes([bytes[16], bytes[17]]);
+    if !matches!(e_type, 2 | 3) {
+        return false;
+    }
+    let e_machine = u16::from_ne_bytes([bytes[18], bytes[19]]);
+    if let Some(exp_mach) = expected_elf_machine()
+        && e_machine != exp_mach
+    {
+        return false;
+    }
+    let e_version = u32::from_ne_bytes([bytes[20], bytes[21], bytes[22], bytes[23]]);
+    if e_version != 1 {
+        return false;
+    }
+    if expected_class == 2 {
+        let Ok(phoff_arr) = bytes[32..40].try_into() else {
+            return false;
+        };
+        let Ok(e_phoff) = usize::try_from(u64::from_ne_bytes(phoff_arr)) else {
+            return false;
+        };
+        let e_phentsize = u16::from_ne_bytes([bytes[54], bytes[55]]) as usize;
+        let e_phnum = u16::from_ne_bytes([bytes[56], bytes[57]]) as usize;
+        e_phoff >= 64
+            && e_phentsize >= 56
+            && e_phnum > 0
+            && e_phnum
+                .checked_mul(e_phentsize)
+                .and_then(|sz| e_phoff.checked_add(sz))
+                .is_some_and(|end| end <= bytes.len())
+    } else {
+        let e_phoff = u32::from_ne_bytes([bytes[28], bytes[29], bytes[30], bytes[31]]) as usize;
+        let e_phentsize = u16::from_ne_bytes([bytes[42], bytes[43]]) as usize;
+        let e_phnum = u16::from_ne_bytes([bytes[44], bytes[45]]) as usize;
+        e_phoff >= 52
+            && e_phentsize >= 32
+            && e_phnum > 0
+            && e_phnum
+                .checked_mul(e_phentsize)
+                .and_then(|sz| e_phoff.checked_add(sz))
+                .is_some_and(|end| end <= bytes.len())
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn expected_macho_cputype() -> Option<u32> {
+    #[cfg(target_arch = "aarch64")]
+    {
+        Some(0x0100_000c)
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        Some(0x0100_0007)
+    }
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    {
+        None
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn is_valid_thin_macho64(slice: &[u8], expected_cpu: Option<u32>) -> bool {
+    if slice.len() < 32 || slice[0..4] != [0xcf, 0xfa, 0xed, 0xfe] {
+        return false;
+    }
+    let cputype = u32::from_le_bytes([slice[4], slice[5], slice[6], slice[7]]);
+    if let Some(exp) = expected_cpu
+        && cputype != exp
+    {
+        return false;
+    }
+    let filetype = u32::from_le_bytes([slice[12], slice[13], slice[14], slice[15]]);
+    let ncmds = u32::from_le_bytes([slice[16], slice[17], slice[18], slice[19]]);
+    let sizeofcmds = u32::from_le_bytes([slice[20], slice[21], slice[22], slice[23]]) as usize;
+    filetype == 2
+        && ncmds > 0
+        && sizeofcmds > 0
+        && 32usize
+            .checked_add(sizeofcmds)
+            .is_some_and(|end| end <= slice.len())
+}
+
+#[cfg(target_os = "macos")]
+fn is_valid_host_macho(bytes: &[u8]) -> bool {
+    if bytes.len() < 8 {
+        return false;
+    }
+    let exp_cpu = expected_macho_cputype();
+    if bytes[0..4] == [0xcf, 0xfa, 0xed, 0xfe] {
+        return is_valid_thin_macho64(bytes, exp_cpu);
+    }
+    if bytes[0..4] == [0xca, 0xfe, 0xba, 0xbe] {
+        let nfat = u32::from_be_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]) as usize;
+        if !(1..=16).contains(&nfat) {
+            return false;
+        }
+        let hdr_end = 8usize + nfat * 20;
+        if bytes.len() < hdr_end {
+            return false;
+        }
+        let mut matched_host_arch = false;
+        for idx in 0..nfat {
+            let base = 8 + idx * 20;
+            let cpu = u32::from_be_bytes([
+                bytes[base],
+                bytes[base + 1],
+                bytes[base + 2],
+                bytes[base + 3],
+            ]);
+            let off = u32::from_be_bytes([
+                bytes[base + 8],
+                bytes[base + 9],
+                bytes[base + 10],
+                bytes[base + 11],
+            ]) as usize;
+            let sz = u32::from_be_bytes([
+                bytes[base + 12],
+                bytes[base + 13],
+                bytes[base + 14],
+                bytes[base + 15],
+            ]) as usize;
+            let Some(slice_end) = off.checked_add(sz) else {
+                return false;
+            };
+            if off < hdr_end || sz < 32 || slice_end > bytes.len() {
+                return false;
+            }
+            if exp_cpu.is_none_or(|e| cpu == e)
+                && is_valid_thin_macho64(&bytes[off..slice_end], exp_cpu)
+            {
+                matched_host_arch = true;
+            }
+        }
+        return matched_host_arch;
+    }
+    false
+}
+
+fn binary_token_matches(first_token: &str, verified_bin_canon: Option<&Path>) -> bool {
+    let first_path = Path::new(first_token);
+    if !first_path.is_absolute() {
+        return false;
+    }
+    let Some(exp_bin) = verified_bin_canon else {
+        return false;
+    };
+    fs::canonicalize(first_path).ok().as_deref() == Some(exp_bin)
+}
+
 fn validate_antigravity_command_list(
     hooks_arr: &[JsonValue],
     expected_event: &str,
     verified_bin_canon: Option<&Path>,
+    expected_ws_canon: Option<&Path>,
 ) -> Result<bool, (&'static str, String)> {
     if hooks_arr.is_empty() {
         return Err((
@@ -1308,7 +1534,7 @@ fn validate_antigravity_command_list(
                 format!("Antigravity '{expected_event}' hook missing string 'command'"),
             ));
         };
-        let tokens = tokenize_antigravity_hook_command(cmd)?;
+        let tokens = tokenize_hook_command(cmd, "Antigravity")?;
         if tokens.len() < 3
             || tokens[1] != "antigravity-hook"
             || tokens[2].as_str() != expected_event
@@ -1336,13 +1562,28 @@ fn validate_antigravity_command_list(
             match flag {
                 "--workspace" if !seen_ws => {
                     seen_ws = true;
-                    if !Path::new(val).is_absolute() {
+                    let ws_arg = Path::new(val);
+                    if !ws_arg.is_absolute() {
                         return Err((
                             "CONFIG_PROTOCOL_INCOMPATIBLE",
                             format!(
                                 "Antigravity '{expected_event}' --workspace argument must be an absolute path"
                             ),
                         ));
+                    }
+                    if let Some(exp_ws) = expected_ws_canon {
+                        let arg_canon =
+                            fs::canonicalize(ws_arg).unwrap_or_else(|_| ws_arg.to_path_buf());
+                        if arg_canon != exp_ws {
+                            return Err((
+                                "CONFIG_WORKSPACE_MISMATCH",
+                                format!(
+                                    "Antigravity '{expected_event}' --workspace '{}' does not match inspected workspace '{}'",
+                                    ws_arg.display(),
+                                    exp_ws.display()
+                                ),
+                            ));
+                        }
                     }
                 }
                 "--trace-log" if !seen_trace => {
@@ -1368,31 +1609,26 @@ fn validate_antigravity_command_list(
             idx += 2;
         }
 
-        let first_path = Path::new(&tokens[0]);
-        if !first_path.is_absolute() {
+        if !binary_token_matches(&tokens[0], verified_bin_canon) {
             all_bins_match = false;
-        } else if let Some(exp_bin) = verified_bin_canon {
-            let tok_canon = fs::canonicalize(first_path).ok();
-            if tok_canon.as_deref() != Some(exp_bin) {
-                all_bins_match = false;
-            }
         }
     }
     Ok(all_bins_match)
 }
 
-fn tokenize_antigravity_hook_command(cmd: &str) -> Result<Vec<String>, (&'static str, String)> {
+fn tokenize_hook_command(cmd: &str, label: &str) -> Result<Vec<String>, (&'static str, String)> {
     if cmd.trim().is_empty() || cmd.bytes().any(|b| b < 0x20 || b == 0x7f) {
         return Err((
             "CONFIG_PROTOCOL_INCOMPATIBLE",
-            "Antigravity hook command is empty or contains control characters".to_string(),
+            format!("{label} hook command is empty or contains control characters"),
         ));
     }
     let mut tokens = Vec::new();
     let mut cur = String::new();
     let mut in_token = false;
     let mut in_single = false;
-    for ch in cmd.chars() {
+    let mut chars = cmd.chars().peekable();
+    while let Some(ch) = chars.next() {
         if in_single {
             if ch == '\'' {
                 in_single = false;
@@ -1402,6 +1638,10 @@ fn tokenize_antigravity_hook_command(cmd: &str) -> Result<Vec<String>, (&'static
         } else if ch == '\'' {
             in_single = true;
             in_token = true;
+        } else if ch == '\\' && chars.peek() == Some(&'\'') {
+            let _ = chars.next();
+            cur.push('\'');
+            in_token = true;
         } else if ch == ' ' || ch == '\t' {
             if in_token {
                 tokens.push(std::mem::take(&mut cur));
@@ -1409,11 +1649,28 @@ fn tokenize_antigravity_hook_command(cmd: &str) -> Result<Vec<String>, (&'static
             }
         } else if matches!(
             ch,
-            ';' | '|' | '&' | '`' | '$' | '<' | '>' | '(' | ')' | '\\' | '"'
+            ';' | '|'
+                | '&'
+                | '`'
+                | '$'
+                | '<'
+                | '>'
+                | '('
+                | ')'
+                | '\\'
+                | '"'
+                | '*'
+                | '?'
+                | '['
+                | ']'
+                | '~'
+                | '#'
+                | '{'
+                | '}'
         ) {
             return Err((
                 "CONFIG_PROTOCOL_INCOMPATIBLE",
-                format!("Antigravity hook command contains disallowed shell metacharacter '{ch}'"),
+                format!("{label} hook command contains disallowed shell metacharacter '{ch}'"),
             ));
         } else {
             cur.push(ch);
@@ -1423,13 +1680,788 @@ fn tokenize_antigravity_hook_command(cmd: &str) -> Result<Vec<String>, (&'static
     if in_single {
         return Err((
             "CONFIG_PROTOCOL_INCOMPATIBLE",
-            "Antigravity hook command has an unclosed single quote".to_string(),
+            format!("{label} hook command has an unclosed single quote"),
         ));
     }
     if in_token {
         tokens.push(cur);
     }
     Ok(tokens)
+}
+
+fn validate_standard_hook_command_entry(
+    cmd: &str,
+    adapter_id: &str,
+    expected_subcmd: &str,
+    verified_bin_canon: Option<&Path>,
+) -> Result<(bool, bool), (&'static str, String)> {
+    let Ok(tokens) = tokenize_hook_command(cmd, adapter_id) else {
+        return Ok((false, false));
+    };
+    if tokens.len() < 2 || tokens[1].as_str() != expected_subcmd {
+        return Ok((false, false));
+    }
+    let rest_valid = match &tokens[2..] {
+        [] => true,
+        [flag, val] if flag == "--adapter" && val == adapter_id => true,
+        _ => false,
+    };
+    if !rest_valid {
+        return Err((
+            "CONFIG_PROTOCOL_INCOMPATIBLE",
+            format!(
+                "{adapter_id} '{expected_subcmd}' command contains unsupported arguments in '{cmd}'"
+            ),
+        ));
+    }
+    let is_guard_cmd = Path::new(&tokens[0])
+        .file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| n == "agent-guard");
+    if !is_guard_cmd {
+        return Ok((false, false));
+    }
+    Ok((true, binary_token_matches(&tokens[0], verified_bin_canon)))
+}
+
+fn validate_nested_hook_event(
+    hooks_root: &JsonValue,
+    adapter_id: &str,
+    event_key: &str,
+    expected_subcmd: &str,
+    wildcard_matchers: Option<&[&str]>,
+    verified_bin_canon: Option<&Path>,
+) -> Result<bool, (&'static str, String)> {
+    let Some(groups) = hooks_root.get(event_key).and_then(JsonValue::as_array) else {
+        return Err((
+            "CONFIG_PROTOCOL_INCOMPATIBLE",
+            format!("missing required 'hooks.{event_key}' array"),
+        ));
+    };
+    let mut found_managed = false;
+    let mut all_matched = verified_bin_canon.is_some();
+    for g in groups {
+        if let Some(allowed_wildcards) = wildcard_matchers {
+            let m = g.get("matcher").and_then(JsonValue::as_str).unwrap_or("");
+            if !allowed_wildcards.contains(&m) {
+                continue;
+            }
+        }
+        let Some(inner) = g.get("hooks").and_then(JsonValue::as_array) else {
+            return Err((
+                "CONFIG_PROTOCOL_INCOMPATIBLE",
+                format!("'{event_key}' entry missing 'hooks' array"),
+            ));
+        };
+        for item in inner {
+            if item.get("type").and_then(JsonValue::as_str) != Some("command") {
+                continue;
+            }
+            let Some(cmd) = item.get("command").and_then(JsonValue::as_str) else {
+                return Err((
+                    "CONFIG_PROTOCOL_INCOMPATIBLE",
+                    format!("'{event_key}' command hook missing string 'command'"),
+                ));
+            };
+            let (is_ours, bin_ok) = validate_standard_hook_command_entry(
+                cmd,
+                adapter_id,
+                expected_subcmd,
+                verified_bin_canon,
+            )?;
+            if is_ours {
+                found_managed = true;
+                all_matched &= bin_ok;
+            }
+        }
+    }
+    if !found_managed {
+        let code = if wildcard_matchers.is_some() {
+            "CONFIG_INCOMPLETE_MATCHER"
+        } else {
+            "CONFIG_PROTOCOL_INCOMPATIBLE"
+        };
+        return Err((
+            code,
+            format!(
+                "{adapter_id} '{event_key}' is missing required 'agent-guard {expected_subcmd}' handler"
+            ),
+        ));
+    }
+    Ok(all_matched)
+}
+
+fn validate_cursor_hook_event(
+    hooks_root: &JsonValue,
+    event_key: &str,
+    expected_subcmd: &str,
+    verified_bin_canon: Option<&Path>,
+) -> Result<bool, (&'static str, String)> {
+    let Some(items) = hooks_root.get(event_key).and_then(JsonValue::as_array) else {
+        return Err((
+            "CONFIG_PROTOCOL_INCOMPATIBLE",
+            format!("missing required Cursor 'hooks.{event_key}' array"),
+        ));
+    };
+    let mut found_managed = false;
+    let mut all_matched = verified_bin_canon.is_some();
+    for item in items {
+        let Some(cmd) = item.get("command").and_then(JsonValue::as_str) else {
+            return Err((
+                "CONFIG_PROTOCOL_INCOMPATIBLE",
+                format!("Cursor '{event_key}' entry missing string 'command'"),
+            ));
+        };
+        let (is_ours, bin_ok) = validate_standard_hook_command_entry(
+            cmd,
+            "cursor",
+            expected_subcmd,
+            verified_bin_canon,
+        )?;
+        if is_ours {
+            found_managed = true;
+            all_matched &= bin_ok;
+        }
+    }
+    if !found_managed {
+        return Err((
+            "CONFIG_PROTOCOL_INCOMPATIBLE",
+            format!(
+                "Cursor '{event_key}' is missing required 'agent-guard {expected_subcmd}' handler"
+            ),
+        ));
+    }
+    Ok(all_matched)
+}
+
+#[derive(Debug, Clone)]
+enum StrictTomlVal {
+    Str(String),
+    Bool(bool),
+    Int(i64),
+    Float,
+    Array(Vec<Self>),
+    InlineTable(Vec<(Vec<String>, Self)>),
+}
+
+fn strip_toml_line_and_count(line: &str) -> Result<(&str, i32, i32), String> {
+    if line.contains("\"\"\"") || line.contains("'''") {
+        return Err("multiline string literals are not permitted in Codex config.toml".to_string());
+    }
+    let mut in_double = false;
+    let mut in_single = false;
+    let mut escaped = false;
+    let mut bracket_delta: i32 = 0;
+    let mut brace_delta: i32 = 0;
+    let mut end_idx = line.len();
+
+    for (idx, ch) in line.char_indices() {
+        if (ch < '\x20' && ch != '\t') || ch == '\x7f' {
+            return Err("control character in TOML line".to_string());
+        }
+        if in_double {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == '"' {
+                in_double = false;
+            }
+        } else if in_single {
+            if ch == '\'' {
+                in_single = false;
+            }
+        } else {
+            match ch {
+                '"' => in_double = true,
+                '\'' => in_single = true,
+                '[' => bracket_delta += 1,
+                ']' => bracket_delta -= 1,
+                '{' => brace_delta += 1,
+                '}' => brace_delta -= 1,
+                '#' => {
+                    end_idx = idx;
+                    break;
+                }
+                _ => {}
+            }
+        }
+    }
+    if in_double || in_single {
+        return Err("unclosed string literal in TOML line".to_string());
+    }
+    if brace_delta != 0 {
+        return Err("unbalanced inline table '{...}' braces on TOML line".to_string());
+    }
+    Ok((&line[..end_idx], bracket_delta, brace_delta))
+}
+
+fn consume_toml_basic_string(input: &str) -> Result<(String, &str), String> {
+    let Some(rest) = input.strip_prefix('"') else {
+        return Err("expected '\"'".to_string());
+    };
+    let mut out = String::new();
+    let mut chars = rest.char_indices();
+    while let Some((idx, ch)) = chars.next() {
+        if ch == '"' {
+            return Ok((out, &rest[idx + 1..]));
+        }
+        if ch == '\\' {
+            let Some((_, esc)) = chars.next() else {
+                return Err("unterminated escape in TOML basic string".to_string());
+            };
+            match esc {
+                '"' => out.push('"'),
+                '\\' => out.push('\\'),
+                'b' => out.push('\u{0008}'),
+                'f' => out.push('\u{000c}'),
+                'n' => out.push('\n'),
+                'r' => out.push('\r'),
+                't' => out.push('\t'),
+                'u' | 'U' => {
+                    let count = if esc == 'u' { 4 } else { 8 };
+                    let mut hex = String::with_capacity(count);
+                    for _ in 0..count {
+                        let Some((_, hc)) = chars.next() else {
+                            return Err("truncated Unicode escape in TOML string".to_string());
+                        };
+                        if !hc.is_ascii_hexdigit() {
+                            return Err("invalid hex digit in TOML Unicode escape".to_string());
+                        }
+                        hex.push(hc);
+                    }
+                    let cp = u32::from_str_radix(&hex, 16)
+                        .ok()
+                        .and_then(char::from_u32)
+                        .ok_or_else(|| "invalid Unicode scalar in TOML string".to_string())?;
+                    out.push(cp);
+                }
+                _ => return Err(format!("invalid escape '\\{esc}' in TOML string")),
+            }
+        } else {
+            out.push(ch);
+        }
+    }
+    Err("unclosed basic string".to_string())
+}
+
+fn consume_toml_literal_string(input: &str) -> Result<(String, &str), String> {
+    let Some(rest) = input.strip_prefix('\'') else {
+        return Err("expected \"'\"".to_string());
+    };
+    let Some(end) = rest.find('\'') else {
+        return Err("unclosed literal string".to_string());
+    };
+    Ok((rest[..end].to_string(), &rest[end + 1..]))
+}
+
+fn parse_toml_key_segments(input: &str) -> Result<(Vec<String>, &str), String> {
+    let mut cur = input.trim_start_matches([' ', '\t']);
+    let mut segments = Vec::new();
+    loop {
+        if cur.starts_with('"') {
+            let (seg, after) = consume_toml_basic_string(cur)?;
+            segments.push(seg);
+            cur = after;
+        } else if cur.starts_with('\'') {
+            let (seg, after) = consume_toml_literal_string(cur)?;
+            segments.push(seg);
+            cur = after;
+        } else {
+            let len = cur
+                .bytes()
+                .take_while(|b| b.is_ascii_alphanumeric() || *b == b'_' || *b == b'-')
+                .count();
+            if len == 0 {
+                return Err("invalid or empty TOML key".to_string());
+            }
+            segments.push(cur[..len].to_string());
+            cur = &cur[len..];
+        }
+        cur = cur.trim_start_matches([' ', '\t']);
+        if let Some(after_dot) = cur.strip_prefix('.') {
+            cur = after_dot.trim_start_matches([' ', '\t']);
+        } else {
+            break;
+        }
+    }
+    Ok((segments, cur))
+}
+
+fn has_valid_digit_underscores(s: &str, radix: u32) -> bool {
+    if s.is_empty() || s.starts_with('_') || s.ends_with('_') || s.contains("__") {
+        return false;
+    }
+    s.chars().all(|c| c == '_' || c.is_digit(radix))
+}
+
+fn parse_toml_number_or_bool(tok: &str) -> Result<StrictTomlVal, String> {
+    match tok {
+        "true" => return Ok(StrictTomlVal::Bool(true)),
+        "false" => return Ok(StrictTomlVal::Bool(false)),
+        "inf" | "+inf" | "-inf" | "nan" | "+nan" | "-nan" => return Ok(StrictTomlVal::Float),
+        _ => {}
+    }
+    if let Some(hex) = tok.strip_prefix("0x") {
+        if !has_valid_digit_underscores(hex, 16) {
+            return Err(format!("invalid hex integer '{tok}'"));
+        }
+        let clean: String = hex.chars().filter(|c| *c != '_').collect();
+        let v =
+            i64::from_str_radix(&clean, 16).map_err(|_| format!("integer overflow in '{tok}'"))?;
+        return Ok(StrictTomlVal::Int(v));
+    }
+    if let Some(oct) = tok.strip_prefix("0o") {
+        if !has_valid_digit_underscores(oct, 8) {
+            return Err(format!("invalid octal integer '{tok}'"));
+        }
+        let clean: String = oct.chars().filter(|c| *c != '_').collect();
+        let v =
+            i64::from_str_radix(&clean, 8).map_err(|_| format!("integer overflow in '{tok}'"))?;
+        return Ok(StrictTomlVal::Int(v));
+    }
+    if let Some(bin) = tok.strip_prefix("0b") {
+        if !has_valid_digit_underscores(bin, 2) {
+            return Err(format!("invalid binary integer '{tok}'"));
+        }
+        let clean: String = bin.chars().filter(|c| *c != '_').collect();
+        let v =
+            i64::from_str_radix(&clean, 2).map_err(|_| format!("integer overflow in '{tok}'"))?;
+        return Ok(StrictTomlVal::Int(v));
+    }
+    let unsigned = tok.strip_prefix(['+', '-']).unwrap_or(tok);
+    if unsigned.contains(['.', 'e', 'E']) {
+        let (mantissa, exp_opt) = if let Some((m, e)) = unsigned.split_once(['e', 'E']) {
+            (m, Some(e))
+        } else {
+            (unsigned, None)
+        };
+        if let Some((int_p, frac_p)) = mantissa.split_once('.') {
+            if !has_valid_digit_underscores(int_p, 10)
+                || !has_valid_digit_underscores(frac_p, 10)
+                || (int_p.len() > 1 && int_p.starts_with('0'))
+            {
+                return Err(format!("invalid TOML float '{tok}'"));
+            }
+        } else if !has_valid_digit_underscores(mantissa, 10)
+            || (mantissa.len() > 1 && mantissa.starts_with('0'))
+        {
+            return Err(format!("invalid TOML float '{tok}'"));
+        }
+        if let Some(exp) = exp_opt {
+            let exp_u = exp.strip_prefix(['+', '-']).unwrap_or(exp);
+            if !has_valid_digit_underscores(exp_u, 10) {
+                return Err(format!("invalid TOML float exponent in '{tok}'"));
+            }
+        }
+        let clean: String = tok.chars().filter(|c| *c != '_').collect();
+        let f: f64 = clean
+            .parse()
+            .map_err(|_| format!("invalid TOML float '{tok}'"))?;
+        if f.is_nan() {
+            return Err(format!("invalid TOML float '{tok}'"));
+        }
+        return Ok(StrictTomlVal::Float);
+    }
+    if !has_valid_digit_underscores(unsigned, 10)
+        || (unsigned.len() > 1 && unsigned.starts_with('0'))
+    {
+        return Err(format!("invalid TOML value '{tok}'"));
+    }
+    let clean: String = tok.chars().filter(|c| *c != '_').collect();
+    let v: i64 = clean
+        .parse()
+        .map_err(|_| format!("invalid TOML integer '{tok}'"))?;
+    Ok(StrictTomlVal::Int(v))
+}
+
+fn consume_toml_value(input: &str, depth: usize) -> Result<(StrictTomlVal, &str), String> {
+    if depth > 8 {
+        return Err("TOML value nesting depth exceeded".to_string());
+    }
+    let s = input.trim_start_matches([' ', '\t']);
+    if s.is_empty() {
+        return Err("expected TOML value".to_string());
+    }
+    if s.starts_with('"') {
+        let (v, rest) = consume_toml_basic_string(s)?;
+        return Ok((StrictTomlVal::Str(v), rest));
+    }
+    if s.starts_with('\'') {
+        let (v, rest) = consume_toml_literal_string(s)?;
+        return Ok((StrictTomlVal::Str(v), rest));
+    }
+    if let Some(mut cur) = s.strip_prefix('[') {
+        let mut items = Vec::new();
+        loop {
+            cur = cur.trim_start_matches([' ', '\t']);
+            if let Some(after_close) = cur.strip_prefix(']') {
+                return Ok((StrictTomlVal::Array(items), after_close));
+            }
+            let (item, after_item) = consume_toml_value(cur, depth + 1)?;
+            items.push(item);
+            cur = after_item.trim_start_matches([' ', '\t']);
+            if let Some(after_comma) = cur.strip_prefix(',') {
+                cur = after_comma;
+            } else if let Some(after_close) = cur.strip_prefix(']') {
+                return Ok((StrictTomlVal::Array(items), after_close));
+            } else {
+                return Err("expected ',' or ']' in TOML array".to_string());
+            }
+        }
+    }
+    if let Some(mut cur) = s.strip_prefix('{') {
+        let mut fields: Vec<(Vec<String>, StrictTomlVal)> = Vec::new();
+        cur = cur.trim_start_matches([' ', '\t']);
+        if let Some(after_close) = cur.strip_prefix('}') {
+            return Ok((StrictTomlVal::InlineTable(fields), after_close));
+        }
+        loop {
+            let (k_segs, after_k) = parse_toml_key_segments(cur)?;
+            let after_k = after_k.trim_start_matches([' ', '\t']);
+            let Some(after_eq) = after_k.strip_prefix('=') else {
+                return Err("expected '=' in TOML inline table".to_string());
+            };
+            let (val, after_v) = consume_toml_value(after_eq, depth + 1)?;
+            if fields.iter().any(|(existing, _)| existing == &k_segs) {
+                return Err("duplicate key in TOML inline table".to_string());
+            }
+            fields.push((k_segs, val));
+            cur = after_v.trim_start_matches([' ', '\t']);
+            if let Some(after_comma) = cur.strip_prefix(',') {
+                cur = after_comma.trim_start_matches([' ', '\t']);
+                if cur.starts_with('}') {
+                    return Err("trailing comma is invalid in TOML inline table".to_string());
+                }
+            } else if let Some(after_close) = cur.strip_prefix('}') {
+                return Ok((StrictTomlVal::InlineTable(fields), after_close));
+            } else {
+                return Err("expected ',' or '}' in TOML inline table".to_string());
+            }
+        }
+    }
+    let tok_len = s
+        .bytes()
+        .take_while(|b| !matches!(b, b' ' | b'\t' | b',' | b']' | b'}'))
+        .count();
+    if tok_len == 0 {
+        return Err("unexpected token in TOML value".to_string());
+    }
+    let val = parse_toml_number_or_bool(&s[..tok_len])?;
+    Ok((val, &s[tok_len..]))
+}
+
+fn insert_toml_entry(
+    entries: &mut std::collections::BTreeMap<Vec<String>, StrictTomlVal>,
+    defined_tables: &mut std::collections::BTreeSet<Vec<String>>,
+    full_path: Vec<String>,
+    val: StrictTomlVal,
+    lineno: usize,
+) -> Result<(), (&'static str, String)> {
+    for prefix_len in 1..full_path.len() {
+        if entries.contains_key(&full_path[..prefix_len]) {
+            return Err((
+                "CONFIG_MALFORMED_TOML",
+                format!("line {lineno}: dotted key conflicts with scalar value"),
+            ));
+        }
+    }
+    if defined_tables.contains(&full_path) || entries.contains_key(&full_path) {
+        return Err((
+            "CONFIG_MALFORMED_TOML",
+            format!(
+                "line {lineno}: duplicate TOML key '{}'",
+                full_path.join(".")
+            ),
+        ));
+    }
+    match val {
+        StrictTomlVal::InlineTable(fields) => {
+            defined_tables.insert(full_path.clone());
+            for (sub_k, sub_v) in fields {
+                let mut child = full_path.clone();
+                child.extend(sub_k);
+                insert_toml_entry(entries, defined_tables, child, sub_v, lineno)?;
+            }
+        }
+        other => {
+            for existing_tbl in defined_tables.iter() {
+                if existing_tbl.starts_with(&full_path) {
+                    return Err((
+                        "CONFIG_MALFORMED_TOML",
+                        format!(
+                            "line {lineno}: key '{}' conflicts with existing table",
+                            full_path.join(".")
+                        ),
+                    ));
+                }
+            }
+            entries.insert(full_path, other);
+        }
+    }
+    Ok(())
+}
+
+fn validate_codex_config_toml(
+    raw_toml: &str,
+    verified_bin_canon: Option<&Path>,
+) -> Result<bool, (&'static str, String)> {
+    let mut statements: Vec<(usize, String)> = Vec::new();
+    let mut pending_array: Option<(usize, String, i32)> = None;
+
+    for (idx, raw_line) in raw_toml.lines().enumerate() {
+        let lineno = idx + 1;
+        let (stripped, b_delta, _) = strip_toml_line_and_count(raw_line)
+            .map_err(|e| ("CONFIG_MALFORMED_TOML", format!("line {lineno}: {e}")))?;
+        let line = stripped.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if let Some((start_ln, mut buf, open_b)) = pending_array.take() {
+            let next_b = open_b + b_delta;
+            if next_b < 0 {
+                return Err((
+                    "CONFIG_MALFORMED_TOML",
+                    format!("line {lineno}: unmatched ']' in multiline TOML array"),
+                ));
+            }
+            buf.push(' ');
+            buf.push_str(line);
+            if buf.len() > 65_536 {
+                return Err((
+                    "CONFIG_MALFORMED_TOML",
+                    format!("line {start_ln}: multiline TOML array exceeds 64 KiB"),
+                ));
+            }
+            if next_b == 0 {
+                statements.push((start_ln, buf));
+            } else {
+                pending_array = Some((start_ln, buf, next_b));
+            }
+            continue;
+        }
+        if line.starts_with('[') {
+            if b_delta != 0 || !line.ends_with(']') {
+                return Err((
+                    "CONFIG_MALFORMED_TOML",
+                    format!("line {lineno}: malformed TOML table header"),
+                ));
+            }
+            statements.push((lineno, line.to_string()));
+        } else if b_delta < 0 {
+            return Err((
+                "CONFIG_MALFORMED_TOML",
+                format!("line {lineno}: unmatched ']' in TOML assignment"),
+            ));
+        } else if b_delta > 0 {
+            pending_array = Some((lineno, line.to_string(), b_delta));
+        } else {
+            statements.push((lineno, line.to_string()));
+        }
+    }
+    if let Some((start_ln, _, _)) = pending_array {
+        return Err((
+            "CONFIG_MALFORMED_TOML",
+            format!("line {start_ln}: unclosed '[' array value in Codex config.toml"),
+        ));
+    }
+
+    let mut current_section: Vec<String> = Vec::new();
+    let mut explicit_sections: std::collections::BTreeSet<Vec<String>> =
+        std::collections::BTreeSet::new();
+    let mut defined_tables: std::collections::BTreeSet<Vec<String>> =
+        std::collections::BTreeSet::new();
+    let mut entries: std::collections::BTreeMap<Vec<String>, StrictTomlVal> =
+        std::collections::BTreeMap::new();
+
+    for (lineno, stmt) in statements {
+        if stmt.starts_with('[') {
+            let inner = stmt[1..stmt.len() - 1].trim();
+            if inner.is_empty() || inner.starts_with('[') || inner.ends_with(']') {
+                return Err((
+                    "CONFIG_MALFORMED_TOML",
+                    format!("line {lineno}: unsupported or empty TOML table header"),
+                ));
+            }
+            let (segs, rest) = parse_toml_key_segments(inner)
+                .map_err(|e| ("CONFIG_MALFORMED_TOML", format!("line {lineno}: {e}")))?;
+            if !rest.trim().is_empty() {
+                return Err((
+                    "CONFIG_MALFORMED_TOML",
+                    format!("line {lineno}: invalid tokens in TOML table header"),
+                ));
+            }
+            if !explicit_sections.insert(segs.clone())
+                || entries.contains_key(&segs)
+                || (1..segs.len()).any(|p| entries.contains_key(&segs[..p]))
+            {
+                return Err((
+                    "CONFIG_MALFORMED_TOML",
+                    format!(
+                        "line {lineno}: duplicate or conflicting TOML table '[{}]'",
+                        segs.join(".")
+                    ),
+                ));
+            }
+            defined_tables.insert(segs.clone());
+            current_section = segs;
+            continue;
+        }
+
+        let (key_segs, after_k) = parse_toml_key_segments(&stmt)
+            .map_err(|e| ("CONFIG_MALFORMED_TOML", format!("line {lineno}: {e}")))?;
+        let Some(rhs) = after_k.trim_start_matches([' ', '\t']).strip_prefix('=') else {
+            return Err((
+                "CONFIG_MALFORMED_TOML",
+                format!("line {lineno}: expected '=' after TOML key"),
+            ));
+        };
+        let (val, rest) = consume_toml_value(rhs, 0)
+            .map_err(|e| ("CONFIG_MALFORMED_TOML", format!("line {lineno}: {e}")))?;
+        if !rest.trim().is_empty() {
+            return Err((
+                "CONFIG_MALFORMED_TOML",
+                format!("line {lineno}: unexpected trailing tokens after TOML value"),
+            ));
+        }
+        let mut full_path = current_section.clone();
+        full_path.extend(key_segs);
+        insert_toml_entry(&mut entries, &mut defined_tables, full_path, val, lineno)?;
+    }
+
+    if let Some(ap_val) = entries.get(&vec!["approval_policy".to_string()]) {
+        let StrictTomlVal::Str(ap) = ap_val else {
+            return Err((
+                "CONFIG_MALFORMED_TOML",
+                "approval_policy must be a quoted string".to_string(),
+            ));
+        };
+        if ap == "never" {
+            return Err((
+                "CONFIG_HOOKS_DISABLED",
+                "Codex approval_policy = 'never' is forbidden".to_string(),
+            ));
+        }
+    }
+
+    for int_key in [
+        "project_doc_max_bytes",
+        "model_auto_compact_token_limit",
+        "tool_output_token_limit",
+    ] {
+        if let Some(v) = entries.get(&vec![int_key.to_string()]) {
+            match v {
+                StrictTomlVal::Int(n) if *n > 0 => {}
+                _ => {
+                    return Err((
+                        "CONFIG_MALFORMED_TOML",
+                        format!("{int_key} must be a positive integer"),
+                    ));
+                }
+            }
+        }
+    }
+
+    if let Some(fb_val) = entries.get(&vec!["project_doc_fallback_filenames".to_string()]) {
+        let StrictTomlVal::Array(items) = fb_val else {
+            return Err((
+                "CONFIG_MALFORMED_TOML",
+                "project_doc_fallback_filenames must be an array".to_string(),
+            ));
+        };
+        if !items.is_empty() {
+            return Err((
+                "CONFIG_PROTOCOL_INCOMPATIBLE",
+                "Codex project_doc_fallback_filenames must be empty ([]) to enforce root-only AGENTS.md"
+                    .to_string(),
+            ));
+        }
+    }
+
+    let Some(sm_val) = entries.get(&vec!["sandbox_mode".to_string()]) else {
+        return Err((
+            "CONFIG_PROTOCOL_INCOMPATIBLE",
+            "Codex config.toml is missing required sandbox_mode".to_string(),
+        ));
+    };
+    let StrictTomlVal::Str(sandbox_mode) = sm_val else {
+        return Err((
+            "CONFIG_MALFORMED_TOML",
+            "sandbox_mode must be a quoted string".to_string(),
+        ));
+    };
+    match sandbox_mode.as_str() {
+        "workspace-write" => {
+            let net_key = vec![
+                "sandbox_workspace_write".to_string(),
+                "network_access".to_string(),
+            ];
+            match entries.get(&net_key) {
+                Some(StrictTomlVal::Bool(false)) => {}
+                Some(StrictTomlVal::Bool(true)) | None => {
+                    return Err((
+                        "CONFIG_PROTOCOL_INCOMPATIBLE",
+                        "Codex workspace-write mode requires [sandbox_workspace_write] network_access = false".to_string(),
+                    ));
+                }
+                Some(_) => {
+                    return Err((
+                        "CONFIG_MALFORMED_TOML",
+                        "sandbox_workspace_write.network_access must be a boolean".to_string(),
+                    ));
+                }
+            }
+        }
+        "read-only" => {}
+        other => {
+            return Err((
+                "CONFIG_HOOKS_DISABLED",
+                format!("Codex sandbox_mode '{other}' weakens zero-trust containment"),
+            ));
+        }
+    }
+
+    let Some(notify_val) = entries.get(&vec!["notify".to_string()]) else {
+        return Err((
+            "CONFIG_PROTOCOL_INCOMPATIBLE",
+            "Codex config.toml is missing required notify = [<agent-guard>, \"on-stop\"]"
+                .to_string(),
+        ));
+    };
+    let StrictTomlVal::Array(notify_items) = notify_val else {
+        return Err((
+            "CONFIG_MALFORMED_TOML",
+            "notify must be an array of strings".to_string(),
+        ));
+    };
+    let notify: Vec<&str> = notify_items
+        .iter()
+        .map(|item| match item {
+            StrictTomlVal::Str(s) => Ok(s.as_str()),
+            _ => Err((
+                "CONFIG_MALFORMED_TOML",
+                "notify must be an array of strings".to_string(),
+            )),
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if notify.len() < 2 || notify[1] != "on-stop" {
+        return Err((
+            "CONFIG_PROTOCOL_INCOMPATIBLE",
+            "Codex notify command must invoke '<agent-guard> on-stop'".to_string(),
+        ));
+    }
+    let tail_ok = match &notify[2..] {
+        [] => true,
+        [f, v] if *f == "--adapter" && *v == "codex" => true,
+        _ => false,
+    };
+    if !tail_ok {
+        return Err((
+            "CONFIG_PROTOCOL_INCOMPATIBLE",
+            "Codex notify array contains unsupported arguments".to_string(),
+        ));
+    }
+    Ok(binary_token_matches(notify[0], verified_bin_canon))
 }
 
 /// Evaluates Property 2 (`ConfigState`) without inferring runtime invocation or enforcement.
@@ -1442,6 +2474,7 @@ pub fn evaluate_config_state(
         InstallState::Verified { binary_path, .. } => Some(PathBuf::from(binary_path)),
         _ => None,
     };
+    let expected_ws_canon = fs::canonicalize(workspace).ok();
 
     match adapter_id {
         "antigravity" => {
@@ -1598,6 +2631,7 @@ pub fn evaluate_config_state(
                         inner_hooks,
                         tool_ev,
                         verified_bin_canon.as_deref(),
+                        expected_ws_canon.as_deref(),
                     ) {
                         Ok(matched) => all_bins_match &= matched,
                         Err((code, detail)) => {
@@ -1633,6 +2667,7 @@ pub fn evaluate_config_state(
                     arr,
                     direct_ev,
                     verified_bin_canon.as_deref(),
+                    expected_ws_canon.as_deref(),
                 ) {
                     Ok(matched) => all_bins_match &= matched,
                     Err((code, detail)) => {
@@ -1731,27 +2766,231 @@ pub fn evaluate_config_state(
                     detail: "integration config contains invalid UTF-8".to_string(),
                 };
             };
-            if adapter_id != "codex" && JsonValue::parse(text).is_err() {
-                return ConfigState::Invalid {
-                    adapter_id: adapter_id.to_string(),
-                    config_rel_path: Some(rel_label),
-                    reason_code: "CONFIG_MALFORMED_JSON",
-                    detail: "integration config contains malformed JSON".to_string(),
-                };
-            }
-            let bin_matches = match verified_bin_canon {
-                Some(ref bin) => {
-                    adapter_id == "codex" || text.contains(&bin.to_string_lossy().into_owned())
+
+            let bin_matches = match adapter_id {
+                "codex" => match validate_codex_config_toml(text, verified_bin_canon.as_deref()) {
+                    Ok(matched) => matched,
+                    Err((code, detail)) => {
+                        return ConfigState::Invalid {
+                            adapter_id: adapter_id.to_string(),
+                            config_rel_path: Some(rel_label),
+                            reason_code: code,
+                            detail,
+                        };
+                    }
+                },
+                "claude" => {
+                    let parsed = match JsonValue::parse(text) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            return ConfigState::Invalid {
+                                adapter_id: adapter_id.to_string(),
+                                config_rel_path: Some(rel_label),
+                                reason_code: "CONFIG_MALFORMED_JSON",
+                                detail: format!("malformed Claude settings.json: {e}"),
+                            };
+                        }
+                    };
+                    if parsed.as_object().is_none() {
+                        return ConfigState::Invalid {
+                            adapter_id: adapter_id.to_string(),
+                            config_rel_path: Some(rel_label),
+                            reason_code: "CONFIG_PROTOCOL_INCOMPATIBLE",
+                            detail: "Claude settings.json root must be a JSON object".to_string(),
+                        };
+                    }
+                    if parsed.get("disableAllHooks").and_then(JsonValue::as_bool) == Some(true) {
+                        return ConfigState::Invalid {
+                            adapter_id: adapter_id.to_string(),
+                            config_rel_path: Some(rel_label),
+                            reason_code: "CONFIG_HOOKS_DISABLED",
+                            detail: "Claude 'disableAllHooks' is true".to_string(),
+                        };
+                    }
+                    let Some(hooks_obj) = parsed.get("hooks").filter(|v| v.as_object().is_some())
+                    else {
+                        return ConfigState::Invalid {
+                            adapter_id: adapter_id.to_string(),
+                            config_rel_path: Some(rel_label),
+                            reason_code: "CONFIG_PROTOCOL_INCOMPATIBLE",
+                            detail: "Claude settings.json missing 'hooks' object".to_string(),
+                        };
+                    };
+                    let mut all_ok = verified_bin_canon.is_some();
+                    for (ev, sub, wc) in [
+                        ("UserPromptSubmit", "user-prompt", None),
+                        ("PreToolUse", "pre-tool", Some(&["*"][..])),
+                        ("PostToolUse", "post-tool", Some(&["*"][..])),
+                        ("PreCompact", "pre-compact", None),
+                        ("Stop", "on-stop", None),
+                    ] {
+                        match validate_nested_hook_event(
+                            hooks_obj,
+                            "claude",
+                            ev,
+                            sub,
+                            wc,
+                            verified_bin_canon.as_deref(),
+                        ) {
+                            Ok(m) => all_ok &= m,
+                            Err((code, detail)) => {
+                                return ConfigState::Invalid {
+                                    adapter_id: adapter_id.to_string(),
+                                    config_rel_path: Some(rel_label),
+                                    reason_code: code,
+                                    detail,
+                                };
+                            }
+                        }
+                    }
+                    all_ok
                 }
-                None => false,
+                "gemini" => {
+                    let parsed = match JsonValue::parse(text) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            return ConfigState::Invalid {
+                                adapter_id: adapter_id.to_string(),
+                                config_rel_path: Some(rel_label),
+                                reason_code: "CONFIG_MALFORMED_JSON",
+                                detail: format!("malformed Gemini settings.json: {e}"),
+                            };
+                        }
+                    };
+                    if parsed.as_object().is_none() {
+                        return ConfigState::Invalid {
+                            adapter_id: adapter_id.to_string(),
+                            config_rel_path: Some(rel_label),
+                            reason_code: "CONFIG_PROTOCOL_INCOMPATIBLE",
+                            detail: "Gemini settings.json root must be a JSON object".to_string(),
+                        };
+                    }
+                    if parsed
+                        .get("hooksConfig")
+                        .and_then(|v| v.get("enabled"))
+                        .and_then(JsonValue::as_bool)
+                        == Some(false)
+                        || parsed
+                            .get("tools")
+                            .and_then(|v| v.get("enableHooks"))
+                            .and_then(JsonValue::as_bool)
+                            == Some(false)
+                    {
+                        return ConfigState::Invalid {
+                            adapter_id: adapter_id.to_string(),
+                            config_rel_path: Some(rel_label),
+                            reason_code: "CONFIG_HOOKS_DISABLED",
+                            detail: "Gemini hooks are explicitly disabled in settings.json"
+                                .to_string(),
+                        };
+                    }
+                    let Some(hooks_obj) = parsed.get("hooks").filter(|v| v.as_object().is_some())
+                    else {
+                        return ConfigState::Invalid {
+                            adapter_id: adapter_id.to_string(),
+                            config_rel_path: Some(rel_label),
+                            reason_code: "CONFIG_PROTOCOL_INCOMPATIBLE",
+                            detail: "Gemini settings.json missing 'hooks' object".to_string(),
+                        };
+                    };
+                    let mut all_ok = verified_bin_canon.is_some();
+                    for (ev, sub, wc) in [
+                        ("BeforeAgent", "user-prompt", None),
+                        ("BeforeTool", "pre-tool", Some(&[".*", "*"][..])),
+                        ("AfterTool", "post-tool", Some(&[".*", "*"][..])),
+                        ("PreCompress", "pre-compact", None),
+                        ("AfterAgent", "on-stop", None),
+                    ] {
+                        match validate_nested_hook_event(
+                            hooks_obj,
+                            "gemini",
+                            ev,
+                            sub,
+                            wc,
+                            verified_bin_canon.as_deref(),
+                        ) {
+                            Ok(m) => all_ok &= m,
+                            Err((code, detail)) => {
+                                return ConfigState::Invalid {
+                                    adapter_id: adapter_id.to_string(),
+                                    config_rel_path: Some(rel_label),
+                                    reason_code: code,
+                                    detail,
+                                };
+                            }
+                        }
+                    }
+                    all_ok
+                }
+                _ => {
+                    let parsed = match JsonValue::parse(text) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            return ConfigState::Invalid {
+                                adapter_id: adapter_id.to_string(),
+                                config_rel_path: Some(rel_label),
+                                reason_code: "CONFIG_MALFORMED_JSON",
+                                detail: format!("malformed Cursor hooks.json: {e}"),
+                            };
+                        }
+                    };
+                    if parsed.get("version").and_then(JsonValue::as_u64) != Some(1) {
+                        return ConfigState::Invalid {
+                            adapter_id: adapter_id.to_string(),
+                            config_rel_path: Some(rel_label),
+                            reason_code: "CONFIG_PROTOCOL_INCOMPATIBLE",
+                            detail: "Cursor hooks.json must specify \"version\": 1".to_string(),
+                        };
+                    }
+                    let Some(hooks_obj) = parsed.get("hooks").filter(|v| v.as_object().is_some())
+                    else {
+                        return ConfigState::Invalid {
+                            adapter_id: adapter_id.to_string(),
+                            config_rel_path: Some(rel_label),
+                            reason_code: "CONFIG_PROTOCOL_INCOMPATIBLE",
+                            detail: "Cursor hooks.json missing 'hooks' object".to_string(),
+                        };
+                    };
+                    let mut all_ok = verified_bin_canon.is_some();
+                    for (ev, sub) in [
+                        ("beforeSubmitPrompt", "user-prompt"),
+                        ("beforeShellExecution", "pre-tool"),
+                        ("afterShellExecution", "post-tool"),
+                        ("beforeReadFile", "pre-tool"),
+                        ("beforeMCPExecution", "pre-tool"),
+                        ("afterMCPExecution", "post-tool"),
+                        ("preCompact", "pre-compact"),
+                        ("afterFileEdit", "post-edit"),
+                        ("stop", "on-stop"),
+                    ] {
+                        match validate_cursor_hook_event(
+                            hooks_obj,
+                            ev,
+                            sub,
+                            verified_bin_canon.as_deref(),
+                        ) {
+                            Ok(m) => all_ok &= m,
+                            Err((code, detail)) => {
+                                return ConfigState::Invalid {
+                                    adapter_id: adapter_id.to_string(),
+                                    config_rel_path: Some(rel_label),
+                                    reason_code: code,
+                                    detail,
+                                };
+                            }
+                        }
+                    }
+                    all_ok
+                }
             };
             if !bin_matches {
                 return ConfigState::Invalid {
                     adapter_id: adapter_id.to_string(),
                     config_rel_path: Some(rel_label),
                     reason_code: "CONFIG_BINARY_MISMATCH",
-                    detail: "integration config does not reference the verified agent-guard binary"
-                        .to_string(),
+                    detail:
+                        "integration config command does not pin the verified agent-guard binary"
+                            .to_string(),
                 };
             }
             ConfigState::Valid {
@@ -2332,20 +3571,62 @@ pub fn evaluate_enforcement_report(
     }
 
     let (invoked, host_enforced) = match receipt_check {
-        ReceiptCheck::Valid(rec) => (
-            InvocationState::Verified {
-                last_observed_ts_unix: rec.verified_at_unix,
-                last_event: "PreToolUse".to_string(),
-                evidence_source: EvidenceSource::ObserverVerificationReceipt,
-                trust_level: TrustLevel::ObserverVerified,
-            },
-            HostEnforcement::Verified {
-                verified_at_unix: rec.verified_at_unix,
-                challenge_id: rec.challenge_id,
-                evidence_source: EvidenceSource::ObserverVerificationReceipt,
-                trust_level: TrustLevel::ObserverVerified,
-            },
-        ),
+        ReceiptCheck::Valid(rec)
+            if !matches!(snapshot.execution_mode, ExecutionMode::UnsupportedHost(_))
+                && adapter_id != "codex" =>
+        {
+            (
+                InvocationState::Verified {
+                    last_observed_ts_unix: rec.verified_at_unix,
+                    last_event: "PreToolUse".to_string(),
+                    evidence_source: EvidenceSource::ObserverVerificationReceipt,
+                    trust_level: TrustLevel::ObserverVerified,
+                },
+                HostEnforcement::Verified {
+                    verified_at_unix: rec.verified_at_unix,
+                    challenge_id: rec.challenge_id,
+                    evidence_source: EvidenceSource::ObserverVerificationReceipt,
+                    trust_level: TrustLevel::ObserverVerified,
+                },
+            )
+        }
+        ReceiptCheck::Valid(_) => {
+            let host_state = match &snapshot.execution_mode {
+                ExecutionMode::UnsupportedHost(mode_name) => {
+                    let detail = format!(
+                        "execution mode '{mode_name}' has no verified host hook enforcement support"
+                    );
+                    limitations.push(CapabilityLimitation {
+                        capability: "host_enforced",
+                        code: "UNSUPPORTED_EXECUTION_MODE",
+                        detail: detail.clone(),
+                    });
+                    HostEnforcement::NotVerifiedForExecutionMode {
+                        execution_mode: mode_name.clone(),
+                        reason_code: "UNSUPPORTED_EXECUTION_MODE",
+                        detail,
+                    }
+                }
+                _ => {
+                    let detail = "codex integration configures OS sandbox, MCP, and on-stop notify without a synchronous PreToolUse denial hook".to_string();
+                    limitations.push(CapabilityLimitation {
+                        capability: "host_enforced",
+                        code: "ADAPTER_LACKS_PRETOOL_HOOK",
+                        detail: detail.clone(),
+                    });
+                    HostEnforcement::Unverified {
+                        reason_code: "ADAPTER_LACKS_PRETOOL_HOOK",
+                        detail,
+                    }
+                }
+            };
+            (
+                InvocationState::NoneObserved {
+                    reason_code: "NO_INVOCATIONS_OBSERVED",
+                },
+                host_state,
+            )
+        }
         ReceiptCheck::Rejected { code, detail } => {
             limitations.push(CapabilityLimitation {
                 capability: "host_enforced",
@@ -2364,13 +3645,27 @@ pub fn evaluate_enforcement_report(
             } else {
                 InvocationState::NoneObserved { reason_code: code }
             };
-            (
-                inv,
-                HostEnforcement::Unverified {
+            let host_state = match &snapshot.execution_mode {
+                ExecutionMode::AntigravityRemoteAgentsVm => {
+                    HostEnforcement::NotVerifiedForExecutionMode {
+                        execution_mode: snapshot.execution_mode.as_str().to_string(),
+                        reason_code: code,
+                        detail,
+                    }
+                }
+                ExecutionMode::UnsupportedHost(mode_name) => {
+                    HostEnforcement::NotVerifiedForExecutionMode {
+                        execution_mode: mode_name.clone(),
+                        reason_code: "UNSUPPORTED_EXECUTION_MODE",
+                        detail,
+                    }
+                }
+                ExecutionMode::LocalHost => HostEnforcement::Unverified {
                     reason_code: code,
                     detail,
                 },
-            )
+            };
+            (inv, host_state)
         }
         ReceiptCheck::Absent => {
             if let Some(malformed_msg) = diag.malformed_error {
@@ -2461,6 +3756,11 @@ pub fn evaluate_enforcement_report(
                             (
                                 "INTEGRATION_UNCONFIGURED",
                                 "host enforcement cannot be verified until valid hook configuration is installed".to_string(),
+                            )
+                        } else if adapter_id == "codex" {
+                            (
+                                "ADAPTER_LACKS_PRETOOL_HOOK",
+                                "codex integration configures OS sandbox, MCP, and on-stop notify without a synchronous PreToolUse denial hook".to_string(),
                             )
                         } else if diag.count > 0 {
                             (
@@ -2599,6 +3899,72 @@ fn hex_decode_64(hex: &str) -> Result<[u8; 64], String> {
     Ok(out)
 }
 
+fn check_observer_environment_allowed() -> Result<(), ContractError> {
+    if std::env::var("AGENT_GUARD_IN_SANDBOX").as_deref() == Ok("1")
+        || std::env::var("AGENT_GUARD_WORKER_LOCK").as_deref() == Ok("1")
+    {
+        return Err(ContractError::new(
+            "SANDBOX_FORBIDDEN",
+            "verify-enforcement cannot run inside an agent worker sandbox",
+        ));
+    }
+    for marker in [
+        "AGENT_GUARD_ROLE",
+        "ANTIGRAVITY_AGENT",
+        "CLAUDECODE",
+        "CLAUDE_CODE_ENTRYPOINT",
+        "CURSOR_TRACE_ID",
+        "CURSOR_AGENT",
+        "CODEX_SANDBOX",
+        "CODEX_ENV_SANDBOX",
+        "GEMINI_CLI",
+    ] {
+        if std::env::var_os(marker).is_some_and(|v| !v.is_empty()) {
+            return Err(ContractError::new(
+                "SANDBOX_FORBIDDEN",
+                format!(
+                    "verify-enforcement cannot run inside an active agent harness environment ({marker} set)"
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn json_value_mentions_canary(val: &JsonValue, canary_rel: &str) -> bool {
+    match val {
+        JsonValue::Str(s) => s.contains(canary_rel),
+        JsonValue::Array(items) => items
+            .iter()
+            .any(|v| json_value_mentions_canary(v, canary_rel)),
+        JsonValue::Object(entries) => entries
+            .iter()
+            .any(|(_, v)| json_value_mentions_canary(v, canary_rel)),
+        _ => false,
+    }
+}
+
+fn payload_tool_input_targets_canary(parsed: &JsonValue, canary_rel: &str) -> bool {
+    for key in [
+        "tool_input",
+        "parameters",
+        "toolInput",
+        "command",
+        "CommandLine",
+        "file_path",
+        "path",
+        "TargetFile",
+        "AbsolutePath",
+    ] {
+        if let Some(sub) = parsed.get(key)
+            && json_value_mentions_canary(sub, canary_rel)
+        {
+            return true;
+        }
+    }
+    false
+}
+
 /// Step A of Phase 4: Issues a bounded challenge bound to exact `(mode, workspace, config, binary)`
 /// digests and a pinned Ed25519 observer public key (`observer_pubkey_hex`).
 pub fn begin_verification(
@@ -2609,12 +3975,19 @@ pub fn begin_verification(
     external_observer_available: bool,
     observer_pubkey_hex: &str,
 ) -> Result<VerificationChallenge, ContractError> {
-    if std::env::var("AGENT_GUARD_IN_SANDBOX").as_deref() == Ok("1")
-        || std::env::var("AGENT_GUARD_WORKER_LOCK").as_deref() == Ok("1")
-    {
+    check_observer_environment_allowed()?;
+
+    if let ExecutionMode::UnsupportedHost(ref mode_name) = snapshot.execution_mode {
         return Err(ContractError::new(
-            "SANDBOX_FORBIDDEN",
-            "verify-enforcement cannot run inside an agent worker sandbox",
+            "UNSUPPORTED_EXECUTION_MODE",
+            format!("execution mode '{mode_name}' does not support host hook enforcement"),
+        ));
+    }
+
+    if adapter_id == "codex" {
+        return Err(ContractError::new(
+            "VERIFICATION_UNAVAILABLE",
+            "codex integration uses sandbox_mode + MCP + on-stop notify and has no synchronous PreToolUse denial hook",
         ));
     }
 
@@ -2654,12 +4027,12 @@ pub fn begin_verification(
     let observer_pubkey_norm = trimmed_pk.to_ascii_lowercase();
 
     let installed = evaluate_install_state(bin_dir, snapshot.effective_version());
-    let (bin_ver, bin_sha) = match installed {
+    let (bin_ver, bin_sha) = match &installed {
         InstallState::Verified {
             version,
             binary_sha256,
             ..
-        } => (version, binary_sha256),
+        } => (version.clone(), binary_sha256.clone()),
         InstallState::Missing { reason_code, .. } => {
             return Err(ContractError::new(
                 reason_code,
@@ -2670,18 +4043,10 @@ pub fn begin_verification(
             reason_code,
             detail,
             ..
-        } => return Err(ContractError::new(reason_code, detail)),
+        } => return Err(ContractError::new(reason_code, detail.clone())),
     };
 
-    let configured = evaluate_config_state(
-        workspace,
-        adapter_id,
-        &InstallState::Verified {
-            binary_path: bin_dir.join("agent-guard").display().to_string(),
-            version: bin_ver.clone(),
-            binary_sha256: bin_sha.clone(),
-        },
-    );
+    let configured = evaluate_config_state(workspace, adapter_id, &installed);
     let cfg_sha = match configured {
         ConfigState::Valid { config_sha256, .. } => config_sha256,
         ConfigState::Unconfigured { reason_code, .. } => {
@@ -2823,7 +4188,16 @@ pub fn record_denial_witness(
     raw_input: &[u8],
     deny_code: &str,
 ) {
+    if matches!(
+        deny_code,
+        "HOOK_INPUT_OVERFLOW" | "MALFORMED_HOOK_JSON" | "INVALID_HOOK_JSON"
+    ) {
+        return;
+    }
     let Ok(raw_str) = std::str::from_utf8(raw_input) else {
+        return;
+    };
+    let Ok(input_parsed) = JsonValue::parse(raw_str) else {
         return;
     };
     let dir = state_base_dir().join("enforcement");
@@ -2850,7 +4224,7 @@ pub fn record_denial_witness(
     let Some(canary_rel) = parsed.get("canary_rel_path").and_then(JsonValue::as_str) else {
         return;
     };
-    if !raw_str.contains(canary_rel) {
+    if !payload_tool_input_targets_canary(&input_parsed, canary_rel) {
         return;
     }
     let Some(cid) = parsed.get("challenge_id").and_then(JsonValue::as_str) else {
@@ -2973,12 +4347,17 @@ pub fn complete_verification(
     observer_sig_hex: Option<&str>,
     snapshot: &ProbeSnapshot,
 ) -> Result<VerificationReceipt, ContractError> {
-    if std::env::var("AGENT_GUARD_IN_SANDBOX").as_deref() == Ok("1")
-        || std::env::var("AGENT_GUARD_WORKER_LOCK").as_deref() == Ok("1")
-    {
+    check_observer_environment_allowed()?;
+    if let ExecutionMode::UnsupportedHost(ref mode_name) = snapshot.execution_mode {
         return Err(ContractError::new(
-            "SANDBOX_FORBIDDEN",
-            "verify-enforcement cannot run inside an agent worker sandbox",
+            "UNSUPPORTED_EXECUTION_MODE",
+            format!("execution mode '{mode_name}' does not support host hook enforcement"),
+        ));
+    }
+    if adapter_id == "codex" {
+        return Err(ContractError::new(
+            "VERIFICATION_UNAVAILABLE",
+            "codex integration has no synchronous PreToolUse denial hook",
         ));
     }
 

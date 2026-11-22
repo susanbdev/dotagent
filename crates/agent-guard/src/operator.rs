@@ -294,7 +294,7 @@ pub fn run_doctor_cli(args: &[String], cwd: &Path) -> ExitCode {
             ),
             (
                 "mandatory_protection_verified".to_string(),
-                JsonValue::Bool(runtime_protected),
+                JsonValue::Bool(enf_report.mandatory_protection_verified),
             ),
             ("enforcement".to_string(), enf_report.to_json_value()),
             (
@@ -1222,43 +1222,91 @@ fn write_with_nondestructive_backup(
 /// Rewrites bare `"agent-guard ..."` hook commands to `"<abs_guard_bin> ..."` when deploying
 /// outside the canonical `dotagent` source repo so GUI IDEs (Cursor, VS Code, Claude Desktop)
 /// that do not source interactive shell rc files still execute `agent-guard` deterministically
-/// and cannot be hijacked via mutable `PATH` entries.
-fn pin_hook_binary_in_json(val: &JsonValue, abs_guard_bin: Option<&Path>) -> JsonValue {
+/// and cannot be hijacked via mutable `PATH` entries. Fails closed if `abs_guard_bin` cannot be
+/// safely quoted rather than silently falling back to an unpinned command.
+fn pin_hook_binary_in_json(
+    val: &JsonValue,
+    abs_guard_bin: Option<&Path>,
+    adapter_tag: Option<&str>,
+) -> Result<JsonValue, String> {
     let Some(bin) = abs_guard_bin else {
-        return val.clone();
+        return Ok(val.clone());
     };
-    let bin_str = bin.to_string_lossy();
-    // Only pin if path contains no shell-special quotes/spaces that could break hook command splitting
-    if !bin_str
-        .bytes()
-        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'/' | b'_' | b'-' | b'.'))
-    {
-        return val.clone();
-    }
-    match val {
-        JsonValue::Str(s) => {
-            if let Some(rest) = s.strip_prefix("agent-guard ") {
-                JsonValue::Str(format!("{bin_str} {rest}"))
-            } else if s == "agent-guard" {
-                JsonValue::Str(bin_str.into_owned())
-            } else {
-                JsonValue::Str(s.clone())
+    let bin_q = quote_antigravity_path_arg(bin, "agent-guard binary path")?;
+
+    fn rewrite(node: &JsonValue, bin_q: &str, adapter_tag: Option<&str>) -> JsonValue {
+        match node {
+            JsonValue::Str(s) => {
+                if let Some(rest) = s.strip_prefix("agent-guard ") {
+                    let trimmed = rest.trim();
+                    if let Some(ad) = adapter_tag
+                        && matches!(
+                            trimmed,
+                            "pre-tool"
+                                | "post-tool"
+                                | "user-prompt"
+                                | "pre-compact"
+                                | "post-edit"
+                                | "on-stop"
+                        )
+                    {
+                        JsonValue::Str(format!("{bin_q} {trimmed} --adapter {ad}"))
+                    } else {
+                        JsonValue::Str(format!("{bin_q} {rest}"))
+                    }
+                } else if s == "agent-guard" {
+                    JsonValue::Str(bin_q.to_string())
+                } else {
+                    JsonValue::Str(s.clone())
+                }
             }
+            JsonValue::Array(items) => JsonValue::Array(
+                items
+                    .iter()
+                    .map(|v| rewrite(v, bin_q, adapter_tag))
+                    .collect(),
+            ),
+            JsonValue::Object(entries) => JsonValue::Object(
+                entries
+                    .iter()
+                    .map(|(k, v)| (k.clone(), rewrite(v, bin_q, adapter_tag)))
+                    .collect(),
+            ),
+            other => other.clone(),
         }
-        JsonValue::Array(items) => JsonValue::Array(
-            items
-                .iter()
-                .map(|v| pin_hook_binary_in_json(v, abs_guard_bin))
-                .collect(),
-        ),
-        JsonValue::Object(entries) => JsonValue::Object(
-            entries
-                .iter()
-                .map(|(k, v)| (k.clone(), pin_hook_binary_in_json(v, abs_guard_bin)))
-                .collect(),
-        ),
-        other => other.clone(),
     }
+
+    Ok(rewrite(val, &bin_q, adapter_tag))
+}
+
+fn pin_codex_notify_toml(tpl: &str, abs_guard_bin: Option<&Path>) -> Result<String, String> {
+    let Some(bin) = abs_guard_bin else {
+        return Ok(tpl.to_string());
+    };
+    if !bin.is_absolute() {
+        return Err(format!(
+            "agent-guard binary path '{}' must be an absolute path",
+            bin.display()
+        ));
+    }
+    let Some(s) = bin.to_str() else {
+        return Err(format!(
+            "agent-guard binary path '{}' must be valid UTF-8",
+            bin.display()
+        ));
+    };
+    if s.is_empty() || s.bytes().any(|b| b < 0x20 || b == 0x7f) {
+        return Err(format!(
+            "agent-guard binary path '{}' contains disallowed control characters",
+            bin.display()
+        ));
+    }
+    let bin_lit = JsonValue::Str(s.to_string()).to_json_string();
+    let replacement = format!("notify = [{bin_lit}, \"on-stop\", \"--adapter\", \"codex\"]");
+    if !tpl.contains("notify = [\"agent-guard\", \"on-stop\"]") {
+        return Err("dist/codex/config.toml missing canonical notify array".to_string());
+    }
+    Ok(tpl.replacen("notify = [\"agent-guard\", \"on-stop\"]", &replacement, 1))
 }
 
 /// Merges `template_json` over an optional pre-existing `existing_json`, preserving harmless
@@ -1269,10 +1317,11 @@ fn merge_settings_json_preserving_user_prefs(
     existing_raw: Option<&str>,
     template_raw: &str,
     abs_guard_bin: Option<&Path>,
+    adapter_tag: Option<&str>,
 ) -> Result<String, String> {
     let template_parsed = JsonValue::parse(template_raw)
         .map_err(|e| format!("invalid dist settings JSON template: {e}"))?;
-    let pinned_template = pin_hook_binary_in_json(&template_parsed, abs_guard_bin);
+    let pinned_template = pin_hook_binary_in_json(&template_parsed, abs_guard_bin, adapter_tag)?;
     let Some(template_obj) = pinned_template.as_object() else {
         return Ok(format!("{}\n", pinned_template.to_json_string()));
     };
@@ -1429,7 +1478,6 @@ fn deploy_workspace_bundle(
         ("dist/AGENTS.md", "AGENTS.md"),
         ("dist/.ignore", ".ignore"),
         ("dist/cursor/.cursorignore", ".cursorignore"),
-        ("dist/codex/config.toml", ".codex/config.toml"),
     ];
     for &(src_rel, dst_rel) in copy_pairs {
         let bytes = fs::read(dotagent_root.join(src_rel))
@@ -1444,6 +1492,22 @@ fn deploy_workspace_bundle(
         )?;
     }
 
+    let codex_tpl = fs::read_to_string(dotagent_root.join("dist/codex/config.toml"))
+        .map_err(|e| format!("missing 'dist/codex/config.toml': {e}"))?;
+    let codex_bytes = if is_external {
+        pin_codex_notify_toml(&codex_tpl, abs_guard_bin)?.into_bytes()
+    } else {
+        codex_tpl.into_bytes()
+    };
+    write_with_nondestructive_backup(
+        &target_root.join(".codex/config.toml"),
+        &codex_bytes,
+        mode,
+        false,
+        dry_run,
+        log,
+    )?;
+
     // Claude settings.json: preserve custom user top-level preferences & pin absolute binary on external workspaces
     let claude_tpl = fs::read_to_string(dotagent_root.join("dist/claude/settings.json"))
         .map_err(|e| format!("missing dist/claude/settings.json: {e}"))?;
@@ -1454,6 +1518,7 @@ fn deploy_workspace_bundle(
             existing_raw.as_deref(),
             &claude_tpl,
             abs_guard_bin,
+            Some("claude"),
         )?
         .into_bytes()
     } else {
@@ -1470,7 +1535,7 @@ fn deploy_workspace_bundle(
             .map_err(|e| format!("invalid dist/cursor/hooks.json: {e}"))?;
         format!(
             "{}\n",
-            pin_hook_binary_in_json(&parsed, abs_guard_bin).to_json_string()
+            pin_hook_binary_in_json(&parsed, abs_guard_bin, Some("cursor"))?.to_json_string()
         )
         .into_bytes()
     } else {
@@ -1594,6 +1659,7 @@ pub(crate) fn execute_activate(
         existing_gemini.as_deref(),
         &gemini_settings_tpl,
         abs_guard_opt,
+        Some("gemini"),
     )?;
     write_with_nondestructive_backup(
         &gemini_settings_dst,

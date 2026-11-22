@@ -296,36 +296,111 @@ fn prepare_checkpoint_target(tmp: &Path, protected_roots: &[&Path]) -> std::io::
     Ok(target)
 }
 
+#[cfg(target_os = "linux")]
+fn current_euid_egid() -> Option<(u32, u32)> {
+    use std::os::fd::OwnedFd;
+    use std::os::unix::fs::MetadataExt;
+    use std::os::unix::net::UnixDatagram;
+    let sock = UnixDatagram::unbound().ok()?;
+    let fd: OwnedFd = sock.into();
+    let meta = fs::File::from(fd).metadata().ok()?;
+    Some((meta.uid(), meta.gid()))
+}
+
+#[cfg(target_os = "linux")]
+fn is_trusted_probe_exe_meta(meta: &fs::Metadata, my_uid: u32, my_gid: u32) -> bool {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    if !meta.file_type().is_file() {
+        return false;
+    }
+    let mode = meta.permissions().mode();
+    if (mode & 0o111) == 0 || (mode & 0o002) != 0 {
+        return false;
+    }
+    if meta.uid() != my_uid && meta.uid() != 0 {
+        return false;
+    }
+    if (mode & 0o020) != 0 && (meta.uid() != my_uid || meta.gid() != my_gid) {
+        return false;
+    }
+    true
+}
+
+#[cfg(target_os = "linux")]
+pub fn is_trusted_probe_exe_file(path: &Path, my_uid: u32, my_gid: u32) -> bool {
+    let Ok(meta) = fs::symlink_metadata(path) else {
+        return false;
+    };
+    if meta.file_type().is_symlink() {
+        return false;
+    }
+    is_trusted_probe_exe_meta(&meta, my_uid, my_gid)
+}
+
+#[cfg(target_os = "linux")]
+fn is_known_self_probe_binary() -> bool {
+    env::current_exe()
+        .ok()
+        .and_then(|exe| exe.file_name().map(|n| n.to_os_string()))
+        .and_then(|n| n.into_string().ok())
+        .is_some_and(|raw| {
+            let name = raw.strip_suffix(" (deleted)").unwrap_or(raw.as_str());
+            matches!(name, "agent-guard" | "dotagent" | "dotagent-harness")
+        })
+}
+
+#[cfg(target_os = "linux")]
+fn resolve_self_probe_exe() -> Option<PathBuf> {
+    if !is_known_self_probe_binary() {
+        return None;
+    }
+    let (my_uid, my_gid) = current_euid_egid()?;
+    let self_exe = Path::new("/proc/self/exe");
+    let meta = fs::metadata(self_exe).ok()?;
+    is_trusted_probe_exe_meta(&meta, my_uid, my_gid).then(|| self_exe.to_path_buf())
+}
+
 /// Probes host OS kernel sandbox enforcement without mutating the current process.
 pub fn probe_host_sandbox_mode() -> KernelSandboxMode {
     #[cfg(target_os = "linux")]
     {
-        if let Ok(exe) = env::current_exe() {
-            let mut candidates = Vec::new();
-            for anc in exe.ancestors().skip(1).take(5) {
-                for name in ["agent-guard", "dotagent"] {
-                    let cand = anc.join(name);
-                    if cand != exe && cand.is_file() && !candidates.contains(&cand) {
-                        candidates.push(cand);
-                    }
+        if let Some(bin) = resolve_self_probe_exe() {
+            if let Ok(out) = Command::new(bin).arg("--probe-landlock-child").output()
+                && out.status.success()
+            {
+                let text = String::from_utf8_lossy(&out.stdout);
+                if text.contains("linux-landlock-enforced") {
+                    return KernelSandboxMode::LinuxLandlockEnforced;
+                }
+                if text.contains("linux-landlock-partial") {
+                    return KernelSandboxMode::LinuxLandlockPartiallyEnforced;
+                }
+                if text.contains("fallback-env-and-ast-only") {
+                    return KernelSandboxMode::FallbackEnvAndAstOnly;
                 }
             }
-            candidates.push(exe);
-            for bin in candidates {
-                if let Ok(out) = Command::new(bin).arg("--probe-landlock-child").output()
-                    && out.status.success()
-                {
-                    let text = String::from_utf8_lossy(&out.stdout);
-                    if text.contains("linux-landlock-enforced") {
-                        return KernelSandboxMode::LinuxLandlockEnforced;
-                    }
-                    if text.contains("linux-landlock-partial") {
-                        return KernelSandboxMode::LinuxLandlockPartiallyEnforced;
-                    }
-                    if text.contains("fallback-env-and-ast-only") {
-                        return KernelSandboxMode::FallbackEnvAndAstOnly;
-                    }
-                }
+            return KernelSandboxMode::FallbackEnvAndAstOnly;
+        }
+        if !is_known_self_probe_binary() {
+            use landlock::{
+                ABI, Access, AccessFs, AccessNet, CompatLevel, Compatible, Ruleset, RulesetAttr,
+            };
+            if Ruleset::default()
+                .set_compatibility(CompatLevel::HardRequirement)
+                .handle_access(AccessFs::from_all(ABI::V5))
+                .and_then(|r| r.handle_access(AccessNet::from_all(ABI::V5)))
+                .and_then(|r| r.create())
+                .is_ok()
+            {
+                return KernelSandboxMode::LinuxLandlockEnforced;
+            }
+            if Ruleset::default()
+                .set_compatibility(CompatLevel::HardRequirement)
+                .handle_access(AccessFs::from_all(ABI::V1))
+                .and_then(|r| r.create())
+                .is_ok()
+            {
+                return KernelSandboxMode::LinuxLandlockPartiallyEnforced;
             }
         }
         KernelSandboxMode::FallbackEnvAndAstOnly
@@ -367,19 +442,9 @@ pub fn run_sandbox_status_cli() -> ExitCode {
 pub fn probe_host_seccomp_verified() -> Option<bool> {
     #[cfg(target_os = "linux")]
     {
-        let Ok(exe) = env::current_exe() else {
+        let Some(exe) = resolve_self_probe_exe() else {
             return Some(false);
         };
-        let Ok(meta) = fs::symlink_metadata(&exe) else {
-            return Some(false);
-        };
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            if !meta.is_file() || (meta.permissions().mode() & 0o022) != 0 {
-                return Some(false);
-            }
-        }
         if let Ok(out) = Command::new(&exe).arg("--probe-seccomp-child").output()
             && out.status.success()
         {
@@ -2135,6 +2200,19 @@ fn prepare_capability_write_paths(
     }
     if qa_only && patterns.is_empty() {
         patterns.extend(["tests/**".to_string(), "test_attribution.toml".to_string()]);
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        use landlock::{ABI, Access, AccessFs, CompatLevel, Compatible, Ruleset, RulesetAttr};
+        if Ruleset::default()
+            .set_compatibility(CompatLevel::HardRequirement)
+            .handle_access(AccessFs::from_all(ABI::V1))
+            .and_then(|r| r.create())
+            .is_err()
+        {
+            return Ok(Some(Vec::new()));
+        }
     }
 
     let mut writable_files = BTreeSet::new();
