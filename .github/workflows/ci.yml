@@ -130,6 +130,9 @@ jobs:
           file "${preview}/dotagent"
 
           /usr/bin/sandbox-exec -p '(version 1) (allow default) (deny network*)' \
+            "${preview}/dotagent" github-rulesets --help > "${preview}/help.txt"
+          grep -F 'Usage: dotagent github-rulesets' "${preview}/help.txt"
+          /usr/bin/sandbox-exec -p '(version 1) (allow default) (deny network*)' \
             "${preview}/dotagent" github-rulesets --repo susanbdev/dotagent --dry-run > "${preview}/rulesets.json"
           python3 -B - "${preview}/rulesets.json" <<'PY'
           import json, sys

@@ -1012,6 +1012,19 @@ fn check_single_command(
             });
         }
         if let Some(sub) = sub_args.first().map(String::as_str) {
+            if sub == "github-rulesets"
+                && sub_args[1..]
+                    .iter()
+                    .any(|arg| matches!(arg.as_str(), "--verify" | "--apply"))
+            {
+                return Err(CommandViolation {
+                    code: "SELF_TAMPERING_BLOCKED",
+                    detail:
+                        "Live GitHub ruleset operations are unavailable inside the agent shell."
+                            .to_string(),
+                    halt_session: true,
+                });
+            }
             if matches!(
                 sub,
                 "user-prompt"

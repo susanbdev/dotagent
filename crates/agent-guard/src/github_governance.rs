@@ -22,8 +22,9 @@
 //!    - Explicit `bypass_actors: []` (excluding `dotagent-loop[bot]` and repo admins from bypass),
 //!      blocks deletion and force-pushes (`non_fast_forward`), requires linear history, requires PRs
 //!      with `allowed_merge_methods: ["squash"]`, `required_review_thread_resolution: true`,
-//!      `dismiss_stale_reviews_on_push: true`, `copilot_code_review: { review_on_push: true }`, and
-//!      the Guardrail CI jobs and the exact-head `Ring-0 & Copilot Gate` on `dotagent`.
+//!      `dismiss_stale_reviews_on_push: true`, and at least one eligible collaborator approval.
+//!      On `dotagent`, it also requires the Guardrail CI jobs and the exact-head `Ring-0 & Copilot
+//!      Gate`, and configures `copilot_code_review` with `review_on_push: true`.
 
 use std::io::Write;
 use std::path::Path;
@@ -232,18 +233,15 @@ pub fn build_repo_merge_settings_payload() -> JsonValue {
 /// `statuses: write` cannot forge a green context from outside Actions.
 pub const GITHUB_ACTIONS_INTEGRATION_ID: u64 = 15368;
 
+const MINIMUM_APPROVING_REVIEWS: u64 = 1;
+const EXTRA_COPILOT_APPROVAL: &str = "require_extra_approval_for_unattributed_changes";
+
 pub fn build_main_ruleset_payload(
     required_check_contexts: &[String],
     include_copilot_rule: bool,
 ) -> JsonValue {
-    // Fail-safe: unless the server-side `Ring-0 & Copilot Gate` status check is required,
-    // require >= 1 human approval so `main` never relies on CI alone. The native Copilot review
-    // rule alone does NOT lower the floor (it does not block on findings).
-    let has_gate_check = required_check_contexts
-        .iter()
-        .any(|c| c == COPILOT_GATE_CONTEXT);
-    let approving_count = if has_gate_check { 0u64 } else { 1u64 };
-
+    // GitHub pins status contexts to an App identity shared by Actions workflows.
+    // Keep an eligible collaborator approval even when the automated gate is required.
     let mut rules: Vec<JsonValue> = vec![
         JsonValue::Object(vec![(
             "type".to_string(),
@@ -277,13 +275,14 @@ pub fn build_main_ruleset_payload(
                         "require_code_owner_review".to_string(),
                         JsonValue::Bool(false),
                     ),
+                    (EXTRA_COPILOT_APPROVAL.to_string(), JsonValue::Bool(true)),
                     (
                         "require_last_push_approval".to_string(),
                         JsonValue::Bool(false),
                     ),
                     (
                         "required_approving_review_count".to_string(),
-                        JsonValue::Uint(approving_count),
+                        JsonValue::Uint(MINIMUM_APPROVING_REVIEWS),
                     ),
                     (
                         "required_review_thread_resolution".to_string(),
@@ -631,10 +630,17 @@ pub fn selected_actions_drift(sel: &JsonValue) -> Vec<String> {
     out
 }
 
-/// Deep verification of the `dotagent-main-zero-trust` ruleset body against the payload that
+/// Deep verification of the `dotagent-zero-trust-main` ruleset body against the payload that
 /// `--apply` writes: required checks + strict policy, pull_request parameters, and target refs.
 pub fn ruleset_detail_drift(detail: &JsonValue, required_checks: &[String]) -> Vec<String> {
     let mut out = Vec::new();
+    if !detail
+        .get("bypass_actors")
+        .and_then(JsonValue::as_array)
+        .is_some_and(<[JsonValue]>::is_empty)
+    {
+        out.push("ruleset bypass_actors must be an explicit empty array".to_string());
+    }
     let empty: &[JsonValue] = &[];
     let rules = detail
         .get("rules")
@@ -671,16 +677,17 @@ pub fn ruleset_detail_drift(detail: &JsonValue, required_checks: &[String]) -> V
             if methods != ["squash"] {
                 out.push("pull_request.allowed_merge_methods is not exactly [squash]".to_string());
             }
-            let has_review_gate = required_checks.iter().any(|c| c == COPILOT_GATE_CONTEXT);
             let approvals = p
                 .get("required_approving_review_count")
                 .and_then(JsonValue::as_u64)
                 .unwrap_or(0);
-            if !has_review_gate && approvals < 1 {
-                out.push(
-                    "no Ring-0 & Copilot Gate check and required_approving_review_count < 1"
-                        .to_string(),
-                );
+            if approvals < MINIMUM_APPROVING_REVIEWS {
+                out.push(format!(
+                    "pull_request.required_approving_review_count must be at least {MINIMUM_APPROVING_REVIEWS}"
+                ));
+            }
+            if p.get(EXTRA_COPILOT_APPROVAL).and_then(JsonValue::as_bool) != Some(true) {
+                out.push(format!("pull_request.{EXTRA_COPILOT_APPROVAL} is not true"));
             }
         }
     }
@@ -1108,15 +1115,6 @@ fn configure_or_verify_repo(
                 }
                 Some(id) => {
                     let detail = gh_api_get_json(gh, &format!("repos/{full_repo}/rulesets/{id}"))?;
-                    if detail
-                        .get("bypass_actors")
-                        .and_then(JsonValue::as_array)
-                        .is_some_and(|a| !a.is_empty())
-                    {
-                        drift_findings.push(format!(
-                            "ruleset '{RULESET_NAME}' has non-empty bypass_actors (must be [] so dotagent-loop[bot] cannot bypass gates)"
-                        ));
-                    }
                     let rules_arr = detail
                         .get("rules")
                         .and_then(JsonValue::as_array)
@@ -1324,27 +1322,49 @@ mod tests {
         assert!(s.contains("Ring-0 Constitutional Ratchet"));
         assert!(s.contains("Ring-0 & Copilot Gate"));
 
-        // Empty checks + no Copilot rule falls back to >= 1 human approval!
+        // The approval floor applies regardless of the selected automated gates.
         let empty_fb = build_main_ruleset_payload(&[], false).to_json_string();
         assert!(empty_fb.contains("\"required_approving_review_count\":1"));
-        // CI checks without any review gate still require a human approval.
         let ci_only = build_main_ruleset_payload(&checks_without_review, false).to_json_string();
         assert!(ci_only.contains("\"required_approving_review_count\":1"));
-        // The native Copilot rule alone never lowers the human approval floor.
         let copilot_only = build_main_ruleset_payload(&[], true).to_json_string();
         assert!(copilot_only.contains("\"required_approving_review_count\":1"));
         let weak = build_main_ruleset_payload(&checks_without_review, true);
         let copilot_ci = weak.to_json_string();
         assert!(copilot_ci.contains("\"required_approving_review_count\":1"));
-        // With the gate check required, the floor is 0 and checks are pinned to Actions.
-        assert!(s.contains("\"required_approving_review_count\":0"));
+        assert!(s.contains("\"required_approving_review_count\":1"));
+        assert!(s.contains("\"require_extra_approval_for_unattributed_changes\":true"));
         assert!(s.contains("\"integration_id\":15368"));
 
-        // The payload written by --apply must verify with zero drift.
         assert!(ruleset_detail_drift(&payload, &checks).is_empty());
         let drift = ruleset_detail_drift(&weak, &checks);
         assert!(drift.iter().any(|d| d.contains("Ring-0 & Copilot Gate")));
-        // An unpinned check (spoofable via the statuses API) is drift.
+        let no_approval = JsonValue::parse(&s.replace(
+            "\"required_approving_review_count\":1",
+            "\"required_approving_review_count\":0",
+        ))
+        .unwrap();
+        assert!(
+            ruleset_detail_drift(&no_approval, &checks)
+                .iter()
+                .any(|d| { d.contains("required_approving_review_count") })
+        );
+        let no_extra_approval = JsonValue::parse(&s.replace(
+            "\"require_extra_approval_for_unattributed_changes\":true,",
+            "",
+        ))
+        .unwrap();
+        assert!(
+            ruleset_detail_drift(&no_extra_approval, &checks)
+                .iter()
+                .any(|d| { d.contains(EXTRA_COPILOT_APPROVAL) })
+        );
+        let no_bypass = JsonValue::parse(&s.replace("\"bypass_actors\":[],", "")).unwrap();
+        assert!(
+            ruleset_detail_drift(&no_bypass, &checks)
+                .iter()
+                .any(|d| { d.contains("bypass_actors") })
+        );
         let unpinned =
             JsonValue::parse(&s.replace("\"integration_id\":15368", "\"integration_id\":1"))
                 .unwrap_or(JsonValue::Null);

@@ -1,6 +1,6 @@
 # GitHub rulesets
 
-Use the native Rust command `dotagent github-rulesets` to review and reconcile rulesets in one GitHub repository or organization. Live operations use the authenticated GitHub CLI. Use an account or installation with permission to read rulesets for verification and to create or update rulesets in the selected scope for application. [GitHub ruleset API](https://docs.github.com/en/rest/repos/rules)
+Use the native Rust command `dotagent github-rulesets` to review and reconcile rulesets in one GitHub repository or organization. Live operations use the authenticated GitHub CLI. Verification needs ruleset read access. Applying changes requires an authenticated GitHub administrator for the selected scope and interactive confirmation. [GitHub ruleset API](https://docs.github.com/en/rest/repos/rules)
 
 ## Choose the scope
 
@@ -12,7 +12,7 @@ dotagent github-rulesets --org susanbdev
 dotagent github-rulesets --org susanbdev --include-repo types --include-repo policy-hub
 ```
 
-The common default-branch rules require squash pull requests, resolution of review threads, and one approval. Dotagent's repository policy in `OWNER/dotagent` requires its nine checks and Copilot review, with zero required human approvals in the managed rule. GitHub combines rules from all applicable rulesets, so the organization approval policy excludes Dotagent.
+The default-branch rules require squash pull requests, resolution of review threads, and one eligible collaborator approval. Unattributed Copilot changes require an additional approval. Dotagent's repository policy in `OWNER/dotagent` also requires all nine checks and Copilot review. GitHub pins required contexts to the Actions App. Multiple workflows share that App identity, so the policy retains the approval requirement. The organization policy excludes Dotagent so its repository policy can enforce the full check catalog.
 
 ## Review, verify, and apply
 
@@ -24,9 +24,11 @@ dotagent github-rulesets --repo susanbdev/dotagent --apply
 dotagent github-rulesets --repo susanbdev/dotagent --verify
 ```
 
-`--verify` reads GitHub and reports drift. It exits with status 1 for a missing or different ruleset and status 2 for an API or prerequisite error. `--apply` creates or updates the exact managed names owned by the selected repository or organization. GitHub may require ruleset write access to return bypass actor details during verification. An integration that returns `403` needs access to the applicable repository or organization ruleset endpoints. Enable squash merging in the covered repositories before applying. GitHub permissions authorize these operations and ordinary guarded merges. [Organization ruleset API](https://docs.github.com/en/rest/orgs/rules)
+`--verify` reads GitHub and reports drift. It exits with status 1 for a missing or different managed ruleset and status 2 for an API or prerequisite error. Repository verification checks the effective default-branch rules when the managed ruleset matches. Organization verification checks the organization-owned payload. GitHub may require ruleset write access to return bypass actor details during verification. [Organization ruleset API](https://docs.github.com/en/rest/orgs/rules)
 
-For Dotagent, `--proof-pr N` selects an open non-draft or merged pull request targeting that repository's default branch. Use a PR whose exact head has passed all nine required checks. The default for `--apply` selects the newest merged PR into the default branch and stops if its exact evidence is missing or unsuccessful. Run `--verify --proof-pr N` to check that evidence before applying. If Copilot has returned a clean review and the status is still pending, rerun the trusted **Server-Side Ring-0 & Copilot Gate** workflow for that exact PR revision. [Review gate](../.github/workflows/copilot-gate.yml)
+`--apply` runs from an operator terminal. It checks the administrator identity and scope, asks you to confirm both before changing a ruleset, and requires GitHub Actions pull-request approval to be disabled. Enable squash merging in the covered repositories before applying. Apply updates only managed rulesets in the selected scope and rejects changes that would drop stronger existing review requirements or required contexts. If an apply reports an interrupted write, use `--verify` to inspect the resulting state before retrying.
+
+For Dotagent, `--proof-pr N` selects an open non-draft or merged pull request targeting that repository's default branch. The default selects the newest merged PR into the default branch. Every apply requires successful checks and a clean Copilot review on the exact proof head, including tag-only updates. The command rechecks PR and repository identity after reading the evidence. Run `--verify --proof-pr N` to check the evidence without writing. If Copilot has returned a clean review and the status is still pending, rerun the trusted **Server-Side Ring-0 & Copilot Gate** workflow for that exact PR revision. [Review gate](../.github/workflows/copilot-gate.yml)
 
 ## Dotagent required checks
 
@@ -64,6 +66,6 @@ Review the release configuration before applying the optional tag rules.
 
 1. Install the release promoter GitHub App specifically on the selected Dotagent repository with Contents write access. Record the numeric GitHub App ID.
 2. Configure the `release` environment with required reviewers. If you restrict deployment refs, allow `main` for promotion and `v*` tags for publication jobs.
-3. Set `PROMOTER_APP_ID` to the same App ID and configure `PROMOTER_APP_PRIVATE_KEY` as an Actions secret. The command supports the environment or repository settings. Verification checks secret enrollment by name.
+3. Set the `release` environment variable `PROMOTER_APP_ID` to the same App ID. Store `PROMOTER_APP_PRIVATE_KEY` as a secret in that environment. Remove any repository-level or repository-visible organization-level copy of that secret. GitHub exposes enrollment metadata to the checker. Verify the installed App and its key in the release environment before relying on the tag-creation exception.
 
 Use the same App ID in dry-run, verify, and apply so each command selects the same tag policy. The live preflight checks release reviewers and App configuration before applying the tag rules. Follow the separate signing instructions to enroll a public OpenSSH FIDO2 key and produce a signed release request. [Release signing](RELEASE_SIGNING.md) · [Release workflow](../.github/workflows/release.yml)

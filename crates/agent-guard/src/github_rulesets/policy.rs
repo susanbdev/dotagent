@@ -175,10 +175,6 @@ fn canonical(value: &JsonValue) -> JsonValue {
                     let default = match (key.as_str(), value) {
                         ("parameters", JsonValue::Object(fields)) => fields.is_empty(),
                         ("required_reviewers", JsonValue::Array(reviewers)) => reviewers.is_empty(),
-                        (
-                            "require_extra_approval_for_unattributed_changes",
-                            JsonValue::Bool(false),
-                        ) => true,
                         _ => false,
                     };
                     (!default).then(|| (key.clone(), canonical(value)))
@@ -229,6 +225,57 @@ pub(super) fn drift(existing: &JsonValue, wanted: &JsonValue) -> Result<Vec<&'st
         .collect())
 }
 
+pub(super) fn verify_effective_branch(
+    wanted: &JsonValue,
+    effective: &[JsonValue],
+    id: u64,
+    repo: &str,
+) -> Result<(), String> {
+    let expected = wanted
+        .get("rules")
+        .filter(|rules| rules.as_array().is_some_and(|rules| !rules.is_empty()))
+        .ok_or_else(|| format!("{}: missing desired branch rules", name(wanted)))?;
+    let mut owned = Vec::new();
+    for rule in effective {
+        if rule.get("ruleset_id").and_then(JsonValue::as_u64) != Some(id) {
+            continue;
+        }
+        if rule.get("ruleset_source_type").and_then(JsonValue::as_str) != Some("Repository")
+            || !rule
+                .get("ruleset_source")
+                .and_then(JsonValue::as_str)
+                .is_some_and(|source| source.eq_ignore_ascii_case(repo))
+        {
+            return Err(format!(
+                "{}: effective rule source differs from {repo}",
+                name(wanted)
+            ));
+        }
+        let fields = rule
+            .as_object()
+            .ok_or_else(|| format!("{}: malformed effective branch rule", name(wanted)))?;
+        owned.push(JsonValue::Object(
+            fields
+                .iter()
+                .filter(|(key, _)| {
+                    !matches!(
+                        key.as_str(),
+                        "ruleset_id" | "ruleset_source_type" | "ruleset_source"
+                    )
+                })
+                .cloned()
+                .collect(),
+        ));
+    }
+    if canonical(&JsonValue::Array(owned)) != canonical(expected) {
+        return Err(format!(
+            "{}: effective default-branch rules for {repo} do not match managed policy",
+            name(wanted)
+        ));
+    }
+    Ok(())
+}
+
 fn rule_types(doc: &JsonValue) -> Result<BTreeSet<&str>, String> {
     let rules = doc
         .get("rules")
@@ -251,6 +298,91 @@ fn rule_types(doc: &JsonValue) -> Result<BTreeSet<&str>, String> {
     Ok(types)
 }
 
+fn parameters<'a>(doc: &'a JsonValue, kind: &str) -> Result<Option<&'a JsonValue>, String> {
+    doc.get("rules")
+        .and_then(JsonValue::as_array)
+        .and_then(|rules| {
+            rules
+                .iter()
+                .find(|rule| rule.get("type").and_then(JsonValue::as_str) == Some(kind))
+        })
+        .map(|rule| {
+            rule.get("parameters")
+                .filter(|parameters| parameters.as_object().is_some())
+                .ok_or_else(|| format!("{}: '{kind}' has missing or invalid parameters", name(doc)))
+        })
+        .transpose()
+}
+
+fn approval_count(params: &JsonValue) -> Result<u64, String> {
+    params
+        .get("required_approving_review_count")
+        .and_then(JsonValue::as_u64)
+        .ok_or_else(|| "pull_request rule has missing or invalid approval count".to_owned())
+}
+
+fn preserve_review_policy(current: &JsonValue, target: &JsonValue) -> Result<(), String> {
+    if approval_count(current)? > approval_count(target)? {
+        return Err("apply would reduce the existing approval count".to_owned());
+    }
+    for field in ["require_code_owner_review", "require_last_push_approval"] {
+        let value = current
+            .get(field)
+            .and_then(JsonValue::as_bool)
+            .ok_or_else(|| format!("pull_request rule has missing or invalid {field}"))?;
+        if value && target.get(field).and_then(JsonValue::as_bool) != Some(true) {
+            return Err(format!("apply would remove existing {field} protection"));
+        }
+    }
+    if let Some(reviewers) = current.get("required_reviewers") {
+        let entries = reviewers
+            .as_array()
+            .ok_or_else(|| "pull_request rule has invalid required_reviewers".to_owned())?;
+        if !entries.is_empty()
+            && target
+                .get("required_reviewers")
+                .is_none_or(|replacement| canonical(reviewers) != canonical(replacement))
+        {
+            return Err("apply would change existing required reviewers".to_owned());
+        }
+    }
+    if let Some(dismissal) = current.get("dismissal_restrictions") {
+        let enabled = dismissal
+            .get("enabled")
+            .and_then(JsonValue::as_bool)
+            .ok_or_else(|| "pull_request rule has invalid dismissal_restrictions".to_owned())?;
+        if enabled
+            && target
+                .get("dismissal_restrictions")
+                .is_none_or(|replacement| canonical(dismissal) != canonical(replacement))
+        {
+            return Err("apply would change existing review dismissal restrictions".to_owned());
+        }
+    }
+    Ok(())
+}
+
+fn status_contexts(params: &JsonValue) -> Result<BTreeSet<&str>, String> {
+    let checks = params
+        .get("required_status_checks")
+        .and_then(JsonValue::as_array)
+        .ok_or_else(|| "required_status_checks rule has missing or invalid checks".to_owned())?;
+    let mut contexts = BTreeSet::new();
+    for check in checks {
+        let name = check
+            .get("context")
+            .and_then(JsonValue::as_str)
+            .filter(|name| !name.is_empty())
+            .ok_or_else(|| "required_status_checks rule has a missing context".to_owned())?;
+        if !contexts.insert(name) {
+            return Err(format!(
+                "required_status_checks rule has duplicate context '{name}'"
+            ));
+        }
+    }
+    Ok(contexts)
+}
+
 pub(super) fn apply_safety(existing: &JsonValue, wanted: &JsonValue) -> Result<(), String> {
     require_bypass_metadata(existing)?;
     let target = existing.get("target").and_then(JsonValue::as_str);
@@ -269,6 +401,26 @@ pub(super) fn apply_safety(existing: &JsonValue, wanted: &JsonValue) -> Result<(
             name(wanted),
             extra.join(", ")
         ));
+    }
+    if let Some(current) = parameters(existing, "pull_request")? {
+        let target = parameters(wanted, "pull_request")?
+            .ok_or_else(|| "desired ruleset is missing pull_request parameters".to_owned())?;
+        preserve_review_policy(current, target)?;
+    }
+    if let Some(current) = parameters(existing, "required_status_checks")? {
+        let target = parameters(wanted, "required_status_checks")?.ok_or_else(|| {
+            "desired ruleset is missing required_status_checks parameters".to_owned()
+        })?;
+        let current = status_contexts(current)?;
+        let target = status_contexts(target)?;
+        let extra: Vec<_> = current.difference(&target).copied().collect();
+        if !extra.is_empty() {
+            return Err(format!(
+                "{}: apply would remove required status contexts: {}",
+                name(wanted),
+                extra.join(", ")
+            ));
+        }
     }
     Ok(())
 }
@@ -310,6 +462,7 @@ mod tests {
         let repo = plan(&["--repo", "owner/other"]);
         assert_eq!(name(&repo[0]), "dotagent-baseline-main");
         assert_eq!(approvals(&repo[0]), Some(1));
+        assert_eq!(repo[0].get("bypass_actors"), Some(&json("[]")));
         assert_eq!(
             rule_types(&repo[0]).unwrap(),
             BTreeSet::from([
@@ -330,6 +483,7 @@ mod tests {
             "beta",
         ]);
         assert_eq!(approvals(&org[0]), Some(1));
+        assert_eq!(org[0].get("bypass_actors"), Some(&json("[]")));
         let repositories = org[0]
             .get("conditions")
             .unwrap()
@@ -352,7 +506,8 @@ mod tests {
             panic!("expected three rulesets")
         };
         assert_eq!(name(branch), "dotagent-zero-trust-main");
-        assert_eq!(approvals(branch), Some(0));
+        assert_eq!(approvals(branch), Some(1));
+        assert_eq!(branch.get("bypass_actors"), Some(&json("[]")));
         let checks = rule(branch, "required_status_checks")
             .get("parameters")
             .unwrap()
@@ -404,21 +559,75 @@ mod tests {
             "name":"managed","target":"branch","enforcement":"active","bypass_actors":[],
             "conditions":{"ref_name":{"include":["~DEFAULT_BRANCH"],"exclude":[]},
             "repository_name":{"include":["alpha","beta"],"exclude":["dotagent"],"protected":false}},
-            "rules":[{"type":"deletion"},{"type":"pull_request","parameters":{"required_approving_review_count":1}}]
+            "rules":[{"type":"deletion"},{"type":"pull_request","parameters":{"required_approving_review_count":1,
+            "require_extra_approval_for_unattributed_changes":true}}]
         }"#,
         );
         let response = r#"{
             "id":12,"rules":[{"parameters":{"required_reviewers":[],"required_approving_review_count":1,
-            "require_extra_approval_for_unattributed_changes":false},"type":"pull_request"},
+            "require_extra_approval_for_unattributed_changes":true},"type":"pull_request"},
             {"parameters":{},"type":"deletion"}],"bypass_actors":[],"enforcement":"active","target":"branch",
             "conditions":{"repository_name":{"exclude":["dotagent"],"include":["beta","alpha"]},
             "ref_name":{"include":["~DEFAULT_BRANCH"]}},"name":"managed"
         }"#;
         assert!(drift(&json(response), &wanted).unwrap().is_empty());
-        assert_eq!(
-            drift(&json(&response.replace("false", "true")), &wanted).unwrap(),
-            vec!["rules"]
+        for changed in [
+            response.replace("true", "false"),
+            response.replace(
+                ",\n            \"require_extra_approval_for_unattributed_changes\":true",
+                "",
+            ),
+            response.replace(
+                "required_approving_review_count\":1",
+                "required_approving_review_count\":0",
+            ),
+        ] {
+            assert_eq!(drift(&json(&changed), &wanted).unwrap(), vec!["rules"]);
+        }
+    }
+
+    #[test]
+    fn effective_branch_requires_exact_managed_rules_from_the_selected_repository() {
+        let wanted = &plan(&["--repo", "owner/dotagent"])[0];
+        let effective: Vec<_> = wanted
+            .get("rules")
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|rule| {
+                let mut fields = rule.as_object().unwrap().to_vec();
+                fields.extend([
+                    ("ruleset_id".to_owned(), JsonValue::Uint(13)),
+                    ("ruleset_source".to_owned(), string("Owner/Dotagent")),
+                    ("ruleset_source_type".to_owned(), string("Repository")),
+                ]);
+                JsonValue::Object(fields)
+            })
+            .collect();
+        assert!(verify_effective_branch(wanted, &effective, 13, "owner/dotagent").is_ok());
+        assert!(verify_effective_branch(wanted, &effective, 14, "owner/dotagent").is_err());
+        assert!(verify_effective_branch(wanted, &effective, 13, "other/dotagent").is_err());
+        assert!(
+            verify_effective_branch(
+                wanted,
+                &effective[..effective.len() - 1],
+                13,
+                "owner/dotagent"
+            )
+            .is_err()
         );
+        let unpinned: Vec<_> = effective
+            .iter()
+            .map(|rule| {
+                json(
+                    &rule
+                        .to_json_string()
+                        .replace("\"integration_id\":15368", "\"integration_id\":1"),
+                )
+            })
+            .collect();
+        assert!(verify_effective_branch(wanted, &unpinned, 13, "owner/dotagent").is_err());
     }
 
     #[test]
@@ -448,5 +657,55 @@ mod tests {
                 .contains("duplicate 'deletion' rules")
         );
         assert!(apply_safety(&wanted, &wanted).is_ok());
+    }
+
+    #[test]
+    fn application_preserves_existing_stronger_review_and_check_requirements() {
+        let wanted = &plan(&["--repo", "owner/dotagent"])[0];
+        let raw = wanted.to_json_string();
+        for (current, replacement, diagnostic) in [
+            (
+                "\"required_approving_review_count\":1",
+                "\"required_approving_review_count\":2",
+                "reduce the existing approval count",
+            ),
+            (
+                "\"require_code_owner_review\":false",
+                "\"require_code_owner_review\":true",
+                "require_code_owner_review",
+            ),
+            (
+                "\"require_last_push_approval\":false",
+                "\"require_last_push_approval\":true",
+                "require_last_push_approval",
+            ),
+            (
+                "\"require_last_push_approval\":false",
+                r#""require_last_push_approval":false,"required_reviewers":[{"reviewer":{"id":1,"type":"Team"},"file_patterns":["**/*"],"minimum_approvals":1}]"#,
+                "existing required reviewers",
+            ),
+            (
+                "\"require_last_push_approval\":false",
+                r#""require_last_push_approval":false,"dismissal_restrictions":{"enabled":true,"allowed_actors":[]}"#,
+                "review dismissal restrictions",
+            ),
+            (
+                "\"required_status_checks\":[",
+                r#""required_status_checks":[{"context":"Additional trusted check","integration_id":15368},"#,
+                "Additional trusted check",
+            ),
+        ] {
+            let existing = json(&raw.replace(current, replacement));
+            assert!(
+                apply_safety(&existing, wanted)
+                    .unwrap_err()
+                    .contains(diagnostic)
+            );
+        }
+        let previous = json(&raw.replace(
+            "\"required_approving_review_count\":1",
+            "\"required_approving_review_count\":0",
+        ));
+        assert!(apply_safety(&previous, wanted).is_ok());
     }
 }

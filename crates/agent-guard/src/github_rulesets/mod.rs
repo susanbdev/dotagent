@@ -5,20 +5,24 @@
 mod api;
 mod policy;
 
+use std::io::{self, IsTerminal, Read, Write};
 use std::process::ExitCode;
 
 use crate::feedback_loop::validate_owner_repo;
 use crate::github_governance::validate_github_ident;
 use crate::json::JsonValue;
 
-use self::api::{Api, GhApi, verify_release_settings, verify_repo_readiness};
+use self::api::{
+    Api, GhApi, encode_url_component, verify_apply_authority, verify_release_settings,
+    verify_repo_readiness,
+};
 
 const USAGE: &str = "Usage: dotagent github-rulesets (--repo OWNER/REPO | --org ORG)\n\
     [--include-repo NAME]... [--dry-run | --verify | --apply]\n\
     [--proof-pr NUMBER] [--promoter-app-id ID]\n\
     --dry-run     Print the desired rulesets offline (default)\n\
     --verify      Check GitHub for drift without writing\n\
-    --apply       Reconcile only the managed rulesets";
+    --apply       Reconcile managed rulesets from a verified administrator's terminal";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Scope {
@@ -177,8 +181,11 @@ pub(crate) fn run_cli(raw: &[String]) -> ExitCode {
         }
         if args.mode == Mode::Apply {
             crate::fleet::verify_operator_not_in_agent_sandbox("dotagent github-rulesets --apply")?;
+            if !io::stdin().is_terminal() || !io::stderr().is_terminal() {
+                return Err("--apply requires an interactive operator terminal".to_string());
+            }
         }
-        reconcile(&GhApi::new()?, &args, &desired)
+        reconcile(&GhApi::new()?, &args, &desired, confirm_apply)
     })();
     match result {
         Ok(code) => code,
@@ -187,6 +194,30 @@ pub(crate) fn run_cli(raw: &[String]) -> ExitCode {
             ExitCode::from(2)
         }
     }
+}
+
+fn confirm_apply(login: &str, scope: &Scope) -> Result<(), String> {
+    let (kind, name) = scope.source();
+    let phrase = format!("apply {login} {}", scope.owner_path());
+    let mut terminal = io::stderr().lock();
+    writeln!(
+        terminal,
+        "GitHub administrator {login} is applying rules to {kind} {name}."
+    )
+    .and_then(|()| write!(terminal, "Type '{phrase}' to proceed: "))
+    .and_then(|()| terminal.flush())
+    .map_err(|error| format!("cannot prompt for operator confirmation: {error}"))?;
+    let mut response = String::new();
+    use io::BufRead as _;
+    io::stdin()
+        .lock()
+        .take(512)
+        .read_line(&mut response)
+        .map_err(|error| format!("cannot read operator confirmation: {error}"))?;
+    if response.trim_end_matches(['\r', '\n']) != phrase {
+        return Err("operator confirmation did not match the administrator and scope".to_string());
+    }
+    Ok(())
 }
 
 fn check_identity(document: &JsonValue, scope: &Scope, name: &str) -> Result<u64, String> {
@@ -219,7 +250,148 @@ struct Change<'a> {
     previous: Option<(u64, JsonValue)>,
 }
 
-fn reconcile(api: &impl Api, args: &Args, desired: &[JsonValue]) -> Result<ExitCode, String> {
+fn read_managed(
+    api: &impl Api,
+    listed: &[JsonValue],
+    endpoint: &str,
+    detail_query: &str,
+    scope: &Scope,
+    name: &str,
+) -> Result<Option<(u64, JsonValue)>, String> {
+    let mut found = None;
+    for item in listed {
+        let item_name = item
+            .get("name")
+            .and_then(JsonValue::as_str)
+            .ok_or_else(|| "GitHub returned a malformed ruleset list entry".to_string())?;
+        if item_name == name && found.replace(item).is_some() {
+            return Err(format!("{name}: multiple managed rulesets found"));
+        }
+    }
+    let Some(metadata) = found else {
+        return Ok(None);
+    };
+    let id = check_identity(metadata, scope, name)?;
+    let current = api.get(&format!("{endpoint}/{id}{detail_query}"))?;
+    if check_identity(&current, scope, name)? != id {
+        return Err(format!("{name}: ruleset ID changed during read"));
+    }
+    Ok(Some((id, current)))
+}
+
+fn verify_org_readiness(api: &impl Api, args: &Args, org: &str) -> Result<(), String> {
+    let repos = api.items(&format!("orgs/{org}/repos?type=all&per_page=100"), ".[]")?;
+    let mut covered = std::collections::BTreeSet::new();
+    for repo in &repos {
+        let name = repo
+            .get("name")
+            .and_then(JsonValue::as_str)
+            .ok_or_else(|| "GitHub organization repository entry lacks a name".to_string())?;
+        validate_github_ident(name)?;
+        if name.eq_ignore_ascii_case("dotagent")
+            || (!args.include_repos.is_empty()
+                && !args
+                    .include_repos
+                    .iter()
+                    .any(|selected| selected.eq_ignore_ascii_case(name)))
+        {
+            continue;
+        }
+        if repo.get("archived").and_then(JsonValue::as_bool) == Some(true) {
+            continue;
+        }
+        let slug = format!("{org}/{name}");
+        if !repo
+            .get("full_name")
+            .and_then(JsonValue::as_str)
+            .is_some_and(|full_name| full_name.eq_ignore_ascii_case(&slug))
+        {
+            return Err(format!(
+                "organization repository identity does not match {slug}"
+            ));
+        }
+        verify_repo_readiness(api, args, &format!("repos/{slug}"))?;
+        covered.insert(name.to_ascii_lowercase());
+    }
+    if covered.is_empty()
+        || args
+            .include_repos
+            .iter()
+            .any(|repo| !covered.contains(&repo.to_ascii_lowercase()))
+    {
+        return Err(
+            "organization policy scope could not be verified for the selected active repositories"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+fn verify_effective_repo_branch(
+    api: &impl Api,
+    repo: &str,
+    id: u64,
+    wanted: &JsonValue,
+) -> Result<(), String> {
+    let details = api.get(&format!("repos/{repo}"))?;
+    if !details
+        .get("full_name")
+        .and_then(JsonValue::as_str)
+        .is_some_and(|name| name.eq_ignore_ascii_case(repo))
+    {
+        return Err(format!("GitHub repository identity does not match {repo}"));
+    }
+    let default = details
+        .get("default_branch")
+        .and_then(JsonValue::as_str)
+        .filter(|branch| !branch.is_empty())
+        .ok_or_else(|| format!("{repo}: missing default branch"))?;
+    let branch = encode_url_component(default);
+    let effective = api.items(
+        &format!("repos/{repo}/rules/branches/{branch}?per_page=100"),
+        ".[]",
+    )?;
+    policy::verify_effective_branch(wanted, &effective, id, repo)
+}
+
+fn check_managed_state(
+    api: &impl Api,
+    args: &Args,
+    desired: &[JsonValue],
+    endpoint: &str,
+    list_endpoint: &str,
+    detail_query: &str,
+) -> Result<(), String> {
+    let listed = api.items(list_endpoint, ".[]")?;
+    for wanted in desired {
+        let name = wanted
+            .get("name")
+            .and_then(JsonValue::as_str)
+            .ok_or_else(|| "managed ruleset is missing its name".to_string())?;
+        let (id, current) = read_managed(api, &listed, endpoint, detail_query, &args.scope, name)?
+            .ok_or_else(|| format!("{name}: ruleset missing during final verification"))?;
+        let fields = policy::drift(&current, wanted)?;
+        if !fields.is_empty() {
+            return Err(format!(
+                "{name}: drift during final verification in {}",
+                fields.join(", ")
+            ));
+        }
+        if let Scope::Repo(repo) = &args.scope
+            && wanted.get("target").and_then(JsonValue::as_str) == Some("branch")
+        {
+            verify_effective_repo_branch(api, repo, id, wanted)?;
+        }
+    }
+    Ok(())
+}
+
+fn reconcile(
+    api: &impl Api,
+    args: &Args,
+    desired: &[JsonValue],
+    confirm: impl FnOnce(&str, &Scope) -> Result<(), String>,
+) -> Result<ExitCode, String> {
     let owner = args.scope.owner_path();
     let endpoint = format!("{owner}/rulesets");
     let (list_query, detail_query) = match &args.scope {
@@ -229,17 +401,22 @@ fn reconcile(api: &impl Api, args: &Args, desired: &[JsonValue]) -> Result<ExitC
         ),
         Scope::Org(_) => ("?per_page=100", ""),
     };
-    let listed = api.items(&format!("{endpoint}{list_query}"), ".[]")?;
+    let list_endpoint = format!("{endpoint}{list_query}");
+    let authority = if args.mode == Mode::Apply {
+        Some(verify_apply_authority(api, &args.scope)?)
+    } else {
+        None
+    };
+    let listed = api.items(&list_endpoint, ".[]")?;
     let mut changes = Vec::new();
     for wanted in desired {
         let name = wanted
             .get("name")
             .and_then(JsonValue::as_str)
             .ok_or_else(|| "managed ruleset is missing its name".to_string())?;
-        let mut matching = listed
-            .iter()
-            .filter(|item| item.get("name").and_then(JsonValue::as_str) == Some(name));
-        let Some(metadata) = matching.next() else {
+        let Some((id, current)) =
+            read_managed(api, &listed, &endpoint, detail_query, &args.scope, name)?
+        else {
             println!("{name}: missing");
             changes.push(Change {
                 name,
@@ -248,14 +425,6 @@ fn reconcile(api: &impl Api, args: &Args, desired: &[JsonValue]) -> Result<ExitC
             });
             continue;
         };
-        if matching.next().is_some() {
-            return Err(format!("{name}: multiple managed rulesets found"));
-        }
-        let id = check_identity(metadata, &args.scope, name)?;
-        let current = api.get(&format!("{endpoint}/{id}{detail_query}"))?;
-        if check_identity(&current, &args.scope, name)? != id {
-            return Err(format!("{name}: ruleset ID changed during read"));
-        }
         let fields = policy::drift(&current, wanted)?;
         if fields.is_empty() {
             println!("{name}: in sync");
@@ -272,53 +441,114 @@ fn reconcile(api: &impl Api, args: &Args, desired: &[JsonValue]) -> Result<ExitC
         }
     }
 
-    if let Some(app_id) = args.promoter_app_id {
-        verify_release_settings(api, &owner, app_id)?;
+    if let Some((login, ..)) = &authority
+        && !changes.is_empty()
+    {
+        confirm(login, &args.scope)?;
     }
     if args.mode == Mode::Verify {
+        if let Some(app_id) = args.promoter_app_id {
+            verify_release_settings(api, &owner, app_id)?;
+        }
         if args.proof_pr.is_some() {
             verify_repo_readiness(api, args, &owner)?;
         }
+        if changes.is_empty() {
+            check_managed_state(api, args, desired, &endpoint, &list_endpoint, detail_query)?;
+        }
         return Ok(ExitCode::from(u8::from(!changes.is_empty())));
     }
-    if args.is_dotagent() || (matches!(args.scope, Scope::Repo(_)) && !changes.is_empty()) {
-        verify_repo_readiness(api, args, &owner)?;
+    match &args.scope {
+        Scope::Repo(_) => verify_repo_readiness(api, args, &owner)?,
+        Scope::Org(org) => verify_org_readiness(api, args, org)?,
     }
-    for change in changes {
-        let name = change.name;
-        let (written, operation) = if let Some((id, previous)) = change.previous {
-            let path = format!("{endpoint}/{id}");
-            let snapshot = api.get(&format!("{path}{detail_query}"))?;
-            if check_identity(&snapshot, &args.scope, name)? != id
-                || !policy::drift(&snapshot, &previous)?.is_empty()
-            {
+    if let Some(app_id) = args.promoter_app_id {
+        verify_release_settings(api, &owner, app_id)?;
+    }
+    let expected = authority.ok_or_else(|| "only apply mode may reconcile rulesets".to_string())?;
+    let mut attempted = 0;
+    let apply_result = (|| {
+        for change in changes {
+            let name = change.name;
+            if verify_apply_authority(api, &args.scope)? != expected {
+                return Err("GitHub administrator changed since operator confirmation".to_string());
+            }
+            let listed = api.items(&list_endpoint, ".[]")?;
+            if name == "dotagent-release-tag-creation" {
+                let immutable_name = "dotagent-release-tag-immutability";
+                let immutable = desired
+                    .iter()
+                    .find(|rule| {
+                        rule.get("name").and_then(JsonValue::as_str) == Some(immutable_name)
+                    })
+                    .ok_or_else(|| "release policy lacks immutable tags".to_string())?;
+                let (_, live) = read_managed(
+                    api,
+                    &listed,
+                    &endpoint,
+                    detail_query,
+                    &args.scope,
+                    immutable_name,
+                )?
+                .ok_or_else(|| "release tag immutability ruleset is absent".to_string())?;
+                if !policy::drift(&live, immutable)?.is_empty() {
+                    return Err(
+                        "release tag immutability drifted before creating the promoter exception"
+                            .to_string(),
+                    );
+                }
+            }
+            let current = read_managed(api, &listed, &endpoint, detail_query, &args.scope, name)?;
+            let (written, operation) = if let Some((id, previous)) = change.previous {
+                let path = format!("{endpoint}/{id}");
+                let Some((current_id, snapshot)) = current else {
+                    return Err(format!("{name}: ruleset disappeared during apply"));
+                };
+                if current_id != id || !policy::drift(&snapshot, &previous)?.is_empty() {
+                    return Err(format!(
+                        "{name}: ruleset changed during apply; preview it again"
+                    ));
+                }
+                attempted += 1;
+                let written = api.write("PUT", &path, change.desired)?;
+                if ruleset_id(&written)? != id {
+                    return Err(format!(
+                        "{name}: GitHub returned a different ruleset ID after update"
+                    ));
+                }
+                (written, "updated")
+            } else {
+                if current.is_some() {
+                    return Err(format!(
+                        "{name}: ruleset appeared during apply; preview it again"
+                    ));
+                }
+                attempted += 1;
+                (api.write("POST", &endpoint, change.desired)?, "created")
+            };
+            let id = ruleset_id(&written)?;
+            let updated = api.get(&format!("{endpoint}/{id}{detail_query}"))?;
+            if check_identity(&updated, &args.scope, name)? != id {
+                return Err(format!("{name}: ruleset ID changed after write"));
+            }
+            let fields = policy::drift(&updated, change.desired)?;
+            if !fields.is_empty() {
                 return Err(format!(
-                    "{name}: ruleset changed during apply; preview it again"
+                    "{name}: GitHub returned drift after write: {}",
+                    fields.join(", ")
                 ));
             }
-            let written = api.write("PUT", &path, change.desired)?;
-            if ruleset_id(&written)? != id {
-                return Err(format!(
-                    "{name}: GitHub returned a different ruleset ID after update"
-                ));
-            }
-            (written, "updated")
-        } else {
-            (api.write("POST", &endpoint, change.desired)?, "created")
-        };
-        let id = ruleset_id(&written)?;
-        let updated = api.get(&format!("{endpoint}/{id}{detail_query}"))?;
-        if check_identity(&updated, &args.scope, name)? != id {
-            return Err(format!("{name}: ruleset ID changed after write"));
+            println!("{name}: {operation} (ID {id})");
         }
-        let fields = policy::drift(&updated, change.desired)?;
-        if !fields.is_empty() {
+        check_managed_state(api, args, desired, &endpoint, &list_endpoint, detail_query)
+    })();
+    if let Err(error) = apply_result {
+        if attempted > 0 {
             return Err(format!(
-                "{name}: GitHub returned drift after write: {}",
-                fields.join(", ")
+                "{error}. {attempted} ruleset write(s) attempted; verify the managed rulesets before retrying"
             ));
         }
-        println!("{name}: {operation} (ID {id})");
+        return Err(error);
     }
     Ok(ExitCode::SUCCESS)
 }
@@ -336,12 +566,39 @@ mod tests {
     struct Fixture {
         ruleset: RefCell<Option<JsonValue>>,
         writes: Cell<usize>,
+        reject_authority: Cell<bool>,
+        lose_write_response: Cell<bool>,
+        hide_effective_rules: Cell<bool>,
+        squash_disabled: Cell<bool>,
     }
 
     impl Api for Fixture {
         fn get(&self, endpoint: &str) -> Result<JsonValue, String> {
+            if endpoint == "user" {
+                let kind = if self.reject_authority.get() {
+                    "Bot"
+                } else {
+                    "User"
+                };
+                return JsonValue::parse(&format!(
+                    r#"{{"login":"fixture-admin","id":42,"type":"{kind}"}}"#
+                ));
+            }
             if endpoint == format!("repos/{REPO}") {
-                return JsonValue::parse(r#"{"allow_squash_merge":true,"archived":false}"#);
+                let squash = !self.squash_disabled.get();
+                return JsonValue::parse(&format!(
+                    r#"{{"id":77,"full_name":"fixture-org/library","allow_squash_merge":{squash},"archived":false,"default_branch":"main","permissions":{{"admin":true}}}}"#
+                ));
+            }
+            if endpoint == "orgs/fixture-org/memberships/fixture-admin" {
+                return JsonValue::parse(
+                    r#"{"role":"admin","state":"active","organization":{"login":"fixture-org","id":77},"user":{"login":"fixture-admin","id":42}}"#,
+                );
+            }
+            if endpoint == format!("repos/{REPO}/actions/permissions/workflow")
+                || endpoint == "orgs/fixture-org/actions/permissions/workflow"
+            {
+                return JsonValue::parse(r#"{"can_approve_pull_request_reviews":false}"#);
             }
             assert_eq!(endpoint, format!("{ENDPOINT}/1?includes_parents=false"));
             self.ruleset
@@ -351,6 +608,40 @@ mod tests {
         }
 
         fn items(&self, endpoint: &str, selector: &str) -> Result<Vec<JsonValue>, String> {
+            if endpoint == "orgs/fixture-org/repos?type=all&per_page=100" {
+                return Ok(vec![JsonValue::parse(
+                    r#"{"id":77,"name":"library","full_name":"fixture-org/library","archived":false}"#,
+                )?]);
+            }
+            if endpoint == "orgs/fixture-org/rulesets?per_page=100" {
+                return Ok(Vec::new());
+            }
+            if endpoint == format!("repos/{REPO}/rules/branches/main?per_page=100") {
+                if self.hide_effective_rules.get() {
+                    return Ok(Vec::new());
+                }
+                let stored = self.ruleset.borrow();
+                let rules = stored
+                    .as_ref()
+                    .and_then(|ruleset| ruleset.get("rules"))
+                    .and_then(JsonValue::as_array)
+                    .ok_or("ruleset missing")?;
+                return rules
+                    .iter()
+                    .map(|rule| {
+                        let mut fields = rule.as_object().ok_or("rule is not an object")?.to_vec();
+                        fields.extend([
+                            ("ruleset_id".into(), JsonValue::Uint(1)),
+                            (
+                                "ruleset_source_type".into(),
+                                JsonValue::Str("Repository".into()),
+                            ),
+                            ("ruleset_source".into(), JsonValue::Str(REPO.into())),
+                        ]);
+                        Ok(JsonValue::Object(fields))
+                    })
+                    .collect();
+            }
             assert_eq!(
                 endpoint,
                 format!("{ENDPOINT}?includes_parents=false&per_page=100")
@@ -379,6 +670,9 @@ mod tests {
             ]);
             let record = JsonValue::Object(record);
             self.ruleset.replace(Some(record.clone()));
+            if self.lose_write_response.replace(false) {
+                return Err("simulated response timeout after commit".into());
+            }
             Ok(record)
         }
     }
@@ -391,6 +685,14 @@ mod tests {
         )
     }
 
+    fn confirmed(api: &impl Api, args: &Args, desired: &[JsonValue]) -> Result<ExitCode, String> {
+        reconcile(api, args, desired, |login, scope| {
+            assert_eq!(login, "fixture-admin");
+            assert_eq!(scope, &args.scope);
+            Ok(())
+        })
+    }
+
     #[test]
     fn reconciling_checks_drift_and_writes_only_when_required() {
         let fixture = Fixture::default();
@@ -398,12 +700,12 @@ mod tests {
         let apply = options(&["--repo", REPO, "--apply"]).expect("apply arguments");
         let desired = policy::desired(&apply).expect("repository ruleset");
         assert_eq!(
-            reconcile(&fixture, &verify, &desired),
+            confirmed(&fixture, &verify, &desired),
             Ok(ExitCode::from(1))
         );
         assert_eq!(fixture.writes.get(), 0);
-        assert_eq!(reconcile(&fixture, &apply, &desired), Ok(ExitCode::SUCCESS));
-        assert_eq!(reconcile(&fixture, &apply, &desired), Ok(ExitCode::SUCCESS));
+        assert_eq!(confirmed(&fixture, &apply, &desired), Ok(ExitCode::SUCCESS));
+        assert_eq!(confirmed(&fixture, &apply, &desired), Ok(ExitCode::SUCCESS));
         assert_eq!(fixture.writes.get(), 1);
 
         if let Some(JsonValue::Object(fields)) = fixture.ruleset.borrow_mut().as_mut() {
@@ -414,14 +716,14 @@ mod tests {
             *enforcement = JsonValue::Str("disabled".into());
         }
         assert_eq!(
-            reconcile(&fixture, &verify, &desired),
+            confirmed(&fixture, &verify, &desired),
             Ok(ExitCode::from(1))
         );
         assert_eq!(fixture.writes.get(), 1);
-        assert_eq!(reconcile(&fixture, &apply, &desired), Ok(ExitCode::SUCCESS));
+        assert_eq!(confirmed(&fixture, &apply, &desired), Ok(ExitCode::SUCCESS));
         assert_eq!(fixture.writes.get(), 2);
         assert_eq!(
-            reconcile(&fixture, &verify, &desired),
+            confirmed(&fixture, &verify, &desired),
             Ok(ExitCode::SUCCESS)
         );
     }
@@ -435,8 +737,151 @@ mod tests {
             JsonValue::parse(r#"{"name":"dotagent-baseline-main","id":1,"source":"fixture-org","source_type":"Organization"}"#)
                 .expect("inherited ruleset"),
         ));
-        assert!(reconcile(&fixture, &apply, &desired).is_err());
+        assert!(confirmed(&fixture, &apply, &desired).is_err());
         assert_eq!(fixture.writes.get(), 0);
+    }
+
+    #[test]
+    fn rejects_unauthorized_or_unconfirmed_apply_without_writes() {
+        let fixture = Fixture::default();
+        let apply = options(&["--repo", REPO, "--apply"]).expect("apply arguments");
+        let desired = policy::desired(&apply).expect("repository ruleset");
+        fixture.reject_authority.set(true);
+        assert!(
+            reconcile(&fixture, &apply, &desired, |_, _| panic!(
+                "unauthorized prompt"
+            ))
+            .is_err()
+        );
+        assert_eq!(fixture.writes.get(), 0);
+
+        fixture.reject_authority.set(false);
+        assert!(
+            reconcile(&fixture, &apply, &desired, |_, _| Err(
+                "confirmation denied".into()
+            ))
+            .is_err()
+        );
+        assert_eq!(fixture.writes.get(), 0);
+    }
+
+    #[test]
+    fn organization_apply_checks_selected_repositories_before_writing() {
+        let fixture = Fixture::default();
+        fixture.squash_disabled.set(true);
+        let apply = options(&[
+            "--org",
+            "fixture-org",
+            "--include-repo",
+            "library",
+            "--apply",
+        ])
+        .expect("organization apply arguments");
+        let desired = policy::desired(&apply).expect("organization ruleset");
+        let error = confirmed(&fixture, &apply, &desired).expect_err("repository is not ready");
+        assert!(error.contains("squash"), "{error}");
+        assert_eq!(fixture.writes.get(), 0);
+    }
+
+    #[test]
+    fn an_interrupted_write_is_reported_and_can_be_verified_without_a_duplicate() {
+        let fixture = Fixture::default();
+        let apply = options(&["--repo", REPO, "--apply"]).expect("apply arguments");
+        let verify = options(&["--repo", REPO, "--verify"]).expect("verify arguments");
+        let desired = policy::desired(&apply).expect("repository ruleset");
+        fixture.lose_write_response.set(true);
+        let error = confirmed(&fixture, &apply, &desired).expect_err("write outcome is unknown");
+        assert!(error.contains("1 ruleset write(s) attempted"));
+        assert_eq!(
+            confirmed(&fixture, &verify, &desired),
+            Ok(ExitCode::SUCCESS)
+        );
+        assert_eq!(confirmed(&fixture, &apply, &desired), Ok(ExitCode::SUCCESS));
+        assert_eq!(fixture.writes.get(), 1);
+        fixture.hide_effective_rules.set(true);
+        assert!(confirmed(&fixture, &verify, &desired).is_err());
+        assert_eq!(fixture.writes.get(), 1);
+    }
+
+    #[test]
+    fn missing_dotagent_proof_blocks_missing_or_drifting_tag_rules() {
+        struct UnreadyDotagent {
+            existing: Vec<JsonValue>,
+            writes: Cell<usize>,
+        }
+
+        impl Api for UnreadyDotagent {
+            fn get(&self, endpoint: &str) -> Result<JsonValue, String> {
+                match endpoint {
+                    "user" => JsonValue::parse(r#"{"login":"fixture-admin","id":42,"type":"User"}"#),
+                    "repos/fixture-org/dotagent" => JsonValue::parse(r#"{"id":77,"full_name":"fixture-org/dotagent","allow_squash_merge":true,"archived":false,"default_branch":"main","permissions":{"admin":true}}"#),
+                    "repos/fixture-org/dotagent/actions/permissions/workflow" => JsonValue::parse(r#"{"can_approve_pull_request_reviews":false}"#),
+                    "repos/fixture-org/dotagent/pulls/23" => Err("proof PR unavailable".into()),
+                    _ => self.existing.iter().find(|rule| {
+                        rule.get("id").and_then(JsonValue::as_u64).is_some_and(|id| {
+                            endpoint == format!("repos/fixture-org/dotagent/rulesets/{id}?includes_parents=false")
+                        })
+                    }).cloned().ok_or_else(|| format!("unexpected GET {endpoint}")),
+                }
+            }
+
+            fn items(&self, endpoint: &str, selector: &str) -> Result<Vec<JsonValue>, String> {
+                assert_eq!(selector, ".[]");
+                match endpoint {
+                    "repos/fixture-org/dotagent/rulesets?includes_parents=false&per_page=100" => {
+                        Ok(self.existing.clone())
+                    }
+                    "repos/fixture-org/dotagent/rules/branches/main?per_page=100" => Ok(Vec::new()),
+                    _ => Err(format!("unexpected list {endpoint}")),
+                }
+            }
+
+            fn write(&self, _: &str, _: &str, _: &JsonValue) -> Result<JsonValue, String> {
+                self.writes.set(self.writes.get() + 1);
+                Err("unexpected governance mutation".into())
+            }
+        }
+
+        let args = options(&[
+            "--repo",
+            "fixture-org/dotagent",
+            "--apply",
+            "--proof-pr",
+            "23",
+            "--promoter-app-id",
+            "1234",
+        ])
+        .expect("configuration arguments");
+        let desired = policy::desired(&args).expect("Dotagent policy");
+        let owned = |id: u64, rule: &JsonValue, enforcement: &str| {
+            let mut entries = rule.as_object().expect("ruleset object").to_vec();
+            entries.retain(|(key, _)| key != "enforcement");
+            entries.extend([
+                ("enforcement".into(), JsonValue::Str(enforcement.into())),
+                ("id".into(), JsonValue::Uint(id)),
+                ("source_type".into(), JsonValue::Str("Repository".into())),
+                (
+                    "source".into(),
+                    JsonValue::Str("fixture-org/dotagent".into()),
+                ),
+            ]);
+            JsonValue::Object(entries)
+        };
+        let branch = owned(10, &desired[0], "active");
+        let drifting_tag = owned(11, &desired[1], "disabled");
+        for existing in [
+            vec![branch.clone()],
+            vec![branch, drifting_tag.clone()],
+            vec![drifting_tag],
+        ] {
+            let fixture = UnreadyDotagent {
+                existing,
+                writes: Cell::new(0),
+            };
+            let error = confirmed(&fixture, &args, &desired).expect_err("reject missing proof");
+            assert!(error.contains("proof PR unavailable"), "{error}");
+            assert_eq!(fixture.writes.get(), 0);
+        }
     }
 
     #[test]
