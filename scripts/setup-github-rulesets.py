@@ -16,6 +16,11 @@ REVIEW_GATE = "Ring-0 & Copilot Gate"
 APP_VARIABLE = "PROMOTER_APP_ID"
 APP_SECRET = "PROMOTER_APP_PRIVATE_KEY"
 CHECK_CATALOG = Path(__file__).resolve().parents[1] / "config/github-required-checks.txt"
+OPERATOR_ONLY_MARKERS = (
+    "AGENT_GUARD_IN_SANDBOX", "AGENT_GUARD_WORKER_LOCK", "AGENT_GUARD_ROLE",
+    "CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT", "CURSOR_TRACE_ID", "CURSOR_AGENT",
+    "CODEX_SANDBOX", "CODEX_ENV_SANDBOX", "GEMINI_CLI", "ANTIGRAVITY_AGENT",
+)
 
 
 class RulesetError(Exception):
@@ -98,6 +103,8 @@ def arguments(argv):
     args.dotagent = bool(args.repo and args.repo.rsplit("/", 1)[1].lower() == "dotagent")
     if args.include_repo and not args.org:
         parser.error("--include-repo requires --org")
+    if any(name.lower() == "dotagent" for name in args.include_repo):
+        parser.error("configure Dotagent separately with --repo OWNER/dotagent")
     if (args.proof_pr or args.promoter_app_id) and not args.dotagent:
         parser.error("--proof-pr and --promoter-app-id require a repository named dotagent")
     return args
@@ -131,7 +138,7 @@ def policy(args):
         "dismiss_stale_reviews_on_push": True,
         "require_code_owner_review": False,
         "require_last_push_approval": False,
-        "required_approving_review_count": 0,
+        "required_approving_review_count": 0 if args.dotagent else 1,
         "required_review_thread_resolution": True,
     }})
     branch_name = "dotagent-baseline-main"
@@ -153,7 +160,9 @@ def policy(args):
     branch = ruleset(branch_name, "branch", ["~DEFAULT_BRANCH"], branch_rules)
     if args.org:
         names = sorted(set(args.include_repo)) or ["~ALL"]
-        branch["conditions"]["repository_name"] = {"include": names, "exclude": [], "protected": False}
+        branch["conditions"]["repository_name"] = {
+            "include": names, "exclude": ["dotagent"], "protected": False,
+        }
     desired = [branch]
     if args.promoter_app_id:
         desired.extend([
@@ -325,7 +334,8 @@ def reconcile(api, args, endpoint, desired):
         return int(bool(changes))
     if args.promoter_app_id:
         verify_release_settings(api, f"repos/{args.repo}", args.promoter_app_id)
-    if args.repo and any(wanted["target"] == "branch" for _, _, wanted in changes):
+    branch_changed = any(wanted["target"] == "branch" for _, _, wanted in changes)
+    if args.dotagent or (args.repo and branch_changed):
         verify_repo_readiness(api, args)
     for path, previous, wanted in changes:
         if previous:
@@ -351,8 +361,8 @@ def main(argv=None):
             print(json.dumps({"endpoint": endpoint, "rulesets": desired}, indent=2))
             return 0
         if args.mode == "apply":
-            for marker in ("AGENT_GUARD_IN_SANDBOX", "AGENT_GUARD_WORKER_LOCK", "AGENT_GUARD_ROLE"):
-                if os.environ.get(marker, "").lower() not in ("", "0", "false"):
+            for marker in OPERATOR_ONLY_MARKERS:
+                if os.environ.get(marker, "").strip().lower() not in ("", "0", "false"):
                     raise RulesetError(f"--apply requires an operator shell ({marker} is set)")
         return reconcile(Api(), args, endpoint, desired)
     except (RulesetError, OSError, ValueError, KeyError, TypeError, subprocess.TimeoutExpired) as error:

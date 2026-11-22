@@ -4,15 +4,15 @@ Use `scripts/setup-github-rulesets.py` to review and reconcile rulesets in one G
 
 ## Choose the scope
 
-Pass `--repo OWNER/REPO` for a repository-owned ruleset, or `--org ORG` for an organization-owned ruleset. An organization scope includes all repositories (`~ALL`) by default. Repeat `--include-repo NAME` to use a specific list of repository names in that organization.
+Pass `--repo OWNER/REPO` for a repository-owned ruleset, or `--org ORG` for an organization-owned ruleset. An organization scope covers all repositories except `dotagent` by default. Repeat `--include-repo NAME` to use a specific list of repository names in that organization. Configure Dotagent with its repository scope.
 
 ```sh
 python3 scripts/setup-github-rulesets.py --repo susanbdev/dotagent
 python3 scripts/setup-github-rulesets.py --org susanbdev
-python3 scripts/setup-github-rulesets.py --org susanbdev --include-repo dotagent --include-repo policy-hub
+python3 scripts/setup-github-rulesets.py --org susanbdev --include-repo types --include-repo policy-hub
 ```
 
-The common default-branch rules require squash pull requests and resolution of review threads. The managed rule sets the human approval count to zero. Apply Dotagent's repository policy in `OWNER/dotagent` to require its checks and Copilot review. The common organization policy is suitable for repositories with different workflows.
+The common default-branch rules require squash pull requests, resolution of review threads, and one approval. Dotagent's repository policy in `OWNER/dotagent` requires its nine checks and Copilot review, with zero required human approvals in the managed rule. GitHub combines rules from all applicable rulesets, so the organization approval policy excludes Dotagent.
 
 ## Review, verify, and apply
 

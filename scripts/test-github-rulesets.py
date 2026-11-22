@@ -95,12 +95,12 @@ class RulesetTests(unittest.TestCase):
     def setUp(self):
         self.api = FakeApi()
 
-    def invoke(self, *args):
+    def invoke(self, *args, env=None):
         output, errors = io.StringIO(), io.StringIO()
         with (
             patch.object(rulesets, "Api", return_value=self.api),
             patch.object(rulesets.subprocess, "run", side_effect=AssertionError("Unexpected subprocess")),
-            patch.dict(os.environ, {}, clear=True),
+            patch.dict(os.environ, env or {}, clear=True),
             contextlib.redirect_stdout(output),
             contextlib.redirect_stderr(errors),
         ):
@@ -205,6 +205,9 @@ class RulesetTests(unittest.TestCase):
         self.assertEqual(record["name"], RULESET_NAME)
         self.assertEqual(record["source_type"], "Organization")
         self.assertEqual(record["conditions"]["repository_name"]["include"], ["library", "tools"])
+        self.assertEqual(record["conditions"]["repository_name"]["exclude"], ["dotagent"])
+        pull_request = next(rule for rule in record["rules"] if rule["type"] == "pull_request")
+        self.assertEqual(pull_request["parameters"]["required_approving_review_count"], 1)
         self.assertEqual(self.api.saved[REPO_ENDPOINT], {})
         self.api.requests.clear()
         status, output, errors = self.invoke(*args, "--apply")
@@ -287,6 +290,29 @@ class RulesetTests(unittest.TestCase):
         with self.assertRaisesRegex(rulesets.RulesetError, "needs merge_group"):
             rulesets.verify_repo_readiness(api, args)
         api.items.assert_called_once_with(f"repos/{full_repo}/rules/branches/release%2Fmain?per_page=100")
+
+    def test_dotagent_readiness_runs_when_branch_policy_is_already_aligned(self):
+        full_repo = f"{ORG}/dotagent"
+        args = rulesets.arguments(["--repo", full_repo, "--apply"])
+        desired = rulesets.policy(args)
+        current = {
+            **desired[0], "id": 9, "source": full_repo, "source_type": "Repository",
+        }
+        api = Mock()
+        api.items.return_value = [current]
+        api.get.return_value = current
+        with patch.object(rulesets, "verify_repo_readiness") as verify, contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(rulesets.reconcile(api, args, f"repos/{full_repo}/rulesets", desired), 0)
+        verify.assert_called_once_with(api, args)
+        api.write.assert_not_called()
+
+    def test_operator_markers_stop_apply_before_any_api_calls(self):
+        for marker in ("AGENT_GUARD_WORKER_LOCK", "CLAUDECODE", "CODEX_ENV_SANDBOX", "GEMINI_CLI"):
+            with self.subTest(marker=marker):
+                status, output, errors = self.invoke("--repo", REPO, "--apply", env={marker: "1"})
+                self.assertEqual(status, 2, output + errors)
+                self.assertIn(marker, errors)
+        self.assertEqual(self.api.requests, [])
 
 
 if __name__ == "__main__":
