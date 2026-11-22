@@ -1269,6 +1269,15 @@ fn handle_pre_tool_use(parsed: &JsonValue, common: &CommonEnvelope) -> Antigravi
     .to_json_string();
 
     let decision = eval_pre_tool_authoritative(&norm_payload, &common.selected_workspace);
+    if let Decision::Deny { code, .. } = &decision {
+        crate::enforcement_state::record_denial_witness(
+            &common.selected_workspace,
+            "antigravity",
+            "PreToolUse",
+            norm_payload.as_bytes(),
+            code,
+        );
+    }
     format_pre_tool_outcome(decision, &tc.args)
 }
 

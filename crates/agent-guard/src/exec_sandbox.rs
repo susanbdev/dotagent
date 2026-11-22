@@ -344,15 +344,91 @@ pub fn probe_host_sandbox_mode() -> KernelSandboxMode {
     }
 }
 
-/// Probes whether OS-level kernel filesystem sandboxing is supported on the current host.
+/// Probes whether OS-level kernel filesystem and seccomp network sandboxing are supported on the current host.
 pub fn run_sandbox_status_cli() -> ExitCode {
     let mode = probe_host_sandbox_mode();
+    let seccomp_label = match probe_host_seccomp_verified() {
+        Some(true) => "verified",
+        Some(false) => "unavailable",
+        None => "not-applicable",
+    };
     println!(
-        "[AGENT-GUARD SANDBOX STATUS] mode={} kernel_enforced={}",
+        "[AGENT-GUARD SANDBOX STATUS] mode={} kernel_enforced={} seccomp={}",
         mode.as_str(),
-        mode.is_kernel_enforced()
+        mode.is_kernel_enforced(),
+        seccomp_label
     );
     ExitCode::SUCCESS
+}
+
+/// Probes Linux `seccomp-bpf` socket containment in an isolated child process without mutating
+/// the caller. Returns `Some(true)` when verified on Linux, `Some(false)` when unavailable on Linux,
+/// and `None` on non-Linux operating systems.
+pub fn probe_host_seccomp_verified() -> Option<bool> {
+    #[cfg(target_os = "linux")]
+    {
+        if let Ok(exe) = env::current_exe() {
+            let mut candidates = Vec::new();
+            for anc in exe.ancestors().skip(1).take(5) {
+                for name in ["agent-guard", "dotagent"] {
+                    let cand = anc.join(name);
+                    if cand != exe && cand.is_file() && !candidates.contains(&cand) {
+                        candidates.push(cand);
+                    }
+                }
+            }
+            candidates.push(exe);
+            for bin in candidates {
+                if let Ok(out) = Command::new(bin).arg("--probe-seccomp-child").output()
+                    && out.status.success()
+                {
+                    let text = String::from_utf8_lossy(&out.stdout);
+                    if text.contains("seccomp-verified") {
+                        return Some(true);
+                    }
+                    if text.contains("seccomp-unavailable") {
+                        return Some(false);
+                    }
+                }
+            }
+        }
+        Some(false)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        None
+    }
+}
+
+/// Internal subprocess probe (`agent-guard --probe-seccomp-child`) installing the unprivileged
+/// `seccomp-bpf` `AF_UNIX`/`AF_NETLINK` socket allowlist filter and verifying that `AF_INET`
+/// socket creation is rejected by the kernel with `EPERM`.
+pub fn run_probe_seccomp_child() -> ExitCode {
+    #[cfg(target_os = "linux")]
+    {
+        if apply_linux_seccomp_net_filter().is_err() {
+            println!("seccomp-unavailable");
+            return ExitCode::SUCCESS;
+        }
+        match std::net::UdpSocket::bind("127.0.0.1:0") {
+            Err(e)
+                if e.kind() == std::io::ErrorKind::PermissionDenied
+                    || e.raw_os_error() == Some(1) =>
+            {
+                println!("seccomp-verified");
+                ExitCode::SUCCESS
+            }
+            _ => {
+                println!("seccomp-unavailable");
+                ExitCode::SUCCESS
+            }
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        println!("seccomp-not-applicable");
+        ExitCode::SUCCESS
+    }
 }
 
 /// Internal subprocess probe (`agent-guard --probe-landlock-child`) safely testing Landlock ABI.

@@ -72,6 +72,10 @@ pub fn run_cli_entrypoint() -> ExitCode {
         "compile" | "compiler" => exec_sibling_tool("dotagent-compiler", &args[1..]),
         "harness" => exec_sibling_tool("dotagent-harness", &args[1..]),
         "doctor" => crate::operator::run_doctor_cli(&args[1..], &cwd),
+        "status" => crate::enforcement_state::run_status_cli(&args[1..], &cwd),
+        "verify-enforcement" => {
+            crate::enforcement_state::run_verify_enforcement_cli(&args[1..], &cwd)
+        }
         "explain" => crate::diagnostics::run_explain_cli(&args[1..]),
         "session-reset" => crate::operator::run_session_reset_cli(&args[1..], &cwd),
         "elevate" => crate::operator::run_elevate_cli(&args[1..], &cwd),
@@ -101,6 +105,18 @@ pub fn run_cli_entrypoint() -> ExitCode {
             let decision = eval_hook_preferring_hot_coord("pre-tool", &payload, &cwd, || {
                 handle_pre_tool_hook(&payload, &cwd)
             });
+            if let Decision::Deny { code, .. } = &decision {
+                let ws_root = resolve_repo_root(&cwd);
+                for adapter_id in ["gemini", "claude", "cursor"] {
+                    crate::enforcement_state::record_denial_witness(
+                        &ws_root,
+                        adapter_id,
+                        "PreToolUse",
+                        payload.as_bytes(),
+                        code,
+                    );
+                }
+            }
             emit_hook_decision(decision, HookPhase::PreTool)
         }
         "post-tool" => {
@@ -268,6 +284,7 @@ pub fn run_cli_entrypoint() -> ExitCode {
         "exec-sandbox" => crate::exec_sandbox::run_exec_sandbox_cli(&args[1..], &cwd),
         "sandbox-status" => crate::exec_sandbox::run_sandbox_status_cli(),
         "--probe-landlock-child" => crate::exec_sandbox::run_probe_landlock_child(),
+        "--probe-seccomp-child" => crate::exec_sandbox::run_probe_seccomp_child(),
         "--version" | "-V" | "version" => {
             let bin_label = if is_dotagent_cli {
                 "dotagent"

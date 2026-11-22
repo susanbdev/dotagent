@@ -26,6 +26,7 @@ pub mod cmd_policy;
 pub mod coordinator;
 pub mod crypto;
 pub mod diagnostics;
+pub mod enforcement_state;
 pub mod exec_sandbox;
 pub mod feedback;
 pub mod feedback_loop;

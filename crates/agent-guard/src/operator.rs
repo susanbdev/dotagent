@@ -15,7 +15,6 @@ use std::process::{Command, ExitCode};
 
 use crate::budget_guard::load_active_profile;
 use crate::coordinator::{coordinator_socket_path, ping_coordinator};
-use crate::exec_sandbox::probe_host_sandbox_mode;
 use crate::json::JsonValue;
 use crate::qa_suspects::plan_lock_state_path;
 use crate::traversal_ledger::{SessionLedger, state_base_dir};
@@ -63,7 +62,11 @@ struct DoctorCheck {
 pub fn run_doctor_cli(args: &[String], cwd: &Path) -> ExitCode {
     let mut json_mode = false;
     let mut allow_degraded = false;
-    let mut require_mediation = false;
+    let mut require_host_enforced = false;
+    let mut adapter_id = "antigravity".to_string();
+    let mut mode_override: Option<String> = None;
+    let mut bin_dir_opt: Option<PathBuf> = None;
+    let mut trace_log_opt: Option<PathBuf> = None;
     let mut session_override: Option<String> = None;
     let mut target_dir_opt: Option<PathBuf> = None;
 
@@ -78,9 +81,41 @@ pub fn run_doctor_cli(args: &[String], cwd: &Path) -> ExitCode {
                 allow_degraded = true;
                 i += 1;
             }
-            "--require-mediation" => {
-                require_mediation = true;
+            "--require-host-enforced" | "--require-mediation" => {
+                require_host_enforced = true;
                 i += 1;
+            }
+            "--adapter" => {
+                let Some(aid) = args.get(i + 1) else {
+                    eprintln!("[doctor] missing value after --adapter");
+                    return ExitCode::from(2);
+                };
+                adapter_id = aid.clone();
+                i += 2;
+            }
+            "--execution-mode" => {
+                let Some(em) = args.get(i + 1) else {
+                    eprintln!("[doctor] missing value after --execution-mode");
+                    return ExitCode::from(2);
+                };
+                mode_override = Some(em.clone());
+                i += 2;
+            }
+            "--bin-dir" => {
+                let Some(bd) = args.get(i + 1) else {
+                    eprintln!("[doctor] missing path after --bin-dir");
+                    return ExitCode::from(2);
+                };
+                bin_dir_opt = Some(PathBuf::from(bd));
+                i += 2;
+            }
+            "--trace-log" => {
+                let Some(tp) = args.get(i + 1) else {
+                    eprintln!("[doctor] missing path after --trace-log");
+                    return ExitCode::from(2);
+                };
+                trace_log_opt = Some(PathBuf::from(tp));
+                i += 2;
             }
             "--session" => {
                 let Some(sid) = args.get(i + 1) else {
@@ -96,7 +131,7 @@ pub fn run_doctor_cli(args: &[String], cwd: &Path) -> ExitCode {
             }
             other => {
                 eprintln!(
-                    "[doctor] unrecognized argument '{other}' (usage: `dotagent doctor [--json] [--allow-degraded] [--require-mediation] [--session <id>] [workspace]`)"
+                    "[doctor] unrecognized argument '{other}' (usage: `dotagent doctor [--json] [--allow-degraded] [--require-host-enforced] [--adapter <id>] [--execution-mode <mode>] [--bin-dir <dir>] [--trace-log <path>] [--session <id>] [workspace]`)"
                 );
                 return ExitCode::from(2);
             }
@@ -104,20 +139,35 @@ pub fn run_doctor_cli(args: &[String], cwd: &Path) -> ExitCode {
     }
     let target_dir = target_dir_opt.unwrap_or_else(|| resolve_repo_root(cwd));
 
+    let probe_snapshot =
+        match crate::enforcement_state::ProbeSnapshot::probe_live(mode_override.as_deref()) {
+            Ok(s) => s,
+            Err(msg) => {
+                eprintln!("[doctor] {msg}");
+                return ExitCode::from(2);
+            }
+        };
+
     let mut checks = Vec::with_capacity(7);
 
     // 1. Binary integrity & 0555 permissions check
     checks.push(check_binaries_health());
 
-    // 2. OS Kernel VFS + TCP sandbox readiness
-    let sbx_mode = probe_host_sandbox_mode();
+    // 2. OS Kernel VFS + seccomp-bpf readiness
+    let sbx_mode = probe_snapshot.kernel_fs_mode;
+    let seccomp_label = match probe_snapshot.seccomp_net {
+        Some(true) => "verified",
+        Some(false) => "unavailable",
+        None => "not_applicable",
+    };
     checks.push(DoctorCheck {
         name: "kernel_sandbox",
         ok: sbx_mode.is_kernel_enforced() || allow_degraded,
         detail: format!(
-            "mode={} kernel_enforced={} allow_degraded={} (pass --allow-degraded to permit non-kernel environments)",
+            "mode={} kernel_enforced={} seccomp={} allow_degraded={} (pass --allow-degraded to permit non-kernel environments)",
             sbx_mode.as_str(),
             sbx_mode.is_kernel_enforced(),
+            seccomp_label,
             allow_degraded
         ),
     });
@@ -196,19 +246,33 @@ pub fn run_doctor_cli(args: &[String], cwd: &Path) -> ExitCode {
         ),
     });
 
+    let bin_dir = bin_dir_opt.unwrap_or_else(|| {
+        if let Ok(home) = std::env::var("HOME") {
+            let cand = PathBuf::from(home).join(".local/bin");
+            if cand.is_dir() {
+                return cand;
+            }
+        }
+        std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().map(Path::to_path_buf))
+            .unwrap_or_else(|| PathBuf::from(".local/bin"))
+    });
+    let enf_report = crate::enforcement_state::evaluate_enforcement_report(
+        &target_dir,
+        &bin_dir,
+        &adapter_id,
+        trace_log_opt.as_deref(),
+        session_override.as_deref(),
+        &probe_snapshot,
+    );
+
     let static_ok = checks.iter().all(|c| c.ok);
-    let (sid, mediated_calls) = probe_session_mediation(&target_dir, session_override.as_deref());
-    let mediation_observed = mediated_calls > 0;
-    let runtime_protected = static_ok && mediation_observed;
-    let overall_ok = if require_mediation {
+    let runtime_protected = static_ok && enf_report.mandatory_protection_verified;
+    let overall_ok = if require_host_enforced {
         runtime_protected
     } else {
         static_ok
-    };
-    let mediation_status = if mediation_observed {
-        "observed"
-    } else {
-        "unverified"
     };
 
     if json_mode {
@@ -229,17 +293,10 @@ pub fn run_doctor_cli(args: &[String], cwd: &Path) -> ExitCode {
                 JsonValue::Bool(static_ok),
             ),
             (
-                "host_mediation".to_string(),
-                JsonValue::Str(mediation_status.to_string()),
-            ),
-            (
-                "mediated_tool_calls".to_string(),
-                JsonValue::Uint(mediated_calls),
-            ),
-            (
-                "runtime_protected".to_string(),
+                "mandatory_protection_verified".to_string(),
                 JsonValue::Bool(runtime_protected),
             ),
+            ("enforcement".to_string(), enf_report.to_json_value()),
             (
                 "workspace".to_string(),
                 JsonValue::Str(target_dir.display().to_string()),
@@ -259,26 +316,14 @@ pub fn run_doctor_cli(args: &[String], cwd: &Path) -> ExitCode {
         }
         if static_ok {
             println!(
-                "Static controls: HEALTHY (kernel and configuration verified; does not prove live host mediation)"
+                "Static controls: HEALTHY (local binary/policy/repo invariants passed; does not prove live host enforcement)"
             );
         } else {
             eprintln!(
                 "Static controls: UNHEALTHY (one or more required security controls failed; run `dotagent explain <CODE>` for guidance)"
             );
         }
-        if mediation_observed {
-            println!(
-                "Host mediation:  OBSERVED ({mediated_calls} mediated tool call(s) recorded for session '{sid}')"
-            );
-        } else if require_mediation {
-            eprintln!(
-                "Host mediation:  UNVERIFIED (0 mediated tool calls observed for session '{sid}'; failing --require-mediation because config/binary presence alone does not protect a runtime)"
-            );
-        } else {
-            println!(
-                "Host mediation:  UNVERIFIED (0 mediated tool calls observed for session '{sid}'; config/binary presence alone does not protect a runtime)"
-            );
-        }
+        print!("{}", enf_report.format_human());
     }
 
     if overall_ok {
@@ -360,16 +405,6 @@ fn resolve_doctor_session_id(session_override: Option<&str>) -> String {
         Some(s) if !s.trim().is_empty() => s.trim().to_string(),
         _ => std::env::var("AGENT_GUARD_SESSION_ID").unwrap_or_else(|_| "default".to_string()),
     }
-}
-
-fn probe_session_mediation(repo_root: &Path, session_override: Option<&str>) -> (String, u64) {
-    let sid = resolve_doctor_session_id(session_override);
-    let session_file = crate::traversal_ledger::session_ledger_path(repo_root, &sid);
-    if !session_file.is_file() {
-        return (sid, 0);
-    }
-    let ledger = SessionLedger::load_or_create(repo_root, &sid);
-    (sid, ledger.tool_calls as u64)
 }
 
 fn check_session_state_health(repo_root: &Path, session_override: Option<&str>) -> DoctorCheck {
@@ -2673,7 +2708,7 @@ pub fn execute_antigravity_activate_with_trace(
     )?;
 
     log.push(format!(
-        "[activate] Installed workspace Antigravity hook configuration for '{}' (pinned binary='{}', global config untouched; host_mediation=unverified until live tool-call traversal is observed; Antigravity Remote Agents is not enforced in tested configuration).",
+        "[activate] Installed workspace Antigravity hook configuration for '{}' (pinned binary='{}', global config untouched; host_enforced=unverified until observer-verified denial mediation is established; tested Antigravity Remote Agents VM configuration was not mediated).",
         target_ws.display(),
         verified_guard.display()
     ));
@@ -2710,7 +2745,7 @@ fn activate_workspace_scoped_all(
         }
     }
     log.push(format!(
-        "[activate] Installed workspace-scoped harness configuration for '{}' (global config untouched; host_mediation=unverified until live tool-call traversal is observed).",
+        "[activate] Installed workspace-scoped harness configuration for '{}' (global config untouched; host_enforced=unverified until observer-verified denial mediation is established).",
         target_ws.display()
     ));
     Ok(log)
