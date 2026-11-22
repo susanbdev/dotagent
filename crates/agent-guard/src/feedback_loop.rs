@@ -20,8 +20,8 @@
 //!    parent Rust process memory. Stage 1-4 subprocesses run with `Command::env_clear()`. Raw
 //!    ballot notes stop at Stage 1 (Auditor, `--deny-net`), which emits a strictly validated
 //!    `Ring2RemediationSpec` JSON with zero free-form prose passed to Stage 3 (`--implementer-cmd`).
-//! 4. **Structural Copilot Gate & Post-Fix Stale Thread Resolution**: Verifies all 7 required status
-//!    checks (6 CI jobs + `Ring-0 & Copilot Gate`), confirms `copilot-pull-request-reviewer[bot]`
+//! 4. **Structural Copilot Gate & Post-Fix Stale Thread Resolution**: Verifies the required CI
+//!    checks and `Ring-0 & Copilot Gate`, confirms `copilot-pull-request-reviewer[bot]`
 //!    reviewed `head_sha` with `0` inline review comments, and resolves stale threads from prior
 //!    commits *only after* a fresh `0`-comment Copilot review lands on the new `head_sha`.
 
@@ -2458,7 +2458,7 @@ fn run_worktree_adversarial_copilot_and_merge(
         tok,
     )?;
 
-    // --- STAGE 5: Non-Bypass PR + 7 Required Checks + Structural Copilot Review Gate ---
+    // Stage 5 verifies required CI checks and Copilot review on the pull request.
     let pr_title = format!(
         "fix(guard): resolve friction {} ({})",
         spec.cluster_key, spec.binary_or_tool
@@ -2581,9 +2581,9 @@ fn run_worktree_adversarial_copilot_and_merge(
         }
 
         if status.copilot_zero_inline_on_head && status.unresolved_threads.is_empty() {
-            // --- STAGE 6: Final Local Ratchet Double-Check + 7-Gate Poll + Match-Head Squash-Merge ---
+            // Stage 6 rechecks the ratchet and all gates before merging the verified head.
             verify_ring0_ratchet(wt_dir, base_ref, true)?;
-            wait_for_full_seven_gate_green(
+            wait_for_required_checks_green(
                 gh,
                 tok,
                 &cfg.target_repo,
@@ -3179,8 +3179,8 @@ fn wait_for_pr_ci_and_copilot(
             .unwrap_or("")
             .to_string();
 
-        // Phase 1 evaluates only the 6 CI checks: the 7th `Ring-0 & Copilot Gate` status legitimately
-        // stays `pending` until stale Copilot threads are resolved, so it is polled separately below.
+        // The Ring-0 & Copilot status can remain pending until stale review threads are resolved.
+        // This phase checks CI and the exact-head Copilot review.
         let (ci_done, ci_green) =
             evaluate_status_rollup(pr_json.get("statusCheckRollup"), is_dotagent_repo, false);
         let (copilot_reviewed_head, copilot_zero_inline) =
@@ -3200,7 +3200,7 @@ fn wait_for_pr_ci_and_copilot(
 
         if started.elapsed() >= Duration::from_secs(timeout_secs) {
             return Err(format!(
-                "timed out after {timeout_secs}s waiting for 7 required checks + Copilot review on PR #{pr_number}"
+                "timed out after {timeout_secs}s waiting for required CI checks and Copilot review on PR #{pr_number}"
             ));
         }
         thread::sleep(Duration::from_secs(poll_secs));
@@ -3210,9 +3210,9 @@ fn wait_for_pr_ci_and_copilot(
 const COPILOT_GATE_STATUS_CONTEXT: &str = "Ring-0 & Copilot Gate";
 const COPILOT_GATE_AUX_CHECK_RUN: &str = "Evaluate Ring-0 & Copilot Gate Status";
 
-/// Polls until all 7 required checks (including the `Ring-0 & Copilot Gate` commit status) are
+/// Polls until the required checks, including the `Ring-0 & Copilot Gate` commit status, are
 /// green on `expected_head`. Any failure, head drift, or timeout fails closed.
-fn wait_for_full_seven_gate_green(
+fn wait_for_required_checks_green(
     gh: &Path,
     tok: Option<&ZeroizingToken>,
     repo: &str,
@@ -3223,6 +3223,15 @@ fn wait_for_full_seven_gate_green(
 ) -> Result<(), String> {
     let started = Instant::now();
     let is_dotagent_repo = repo.ends_with("/dotagent");
+    let gate = if is_dotagent_repo {
+        format!(
+            "{} required checks ({})",
+            DOTAGENT_REQUIRED_CHECKS.len(),
+            DOTAGENT_REQUIRED_CHECKS.join(", ")
+        )
+    } else {
+        "required repository checks".to_string()
+    };
     loop {
         let view = gh_cmd_with_token(gh, tok)
             .args([
@@ -3250,7 +3259,7 @@ fn wait_for_full_seven_gate_green(
             .unwrap_or("");
         if head_sha != expected_head {
             return Err(format!(
-                "PR_HEAD_MISMATCH: PR #{pr_number} head moved to '{head_sha}' while awaiting the 7-check gate"
+                "PR_HEAD_MISMATCH: PR #{pr_number} head moved to '{head_sha}' while awaiting {gate}"
             ));
         }
         let (done, green) =
@@ -3260,12 +3269,12 @@ fn wait_for_full_seven_gate_green(
                 return Ok(());
             }
             return Err(format!(
-                "PR #{pr_number} required 7-check gate failed on commit {expected_head}"
+                "PR #{pr_number} {gate} failed on commit {expected_head}"
             ));
         }
         if started.elapsed() >= Duration::from_secs(timeout_secs) {
             return Err(format!(
-                "timed out after {timeout_secs}s waiting for the 7-check gate on PR #{pr_number}"
+                "timed out after {timeout_secs}s waiting for {gate} on PR #{pr_number}"
             ));
         }
         thread::sleep(Duration::from_secs(poll_secs));
@@ -3274,7 +3283,7 @@ fn wait_for_full_seven_gate_green(
 
 fn evaluate_status_rollup(
     rollup_opt: Option<&JsonValue>,
-    require_dotagent_seven: bool,
+    require_dotagent_checks: bool,
     include_copilot_gate: bool,
 ) -> (bool, bool) {
     let Some(arr) = rollup_opt.and_then(JsonValue::as_array) else {
@@ -3324,7 +3333,7 @@ fn evaluate_status_rollup(
         return (true, false);
     }
 
-    if require_dotagent_seven {
+    if require_dotagent_checks {
         for &req_name in DOTAGENT_REQUIRED_CHECKS {
             if !include_copilot_gate && req_name == COPILOT_GATE_STATUS_CONTEXT {
                 continue;
@@ -3687,6 +3696,41 @@ fn cleanup_worktree(repo_root: &Path, canon_parent: &Path, wt_dir: &Path) {
 mod tests {
     use super::*;
 
+    fn set_fixture_ballot_time(repo: &Path, timestamp: u64) {
+        use crate::coordinator::compute_domain_tag_for_feedback;
+        use crate::feedback::{
+            FEEDBACK_BALLOT_HMAC_DOMAIN, load_or_init_global_feedback_key, utc_day_yyyymmdd,
+        };
+
+        let key = load_or_init_global_feedback_key().expect("fixture ballot key");
+        let mut ballots = load_verified_ballots(repo).expect("signed fixture ballots");
+        let latest = ballots.last_mut().expect("newly submitted fixture ballot");
+        let (repo_prefix, _) = latest
+            .repo_day_bucket
+            .split_once(':')
+            .expect("fixture ballot bucket");
+        latest.repo_day_bucket = format!("{repo_prefix}:{}", utc_day_yyyymmdd(timestamp));
+        latest.ts_unix = timestamp;
+        latest.mac_hex = hex_encode(
+            &compute_domain_tag_for_feedback(
+                key.as_bytes(),
+                FEEDBACK_BALLOT_HMAC_DOMAIN,
+                &latest.canonical_mac_bytes(),
+            )
+            .expect("sign fixture ballot timeline"),
+        );
+        let mut spool = fs::File::create(
+            feedback_state_dir()
+                .expect("fixture feedback state")
+                .join("ballots.jsonl"),
+        )
+        .expect("write fixture ballot spool");
+        for ballot in ballots {
+            writeln!(spool, "{}", ballot.to_json_value().to_json_string())
+                .expect("write dated fixture ballot");
+        }
+    }
+
     #[test]
     #[ignore = "separate process entry point for the feedback integration fixture"]
     fn feedback_cli_fixture_driver() {
@@ -3700,6 +3744,10 @@ mod tests {
             .collect();
         let cwd = std::env::current_dir().expect("fixture checkout");
         let exit = match args.split_first() {
+            Some((command, [timestamp])) if command == "set-fixture-ballot-time" => {
+                set_fixture_ballot_time(&cwd, timestamp.parse().expect("fixture UNIX timestamp"));
+                ExitCode::SUCCESS
+            }
             Some((command, args)) if command == "sync-github" => {
                 run_feedback_sync_github_cli(args, &cwd)
             }

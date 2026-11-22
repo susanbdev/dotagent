@@ -90,7 +90,7 @@ audit_cargo_config() {
 
 audit_prebuild_traps() {
     local scan_dir="${DOTAGENT_ROOT}" cargo_cfg tc_cfg
-    local directives='rustc-wrapper|workspace-wrapper|linker[[:space:]]*=|runner[[:space:]]*=|\brustc[[:space:]]*='
+    local directives='rustc-wrapper|workspace-wrapper|linker[[:space:]]*=|runner[[:space:]]*=|(^|[^[:alnum:]_-])rustc[[:space:]]*='
     if [[ -z "${PREBUILT_DIR}" ]]; then
         directives="${directives}|rustc_wrapper|rustflags|rustdocflags|credential-provider"
         directives="${directives}|^[[:space:]]*\[+[[:space:]]*[\"']?(alias|env|target)[\"']?[[:space:]]*(\.|\])"

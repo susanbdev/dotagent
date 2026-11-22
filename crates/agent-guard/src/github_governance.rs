@@ -23,7 +23,7 @@
 //!      blocks deletion and force-pushes (`non_fast_forward`), requires linear history, requires PRs
 //!      with `allowed_merge_methods: ["squash"]`, `required_review_thread_resolution: true`,
 //!      `dismiss_stale_reviews_on_push: true`, `copilot_code_review: { review_on_push: true }`, and
-//!      **all 7 required status checks** on `dotagent` (6 CI jobs + `Ring-0 & Copilot Gate`).
+//!      the Guardrail CI jobs and the exact-head `Ring-0 & Copilot Gate` on `dotagent`.
 
 use std::io::Write;
 use std::path::Path;
@@ -1303,7 +1303,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn builds_seven_check_non_bypass_ruleset_and_validates_identifiers() {
+    fn builds_required_check_non_bypass_ruleset_and_validates_identifiers() {
         let checks: Vec<String> = DOTAGENT_REQUIRED_CHECKS
             .iter()
             .map(|s| (*s).to_string())
