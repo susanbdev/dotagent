@@ -208,7 +208,9 @@ pub(super) fn active() -> bool {
 
 /// The explicit operator baseline may wait for its new collector before running its checks.
 pub(super) fn prepare_baseline() {
-    if !enabled() { return; }
+    if !enabled() {
+        return;
+    }
     let deadline = Instant::now() + Duration::from_secs(2);
     while !active() && Instant::now() < deadline {
         std::thread::park_timeout(Duration::from_millis(20));
@@ -448,10 +450,25 @@ pub(super) fn delivery_status() -> io::Result<crate::json::JsonValue> {
         }
         if let Some(last) = snapshot.get("last_producer_before_handoff") {
             let mut counts = Vec::new();
-            for name in ["pid","frame_sequence","accepted","capacity","contended","unavailable","invalid","transport","closed"] {
-                if let Some(n) = last.get(name).and_then(JsonValue::as_u64) { counts.push((name.into(), JsonValue::Uint(n))); }
+            for name in [
+                "pid",
+                "frame_sequence",
+                "accepted",
+                "capacity",
+                "contended",
+                "unavailable",
+                "invalid",
+                "transport",
+                "closed",
+            ] {
+                if let Some(n) = last.get(name).and_then(JsonValue::as_u64) {
+                    counts.push((name.into(), JsonValue::Uint(n)));
+                }
             }
-            fields.push(("last_producer_before_handoff".into(), JsonValue::Object(counts)));
+            fields.push((
+                "last_producer_before_handoff".into(),
+                JsonValue::Object(counts),
+            ));
         }
     }
     Ok(JsonValue::Object(vec![
@@ -493,7 +510,8 @@ pub(crate) fn collect(owned: bool) -> io::Result<()> {
     loop {
         if Instant::now() >= next_report {
             let counts = runtime.counts();
-            if Some(counts) != last_report && endpoint.report(counts, false, &last_producer).is_ok() {
+            if Some(counts) != last_report && endpoint.report(counts, false, &last_producer).is_ok()
+            {
                 last_report = Some(counts);
             }
             next_report = Instant::now() + Duration::from_millis(100);

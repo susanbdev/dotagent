@@ -20,7 +20,10 @@ static PERMISSION_FAILURES: AtomicU64 = AtomicU64::new(0);
 static SPACE_FAILURES: AtomicU64 = AtomicU64::new(0);
 
 pub(super) fn storage_failures() -> (u64, u64) {
-    (PERMISSION_FAILURES.load(Ordering::Relaxed), SPACE_FAILURES.load(Ordering::Relaxed))
+    (
+        PERMISSION_FAILURES.load(Ordering::Relaxed),
+        SPACE_FAILURES.load(Ordering::Relaxed),
+    )
 }
 
 static FAILED_APPENDS: AtomicU64 = AtomicU64::new(0);

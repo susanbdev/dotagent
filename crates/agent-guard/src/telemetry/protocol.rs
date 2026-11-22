@@ -56,8 +56,8 @@ fn only(value: &JsonValue, keys: &[&str]) -> bool {
 /// Transport only fixed tool classes; harness-supplied tool names can contain arbitrary text.
 pub(crate) fn tool_class(raw: &str) -> &str {
     match raw {
-        "Read" | "Write" | "Edit" | "Bash" | "Task" | "Grep" | "Glob" | "Agent"
-        | "git" | "rg" | "ls" | "cat" | "sed" | "cargo" | "sh" | "bash" | "read-safe" => raw,
+        "Read" | "Write" | "Edit" | "Bash" | "Task" | "Grep" | "Glob" | "Agent" | "git" | "rg"
+        | "ls" | "cat" | "sed" | "cargo" | "sh" | "bash" | "read-safe" => raw,
         _ => "other",
     }
 }
@@ -250,9 +250,20 @@ pub(super) struct Received {
 
 impl Received {
     pub(super) fn diagnostic(&self) -> JsonValue {
-        let names = ["accepted", "capacity", "contended", "unavailable", "invalid", "transport", "closed"];
-        let mut fields: Vec<_> = names.into_iter().zip(self.counts)
-            .map(|(name, count)| (name.to_owned(), JsonValue::Uint(count))).collect();
+        let names = [
+            "accepted",
+            "capacity",
+            "contended",
+            "unavailable",
+            "invalid",
+            "transport",
+            "closed",
+        ];
+        let mut fields: Vec<_> = names
+            .into_iter()
+            .zip(self.counts)
+            .map(|(name, count)| (name.to_owned(), JsonValue::Uint(count)))
+            .collect();
         fields.push(("pid".into(), JsonValue::Uint(self.pid.into())));
         fields.push(("frame_sequence".into(), JsonValue::Uint(self.sequence)));
         fields.push(("producer_confirmed_persisted".into(), JsonValue::Null));
@@ -409,7 +420,9 @@ impl Record {
         out.extend_from_slice(&std::process::id().to_be_bytes());
         out.extend_from_slice(&seq.to_be_bytes());
         out.extend_from_slice(&now.to_be_bytes());
-        for count in super::runtime::handoff_counts() { out.extend_from_slice(&count.to_be_bytes()); }
+        for count in super::runtime::handoff_counts() {
+            out.extend_from_slice(&count.to_be_bytes());
+        }
         out.extend_from_slice(body.as_bytes());
         let mut mac = Hmac::<Sha256>::new_from_slice(key).ok()?;
         mac.update(DOMAIN);
@@ -442,10 +455,14 @@ impl Record {
             return None;
         }
         let mut counts = [0; 7];
-        for (value, bytes) in counts.iter_mut().zip(frame.get(28..HEADER)?.chunks_exact(8)) {
-            *value = u64::from_be_bytes(bytes.try_into().ok()?);
+        for (idx, value) in counts.iter_mut().enumerate() {
+            let start = 28 + idx * 8;
+            *value = u64::from_be_bytes(frame.get(start..start + 8)?.try_into().ok()?);
         }
-        Some(Received { record, tag: tag.try_into().ok()?, counts,
+        Some(Received {
+            record,
+            tag: tag.try_into().ok()?,
+            counts,
             pid: u32::from_be_bytes(frame.get(8..12)?.try_into().ok()?),
             sequence: u64::from_be_bytes(frame.get(12..20)?.try_into().ok()?),
         })

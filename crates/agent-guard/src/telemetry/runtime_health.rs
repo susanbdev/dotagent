@@ -90,7 +90,10 @@ pub(super) fn status(audit: Counters, export: Counters, closing: bool) -> JsonVa
     );
     if let JsonValue::Object(fields) = &mut value {
         let (permission, full) = store::storage_failures();
-        fields.push(("storage_permission_denied".into(), JsonValue::Uint(permission)));
+        fields.push((
+            "storage_permission_denied".into(),
+            JsonValue::Uint(permission),
+        ));
         fields.push(("storage_full".into(), JsonValue::Uint(full)));
     }
     value

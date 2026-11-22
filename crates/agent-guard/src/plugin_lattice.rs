@@ -322,7 +322,12 @@ pub fn apply_pre_tool_plugin_lattice(
                             JsonValue::Str("PLUGIN_LATTICE_SIGNAL".to_string()),
                         ),
                         ("risk_level".to_string(), JsonValue::Str("low".to_string())),
-                        ("tool_name".to_string(), JsonValue::Str(crate::telemetry::protocol::tool_class(&snap.tool_name).into())),
+                        (
+                            "tool_name".to_string(),
+                            JsonValue::Str(
+                                crate::telemetry::protocol::tool_class(&snap.tool_name).into(),
+                            ),
+                        ),
                     ])
                 });
             } else {

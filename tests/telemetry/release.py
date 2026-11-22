@@ -85,6 +85,16 @@ def process(args, repo, env, ready=True):
         child.stdout.close()
 
 
+def pid_alive(pid):
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+
+
 def health(state):
     path = state / "observations/health"
     return json.loads(path.read_bytes()) if path.is_file() else {}
@@ -202,35 +212,42 @@ def exercise(mode, bins):
 
 
 def shipped_host(bins):
-    with workspace() as (repo, state, env), process(
-            [bins / "dotagent", "hook-daemon", "--idle-secs", "30"], repo, env, ready=False) as host:
-        address = state / "daemon/hook.sock"
-        until(address.is_socket)
-        def rpc(payload):
-            request = {"op": "eval_hook", "phase": "post-tool", "repo_root": str(repo),
-                       "cwd": str(repo), "payload": json.dumps(payload)}
-            with socket.socket(socket.AF_UNIX) as client:
-                client.settimeout(WATCHDOG)
-                client.connect(os.path.relpath(address))
-                client.sendall(json.dumps(request).encode() + b"\n")
-                return json.loads(client.makefile("rb").readline())
-        until((state / "observations/route").is_file)
-        allow = {"tool_name": "Read", "tool_response": "unique_private_fixture_output"}
-        deny = {"tool_name": "Task", "tool_response": "ordinary detail " * 100}
-        assert rpc(allow)["allow"] is True
-        assert rpc(deny)["code"] == "SUBAGENT_RETURN_BUDGET_EXCEEDED"
-        until(lambda: any(r.get("event_type") == "USAGE_AND_DISPOSITION" for r in observed(state)))
-        assert b"unique_private_fixture_output" not in (state / "audit.jsonl").read_bytes()
-        assert host.poll() is None
-        first_pid = until(lambda: health(state).get("collector_pid"))
-        os.kill(first_pid, signal.SIGKILL)
-        def replacement():
-            pid = health(state).get("collector_pid")
-            return pid and pid != first_pid
-        until(replacement)
-        assert rpc(allow)["allow"] is True
-        assert rpc(deny)["code"] == "SUBAGENT_RETURN_BUDGET_EXCEEDED"
-        assert host.poll() is None
+    with workspace() as (repo, state, env):
+        with process([bins / "dotagent", "hook-daemon", "--idle-secs", "30"],
+                     repo, env, ready=False) as host:
+            address = state / "daemon/hook.sock"
+            until(address.is_socket)
+            def rpc(payload):
+                request = {"op": "eval_hook", "phase": "post-tool", "repo_root": str(repo),
+                           "cwd": str(repo), "payload": json.dumps(payload)}
+                with socket.socket(socket.AF_UNIX) as client:
+                    client.settimeout(WATCHDOG)
+                    client.connect(os.path.relpath(address))
+                    client.sendall(json.dumps(request).encode() + b"\n")
+                    return json.loads(client.makefile("rb").readline())
+            until((state / "observations/route").is_file)
+            allow = {"tool_name": "Read", "tool_response": "unique_private_fixture_output"}
+            deny = {"tool_name": "Task", "tool_response": "ordinary detail " * 100}
+            assert rpc(allow)["allow"] is True
+            assert rpc(deny)["code"] == "SUBAGENT_RETURN_BUDGET_EXCEEDED"
+            until(lambda: any(r.get("event_type") == "USAGE_AND_DISPOSITION" for r in observed(state)))
+            assert b"unique_private_fixture_output" not in (state / "audit.jsonl").read_bytes()
+            assert host.poll() is None
+            first_pid = until(lambda: health(state).get("collector_pid"))
+            os.kill(first_pid, signal.SIGKILL)
+            def replacement():
+                pid = health(state).get("collector_pid")
+                return pid if pid and pid != first_pid else None
+            replacement_pid = until(replacement)
+            assert rpc(allow)["allow"] is True
+            assert rpc(deny)["code"] == "SUBAGENT_RETURN_BUDGET_EXCEEDED"
+            assert host.poll() is None
+        def collector_closed():
+            return (not pid_alive(replacement_pid)
+                    and health(state).get("phase") == "closing"
+                    and not (state / "observations/in").exists()
+                    and not (state / "observations/route").exists())
+        until(collector_closed)
 
 
 def boundaries(bins):

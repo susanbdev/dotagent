@@ -1651,7 +1651,9 @@ pub fn commit_ballot_on_host_redacted(
                 if key == "canonical_shape" {
                     *value = JsonValue::Str("[redacted]".into());
                 } else if key == "target_bin_or_tool" {
-                    *value = JsonValue::Str(crate::telemetry::protocol::tool_class(value.as_str().unwrap_or("")).into());
+                    *value = JsonValue::Str(
+                        crate::telemetry::protocol::tool_class(value.as_str().unwrap_or("")).into(),
+                    );
                 }
             }
         }

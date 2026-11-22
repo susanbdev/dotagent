@@ -13,7 +13,8 @@ static FAULT: AtomicU8 = AtomicU8::new(0);
 pub(super) fn before_store(frame: &[u8]) -> io::Result<()> {
     match FAULT.load(Ordering::Relaxed) {
         1 => panic!("injected release collector panic"),
-        2 => std::fs::OpenOptions::new().write(true)
+        2 => std::fs::OpenOptions::new()
+            .write(true)
             .open(crate::traversal_ledger::observation_state_root_dir().join("write-denied"))?
             .write_all(frame),
         3 => {

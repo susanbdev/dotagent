@@ -594,10 +594,15 @@ pub(crate) fn submit_record(kind: Kind, build: impl FnOnce() -> JsonValue) -> Su
 pub(super) fn handoff_counts() -> [u64; 7] {
     let a = AUDIT_OFFLINE.snapshot();
     let b = EXPORT_OFFLINE.snapshot();
-    [a.queued.saturating_add(b.queued), a.full.saturating_add(b.full),
-        a.contended.saturating_add(b.contended), a.unavailable.saturating_add(b.unavailable),
-        a.invalid.saturating_add(b.invalid), a.transport.saturating_add(b.transport),
-        a.closed.saturating_add(b.closed)]
+    [
+        a.queued.saturating_add(b.queued),
+        a.full.saturating_add(b.full),
+        a.contended.saturating_add(b.contended),
+        a.unavailable.saturating_add(b.unavailable),
+        a.invalid.saturating_add(b.invalid),
+        a.transport.saturating_add(b.transport),
+        a.closed.saturating_add(b.closed),
+    ]
 }
 
 pub(crate) fn note_invalid_audit() {
