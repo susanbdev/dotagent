@@ -1099,6 +1099,7 @@ fn check_immutable_control_plane(repo_rel: &str) -> Result<(), PathViolation> {
         ".codex/",
         ".cursor/",
         ".gemini/",
+        ".agents/",
         ".github/",
         ".cargo/",
         ".yarn/",

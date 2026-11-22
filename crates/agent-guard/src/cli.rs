@@ -90,6 +90,7 @@ pub fn run_cli_entrypoint() -> ExitCode {
         "verify-receipt" => crate::stop_receipt::run_verify_receipt_cli(&args[1..], &cwd),
         "receipt-pubkey" => crate::stop_receipt::run_receipt_pubkey_cli(&args[1..], &cwd),
         "mcp-gateway" => crate::mcp_gateway::run_mcp_gateway_cli(&args[1..], &cwd),
+        "antigravity-hook" => crate::antigravity::run_cli(&args[1..]),
         "pre-tool" => {
             let payload = match read_bounded_stdin_or_arg(&args[1..]) {
                 Ok(s) => s,
@@ -285,6 +286,8 @@ pub fn run_cli_entrypoint() -> ExitCode {
                  Operator & Onboarding Commands:\n\
                  \x20 activate [--workspace <dir>] [--dry-run]  Non-destructive multi-harness activation & backups\n\
                  \x20 deactivate [--workspace <dir>]            Restore .dotagent.bak files & remove deployed plane\n\
+                 \x20 activate --antigravity --workspace <dir> [--dotagent-root <dir>] [--bin-dir <dir>] [--dry-run]\n\
+                 \x20 deactivate --antigravity --workspace <dir> [--sshsig <path>] [--dry-run]\n\
                  \x20 fleet <audit|doctor|sync|build-image|configure-github>  Polyrepo sync, image builder, & GitHub Org rulesets\n\
                  \x20 feedback <submit|status|sync-github|run-loop>  Agent friction ballots, AgentPI stream, & autonomous loop\n\
                  \x20 verify-ring0-ratchet [--base origin/main] Verify Ring-0 immutability & monotonic bypass corpus\n\
@@ -302,6 +305,7 @@ pub fn run_cli_entrypoint() -> ExitCode {
                  Kernel & Hook Commands:\n\
                  \x20 mcp-gateway           Local zero-trust mediating MCP JSON-RPC 2.0 sidecar (PKCE + DPoP)\n\
                  \x20 pre-tool              PreToolUse / BeforeTool JSON hook gate (stdin)\n\
+                 \x20 antigravity-hook      Native Antigravity event (stdin), with --workspace <directory>\n\
                  \x20 post-tool             PostToolUse / AfterTool JSON output scanner (stdin)\n\
                  \x20 user-prompt           UserPromptSubmit turn-isolation reset hook (stdin)\n\
                  \x20 pre-compact           PreCompact / PreCompress step-budget reset & ASCII directive\n\
@@ -488,6 +492,10 @@ fn read_bounded_stdin_or_arg(extra_args: &[String]) -> Result<String, String> {
             .cloned()
             .ok_or_else(|| "missing argument after --json".to_string());
     }
+    read_bounded_hook_stdin()
+}
+
+pub(crate) fn read_bounded_hook_stdin() -> Result<String, String> {
     let mut buf = Vec::new();
     io::stdin()
         .take(MAX_HOOK_STDIN_BYTES + 1)
@@ -866,20 +874,10 @@ fn run_on_stop(args: &[String], cwd: &Path) -> ExitCode {
         return ExitCode::from(2);
     }
 
-    if let Err(errs) = audit_repository(&repo_root) {
+    if let Err(errs) = verify_stop_repository(&repo_root) {
         for e in errs {
             eprintln!("[AGENT-GUARD ON-STOP FAIL] {e}");
         }
-        return ExitCode::from(2);
-    }
-
-    if let Err(swarm_err) = crate::work_ledger::verify_on_stop_swarm_gates(&repo_root) {
-        eprintln!("[AGENT-GUARD ON-STOP FAIL] {swarm_err}");
-        return ExitCode::from(2);
-    }
-
-    if let Err(smoke_err) = crate::smoke_gate::verify_repo_smoke_gate(&repo_root) {
-        eprintln!("[AGENT-GUARD ON-STOP FAIL] {smoke_err}");
         return ExitCode::from(2);
     }
 
@@ -913,4 +911,12 @@ fn run_on_stop(args: &[String], cwd: &Path) -> ExitCode {
         repo_root.display()
     );
     ExitCode::SUCCESS
+}
+
+pub(crate) fn verify_stop_repository(repo_root: &Path) -> Result<(), Vec<String>> {
+    audit_repository(repo_root)?;
+    crate::work_ledger::verify_on_stop_swarm_gates(repo_root).map_err(|error| vec![error])?;
+    crate::smoke_gate::verify_repo_smoke_gate(repo_root)
+        .map(drop)
+        .map_err(|error| vec![error])
 }

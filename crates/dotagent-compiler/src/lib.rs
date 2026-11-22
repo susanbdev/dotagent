@@ -1302,6 +1302,43 @@ url = {escaped_url}
     )
 }
 
+/// Renders the native workspace hook template. The adapter applies the canonical guard policy,
+/// and workspace activation pins each command to the installed guard executable.
+pub fn render_antigravity_hooks() -> String {
+    let events = [
+        ("SessionStart", false),
+        ("PreToolUse", true),
+        ("PostToolUse", true),
+        ("PreInvocation", false),
+        ("PostInvocation", false),
+        ("Stop", false),
+    ];
+    let mut group = vec![("enabled".to_string(), JsonValue::Bool(true))];
+    for (event, tool_event) in events {
+        let handlers = JsonValue::Array(vec![JsonValue::Object(vec![
+            ("type".to_string(), JsonValue::Str("command".to_string())),
+            (
+                "command".to_string(),
+                JsonValue::Str(format!("agent-guard antigravity-hook {event}")),
+            ),
+            ("timeout".to_string(), JsonValue::Uint(10)),
+        ])]);
+        let entries = if tool_event {
+            JsonValue::Array(vec![JsonValue::Object(vec![
+                ("matcher".to_string(), JsonValue::Str("*".to_string())),
+                ("hooks".to_string(), handlers),
+            ])])
+        } else {
+            handlers
+        };
+        group.push((event.to_string(), entries));
+    }
+    format_json_pretty(&JsonValue::Object(vec![(
+        "dotagent".to_string(),
+        JsonValue::Object(group),
+    )]))
+}
+
 /// Lowers `coding-agent` `ProfileIr` into the Cloud / Remote Antigravity VM runtime manifest (`dist/antigravity/harness.json`).
 pub fn render_antigravity_harness_json_from_ir(coding: &ProfileIr) -> String {
     let doc = JsonValue::Object(vec![
@@ -1894,6 +1931,48 @@ pub fn verify_executable_spec_sync(repo_root: &Path) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn antigravity_hooks_use_native_event_shapes_and_match_every_tool() {
+        let config = JsonValue::parse(&render_antigravity_hooks()).expect("valid hook JSON");
+        let group = config.get("dotagent").expect("named dotagent hook group");
+        assert_eq!(
+            group.get("enabled").and_then(JsonValue::as_bool),
+            Some(true)
+        );
+        assert!(config.get("hooks").is_none());
+
+        for event in [
+            "SessionStart",
+            "PreToolUse",
+            "PostToolUse",
+            "PreInvocation",
+            "PostInvocation",
+            "Stop",
+        ] {
+            let [entry] = group.get(event).and_then(JsonValue::as_array).unwrap() else {
+                panic!("expected one {event} hook entry");
+            };
+            let handler = if matches!(event, "PreToolUse" | "PostToolUse") {
+                assert_eq!(entry.get("matcher").and_then(JsonValue::as_str), Some("*"));
+                let [handler] = entry.get("hooks").and_then(JsonValue::as_array).unwrap() else {
+                    panic!("expected one {event} tool handler");
+                };
+                handler
+            } else {
+                entry
+            };
+            assert_eq!(
+                handler.get("type").and_then(JsonValue::as_str),
+                Some("command")
+            );
+            assert_eq!(handler.get("timeout").and_then(JsonValue::as_u64), Some(10));
+            assert_eq!(
+                handler.get("command").and_then(JsonValue::as_str),
+                Some(format!("agent-guard antigravity-hook {event}").as_str())
+            );
+        }
+    }
 
     #[test]
     fn regorus_evaluates_json_and_normalized_codex_toml_policies_and_blocks_bypasses() {

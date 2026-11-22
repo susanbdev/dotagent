@@ -18,6 +18,7 @@
 //! - Cache bleed & cross-repository context contamination (`SHA-256` repo-isolated ledger)
 //! - Confused deputy attacks (git hooks disabled, lifecycle scripts blocked, taint-gated CLIs, MCP lock)
 
+mod antigravity;
 pub mod breadcrumbs;
 pub mod budget_guard;
 pub mod cli;
@@ -327,25 +328,30 @@ pub struct HookCallerContext {
     pub direct_explore: Option<String>,
 }
 
-/// Evaluates `PreToolUse` across Claude Code, Gemini/Antigravity, Cursor, and Codex payloads.
+impl HookCallerContext {
+    fn from_env() -> Self {
+        Self {
+            session_id: std::env::var("AGENT_GUARD_SESSION_ID").ok(),
+            root_session_id: std::env::var("AGENT_GUARD_ROOT_SESSION_ID")
+                .ok()
+                .filter(|s| !s.trim().is_empty())
+                .or_else(|| {
+                    std::env::var("AGENT_GUARD_PARENT_SESSION_ID")
+                        .ok()
+                        .filter(|s| !s.trim().is_empty())
+                }),
+            profile_id: std::env::var("AGENT_GUARD_PROFILE").ok(),
+            role_id: std::env::var("AGENT_GUARD_ROLE").ok(),
+            direct_explore: std::env::var("AGENT_GUARD_DIRECT_EXPLORE").ok(),
+        }
+    }
+}
+
+/// Evaluates normalized `PreToolUse` across the supported harnesses.
 /// Performs FULL pre-ingestion inspection and pre-buffer ASCII sanitization BEFORE a single
 /// non-ASCII byte or escape sequence can reach the LLM context window or KV cache.
 pub fn handle_pre_tool_hook(raw_json: &str, fallback_cwd: &Path) -> Decision {
-    let ctx = HookCallerContext {
-        session_id: std::env::var("AGENT_GUARD_SESSION_ID").ok(),
-        root_session_id: std::env::var("AGENT_GUARD_ROOT_SESSION_ID")
-            .ok()
-            .filter(|s| !s.trim().is_empty())
-            .or_else(|| {
-                std::env::var("AGENT_GUARD_PARENT_SESSION_ID")
-                    .ok()
-                    .filter(|s| !s.trim().is_empty())
-            }),
-        profile_id: std::env::var("AGENT_GUARD_PROFILE").ok(),
-        role_id: std::env::var("AGENT_GUARD_ROLE").ok(),
-        direct_explore: std::env::var("AGENT_GUARD_DIRECT_EXPLORE").ok(),
-    };
-    handle_pre_tool_hook_with_context(raw_json, fallback_cwd, &ctx, None)
+    handle_pre_tool_hook_with_context(raw_json, fallback_cwd, &HookCallerContext::from_env(), None)
 }
 
 pub fn handle_pre_tool_hook_with_context(
@@ -354,7 +360,6 @@ pub fn handle_pre_tool_hook_with_context(
     caller_ctx: &HookCallerContext,
     hot_cache: Option<&traversal_ledger::HotLedgerCache>,
 ) -> Decision {
-    let capture_started = std::time::Instant::now();
     let parsed = match JsonValue::parse(raw_json) {
         Ok(v) => v,
         Err(e) => {
@@ -365,8 +370,18 @@ pub fn handle_pre_tool_hook_with_context(
             );
         }
     };
+    evaluate_pre_tool_payload(&parsed, fallback_cwd, caller_ctx, hot_cache, false)
+}
 
-    let (cwd, repo_root) = match resolve_validated_cwd(&parsed, fallback_cwd) {
+fn evaluate_pre_tool_payload(
+    parsed: &JsonValue,
+    fallback_cwd: &Path,
+    caller_ctx: &HookCallerContext,
+    hot_cache: Option<&traversal_ledger::HotLedgerCache>,
+    require_session_lock: bool,
+) -> Decision {
+    let capture_started = std::time::Instant::now();
+    let (cwd, repo_root) = match resolve_validated_cwd(parsed, fallback_cwd) {
         Ok(pair) => pair,
         Err(dec) => return dec,
     };
@@ -383,8 +398,15 @@ pub fn handle_pre_tool_hook_with_context(
         Ok(p) => p,
         Err(bv) => return Decision::deny(bv.code, bv.detail, false),
     };
-    let session_id = extract_session_id_with_override(&parsed, caller_ctx.session_id.as_deref());
+    let session_id = extract_session_id_with_override(parsed, caller_ctx.session_id.as_deref());
     let _session_lock = SessionLedger::acquire_lock(&repo_root, &session_id);
+    if require_session_lock && _session_lock.is_none() {
+        return Decision::deny(
+            "STATE_LOCK_ERROR",
+            "Cannot lock the active session ledger.",
+            true,
+        );
+    }
     let mut ledger = SessionLedger::load_or_create_with_cache(&repo_root, &session_id, hot_cache);
     ledger.apply_root_session_override(caller_ctx.root_session_id.as_deref());
 
@@ -417,15 +439,15 @@ pub fn handle_pre_tool_hook_with_context(
         return Decision::deny("SESSION_HALTED_OR_EXHAUSTED", msg, true);
     }
 
-    let tool_name = extract_tool_name(&parsed);
-    let tool_input = parsed.get("tool_input").unwrap_or(&parsed);
+    let tool_name = extract_tool_name(parsed);
+    let tool_input = parsed.get("tool_input").unwrap_or(parsed);
     let direct_explore_env = caller_ctx
         .direct_explore
         .as_deref()
         .map(is_truthy_env_val)
         .unwrap_or_else(|| env_flag_enabled("AGENT_GUARD_DIRECT_EXPLORE"));
     let payload_is_airlock_subagent =
-        extract_first_str(&parsed, &["agent_type", "subagent_type", "agent_name"])
+        extract_first_str(parsed, &["agent_type", "subagent_type", "agent_name"])
             .is_some_and(is_allowed_airlock_subagent_name);
 
     if caller_ctx
@@ -574,7 +596,11 @@ pub fn handle_pre_tool_hook_with_context(
             }
         }
     }
-    let _ = ledger.save_locked_with_cache(&repo_root, hot_cache);
+    if let Err(error) = ledger.save_locked_with_cache(&repo_root, hot_cache)
+        && require_session_lock
+    {
+        return Decision::deny("STATE_WRITE_ERROR", error, true);
+    }
     let (action, code, disposition) = match &decision {
         Decision::Deny { code, .. } => ("deny", *code, "denied"),
         Decision::Allow {
@@ -2035,21 +2061,7 @@ fn pre_inspect_file_for_ingestion_with_profile(
 /// Catches runtime command stdout floods, dynamic prompt injections, Unicode smuggling,
 /// and poisoned pointers, while tracking step tokens to trigger immediate compaction!
 pub fn handle_post_tool_hook(raw_json: &str, fallback_cwd: &Path) -> Decision {
-    let ctx = HookCallerContext {
-        session_id: std::env::var("AGENT_GUARD_SESSION_ID").ok(),
-        root_session_id: std::env::var("AGENT_GUARD_ROOT_SESSION_ID")
-            .ok()
-            .filter(|s| !s.trim().is_empty())
-            .or_else(|| {
-                std::env::var("AGENT_GUARD_PARENT_SESSION_ID")
-                    .ok()
-                    .filter(|s| !s.trim().is_empty())
-            }),
-        profile_id: std::env::var("AGENT_GUARD_PROFILE").ok(),
-        role_id: std::env::var("AGENT_GUARD_ROLE").ok(),
-        direct_explore: std::env::var("AGENT_GUARD_DIRECT_EXPLORE").ok(),
-    };
-    handle_post_tool_hook_with_context(raw_json, fallback_cwd, &ctx, None)
+    handle_post_tool_hook_with_context(raw_json, fallback_cwd, &HookCallerContext::from_env(), None)
 }
 
 pub fn handle_post_tool_hook_with_context(

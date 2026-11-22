@@ -21,6 +21,8 @@ use crate::qa_suspects::plan_lock_state_path;
 use crate::traversal_ledger::{SessionLedger, state_base_dir};
 use crate::{audit_repository, resolve_repo_root, verify_global_git_hardening};
 
+mod antigravity;
+
 const REQUIRED_GIT_SETTINGS: &[(&str, &str)] = &[
     ("core.hooksPath", "/dev/null"),
     ("core.attributesFile", "/dev/null"),
@@ -621,6 +623,7 @@ pub fn run_activate_cli(args: &[String], cwd: &Path) -> ExitCode {
     let mut workspace: Option<PathBuf> = None;
     let mut dotagent_root: Option<PathBuf> = None;
     let mut bin_dir: Option<PathBuf> = None;
+    let mut native_antigravity = false;
     let mut dry_run = false;
 
     let mut i = 0usize;
@@ -650,6 +653,10 @@ pub fn run_activate_cli(args: &[String], cwd: &Path) -> ExitCode {
                 bin_dir = Some(PathBuf::from(v));
                 i += 2;
             }
+            "--antigravity" => {
+                native_antigravity = true;
+                i += 1;
+            }
             "--dry-run" => {
                 dry_run = true;
                 i += 1;
@@ -663,6 +670,23 @@ pub fn run_activate_cli(args: &[String], cwd: &Path) -> ExitCode {
                 return ExitCode::from(2);
             }
         }
+    }
+
+    if native_antigravity {
+        let Some(workspace) = workspace else {
+            eprintln!("[activate] --antigravity requires --workspace <dir>");
+            return ExitCode::from(2);
+        };
+        let Some(bundle) = dotagent_root.or_else(|| locate_dotagent_bundle_root(cwd)) else {
+            eprintln!(
+                "[activate] HARD DENY: native Antigravity requires a dotagent bundle (pass --dotagent-root <path>)"
+            );
+            return ExitCode::from(2);
+        };
+        return report_antigravity_operation(
+            "activate",
+            antigravity::activate(cwd, &workspace, &bundle, bin_dir.as_deref(), dry_run),
+        );
     }
 
     let Ok(home_raw) = std::env::var("HOME") else {
@@ -714,6 +738,7 @@ pub fn run_deactivate_cli(args: &[String], cwd: &Path) -> ExitCode {
 
     let mut workspace: Option<PathBuf> = None;
     let mut sshsig_file: Option<PathBuf> = None;
+    let mut native_antigravity = false;
     let mut dry_run = false;
     let mut i = 0usize;
     while i < args.len() {
@@ -734,6 +759,10 @@ pub fn run_deactivate_cli(args: &[String], cwd: &Path) -> ExitCode {
                 sshsig_file = Some(PathBuf::from(v));
                 i += 2;
             }
+            "--antigravity" => {
+                native_antigravity = true;
+                i += 1;
+            }
             "--dry-run" => {
                 dry_run = true;
                 i += 1;
@@ -749,11 +778,6 @@ pub fn run_deactivate_cli(args: &[String], cwd: &Path) -> ExitCode {
         }
     }
 
-    let Ok(home_raw) = std::env::var("HOME") else {
-        eprintln!("[deactivate] HARD DENY: HOME is not set");
-        return ExitCode::from(2);
-    };
-    let home = PathBuf::from(home_raw);
     for marker in [
         "CLAUDECODE",
         "GEMINI_CLI",
@@ -778,6 +802,24 @@ pub fn run_deactivate_cli(args: &[String], cwd: &Path) -> ExitCode {
         return ExitCode::from(2);
     }
 
+    if native_antigravity {
+        let result = (|| {
+            let target = workspace
+                .as_deref()
+                .ok_or("--antigravity requires --workspace <dir>")?;
+            let target = antigravity::workspace_root(cwd, target)?;
+            verify_operator_sshsig_gate(&target, "deactivate", sshsig_file.as_deref())
+                .map_err(|e| format!("{}: {}", e.code, e.detail))?;
+            antigravity::deactivate(&target, dry_run)
+        })();
+        return report_antigravity_operation("deactivate", result);
+    }
+
+    let Ok(home_raw) = std::env::var("HOME") else {
+        eprintln!("[deactivate] HARD DENY: HOME is not set");
+        return ExitCode::from(2);
+    };
+    let home = PathBuf::from(home_raw);
     let target_ws = workspace.unwrap_or_else(|| home.clone());
     let repo_root = resolve_repo_root(if target_ws != home { &target_ws } else { cwd });
 
@@ -795,6 +837,21 @@ pub fn run_deactivate_cli(args: &[String], cwd: &Path) -> ExitCode {
         }
         Err(err) => {
             eprintln!("[deactivate] HARD DENY: {err}");
+            ExitCode::from(2)
+        }
+    }
+}
+
+fn report_antigravity_operation(action: &str, result: Result<Vec<String>, String>) -> ExitCode {
+    match result {
+        Ok(lines) => {
+            for line in lines {
+                println!("{line}");
+            }
+            ExitCode::SUCCESS
+        }
+        Err(err) => {
+            eprintln!("[{action}] HARD DENY: {err}");
             ExitCode::from(2)
         }
     }
