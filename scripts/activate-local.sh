@@ -66,13 +66,44 @@ if [[ -z "${PREBUILT_DIR}" && -n "${PREBUILT_SUMS}" ]]; then
     exit 2
 fi
 
-for dir_chk in "${BIN_DIR}" "${HOME}/.local/state/agent-guard" "${HOME}/.local/state/agent-guard/sessions"; do
-    if [[ -L "${dir_chk}" ]] || [[ -e "${dir_chk}" && ! -d "${dir_chk}" ]]; then
-        echo "[activate-local] HARD DENY: '${dir_chk}' must not be a symlink or non-directory" >&2
-        exit 2
-    fi
+check_nonsymlink_dir_chain() {
+    local target="$1" rest cur="" seg
+    case "${target}" in
+        /*) ;;
+        *)
+            echo "[activate-local] HARD DENY: '${target}' must be an absolute path" >&2
+            exit 2
+            ;;
+    esac
+    rest="${target#/}"
+    while [[ -n "${rest}" ]]; do
+        if [[ "${rest}" == *"/"* ]]; then
+            seg="${rest%%/*}"
+            rest="${rest#*/}"
+        else
+            seg="${rest}"
+            rest=""
+        fi
+        [[ -z "${seg}" ]] && continue
+        if [[ "${seg}" == "." || "${seg}" == ".." ]]; then
+            echo "[activate-local] HARD DENY: '${target}' must not contain '.' or '..' segments" >&2
+            exit 2
+        fi
+        cur="${cur}/${seg}"
+        if [[ -L "${cur}" ]] || [[ -e "${cur}" && ! -d "${cur}" ]]; then
+            echo "[activate-local] HARD DENY: '${cur}' must not be a symlink or non-directory" >&2
+            exit 2
+        fi
+    done
+}
+
+for dir_chk in "${BIN_DIR}" "${HOME}/.local/state/agent-guard/sessions"; do
+    check_nonsymlink_dir_chain "${dir_chk}"
 done
 mkdir -p "${BIN_DIR}" "${HOME}/.local/state/agent-guard/sessions"
+for dir_chk in "${BIN_DIR}" "${HOME}/.local/state/agent-guard/sessions"; do
+    check_nonsymlink_dir_chain "${dir_chk}"
+done
 chmod 700 "${HOME}/.local/state/agent-guard" "${HOME}/.local/state/agent-guard/sessions"
 
 # 0. Pre-build bootstrap audit: reject build-tool RCE traps BEFORE invoking Cargo
@@ -207,7 +238,7 @@ if [[ -n "${PREBUILT_DIR}" ]]; then
             exit 2
         fi
     done
-    for bin_name in agent-guard dotagent-compiler swarm-tool dotagent; do
+    for bin_name in agent-guard agent-guard-sh dotagent-compiler swarm-tool dotagent; do
         if [[ ! -f "${BIN_SRC}/${bin_name}" ]]; then
             echo "[activate-local] HARD DENY: prebuilt binary '${bin_name}' missing in ${BIN_SRC}" >&2
             exit 2
@@ -242,12 +273,9 @@ else
             || cargo build --release --manifest-path "${DOTAGENT_ROOT}/Cargo.toml"
     )
 fi
-for bin_name in agent-guard dotagent-compiler swarm-tool; do
+for bin_name in agent-guard agent-guard-sh dotagent-compiler swarm-tool; do
     install_sealed_bin "${BIN_SRC}/${bin_name}" "${BIN_DIR}/${bin_name}"
 done
-if [[ -f "${BIN_SRC}/agent-guard-sh" ]]; then
-    install_sealed_bin "${BIN_SRC}/agent-guard-sh" "${BIN_DIR}/agent-guard-sh"
-fi
 
 # Install unified `dotagent` CLI (falling back to `agent-guard` multicall binary under minimal test shims)
 if [[ -f "${BIN_SRC}/dotagent" ]]; then

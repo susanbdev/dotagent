@@ -1180,3 +1180,125 @@ fn scenario_11_binary_integrity_mismatch_and_missing_pin_fail_closed() {
     );
     assert!(!repo.join("AGENTS.md").exists());
 }
+
+#[test]
+#[cfg(unix)]
+fn scenario_12_review_regressions_dotagent_sibling_canonical_self_and_transactional_deact() {
+    let sb = fresh_sandbox_dir("s12_review_reg");
+    let home = sb.join("home");
+    let state_dir = sb.join("state");
+    let bin_dir = sb.join("bin");
+    let repo = sb.join("repo");
+    fs::create_dir_all(&home).expect("mkdir home");
+    fs::create_dir_all(&state_dir).expect("mkdir state");
+    stage_guard_binaries(&bin_dir);
+    init_git_repo(&repo, &home);
+
+    // 12a: User sibling hook invoking `dotagent explain --list` MUST NOT be stripped as managed!
+    fs::create_dir_all(repo.join(".cursor")).expect("mkdir .cursor");
+    fs::write(
+        repo.join(".cursor/hooks.json"),
+        "{\n  \"version\": 1,\n  \"hooks\": {\n    \"beforeShellExecution\": [\n      {\n        \"command\": \"/usr/local/bin/dotagent explain --list\"\n      }\n    ]\n  }\n}\n",
+    )
+    .expect("seed cursor dotagent sibling");
+    let orig_agents = "# Original Project Guide\n";
+    fs::write(repo.join("AGENTS.md"), orig_agents).expect("seed AGENTS.md");
+
+    let root = workspace_root();
+    let act = run_dotagent(
+        &home,
+        &state_dir,
+        &[
+            "activate",
+            "--dotagent-root",
+            &root.to_string_lossy(),
+            "--workspace",
+            &repo.to_string_lossy(),
+            "--bin-dir",
+            &bin_dir.to_string_lossy(),
+        ],
+    );
+    assert!(
+        act.status.success(),
+        "activate failed: {}",
+        String::from_utf8_lossy(&act.stderr)
+    );
+    let merged_cursor =
+        fs::read_to_string(repo.join(".cursor/hooks.json")).expect("read merged cursor");
+    assert!(
+        merged_cursor.contains("/usr/local/bin/dotagent explain --list"),
+        "user sibling hook with dotagent basename must be preserved: {merged_cursor}"
+    );
+
+    // 12b: Transactional deactivation rollback: lock `.codex/agents` read-only (`0555`) so removing
+    //      created `.codex/agents/*.md` fails mid-deactivation AFTER `AGENTS.md` was already restored!
+    set_mode(&repo.join(".codex/agents"), 0o555);
+    let deact_fail = execute_workspace_only_deactivate(&repo, false);
+    assert!(
+        deact_fail.is_err(),
+        "deactivation must fail when .codex/agents is 0555"
+    );
+    // Earlier restored `AGENTS.md` MUST have been rolled back to deployed bytes, AND `AGENTS.md.dotagent.bak`
+    // + `.dotagent-manifest.json` MUST still exist so retrying after fixing permissions succeeds!
+    assert_eq!(
+        fs::read(repo.join("AGENTS.md")).expect("rolled back deployed AGENTS.md"),
+        fs::read(root.join("dist/AGENTS.md")).expect("dist AGENTS.md")
+    );
+    assert!(repo.join("AGENTS.md.dotagent.bak").is_file());
+    assert!(repo.join(".dotagent-manifest.json").is_file());
+
+    set_mode(&repo.join(".codex/agents"), 0o755);
+    execute_deactivate(&home, &repo, false).expect("retry deactivate after restoring dir perms");
+    assert_eq!(
+        fs::read_to_string(repo.join("AGENTS.md")).expect("restored AGENTS.md"),
+        orig_agents
+    );
+    let deact_cursor =
+        fs::read_to_string(repo.join(".cursor/hooks.json")).expect("restored cursor");
+    assert!(deact_cursor.contains("/usr/local/bin/dotagent explain --list"));
+
+    // 12c: Canonical self-activation (`target_ws == dotagent_root`) records provenance in `.agent-guard-state/`
+    //      and cleanly deactivates via `execute_deactivate`!
+    let self_bundle = sb.join("self_dotagent");
+    fs::create_dir_all(&self_bundle).expect("mkdir self_dotagent");
+    for sub in ["dist", "dist-verify", "profiles", "skills"] {
+        let st = Command::new("cp")
+            .args(["-R"])
+            .arg(root.join(sub))
+            .arg(self_bundle.join(sub))
+            .status()
+            .expect("cp bundle dir");
+        assert!(st.success());
+    }
+    fs::write(self_bundle.join("AGENTS.md"), "# Pre-sync self notes\n")
+        .expect("seed self AGENTS.md");
+    let self_act = run_dotagent(
+        &home,
+        &state_dir,
+        &[
+            "activate",
+            "--dotagent-root",
+            &self_bundle.to_string_lossy(),
+            "--workspace",
+            &self_bundle.to_string_lossy(),
+            "--bin-dir",
+            &bin_dir.to_string_lossy(),
+        ],
+    );
+    assert!(
+        self_act.status.success(),
+        "self activate failed: {}",
+        String::from_utf8_lossy(&self_act.stderr)
+    );
+    assert!(
+        self_bundle
+            .join(".agent-guard-state/.dotagent-manifest.json")
+            .is_file()
+    );
+    execute_deactivate(&home, &self_bundle, false).expect("self deactivate");
+    assert_eq!(
+        fs::read_to_string(self_bundle.join("AGENTS.md")).expect("restored self AGENTS.md"),
+        "# Pre-sync self notes\n"
+    );
+    assert!(!self_bundle.join(".agent-guard-state").exists());
+}

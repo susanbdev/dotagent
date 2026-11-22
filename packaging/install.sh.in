@@ -146,10 +146,36 @@ dotagent_fetch() {
     )
 }
 
+dotagent_check_nonsymlink_ancestors() {
+    local target="$1" label="$2" rest cur="" seg
+    case "${target}" in
+        /*) ;;
+        *) dotagent_die "${label} ${target} must be an absolute path" ;;
+    esac
+    rest="${target#/}"
+    while [[ -n "${rest}" ]]; do
+        if [[ "${rest}" == *"/"* ]]; then
+            seg="${rest%%/*}"
+            rest="${rest#*/}"
+        else
+            seg="${rest}"
+            rest=""
+        fi
+        [[ -z "${seg}" ]] && continue
+        [[ "${seg}" != "." && "${seg}" != ".." ]] || dotagent_die "${label} ${target} must not contain '.' or '..' segments"
+        cur="${cur}/${seg}"
+        [[ ! -L "${cur}" ]] || dotagent_die "${label} ancestor ${cur} must not be a symlink"
+        if [[ -e "${cur}" && ! -d "${cur}" ]]; then
+            dotagent_die "${label} ancestor ${cur} is not a directory"
+        fi
+    done
+}
+
 dotagent_make_stage() {
     local state="${HOME}/.local/state/agent-guard" rand
-    [[ ! -L "${state}" ]] || dotagent_die "state path ${state} must not be a symlink"
+    dotagent_check_nonsymlink_ancestors "${state}" "state path"
     mkdir -p "${state}"
+    dotagent_check_nonsymlink_ancestors "${state}" "state path"
     [[ -d "${state}" && ! -L "${state}" && -O "${state}" ]] || dotagent_die "state path ${state} is not a user-owned plain directory"
     chmod 0700 "${state}"
     rand="$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')"
@@ -357,9 +383,11 @@ dotagent_install_main() {
 
     # Place the payload tree (docs, dist, profiles, skills, bin) next to its parent, then rename.
     local parent="${share_root%/*}"
-    [[ ! -L "${parent}" ]] || dotagent_die "install parent ${parent} must not be a symlink"
-    [[ ! -L "${bin_final}" ]] || dotagent_die "--bin-dir ${bin_final} must not be a symlink"
+    dotagent_check_nonsymlink_ancestors "${parent}" "install parent"
+    dotagent_check_nonsymlink_ancestors "${bin_final}" "--bin-dir"
     mkdir -p "${parent}" "${bin_final}"
+    dotagent_check_nonsymlink_ancestors "${parent}" "install parent"
+    dotagent_check_nonsymlink_ancestors "${bin_final}" "--bin-dir"
     [[ -d "${bin_final}" && ! -L "${bin_final}" ]] || dotagent_die "--bin-dir ${bin_final} is not a plain directory"
 
     local bin
@@ -371,10 +399,14 @@ dotagent_install_main() {
     done
 
     local fresh="${parent}/.${share_root##*/}.new.$$"
-    if [[ -e "${fresh}" || -L "${fresh}" ]]; then
-        chmod -R u+rwX "${fresh}" 2>/dev/null || true
-        rm -rf "${fresh}"
-    fi
+    local old_share="${parent}/.${share_root##*/}.old.$$"
+    local had_prior_share=0
+    for stale_tree in "${fresh}" "${old_share}"; do
+        if [[ -e "${stale_tree}" || -L "${stale_tree}" ]]; then
+            chmod -R u+rwX "${stale_tree}" 2>/dev/null || true
+            rm -rf "${stale_tree}"
+        fi
+    done
     cp -R "${payload}" "${fresh}"
     dotagent_seal_tree "${fresh}"
 
@@ -385,7 +417,23 @@ dotagent_install_main() {
         chmod 0555 "${bin_final}/.${bin}.tmp.$$"
     done
 
-    dotagent_swap_dir "${fresh}" "${share_root}"
+    chmod 0755 "${fresh}"
+    if [[ -e "${share_root}" || -L "${share_root}" ]]; then
+        had_prior_share=1
+        chmod -R u+rwX "${share_root}" 2>/dev/null || true
+        mv "${share_root}" "${old_share}"
+    fi
+    if ! mv "${fresh}" "${share_root}"; then
+        if [[ "${had_prior_share}" -eq 1 && ( -e "${old_share}" || -L "${old_share}" ) ]]; then
+            mv "${old_share}" "${share_root}" 2>/dev/null || true
+            chmod 0555 "${share_root}" 2>/dev/null || true
+        fi
+        for bin in "${DOTAGENT_BINARIES[@]}"; do
+            rm -f "${bin_final}/.${bin}.tmp.$$" "${bin_final}/.${bin}.prev.$$" 2>/dev/null || true
+        done
+        dotagent_die "failed moving payload tree into ${share_root}"
+    fi
+    chmod 0555 "${share_root}"
 
     local swapped=() swap_ok=1
     for bin in "${DOTAGENT_BINARIES[@]}"; do
@@ -410,7 +458,17 @@ dotagent_install_main() {
         for bin in "${DOTAGENT_BINARIES[@]}"; do
             rm -f "${bin_final}/.${bin}.tmp.$$" "${bin_final}/.${bin}.prev.$$" 2>/dev/null || true
         done
-        dotagent_die "failed swapping binaries into ${bin_final}; rolled back partial binary updates"
+        chmod -R u+rwX "${share_root}" 2>/dev/null || true
+        rm -rf "${share_root}" 2>/dev/null || true
+        if [[ "${had_prior_share}" -eq 1 && ( -e "${old_share}" || -L "${old_share}" ) ]]; then
+            mv "${old_share}" "${share_root}" 2>/dev/null || true
+            chmod 0555 "${share_root}" 2>/dev/null || true
+        fi
+        dotagent_die "failed swapping binaries into ${bin_final}; rolled back share tree and binary updates"
+    fi
+    if [[ "${had_prior_share}" -eq 1 && ( -e "${old_share}" || -L "${old_share}" ) ]]; then
+        chmod -R u+rwX "${old_share}" 2>/dev/null || true
+        rm -rf "${old_share}" 2>/dev/null || true
     fi
     for bin in "${DOTAGENT_BINARIES[@]}"; do
         rm -f "${bin_final}/.${bin}.prev.$$" 2>/dev/null || true

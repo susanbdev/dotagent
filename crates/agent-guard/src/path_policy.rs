@@ -1103,6 +1103,7 @@ fn check_immutable_control_plane(repo_rel: &str) -> Result<(), PathViolation> {
         ".git/",
         ".guard/",
         ".agent-guard/",
+        ".agent-guard-state/",
         ".agents/",
         ".agent/",
         "_agents/",

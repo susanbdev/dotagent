@@ -241,11 +241,29 @@ main() {
     local source_digest
     source_digest="$(git rev-parse "${tag}^{commit}")"
 
-    local state="${HOME}/.local/state/dotagent-release" dir
-    [[ ! -L "${state}" ]] || die "state path ${state} must not be a symlink"
+    local state="${HOME}/.local/state/dotagent-release" dir rest cur="" seg
+    [[ "${state}" == /* ]] || die "state path ${state} must be an absolute path"
+    rest="${state#/}"
+    while [[ -n "${rest}" ]]; do
+        if [[ "${rest}" == *"/"* ]]; then
+            seg="${rest%%/*}"
+            rest="${rest#*/}"
+        else
+            seg="${rest}"
+            rest=""
+        fi
+        [[ -z "${seg}" ]] && continue
+        [[ "${seg}" != "." && "${seg}" != ".." ]] || die "state path ${state} must not contain '.' or '..'"
+        cur="${cur}/${seg}"
+        [[ ! -L "${cur}" ]] || die "state ancestor ${cur} must not be a symlink"
+        if [[ -e "${cur}" && ! -d "${cur}" ]]; then
+            die "state ancestor ${cur} is not a plain directory"
+        fi
+    done
     mkdir -p "${state}"
     chmod 0700 "${state}"
     dir="${state}/${tag}"
+    [[ ! -L "${dir}" ]] || die "release state dir ${dir} must not be a symlink"
     rm -rf "${dir}"
     mkdir -m 0700 "${dir}"
 

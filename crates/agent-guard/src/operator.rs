@@ -1198,86 +1198,15 @@ fn backup_path_for(target: &Path) -> PathBuf {
     PathBuf::from(os)
 }
 
-/// Preserves a pre-existing user file into `<file>.dotagent.bak` once (never overwriting an
-/// existing `.dotagent.bak` on repeated idempotent `activate` runs) whenever its bytes differ
-/// from `new_bytes`.
-fn write_with_nondestructive_backup(
+fn backup_path_in_plane(
     target: &Path,
-    new_bytes: &[u8],
-    mode: u32,
-    use_cp_semantics: bool,
-    dry_run: bool,
-    log: &mut Vec<String>,
-) -> Result<(), String> {
-    reject_if_symlink(target, "target")?;
-    let bak = backup_path_for(target);
-    reject_if_symlink(&bak, "backup file")?;
-
-    if target.is_file()
-        && let Ok(existing) = fs::read(target)
-        && existing != new_bytes
-        && !bak.exists()
-    {
-        if dry_run {
-            log.push(format!(
-                "[dry-run] would back up '{}' -> '{}'",
-                target.display(),
-                bak.display()
-            ));
-        } else {
-            fs::write(&bak, &existing).map_err(|e| {
-                format!(
-                    "failed backing up '{}' to '{}': {e}",
-                    target.display(),
-                    bak.display()
-                )
-            })?;
-            log.push(format!(
-                "[backup] saved pre-existing '{}' -> '{}'",
-                target.display(),
-                bak.display()
-            ));
-        }
+    state_backups_dir: Option<&Path>,
+    rel_path: &str,
+) -> PathBuf {
+    match state_backups_dir {
+        Some(dir) => dir.join(format!("{}.dotagent.bak", rel_path.replace('/', "__"))),
+        None => backup_path_for(target),
     }
-
-    if dry_run {
-        log.push(format!(
-            "[dry-run] would deploy '{}' (mode {:04o}, {} bytes)",
-            target.display(),
-            mode,
-            new_bytes.len()
-        ));
-        return Ok(());
-    }
-
-    if use_cp_semantics {
-        // FUSE / virtiofs persistent mounts (like ~/.gemini) may disallow chmod; write in place cleanly.
-        fs::write(target, new_bytes)
-            .map_err(|e| format!("failed writing '{}': {e}", target.display()))?;
-    } else {
-        if target.exists() {
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                let _ = fs::set_permissions(target, fs::Permissions::from_mode(0o600));
-            }
-            let _ = fs::remove_file(target);
-        }
-        fs::write(target, new_bytes)
-            .map_err(|e| format!("failed writing '{}': {e}", target.display()))?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(target, fs::Permissions::from_mode(mode)).map_err(|e| {
-                format!(
-                    "failed setting mode {:04o} on '{}': {e}",
-                    mode,
-                    target.display()
-                )
-            })?;
-        }
-    }
-    Ok(())
 }
 
 /// Rewrites bare `"agent-guard ..."` hook commands to `"<abs_guard_bin> ..."` when deploying
@@ -1370,14 +1299,15 @@ fn pin_codex_notify_toml(tpl: &str, abs_guard_bin: Option<&Path>) -> Result<Stri
     Ok(tpl.replacen("notify = [\"agent-guard\", \"on-stop\"]", &replacement, 1))
 }
 
-fn first_shell_executable_name(cmd: &str) -> Option<String> {
-    let s = cmd.trim_start();
-    if s.is_empty() {
+fn parse_next_shell_token(bytes: &[u8], start: usize) -> Option<(String, usize)> {
+    let mut i = start;
+    while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    if i >= bytes.len() {
         return None;
     }
-    let bytes = s.as_bytes();
     let mut tok = String::new();
-    let mut i = 0;
     while i < bytes.len() {
         let b = bytes[i];
         if b.is_ascii_whitespace() {
@@ -1409,24 +1339,51 @@ fn first_shell_executable_name(cmd: &str) -> Option<String> {
             i += 1;
         }
     }
-    Path::new(&tok)
-        .file_name()
-        .and_then(|n| n.to_str())
-        .map(ToString::to_string)
+    Some((tok, i))
 }
 
 fn is_agent_guard_hook_item(item: &JsonValue) -> bool {
     if item
         .get("name")
         .and_then(JsonValue::as_str)
-        .is_some_and(|n| n == "agent-guard" || n.starts_with("agent-guard-"))
+        .is_some_and(|n| {
+            matches!(
+                n,
+                "agent-guard-turn-reset"
+                    | "agent-guard-pre-tool"
+                    | "agent-guard-post-tool"
+                    | "agent-guard-pre-compact"
+                    | "agent-guard-on-stop"
+            )
+        })
     {
         return true;
     }
-    item.get("command")
-        .and_then(JsonValue::as_str)
-        .and_then(first_shell_executable_name)
-        .is_some_and(|exe| exe == "agent-guard" || exe == "dotagent")
+    let Some(cmd) = item.get("command").and_then(JsonValue::as_str) else {
+        return false;
+    };
+    let Some((first_tok, next_idx)) = parse_next_shell_token(cmd.as_bytes(), 0) else {
+        return false;
+    };
+    let Some(exe) = Path::new(&first_tok).file_name().and_then(|n| n.to_str()) else {
+        return false;
+    };
+    if !matches!(exe, "agent-guard" | "dotagent") {
+        return false;
+    }
+    let Some((second_tok, _)) = parse_next_shell_token(cmd.as_bytes(), next_idx) else {
+        return false;
+    };
+    matches!(
+        second_tok.as_str(),
+        "pre-tool"
+            | "post-tool"
+            | "user-prompt"
+            | "pre-compact"
+            | "post-edit"
+            | "on-stop"
+            | "antigravity-hook"
+    )
 }
 
 fn strip_agent_guard_from_grouped_event(arr: &[JsonValue]) -> Result<Vec<JsonValue>, String> {
@@ -2016,11 +1973,12 @@ fn write_bundle_provenance_file(
     prior_entry: Option<&FileProvenanceEntry>,
     mode: u32,
     use_cp_semantics: bool,
+    state_backups_dir: Option<&Path>,
     journal: &mut RollbackJournal,
     log: &mut Vec<String>,
 ) -> Result<FileProvenanceEntry, String> {
     let existing_meta = validate_optional_regular_file_lstat(target, "target file")?;
-    let bak = backup_path_for(target);
+    let bak = backup_path_in_plane(target, state_backups_dir, rel_path);
     let existing_bak = validate_optional_regular_file_lstat(&bak, "backup file")?;
 
     #[cfg(unix)]
@@ -2463,6 +2421,7 @@ fn deploy_gemini_home_plane(
                 prior_e,
                 0o644,
                 true,
+                None,
                 &mut journal,
                 log,
             )?;
@@ -2483,49 +2442,57 @@ fn deploy_gemini_home_plane(
     Ok(Some(journal))
 }
 
+const CANONICAL_SELF_STATE_DIR: &str = ".agent-guard-state";
+const CANONICAL_SELF_BACKUPS_DIR: &str = ".agent-guard-state/backups";
+
 fn deploy_canonical_dotagent_mirrors(
     dotagent_root: &Path,
     dry_run: bool,
     log: &mut Vec<String>,
-) -> Result<(), String> {
-    let subdirs = [
+) -> Result<Option<RollbackJournal>, String> {
+    let dir_rels = [
         ".claude",
         ".claude/agents",
         ".cursor",
         ".cursor/agents",
         ".codex",
         ".codex/agents",
+        CANONICAL_SELF_STATE_DIR,
+        CANONICAL_SELF_BACKUPS_DIR,
     ];
-    for sub in subdirs {
-        let _ = validate_optional_dir_lstat(&dotagent_root.join(sub), "harness directory")?;
+    let mut dir_existed = Vec::with_capacity(dir_rels.len());
+    for sub in dir_rels {
+        let existed = validate_optional_dir_lstat(&dotagent_root.join(sub), "harness directory")?;
+        dir_existed.push((sub, existed));
     }
-    if !dry_run {
-        for sub in [".claude/agents", ".cursor/agents", ".codex/agents"] {
-            fs::create_dir_all(dotagent_root.join(sub)).map_err(|e| {
-                format!(
-                    "failed creating '{}': {e}",
-                    dotagent_root.join(sub).display()
-                )
-            })?;
-        }
-    }
-    let pairs: &[(&str, &str)] = &[
+
+    let allowed_rels = workspace_managed_rel_paths();
+    let state_dir = dotagent_root.join(CANONICAL_SELF_STATE_DIR);
+    let state_backups = dotagent_root.join(CANONICAL_SELF_BACKUPS_DIR);
+    let manifest_path = state_dir.join(BUNDLE_PROVENANCE_FILE);
+    let prior_manifest = if dir_existed[6].1
+        && validate_optional_regular_file_lstat(&manifest_path, "canonical provenance manifest")?
+            .is_some()
+    {
+        let raw = fs::read_to_string(&manifest_path)
+            .map_err(|e| format!("failed reading '{}': {e}", manifest_path.display()))?;
+        Some(BundleProvenanceManifest::parse(&raw, &allowed_rels)?)
+    } else {
+        None
+    };
+
+    let mut staged: Vec<(String, Vec<u8>)> = Vec::with_capacity(allowed_rels.len());
+    for &(src_rel, dst_rel) in &[
         ("dist/AGENTS.md", "AGENTS.md"),
         ("dist/.ignore", ".ignore"),
         ("dist/cursor/.cursorignore", ".cursorignore"),
         ("dist/codex/config.toml", ".codex/config.toml"),
         ("dist/claude/settings.json", ".claude/settings.json"),
         ("dist/cursor/hooks.json", ".cursor/hooks.json"),
-    ];
-    for &(src_rel, dst_rel) in pairs {
-        let dst = dotagent_root.join(dst_rel);
-        let _ = validate_optional_regular_file_lstat(&dst, "harness mirror")?;
+    ] {
         let bytes = fs::read(dotagent_root.join(src_rel))
             .map_err(|e| format!("missing '{src_rel}': {e}"))?;
-        if !dry_run && dst.is_file() && fs::read(&dst).ok().as_deref() == Some(bytes.as_slice()) {
-            continue;
-        }
-        write_with_nondestructive_backup(&dst, &bytes, 0o644, false, dry_run, log)?;
+        staged.push((dst_rel.to_string(), bytes));
     }
     for af in AGENT_MD_FILES {
         for (dist_sub, dst_sub) in [
@@ -2533,18 +2500,87 @@ fn deploy_canonical_dotagent_mirrors(
             ("dist/cursor/agents", ".cursor/agents"),
             ("dist/codex/agents", ".codex/agents"),
         ] {
-            let dst = dotagent_root.join(dst_sub).join(af);
-            let _ = validate_optional_regular_file_lstat(&dst, "harness agent mirror")?;
             let bytes = fs::read(dotagent_root.join(dist_sub).join(af))
                 .map_err(|e| format!("missing '{dist_sub}/{af}': {e}"))?;
-            if !dry_run && dst.is_file() && fs::read(&dst).ok().as_deref() == Some(bytes.as_slice())
-            {
-                continue;
-            }
-            write_with_nondestructive_backup(&dst, &bytes, 0o644, false, dry_run, log)?;
+            staged.push((format!("{dst_sub}/{af}"), bytes));
         }
     }
-    Ok(())
+
+    for (rel, _) in &staged {
+        let dst = dotagent_root.join(rel);
+        let parent_exists = dst
+            .parent()
+            .is_some_and(|p| p == dotagent_root || p.is_dir());
+        if parent_exists {
+            let _ = validate_optional_regular_file_lstat(&dst, "harness mirror")?;
+        }
+        if dir_existed[7].1 {
+            let bak = backup_path_in_plane(&dst, Some(&state_backups), rel);
+            let _ = validate_optional_regular_file_lstat(&bak, "canonical mirror backup")?;
+        }
+    }
+
+    if dry_run {
+        for (rel, bytes) in &staged {
+            log.push(format!(
+                "[dry-run] would deploy '{}' (mode 0644, {} bytes)",
+                dotagent_root.join(rel).display(),
+                bytes.len()
+            ));
+        }
+        return Ok(None);
+    }
+
+    let mut journal = RollbackJournal::default();
+    let mut created_dirs = prior_manifest
+        .as_ref()
+        .map(|m| m.created_dirs.clone())
+        .unwrap_or_default();
+
+    let run_res = (|| -> Result<(), String> {
+        for &(rel_d, existed) in &dir_existed {
+            if !existed {
+                let dp = dotagent_root.join(rel_d);
+                fs::create_dir(&dp)
+                    .map_err(|e| format!("failed creating '{}': {e}", dp.display()))?;
+                journal.created_dirs.push(dp);
+                if !created_dirs.iter().any(|d| d == rel_d) {
+                    created_dirs.push(rel_d.to_string());
+                }
+            }
+        }
+
+        let mut entries = Vec::with_capacity(staged.len());
+        for (rel, bytes) in staged {
+            let dst = dotagent_root.join(&rel);
+            let prior_e = prior_manifest.as_ref().and_then(|m| m.entry_for(&rel));
+            let entry = write_bundle_provenance_file(
+                &dst,
+                &rel,
+                &bytes,
+                None,
+                prior_e,
+                0o644,
+                false,
+                Some(&state_backups),
+                &mut journal,
+                log,
+            )?;
+            entries.push(entry);
+        }
+        let new_manifest = BundleProvenanceManifest {
+            created_dirs,
+            entries,
+        };
+        write_bundle_manifest_file(&manifest_path, &new_manifest, 0o644, false, &mut journal)?;
+        Ok(())
+    })();
+
+    if let Err(e) = run_res {
+        journal.rollback();
+        return Err(e);
+    }
+    Ok(Some(journal))
 }
 
 fn deploy_workspace_bundle(
@@ -2555,7 +2591,7 @@ fn deploy_workspace_bundle(
     abs_guard_bin: Option<&Path>,
     dry_run: bool,
     log: &mut Vec<String>,
-) -> Result<(), String> {
+) -> Result<Option<RollbackJournal>, String> {
     verify_all_dist_manifest_sources(dotagent_root)?;
     if !is_external {
         return deploy_canonical_dotagent_mirrors(dotagent_root, dry_run, log);
@@ -2708,7 +2744,7 @@ fn deploy_workspace_bundle(
             true,
             log,
         )?;
-        return Ok(());
+        return Ok(None);
     }
 
     let mut journal = RollbackJournal::default();
@@ -2742,6 +2778,7 @@ fn deploy_workspace_bundle(
                 prior_e,
                 mode,
                 false,
+                None,
                 &mut journal,
                 log,
             )?;
@@ -2770,7 +2807,7 @@ fn deploy_workspace_bundle(
         journal.rollback();
         return Err(e);
     }
-    Ok(())
+    Ok(Some(journal))
 }
 
 pub(crate) fn execute_activate(
@@ -2845,7 +2882,10 @@ pub(crate) fn execute_activate(
     // 2. Enforce all 19 global Git hardening keys (preserving user.name & user.email)
     enforce_global_git_settings(dry_run, &mut log)?;
 
-    if !dry_run && let Err(errs) = audit_repository(dotagent_root) {
+    if is_external_target
+        && !dry_run
+        && let Err(errs) = audit_repository(dotagent_root)
+    {
         return Err(format!(
             "dotagent repository audit failed: {}",
             errs.join("; ")
@@ -2859,7 +2899,7 @@ pub(crate) fn execute_activate(
     // 4. Deploy canonical mirrors in dotagent_root ONLY when activating dotagent_root itself
     //    (never write into read-only release bundles like ~/.local/share/dotagent).
     if !is_external_target {
-        if let Err(e) = deploy_workspace_bundle(
+        let mut self_journal = match deploy_workspace_bundle(
             dotagent_root,
             dotagent_root,
             0o644,
@@ -2868,15 +2908,38 @@ pub(crate) fn execute_activate(
             dry_run,
             &mut log,
         ) {
+            Ok(j) => j,
+            Err(e) => {
+                if let Some(ref mut gj) = gemini_journal {
+                    gj.rollback();
+                }
+                return Err(e);
+            }
+        };
+        if let Err(e) = invalidate_or_purge_swarm_state(dotagent_root, false, dry_run, &mut log) {
+            if let Some(ref mut sj) = self_journal {
+                sj.rollback();
+            }
             if let Some(ref mut gj) = gemini_journal {
                 gj.rollback();
             }
             return Err(e);
         }
-        invalidate_or_purge_swarm_state(dotagent_root, false, dry_run, &mut log)?;
+        if !dry_run && let Err(errs) = audit_repository(dotagent_root) {
+            if let Some(ref mut sj) = self_journal {
+                sj.rollback();
+            }
+            if let Some(ref mut gj) = gemini_journal {
+                gj.rollback();
+            }
+            return Err(format!(
+                "dotagent repository audit failed: {}",
+                errs.join("; ")
+            ));
+        }
     } else {
         // 5. Deploy external target_ws (0444 read-only control plane, provenance backups + pinned binary path)
-        if let Err(e) = deploy_workspace_bundle(
+        let mut ws_journal = match deploy_workspace_bundle(
             dotagent_root,
             target_ws,
             0o444,
@@ -2885,17 +2948,32 @@ pub(crate) fn execute_activate(
             dry_run,
             &mut log,
         ) {
+            Ok(j) => j,
+            Err(e) => {
+                if let Some(ref mut gj) = gemini_journal {
+                    gj.rollback();
+                }
+                return Err(e);
+            }
+        };
+        if let Err(e) = invalidate_or_purge_swarm_state(target_ws, false, dry_run, &mut log) {
+            let _ = execute_antigravity_deactivate(target_ws, false);
+            if let Some(ref mut wj) = ws_journal {
+                wj.rollback();
+            }
             if let Some(ref mut gj) = gemini_journal {
                 gj.rollback();
             }
             return Err(e);
         }
-        invalidate_or_purge_swarm_state(target_ws, false, dry_run, &mut log)?;
         if !dry_run
             && target_ws.join(".git").exists()
             && let Err(errs) = audit_repository(target_ws)
         {
-            let _ = execute_workspace_only_deactivate(target_ws, false);
+            let _ = execute_antigravity_deactivate(target_ws, false);
+            if let Some(ref mut wj) = ws_journal {
+                wj.rollback();
+            }
             if let Some(ref mut gj) = gemini_journal {
                 gj.rollback();
             }
@@ -2933,7 +3011,7 @@ pub(crate) fn activate_external_workspace_only(
 
     let verified_guard = resolve_verified_guard_binary(bin_dir)?;
 
-    deploy_workspace_bundle(
+    let mut ws_journal = deploy_workspace_bundle(
         dotagent_root,
         target_ws,
         0o444,
@@ -2942,12 +3020,21 @@ pub(crate) fn activate_external_workspace_only(
         dry_run,
         &mut log,
     )?;
-    invalidate_or_purge_swarm_state(target_ws, false, dry_run, &mut log)?;
+    if let Err(e) = invalidate_or_purge_swarm_state(target_ws, false, dry_run, &mut log) {
+        let _ = execute_antigravity_deactivate(target_ws, false);
+        if let Some(ref mut wj) = ws_journal {
+            wj.rollback();
+        }
+        return Err(e);
+    }
     if !dry_run
         && target_ws.join(".git").exists()
         && let Err(errs) = audit_repository(target_ws)
     {
-        let _ = execute_workspace_only_deactivate(target_ws, false);
+        let _ = execute_antigravity_deactivate(target_ws, false);
+        if let Some(ref mut wj) = ws_journal {
+            wj.rollback();
+        }
         return Err(format!(
             "target workspace '{}' failed security audit: {}",
             target_ws.display(),
@@ -3055,11 +3142,42 @@ fn plan_bundle_deactivation(
         return Ok(None);
     }
 
-    let manifest_path = root.join(BUNDLE_PROVENANCE_FILE);
-    let manifest_meta =
-        validate_optional_regular_file_lstat(&manifest_path, "bundle provenance manifest")?;
+    let primary_manifest = root.join(BUNDLE_PROVENANCE_FILE);
+    let primary_meta =
+        validate_optional_regular_file_lstat(&primary_manifest, "bundle provenance manifest")?;
 
-    if manifest_meta.is_none() {
+    let state_dir = root.join(CANONICAL_SELF_STATE_DIR);
+    let state_backups = root.join(CANONICAL_SELF_BACKUPS_DIR);
+    let (manifest_path, state_backups_opt): (PathBuf, Option<PathBuf>) = if primary_meta.is_some() {
+        (primary_manifest, None)
+    } else if validate_optional_dir_lstat(&state_dir, "canonical state directory")? {
+        let self_manifest = state_dir.join(BUNDLE_PROVENANCE_FILE);
+        if validate_optional_regular_file_lstat(&self_manifest, "canonical provenance manifest")?
+            .is_some()
+        {
+            let _ = validate_optional_dir_lstat(&state_backups, "canonical backups directory")?;
+            (self_manifest, Some(state_backups))
+        } else {
+            if validate_optional_dir_lstat(&state_backups, "canonical backups directory")? {
+                for rel in allowed_rels {
+                    let bak = backup_path_in_plane(&root.join(rel), Some(&state_backups), rel);
+                    if validate_optional_regular_file_lstat(&bak, "canonical backup")?.is_some() {
+                        return Err(format!(
+                            "{plane_label} backup '{}' exists without provenance manifest '{}'; preserving backup and refusing destructive cleanup",
+                            bak.display(),
+                            self_manifest.display()
+                        ));
+                    }
+                }
+            }
+            (primary_manifest, None)
+        }
+    } else {
+        (primary_manifest, None)
+    };
+
+    if validate_optional_regular_file_lstat(&manifest_path, "bundle provenance manifest")?.is_none()
+    {
         for rel in allowed_rels {
             let t = root.join(rel);
             let parent_ok = match t.parent() {
@@ -3113,6 +3231,7 @@ fn plan_bundle_deactivation(
             None
         };
 
+        let bak = backup_path_in_plane(&target, state_backups_opt.as_deref(), &entry.rel_path);
         let is_cursor_hooks = entry.rel_path == ".cursor/hooks.json";
         if let Some(ref exp_tpl) = entry.managed_group {
             let user_remaining = verify_managed_json_intact_and_extract_user_part(
@@ -3122,7 +3241,6 @@ fn plan_bundle_deactivation(
                 &target,
             )?;
             if entry.pre_existing {
-                let bak = backup_path_for(&target);
                 let Some(bmeta) =
                     validate_optional_regular_file_lstat(&bak, "managed JSON backup")?
                 else {
@@ -3215,7 +3333,6 @@ fn plan_bundle_deactivation(
                 ));
             }
             if entry.pre_existing {
-                let bak = backup_path_for(&target);
                 let Some(bmeta) = validate_optional_regular_file_lstat(&bak, "bundle backup")?
                 else {
                     return Err(format!(
@@ -3264,6 +3381,24 @@ fn plan_bundle_deactivation(
     }))
 }
 
+fn read_prior_target_snapshot(target: &Path) -> Result<(Vec<u8>, u32), String> {
+    let meta = fs::symlink_metadata(target)
+        .map_err(|e| format!("failed statting '{}': {e}", target.display()))?;
+    let bytes =
+        fs::read(target).map_err(|e| format!("failed reading '{}': {e}", target.display()))?;
+    #[cfg(unix)]
+    let mode = {
+        use std::os::unix::fs::PermissionsExt;
+        meta.permissions().mode() & 0o777
+    };
+    #[cfg(not(unix))]
+    let mode = {
+        let _ = meta;
+        0o644
+    };
+    Ok((bytes, mode))
+}
+
 fn execute_bundle_deactivation(
     plan: ValidatedBundleDeactivation,
     use_cp_semantics: bool,
@@ -3306,84 +3441,105 @@ fn execute_bundle_deactivation(
         return Ok(log);
     }
 
-    for action in plan.actions {
-        match action {
-            PlannedDeactivation::RestoreBackup {
-                target,
-                bak,
-                bytes,
-                mode,
-            } => {
-                write_target_bytes_with_mode(
-                    &target,
-                    &bytes,
-                    mode.unwrap_or(0o644),
-                    use_cp_semantics,
-                )?;
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::PermissionsExt;
-                    let _ = fs::set_permissions(&bak, fs::Permissions::from_mode(0o600));
+    // Two-phase transactional execution:
+    // 1. Apply all target file restorations/deletions and remove the provenance manifest BEFORE
+    //    deleting any `.dotagent.bak` backup. Record prior target snapshots so any failure rolls
+    //    back earlier target writes while all backups remain intact on disk.
+    let mut target_rollback: Vec<(PathBuf, Vec<u8>, u32)> = Vec::with_capacity(plan.actions.len());
+    let mut backups_to_delete: Vec<PathBuf> = Vec::new();
+
+    let commit_res = (|| -> Result<(), String> {
+        for action in plan.actions {
+            match action {
+                PlannedDeactivation::RestoreBackup {
+                    target,
+                    bak,
+                    bytes,
+                    mode,
+                } => {
+                    let (prev_bytes, prev_mode) = read_prior_target_snapshot(&target)?;
+                    write_target_bytes_with_mode(
+                        &target,
+                        &bytes,
+                        mode.unwrap_or(0o644),
+                        use_cp_semantics,
+                    )?;
+                    target_rollback.push((target.clone(), prev_bytes, prev_mode));
+                    backups_to_delete.push(bak);
+                    log.push(format!(
+                        "[restore] restored pre-existing '{}' from backup",
+                        target.display()
+                    ));
                 }
-                fs::remove_file(&bak)
-                    .map_err(|e| format!("failed removing backup '{}': {e}", bak.display()))?;
-                log.push(format!(
-                    "[restore] restored pre-existing '{}' from backup",
-                    target.display()
-                ));
-            }
-            PlannedDeactivation::RewriteHooks {
-                target,
-                bak_to_remove,
-                content,
-                mode,
-                remaining_count,
-            } => {
-                write_target_bytes_with_mode(
-                    &target,
-                    content.as_bytes(),
-                    mode.unwrap_or(0o644),
-                    use_cp_semantics,
-                )?;
-                if let Some(bak) = bak_to_remove {
+                PlannedDeactivation::RewriteHooks {
+                    target,
+                    bak_to_remove,
+                    content,
+                    mode,
+                    remaining_count,
+                } => {
+                    let (prev_bytes, prev_mode) = read_prior_target_snapshot(&target)?;
+                    write_target_bytes_with_mode(
+                        &target,
+                        content.as_bytes(),
+                        mode.unwrap_or(0o644),
+                        use_cp_semantics,
+                    )?;
+                    target_rollback.push((target.clone(), prev_bytes, prev_mode));
+                    if let Some(bak) = bak_to_remove {
+                        backups_to_delete.push(bak);
+                    }
+                    log.push(format!(
+                        "[restore] removed dotagent managed settings from '{}' while preserving {} user entry/group(s)",
+                        target.display(),
+                        remaining_count
+                    ));
+                }
+                PlannedDeactivation::RemoveCreated { target } => {
+                    let (prev_bytes, prev_mode) = read_prior_target_snapshot(&target)?;
                     #[cfg(unix)]
                     {
                         use std::os::unix::fs::PermissionsExt;
-                        let _ = fs::set_permissions(&bak, fs::Permissions::from_mode(0o600));
+                        let _ = fs::set_permissions(&target, fs::Permissions::from_mode(0o600));
                     }
-                    fs::remove_file(&bak)
-                        .map_err(|e| format!("failed removing backup '{}': {e}", bak.display()))?;
+                    fs::remove_file(&target)
+                        .map_err(|e| format!("failed removing '{}': {e}", target.display()))?;
+                    target_rollback.push((target.clone(), prev_bytes, prev_mode));
+                    log.push(format!("[remove] removed deployed '{}'", target.display()));
                 }
-                log.push(format!(
-                    "[restore] removed dotagent managed settings from '{}' while preserving {} user entry/group(s)",
-                    target.display(),
-                    remaining_count
-                ));
-            }
-            PlannedDeactivation::RemoveCreated { target } => {
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::PermissionsExt;
-                    let _ = fs::set_permissions(&target, fs::Permissions::from_mode(0o600));
-                }
-                fs::remove_file(&target)
-                    .map_err(|e| format!("failed removing '{}': {e}", target.display()))?;
-                log.push(format!("[remove] removed deployed '{}'", target.display()));
             }
         }
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = fs::set_permissions(&plan.manifest_path, fs::Permissions::from_mode(0o600));
+        }
+        fs::remove_file(&plan.manifest_path).map_err(|e| {
+            format!(
+                "failed removing provenance manifest '{}': {e}",
+                plan.manifest_path.display()
+            )
+        })?;
+        Ok(())
+    })();
+
+    if let Err(err) = commit_res {
+        for (path, prev_bytes, prev_mode) in target_rollback.into_iter().rev() {
+            let _ = write_target_bytes_with_mode(&path, &prev_bytes, prev_mode, use_cp_semantics);
+        }
+        return Err(err);
     }
 
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = fs::set_permissions(&plan.manifest_path, fs::Permissions::from_mode(0o600));
+    // 2. Provenance manifest and all target files are committed; now purge consumed backups & empty dirs.
+    for bak in backups_to_delete {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = fs::set_permissions(&bak, fs::Permissions::from_mode(0o600));
+        }
+        let _ = fs::remove_file(&bak);
     }
-    fs::remove_file(&plan.manifest_path).map_err(|e| {
-        format!(
-            "failed removing provenance manifest '{}': {e}",
-            plan.manifest_path.display()
-        )
-    })?;
     for rel_d in plan.created_dirs.iter().rev() {
         let dp = if rel_d.is_empty() {
             plan.root.clone()
@@ -4821,7 +4977,7 @@ fn activate_workspace_scoped_all(
     validate_existing_regular_dir_lstat(target_ws, "target workspace")?;
     let verified_guard = resolve_verified_guard_binary(bin_dir)?;
     let mut log = Vec::new();
-    deploy_workspace_bundle(
+    let mut ws_journal = deploy_workspace_bundle(
         dotagent_root,
         target_ws,
         0o444,
@@ -4830,10 +4986,20 @@ fn activate_workspace_scoped_all(
         dry_run,
         &mut log,
     )?;
-    invalidate_or_purge_swarm_state(target_ws, false, dry_run, &mut log)?;
+    if let Err(e) = invalidate_or_purge_swarm_state(target_ws, false, dry_run, &mut log) {
+        let _ = execute_antigravity_deactivate(target_ws, false);
+        if let Some(ref mut wj) = ws_journal {
+            wj.rollback();
+        }
+        return Err(e);
+    }
     if !dry_run {
         let failures = crate::antigravity_adapter::audit_workspace_scoped(target_ws);
         if !failures.is_empty() {
+            let _ = execute_antigravity_deactivate(target_ws, false);
+            if let Some(ref mut wj) = ws_journal {
+                wj.rollback();
+            }
             return Err(format!(
                 "target workspace '{}' failed workspace-scoped security audit: {}",
                 target_ws.display(),
