@@ -4,19 +4,25 @@
 //! bounds queue occupancy, and never waits for a worker, sink, or acknowledgement.
 
 use std::collections::VecDeque;
+#[cfg(test)]
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock, TryLockError};
+use std::sync::{Arc, Mutex, TryLockError};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use super::capture::{Context, EventDescriptor, EventIdentity, Payload, Producer};
+use super::protocol::{Kind, Record};
 use super::{runtime_health, store};
+use crate::json::JsonValue;
 
-const QUEUE_CAPACITY: usize = 128;
+pub(super) const QUEUE_CAPACITY: usize = 128;
 const POLL_INTERVAL: Duration = Duration::from_millis(2);
 const SNAPSHOT_INTERVAL: Duration = Duration::from_secs(1);
 
+#[cfg(test)]
 static GLOBAL: OnceLock<Runtime> = OnceLock::new();
+#[cfg(test)]
 static STARTED: AtomicBool = AtomicBool::new(false);
 static AUDIT_OFFLINE: AtomicCounters = AtomicCounters::new();
 static EXPORT_OFFLINE: AtomicCounters = AtomicCounters::new();
@@ -28,6 +34,7 @@ pub(crate) enum DropReason {
     Unavailable,
     Closed,
     Invalid,
+    Transport,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -46,6 +53,7 @@ pub(crate) struct Counters {
     pub unavailable: u64,
     pub closed: u64,
     pub invalid: u64,
+    pub transport: u64,
     pub worker_exits: u64,
     pub worker_panics: u64,
 }
@@ -59,6 +67,7 @@ struct AtomicCounters {
     unavailable: AtomicU64,
     closed: AtomicU64,
     invalid: AtomicU64,
+    transport: AtomicU64,
     worker_exits: AtomicU64,
     worker_panics: AtomicU64,
 }
@@ -74,6 +83,7 @@ impl AtomicCounters {
             unavailable: AtomicU64::new(0),
             closed: AtomicU64::new(0),
             invalid: AtomicU64::new(0),
+            transport: AtomicU64::new(0),
             worker_exits: AtomicU64::new(0),
             worker_panics: AtomicU64::new(0),
         }
@@ -86,6 +96,7 @@ impl AtomicCounters {
             DropReason::Unavailable => &self.unavailable,
             DropReason::Closed => &self.closed,
             DropReason::Invalid => &self.invalid,
+            DropReason::Transport => &self.transport,
         };
         count.fetch_add(1, Ordering::Relaxed);
     }
@@ -102,6 +113,7 @@ impl AtomicCounters {
             unavailable: self.unavailable.load(Ordering::Relaxed),
             closed: self.closed.load(Ordering::Relaxed),
             invalid: self.invalid.load(Ordering::Relaxed),
+            transport: self.transport.load(Ordering::Relaxed),
             worker_exits: self.worker_exits.load(Ordering::Relaxed),
             worker_panics: self.worker_panics.load(Ordering::Relaxed),
         }
@@ -120,6 +132,7 @@ impl Counters {
             .saturating_add(self.unavailable)
             .saturating_add(self.closed)
             .saturating_add(self.invalid)
+            .saturating_add(self.transport)
     }
 
     fn including_offline(mut self, offline: &AtomicCounters) -> Self {
@@ -136,16 +149,27 @@ impl Counters {
 // Keep one owned descriptor in each preallocated slot without a producer-side box.
 #[allow(clippy::large_enum_variant)]
 enum Job {
+    Record(Record),
+    #[cfg(test)]
     Audit(EventDescriptor),
+    #[cfg(test)]
     Task(Box<dyn FnOnce() -> bool + Send + 'static>),
 }
 
 impl Job {
     fn run(self) -> bool {
         match self {
+            Self::Record(record) if record.kind.mirror() => {
+                crate::feedback::write_agentpi_mirror(&record.body)
+            }
+            Self::Record(record) => {
+                store::append(&record.body, store::Durability::Required).is_ok()
+            }
+            #[cfg(test)]
             Self::Audit(event) => event
                 .encode()
                 .is_ok_and(|record| store::append(&record, store::Durability::Buffered).is_ok()),
+            #[cfg(test)]
             Self::Task(task) => task(),
         }
     }
@@ -196,6 +220,7 @@ impl Lane {
 
     // `build` runs on the producer under the admission guard. It may only copy bounded
     // inputs into the job. Encoding, redaction, and sink operations belong in the job.
+    #[cfg(test)]
     fn submit_with<Task>(&self, build: impl FnOnce() -> Task) -> Submission
     where
         Task: FnOnce() -> bool + Send + 'static,
@@ -206,12 +231,14 @@ impl Lane {
         }
     }
 
+    #[cfg(test)]
     fn admit<T>(&self, build: impl FnOnce() -> Option<(Job, T)>) -> Result<T, DropReason> {
         self.try_admit(build).inspect_err(|reason| {
             self.state.counters.note_drop(*reason);
         })
     }
 
+    #[cfg(test)]
     fn try_admit<T>(&self, build: impl FnOnce() -> Option<(Job, T)>) -> Result<T, DropReason> {
         let state = &self.state;
         if !state.accepting.load(Ordering::Acquire) {
@@ -323,19 +350,61 @@ fn run_worker(state: &LaneState, export: Option<&LaneState>) {
     }
 }
 
-struct Runtime {
+pub(super) struct Runtime {
     audit: Lane,
     export: Lane,
 }
 
 impl Runtime {
-    fn start(capacity: usize, report: bool) -> Self {
+    pub(super) fn start(capacity: usize, report: bool) -> Self {
         let audit = Lane::new(capacity);
         let export = Lane::new(capacity);
         export.start("dotagent-export", None);
         let report_export = report.then(|| Arc::clone(&export.state));
         audit.start("dotagent-audit", report_export);
         Self { audit, export }
+    }
+
+    pub(super) fn receive(&self, record: Record) {
+        let lane = if record.kind.mirror() {
+            &self.export
+        } else {
+            &self.audit
+        };
+        // Both sides of this mutex live in the collector. The worker releases it before I/O.
+        let state = &lane.state;
+        let Ok(mut jobs) = state.jobs.lock() else {
+            state.counters.note_drop(DropReason::Unavailable);
+            return;
+        };
+        if !state.running.load(Ordering::Acquire) {
+            state.counters.note_drop(DropReason::Unavailable);
+        } else if jobs.len() >= state.capacity {
+            state.counters.note_drop(DropReason::Full);
+        } else {
+            jobs.push_back(Job::Record(record));
+            state.counters.queued.fetch_add(1, Ordering::Release);
+        }
+    }
+
+    pub(super) fn rejected(&self, reason: DropReason) {
+        self.audit.state.counters.note_drop(reason);
+    }
+
+    pub(super) fn counts(&self) -> (Counters, Counters) {
+        (
+            self.audit.state.counters.snapshot(),
+            self.export.state.counters.snapshot(),
+        )
+    }
+
+    pub(super) fn finish(&self) {
+        self.close();
+        while self.audit.state.running.load(Ordering::Acquire)
+            || self.export.state.running.load(Ordering::Acquire)
+        {
+            thread::park_timeout(POLL_INTERVAL);
+        }
     }
 
     fn close(&self) {
@@ -376,6 +445,7 @@ impl Drop for Runtime {
 
 /// Initialize workers during trusted process setup, before serving any work.
 /// A process that applies its own kernel sandbox must never call this.
+#[cfg(test)]
 pub(crate) fn start_global() -> bool {
     if !super::capture::host_capture_allowed()
         || std::env::var_os("DOTAGENT_TELEMETRY").as_deref() == Some(std::ffi::OsStr::new("0"))
@@ -390,32 +460,99 @@ pub(crate) fn start_global() -> bool {
 }
 
 /// Stop accepting work. This operation deliberately does not join either worker.
+#[cfg(test)]
 pub(crate) fn close_global() {
     if let Some(runtime) = GLOBAL.get() {
         runtime.close();
     }
 }
 
-pub(crate) struct HostTelemetry(bool);
+pub(crate) struct HostTelemetry {
+    #[cfg(unix)]
+    child: Option<std::process::Child>,
+    #[cfg(test)]
+    local: bool,
+}
 
 impl Drop for HostTelemetry {
     fn drop(&mut self) {
-        if self.0 {
+        #[cfg(test)]
+        if self.local {
             close_global();
+        }
+        #[cfg(unix)]
+        if let Some(child) = &mut self.child {
+            drop(child.stdin.take());
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+            loop {
+                if !matches!(child.try_wait(), Ok(None)) {
+                    break;
+                }
+                if std::time::Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    break;
+                }
+                std::thread::park_timeout(std::time::Duration::from_millis(5));
+            }
         }
     }
 }
 
 pub(crate) fn start_host() -> HostTelemetry {
-    HostTelemetry(start_global())
+    HostTelemetry {
+        #[cfg(all(unix, not(test)))]
+        child: super::transport::launch(),
+        #[cfg(all(unix, test))]
+        child: None,
+        #[cfg(test)]
+        local: start_global(),
+    }
 }
 
-/// Allow call sites to elide observation-only context when the lane is unavailable.
 pub(crate) fn audit_active() -> bool {
-    GLOBAL.get().is_some_and(|runtime| {
-        runtime.audit.state.accepting.load(Ordering::Acquire)
-            && runtime.audit.state.running.load(Ordering::Acquire)
-    })
+    #[cfg(test)]
+    if let Some(runtime) = GLOBAL.get() {
+        return runtime.audit.state.accepting.load(Ordering::Acquire)
+            && runtime.audit.state.running.load(Ordering::Acquire);
+    }
+    #[cfg(unix)]
+    {
+        super::transport::enabled()
+    }
+    #[cfg(not(unix))]
+    {
+        false
+    }
+}
+
+fn handoff<T>(mirror: bool, build: impl FnOnce() -> Option<(Record, T)>) -> Result<T, DropReason> {
+    let counters = if mirror {
+        &EXPORT_OFFLINE
+    } else {
+        &AUDIT_OFFLINE
+    };
+    #[cfg(test)]
+    if let Some(runtime) = GLOBAL.get() {
+        let lane = if mirror {
+            &runtime.export
+        } else {
+            &runtime.audit
+        };
+        return lane.admit(|| build().map(|(record, receipt)| (Job::Record(record), receipt)));
+    }
+    #[cfg(unix)]
+    let result = super::transport::send(build);
+    #[cfg(not(unix))]
+    let result = {
+        let _ = build;
+        Err(DropReason::Unavailable)
+    };
+    result
+        .inspect_err(|reason| counters.note_drop(*reason))
+        .inspect(|_| {
+            counters.queued.fetch_add(1, Ordering::Relaxed);
+        })
 }
 
 pub(crate) fn submit_event(
@@ -423,59 +560,67 @@ pub(crate) fn submit_event(
     context: &Context,
     payload: Payload,
 ) -> Option<EventIdentity> {
-    let Some(runtime) = GLOBAL.get() else {
-        AUDIT_OFFLINE.note_drop(DropReason::Unavailable);
-        return None;
-    };
-    runtime
-        .audit
-        .admit(|| {
+    try_event(producer, context, payload).ok()
+}
+
+pub(super) fn try_event(
+    producer: Producer,
+    context: &Context,
+    payload: Payload,
+) -> Result<EventIdentity, DropReason> {
+    #[cfg(test)]
+    if let Some(runtime) = GLOBAL.get() {
+        return runtime.audit.admit(|| {
             let (identity, event) = EventDescriptor::new(producer, context, payload).ok()?;
             Some((Job::Audit(event), identity))
-        })
-        .ok()
+        });
+    }
+    handoff(false, || {
+        let (id, event) = EventDescriptor::new(producer, context, payload).ok()?;
+        Some((
+            Record {
+                kind: Kind::Event,
+                body: event.encode().ok()?,
+            },
+            id,
+        ))
+    })
 }
 
-pub(crate) fn submit_audit_task<Task>(build: impl FnOnce() -> Task) -> Submission
-where
-    Task: FnOnce() -> bool + Send + 'static,
-{
-    match GLOBAL.get() {
-        Some(runtime) => runtime.audit.submit_with(build),
-        None => {
-            AUDIT_OFFLINE.note_drop(DropReason::Unavailable);
-            Submission::Dropped(DropReason::Unavailable)
-        }
+pub(crate) fn submit_record(kind: Kind, build: impl FnOnce() -> JsonValue) -> Submission {
+    match handoff(kind.mirror(), || {
+        Some((
+            Record {
+                kind,
+                body: build(),
+            },
+            (),
+        ))
+    }) {
+        Ok(()) => Submission::Queued,
+        Err(reason) => Submission::Dropped(reason),
     }
 }
 
-pub(crate) fn submit_export<Task>(build: impl FnOnce() -> Task) -> Submission
-where
-    Task: FnOnce() -> bool + Send + 'static,
-{
-    match GLOBAL.get() {
-        Some(runtime) => runtime.export.submit_with(build),
-        None => {
-            EXPORT_OFFLINE.note_drop(DropReason::Unavailable);
-            Submission::Dropped(DropReason::Unavailable)
-        }
-    }
+pub(super) fn handoff_counts() -> [u64; 7] {
+    let a = AUDIT_OFFLINE.snapshot();
+    let b = EXPORT_OFFLINE.snapshot();
+    [
+        a.queued.saturating_add(b.queued),
+        a.full.saturating_add(b.full),
+        a.contended.saturating_add(b.contended),
+        a.unavailable.saturating_add(b.unavailable),
+        a.invalid.saturating_add(b.invalid),
+        a.transport.saturating_add(b.transport),
+        a.closed.saturating_add(b.closed),
+    ]
 }
 
 pub(crate) fn note_invalid_audit() {
-    GLOBAL
-        .get()
-        .map_or(&AUDIT_OFFLINE, |runtime| &runtime.audit.state.counters)
-        .invalid
-        .fetch_add(1, Ordering::Relaxed);
+    AUDIT_OFFLINE.note_drop(DropReason::Invalid);
 }
-
 pub(crate) fn note_invalid_export() {
-    GLOBAL
-        .get()
-        .map_or(&EXPORT_OFFLINE, |runtime| &runtime.export.state.counters)
-        .invalid
-        .fetch_add(1, Ordering::Relaxed);
+    EXPORT_OFFLINE.note_drop(DropReason::Invalid);
 }
 
 #[cfg(test)]

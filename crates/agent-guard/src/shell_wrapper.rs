@@ -17,7 +17,6 @@ use crate::{Decision, handle_pre_tool_hook};
 
 /// Entrypoint for `agent-guard-sh` (`-c <cmd>`, `-lc <cmd>`, or `<script_file> [args...]`).
 pub fn run_shell_wrapper_entrypoint() -> ExitCode {
-    let _telemetry = crate::telemetry::runtime::start_host();
     let raw_args: Vec<String> = std::env::args().skip(1).collect();
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     run_shell_wrapper_with_args(&raw_args, &cwd)

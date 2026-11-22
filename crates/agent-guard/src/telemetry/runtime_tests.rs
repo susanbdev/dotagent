@@ -301,6 +301,7 @@ impl IsolatedState {
             .env("AGENT_GUARD_STATE_DIR", state)
             .env("DOTAGENT_RUNTIME_TEST_MODE", mode)
             .env("DOTAGENT_RUNTIME_TEST_REPO", repo)
+            .env_remove("AGENT_GUARD_HOT_COORD")
             .env_remove("AGENT_GUARD_SESSION_ID")
             .env_remove("DOTAGENT_TELEMETRY")
             .stdin(Stdio::null());
@@ -427,6 +428,7 @@ fn isolated_audit_worker() {
         "hook-absent" => {
             assert!(GLOBAL.get().is_none());
             assert_hook_decisions(observe_hook_decisions(&repo));
+            assert!(GLOBAL.get().is_none(), "local fallback started a collector");
             assert!(AUDIT_OFFLINE.snapshot().unavailable > 0);
             assert!(store::open_audit_read(&path).unwrap().is_none());
         }
@@ -660,10 +662,10 @@ fn exercise_audit_lock(path: &Path) {
 const HOOK_OUTPUT: &str = "ordinary fixture output";
 
 fn observe_hook(repo: &Path) -> crate::Decision {
-    crate::handle_post_tool_hook(
-        r#"{"tool_name":"Read","tool_response":"ordinary fixture output"}"#,
-        repo,
-    )
+    let payload = r#"{"tool_name":"Read","tool_response":"ordinary fixture output"}"#;
+    crate::cli::eval_hook_preferring_hot_coord("post-tool", payload, repo, || {
+        crate::handle_post_tool_hook(payload, repo)
+    })
 }
 
 fn observe_hook_decisions(repo: &Path) -> (crate::Decision, crate::Decision) {

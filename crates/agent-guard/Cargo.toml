@@ -10,6 +10,13 @@ description = "Deterministic zero-trust execution, path, traversal, Unicode, tok
 [lints]
 workspace = true
 
+[features]
+collector-fixture = []
+
+[[example]]
+name = "observation-probe"
+required-features = ["collector-fixture"]
+
 [[bin]]
 name = "agent-guard"
 path = "src/main.rs"

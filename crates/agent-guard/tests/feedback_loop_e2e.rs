@@ -404,14 +404,9 @@ fn mcp_gateway_stdout_is_pure_jsonrpc_and_exports_agentpi_independently() {
     let repo = root.join("repo");
 
     // The JSON-RPC result and the protected mirror have independent delivery paths.
-    let rpc_input = format!(
-        concat!(
-            r#"{{"jsonrpc":"2.0","id":1,"method":"initialize","params":{{"protocolVersion":"2024-11-05"}}}}"#,
-            "\n",
-            r#"{{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{{"name":"dotagent_submit_friction","arguments":{{"denial_id":"{did}","category":"missing_safe_flag","reason_code":"git_log","note_ascii":"need bounded flag"}}}}}}"#,
-            "\n"
-        ),
-        did = did
+    let init_line = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05"}}"#;
+    let call_line = format!(
+        r#"{{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{{"name":"dotagent_submit_friction","arguments":{{"denial_id":"{did}","category":"missing_safe_flag","reason_code":"git_log","note_ascii":"need bounded flag"}}}}}}"#,
     );
     let mut gw = Command::new(agent_guard_bin())
         .current_dir(&repo)
@@ -425,7 +420,24 @@ fn mcp_gateway_stdout_is_pure_jsonrpc_and_exports_agentpi_independently() {
         .spawn()
         .expect("spawn mcp-gateway");
     let mut gw_stdin = gw.stdin.take().expect("stdin");
-    gw_stdin.write_all(rpc_input.as_bytes()).expect("write rpc");
+    writeln!(gw_stdin, "{init_line}").expect("write initialize");
+    gw_stdin.flush().expect("flush initialize");
+
+    // Wait for the asynchronous host collector spawned by `start_host()` to publish its route
+    // before submitting the friction ballot so best-effort AgentPI handoff has a live peer.
+    let route_file = state_dir.join("observations").join("route");
+    let route_deadline = Instant::now() + Duration::from_secs(5);
+    while !route_file.is_file() && Instant::now() < route_deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        route_file.is_file(),
+        "mcp-gateway host telemetry collector must publish observations/route"
+    );
+
+    writeln!(gw_stdin, "{call_line}").expect("write friction call");
+    gw_stdin.flush().expect("flush friction call");
+
     // The gateway remains live during ordinary MCP sessions. Keep it live while waiting for
     // the independent export so closing the test pipe does not race best-effort delivery.
     let event_spool = state_dir.join("feedback").join("agentpi_events.jsonl");
@@ -448,6 +460,13 @@ fn mcp_gateway_stdout_is_pure_jsonrpc_and_exports_agentpi_independently() {
     drop(gw_stdin);
     let gw_out = gw.wait_with_output().expect("wait mcp-gateway");
     assert!(gw_out.status.success());
+
+    // Wait for the supervised collector to finish closing its socket before removing `root`.
+    let socket_file = state_dir.join("observations").join("in");
+    let close_deadline = Instant::now() + Duration::from_secs(5);
+    while socket_file.exists() && Instant::now() < close_deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
 
     let stdout_str = String::from_utf8_lossy(&gw_out.stdout);
     let stderr_str = String::from_utf8_lossy(&gw_out.stderr);

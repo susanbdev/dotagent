@@ -44,7 +44,8 @@ use crate::injection_scan::scan_untrusted_content;
 use crate::json::JsonValue;
 use crate::resolve_repo_root;
 use crate::sanitizer::neuter_to_clean_ascii;
-use crate::telemetry::runtime::{note_invalid_export, submit_export};
+use crate::telemetry::protocol::Kind;
+use crate::telemetry::runtime::{note_invalid_export, submit_record};
 use crate::traversal_ledger::{
     O_NOFOLLOW_FLAG, SessionLedger, compute_session_key_hash, ensure_nonsymlink_state_dir,
 };
@@ -1094,6 +1095,7 @@ fn append_bounded_rotated_jsonl(
     path: &Path,
     line_json: &str,
     acquire_lock: fn(&Path) -> Result<ExclusiveFileLockGuard, String>,
+    sync_mirror: bool,
 ) -> Result<(), String> {
     if line_json.len() + 1 > MAX_JSONL_RECORD_BYTES {
         return Err(format!(
@@ -1109,6 +1111,13 @@ fn append_bounded_rotated_jsonl(
     let _guard = acquire_lock(&lock_path)?;
 
     if let Ok(meta) = fs::symlink_metadata(path) {
+        #[cfg(unix)]
+        if sync_mirror {
+            use std::os::unix::fs::MetadataExt;
+            if !meta.is_file() || meta.nlink() != 1 || meta.mode() & 0o777 != 0o600 {
+                return Err("invalid mirror destination".into());
+            }
+        }
         if meta.file_type().is_symlink() {
             return Err(format!(
                 "SPOOL_SYMLINK_REJECTED: refusing symlinked spool '{}'",
@@ -1150,16 +1159,36 @@ fn append_bounded_rotated_jsonl(
     ))]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        opts.custom_flags(O_NOFOLLOW_FLAG);
+        let nonblocking = if cfg!(target_os = "linux") { 0o4000 } else { 4 };
+        opts.custom_flags(O_NOFOLLOW_FLAG | if sync_mirror { nonblocking } else { 0 });
     }
     let mut f = opts
         .open(path)
         .map_err(|e| format!("failed opening spool '{}': {e}", path.display()))?;
+    if sync_mirror {
+        let meta = f.metadata().map_err(|e| e.to_string())?;
+        if !meta.is_file() {
+            return Err("invalid mirror file".into());
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            if meta.nlink() != 1 || meta.mode() & 0o777 != 0o600 {
+                return Err("invalid mirror file permissions or link count".into());
+            }
+        }
+    }
     let mut framed = String::with_capacity(line_json.len() + 1);
     framed.push_str(line_json);
     framed.push('\n');
     f.write_all(framed.as_bytes())
-        .map_err(|e| format!("failed appending spool '{}': {e}", path.display()))
+        .map_err(|e| format!("failed appending spool '{}': {e}", path.display()))?;
+    if sync_mirror {
+        f.sync_all()
+            .and_then(|()| fs::File::open(parent)?.sync_all())
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(())
 }
 
 pub(crate) fn write_agentpi_mirror(event_json: &JsonValue) -> bool {
@@ -1170,6 +1199,7 @@ pub(crate) fn write_agentpi_mirror(event_json: &JsonValue) -> bool {
                 &dir.join("agentpi_events.jsonl"),
                 &encoded,
                 ExclusiveFileLockGuard::acquire_observation,
+                true,
             )
         })
         .is_ok()
@@ -1199,21 +1229,16 @@ pub fn record_guard_denial_agentpi_signal(
         note_invalid_export();
         return;
     }
-    let _ = submit_export(|| {
-        let repo_root = repo_root.to_path_buf();
-        let [session_id, tool, code, detail] = [session_id, tool, code, detail].map(str::to_owned);
-        move || {
-            let event = guard_denial_agentpi_event(
-                &repo_root,
-                &session_id,
-                &tool,
-                &code,
-                &detail,
-                halted,
-                ts_unix,
-            );
-            write_agentpi_mirror(&event)
-        }
+    let _ = submit_record(Kind::Denial, || {
+        guard_denial_agentpi_event(
+            repo_root,
+            session_id,
+            crate::telemetry::protocol::tool_class(tool),
+            code,
+            if detail.is_empty() { "" } else { "[redacted]" },
+            halted,
+            ts_unix,
+        )
     });
 }
 
@@ -1612,15 +1637,27 @@ pub fn commit_ballot_on_host_redacted(
         &target_spool,
         &rec.to_json_value().to_json_string(),
         ExclusiveFileLockGuard::acquire,
+        false,
     )
     .map_err(FeedbackSubmitError::InvalidBallot)?;
 
     let agentpi_ev = rec.to_agentpi_event_json();
     publish_agentpi_result(&agentpi_ev, sink);
     // The signed ballot journal already bounds the source fields of this projection.
-    let _ = submit_export(|| {
-        let event = agentpi_ev.clone();
-        move || write_agentpi_mirror(&event)
+    let _ = submit_record(Kind::Ballot, || {
+        let mut projection = agentpi_ev.clone();
+        if let JsonValue::Object(fields) = &mut projection {
+            for (key, value) in fields {
+                if key == "canonical_shape" {
+                    *value = JsonValue::Str("[redacted]".into());
+                } else if key == "target_bin_or_tool" {
+                    *value = JsonValue::Str(
+                        crate::telemetry::protocol::tool_class(value.as_str().unwrap_or("")).into(),
+                    );
+                }
+            }
+        }
+        projection
     });
     Ok(agentpi_ev)
 }
@@ -1878,10 +1915,7 @@ pub fn aggregate_verified_clusters(
 pub fn run_feedback_cli(args: &[String], cwd: &Path) -> ExitCode {
     let sub = args.first().map(String::as_str).unwrap_or("--help");
     match sub {
-        "submit" => {
-            let _telemetry = crate::telemetry::runtime::start_host();
-            run_feedback_submit_cli(&args[1..], cwd)
-        }
+        "submit" => run_feedback_submit_cli(&args[1..], cwd),
         "status" => crate::feedback_loop::run_feedback_status_cli(&args[1..], cwd),
         "sync-github" => crate::feedback_loop::run_feedback_sync_github_cli(&args[1..], cwd),
         "triage" => crate::telemetry::run_operator_feedback_triage_cli(&args[1..], cwd),

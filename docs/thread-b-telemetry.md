@@ -95,9 +95,9 @@ Telemetry sink locks and in-process lock registries are separate from the author
 
 | Producer | Lifetime and coverage |
 | --- | --- |
-| CLI pre- and post-tool hooks | Opt-in hot routing evaluates the hook and captures its observations inside the existing host hook daemon. The CLI starts local workers only for local evaluation. Local fallback is one-shot. |
-| CLI pre-compact and safe reads | One process per invocation. Queued work may remain unconfirmed at exit. |
-| Shell wrapper and operator baseline | One process per invocation. The last mediator or prerequisite observations can still be pending when it returns. |
+| CLI pre- and post-tool hooks | Opt-in hot routing evaluates the hook in the existing host hook daemon. Local evaluations, including fallback after a daemon failure, have no pre-established collector and report capture unavailable. |
+| CLI pre-compact, safe reads, shell wrapper, and local feedback submit | One process per invocation. These routes skip worker startup. Observations from these processes have no retained delivery evidence. Signed ballot persistence and the requested CLI response still follow the feedback contract. |
+| Operator baseline | One process per invocation. The last mediator or prerequisite observation can be pending when it returns. |
 | MCP gateway | Client-owned stdio session. The gateway can exit at EOF with queued or in-flight records. |
 | Hook daemon and coordinator | Existing idle-bounded host processes. Their own observations can outlive individual requests. |
 | Feedback and plugin projections | Follow the host that observed the action. Coordinator-mediated ballots use the coordinator's export lane after the signed journal write. |

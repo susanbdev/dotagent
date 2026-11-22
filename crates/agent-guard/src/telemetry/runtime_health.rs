@@ -20,6 +20,7 @@ fn encode_counters(counters: Counters, lifecycle_reported: bool) -> JsonValue {
         ("unavailable", counters.unavailable),
         ("closed", counters.closed),
         ("invalid", counters.invalid),
+        ("transport", counters.transport),
         ("pending", counters.pending()),
     ];
     let lifecycle_counter = |count| {
@@ -65,6 +66,7 @@ fn bounded_counters(value: &JsonValue) -> Option<JsonValue> {
         unavailable: count("unavailable")?,
         closed: count("closed")?,
         invalid: count("invalid")?,
+        transport: count("transport").unwrap_or(0),
         worker_exits,
         worker_panics,
     };
@@ -78,6 +80,23 @@ fn snapshot_payload(audit: JsonValue, export: JsonValue, phase: JsonValue) -> Js
         ("audit_queue".to_string(), audit),
         ("export_queue".to_string(), export),
     ])
+}
+
+pub(super) fn status(audit: Counters, export: Counters, closing: bool) -> JsonValue {
+    let mut value = snapshot_payload(
+        encode_counters(audit, true),
+        encode_counters(export, true),
+        JsonValue::Str(if closing { "closing" } else { "active" }.to_owned()),
+    );
+    if let JsonValue::Object(fields) = &mut value {
+        let (permission, full) = store::storage_failures();
+        fields.push((
+            "storage_permission_denied".into(),
+            JsonValue::Uint(permission),
+        ));
+        fields.push(("storage_full".into(), JsonValue::Uint(full)));
+    }
+    value
 }
 
 pub(super) fn read(payload: &JsonValue) -> Option<JsonValue> {
@@ -108,11 +127,7 @@ pub(super) fn publish(audit: Counters, export: Counters, closing: bool) -> bool 
     let payload = Payload::new(
         EventType::CaptureHealth,
         Completeness::Partial,
-        snapshot_payload(
-            encode_counters(audit, true),
-            encode_counters(export, true),
-            JsonValue::Str(if closing { "closing" } else { "active" }.to_owned()),
-        ),
+        status(audit, export, closing),
     )
     .with_result("observe", REASON, "observed");
     capture::encode(Producer::Capture, &context, payload)

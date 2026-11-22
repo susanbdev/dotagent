@@ -43,7 +43,7 @@ use crate::feedback::{
     AGENTPI_EVENT_SCHEMA, AggregatedFrictionCluster, MAX_AGENTPI_EXPORT_INPUT_BYTES,
     aggregate_verified_clusters, clean_single_line_ascii, compute_cluster_key,
     current_host_spool_id, feedback_state_dir, is_ring0_constitutional_code, is_valid_cluster_key,
-    load_verified_ballots, write_agentpi_mirror,
+    load_verified_ballots,
 };
 use crate::github_governance::{DOTAGENT_REQUIRED_CHECKS, validate_github_ident};
 use crate::json::JsonValue;
@@ -51,7 +51,8 @@ use crate::resolve_repo_root;
 use crate::ring0_ratchet::{validate_git_ref_arg, verify_ring0_ratchet};
 use crate::sanitizer::wrap_spotlight_envelope;
 use crate::telemetry::AGENT_SANDBOX_AND_HARNESS_MARKERS;
-use crate::telemetry::runtime::{note_invalid_export, submit_export};
+use crate::telemetry::protocol::Kind;
+use crate::telemetry::runtime::{note_invalid_export, submit_record};
 use crate::traversal_ledger::ensure_nonsymlink_state_dir;
 
 pub const SYNC_BATCH_SCHEMA_V2: &str = "dotagent.sync_batch.v2";
@@ -2618,27 +2619,25 @@ fn run_worktree_adversarial_copilot_and_merge(
             if spec.cluster_key.len() <= MAX_AGENTPI_EXPORT_INPUT_BYTES
                 && status.head_sha.len() <= MAX_AGENTPI_EXPORT_INPUT_BYTES
             {
-                let _ = submit_export(|| {
-                    let cluster_key = spec.cluster_key.clone();
-                    let head_sha = status.head_sha;
-                    move || {
-                        let event = JsonValue::Object(vec![
-                            (
-                                "schema".to_string(),
-                                JsonValue::Str(AGENTPI_EVENT_SCHEMA.to_string()),
-                            ),
-                            (
-                                "event_type".to_string(),
-                                JsonValue::Str("loop_merge".to_string()),
-                            ),
-                            ("severity".to_string(), JsonValue::Str("INFO".to_string())),
-                            ("cluster_key".to_string(), JsonValue::Str(cluster_key)),
-                            ("issue_number".to_string(), JsonValue::Uint(issue_number)),
-                            ("pr_number".to_string(), JsonValue::Uint(pr_number)),
-                            ("head_sha".to_string(), JsonValue::Str(head_sha)),
-                        ]);
-                        write_agentpi_mirror(&event)
-                    }
+                let _ = submit_record(Kind::Merge, || {
+                    JsonValue::Object(vec![
+                        (
+                            "schema".to_string(),
+                            JsonValue::Str(AGENTPI_EVENT_SCHEMA.to_string()),
+                        ),
+                        (
+                            "event_type".to_string(),
+                            JsonValue::Str("loop_merge".to_string()),
+                        ),
+                        ("severity".to_string(), JsonValue::Str("INFO".to_string())),
+                        (
+                            "cluster_key".to_string(),
+                            JsonValue::Str(spec.cluster_key.clone()),
+                        ),
+                        ("issue_number".to_string(), JsonValue::Uint(issue_number)),
+                        ("pr_number".to_string(), JsonValue::Uint(pr_number)),
+                        ("head_sha".to_string(), JsonValue::Str(status.head_sha)),
+                    ])
                 });
             } else {
                 note_invalid_export();
