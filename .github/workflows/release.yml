@@ -520,8 +520,13 @@ jobs:
           VERIFY_DIR="${RUNNER_TEMP}/post-release-verify"
           ASSETS="${VERIFY_DIR}/assets"
           COMPILER="${GITHUB_WORKSPACE}/target/release/dotagent-compiler"
-          mkdir -p "${ASSETS}"
+          mkdir -p "${ASSETS}" "${VERIFY_DIR}/out-of-band"
           gh release download "${TAG}" --repo "${REPO_FULL}" --pattern '*' --dir "${ASSETS}"
+          for oob in "${ASSETS}"/*.sig "${ASSETS}"/*.sshsig "${ASSETS}/SHA256SUMS.macos" "${ASSETS}/dotagent-${TAG}-universal-apple-darwin.pkg"; do
+            if [[ -e "${oob}" ]]; then
+              mv "${oob}" "${VERIFY_DIR}/out-of-band/"
+            fi
+          done
           attest() {
             gh attestation verify "$1" --repo "${REPO_FULL}" --signer-workflow "${SIGNER_WF}" \
               --source-ref "${GITHUB_REF}" --source-digest "${GITHUB_SHA}" \
@@ -727,12 +732,96 @@ jobs:
           done
           test "${count}" -gt 0
 
-      - name: Publish with keyless OIDC and PEP 740 attestations
-        uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086 # release/v1
-        with:
-          packages-dir: extra/pypi
-          attestations: true
-          skip-existing: true
+      - name: Publish wheels via keyless OIDC Trusted Publishing (stdlib, idempotent)
+        shell: python3 {0}
+        run: |
+          import base64, email, glob, hashlib, json, os, sys, urllib.error, urllib.parse, urllib.request, uuid, zipfile
+
+          req_url = os.environ.get("ACTIONS_ID_TOKEN_REQUEST_URL", "")
+          req_bearer = os.environ.get("ACTIONS_ID_TOKEN_REQUEST_TOKEN", "")
+          if not req_url.startswith("https://") or not req_bearer:
+              raise SystemExit("missing HTTPS ACTIONS_ID_TOKEN_REQUEST_URL or bearer credential")
+
+          sep = "&" if "?" in req_url else "?"
+          oidc_req = urllib.request.Request(
+              req_url + sep + "audience=pypi",
+              headers={"Authorization": "Bearer " + req_bearer, "Accept": "application/json"},
+          )
+          with urllib.request.urlopen(oidc_req, timeout=30) as resp:
+              oidc_jwt = json.loads(resp.read().decode("utf-8"))["value"]
+
+          mint_req = urllib.request.Request(
+              "https://pypi.org/_/oidc/mint-token",
+              data=json.dumps({"token": oidc_jwt}).encode("ascii"),
+              headers={"Content-Type": "application/json", "Accept": "application/json"},
+              method="POST",
+          )
+          with urllib.request.urlopen(mint_req, timeout=30) as resp:
+              minted_cred = json.loads(resp.read().decode("utf-8"))["token"]
+
+          basic = base64.b64encode(("__token__:" + minted_cred).encode("utf-8")).decode("ascii")
+          wheels = sorted(glob.glob("extra/pypi/*.whl"))
+          if not wheels:
+              raise SystemExit("no wheels found in extra/pypi")
+
+          for whl_path in wheels:
+              with open(whl_path, "rb") as fh:
+                  whl_bytes = fh.read()
+              sha256_hex = hashlib.sha256(whl_bytes).hexdigest()
+              with zipfile.ZipFile(whl_path) as zf:
+                  meta_name = [n for n in zf.namelist() if n.endswith(".dist-info/METADATA")][0]
+                  meta_msg = email.message_from_bytes(zf.read(meta_name))
+              fields = [
+                  (":action", "file_upload"),
+                  ("protocol_version", "1"),
+                  ("filetype", "bdist_wheel"),
+                  ("pyversion", "py3"),
+                  ("metadata_version", meta_msg.get("Metadata-Version", "2.1")),
+                  ("name", meta_msg["Name"]),
+                  ("version", meta_msg["Version"]),
+                  ("summary", meta_msg.get("Summary", "")),
+                  ("sha256_digest", sha256_hex),
+              ]
+              boundary = "dotagentBoundary" + uuid.uuid4().hex
+              parts = []
+              for k, v in fields:
+                  parts.append(
+                      (
+                          "--%s\r\nContent-Disposition: form-data; name=\"%s\"\r\n\r\n%s\r\n"
+                          % (boundary, k, v)
+                      ).encode("utf-8")
+                  )
+              fname = os.path.basename(whl_path)
+              parts.append(
+                  (
+                      "--%s\r\nContent-Disposition: form-data; name=\"content\"; filename=\"%s\"\r\n"
+                      "Content-Type: application/octet-stream\r\n\r\n" % (boundary, fname)
+                  ).encode("utf-8")
+              )
+              parts.append(whl_bytes)
+              parts.append(("\r\n--%s--\r\n" % boundary).encode("utf-8"))
+              body = b"".join(parts)
+
+              up_req = urllib.request.Request(
+                  "https://upload.pypi.org/legacy/",
+                  data=body,
+                  headers={
+                      "Authorization": "Basic " + basic,
+                      "Content-Type": "multipart/form-data; boundary=" + boundary,
+                      "User-Agent": "dotagent-release-uploader/2.1",
+                  },
+                  method="POST",
+              )
+              try:
+                  with urllib.request.urlopen(up_req, timeout=120) as resp:
+                      sys.stdout.write("uploaded %s (HTTP %d)\n" % (fname, resp.status))
+              except urllib.error.HTTPError as err:
+                  err_body = err.read().decode("utf-8", "replace")
+                  if err.code in (400, 409) and "already exists" in (err.reason + " " + err_body).lower():
+                      sys.stdout.write("skip %s: already published on PyPI\n" % fname)
+                  else:
+                      sys.stderr.write("PyPI upload failed for %s (HTTP %d %s): %s\n" % (fname, err.code, err.reason, err_body))
+                      raise SystemExit(1)
 
   publish-npm:
     name: Publish packages to npm (Trusted Publishing + provenance)
@@ -854,5 +943,9 @@ jobs:
           cp extra/brew/dotagent.rb tap/Formula/dotagent.rb
           cd tap
           git add Formula/dotagent.rb
-          git commit -m "dotagent ${GITHUB_REF_NAME}"
-          git push origin HEAD
+          if ! git diff --cached --quiet; then
+            git commit -m "dotagent ${GITHUB_REF_NAME}"
+            git push origin HEAD
+          else
+            echo "Formula/dotagent.rb already up to date for ${GITHUB_REF_NAME}"
+          fi

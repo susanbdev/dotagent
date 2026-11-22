@@ -151,7 +151,7 @@ pub fn run_doctor_cli(args: &[String], cwd: &Path) -> ExitCode {
     let mut checks = Vec::with_capacity(7);
 
     // 1. Binary integrity & 0555 permissions check
-    checks.push(check_binaries_health());
+    checks.push(check_binaries_health(bin_dir_opt.as_deref()));
 
     // 2. OS Kernel VFS + seccomp-bpf readiness
     let sbx_mode = probe_snapshot.kernel_fs_mode;
@@ -333,12 +333,53 @@ pub fn run_doctor_cli(args: &[String], cwd: &Path) -> ExitCode {
     }
 }
 
-fn check_binaries_health() -> DoctorCheck {
+fn check_binaries_health(explicit_bin_dir: Option<&Path>) -> DoctorCheck {
     let exe_info = std::env::current_exe()
         .map(|p| p.display().to_string())
         .unwrap_or_else(|_| "<unknown>".to_string());
+    if let Some(exp_dir) = explicit_bin_dir {
+        return match crate::enforcement_state::evaluate_install_state(
+            exp_dir,
+            env!("CARGO_PKG_VERSION"),
+        ) {
+            crate::enforcement_state::InstallState::Verified {
+                binary_path,
+                binary_sha256,
+                ..
+            } => DoctorCheck {
+                name: "binary_integrity",
+                ok: true,
+                detail: format!(
+                    "verified binary='{}' sha256={} (active_exe='{}')",
+                    binary_path,
+                    &binary_sha256[..16],
+                    exe_info
+                ),
+            },
+            other => DoctorCheck {
+                name: "binary_integrity",
+                ok: false,
+                detail: format!(
+                    "explicit --bin-dir '{}' failed verification: {other:?}",
+                    exp_dir.display()
+                ),
+            },
+        };
+    }
     if let Ok(home) = std::env::var("HOME") {
         let bin_dir = PathBuf::from(home).join(".local/bin");
+        if let Ok(dmeta) = fs::symlink_metadata(&bin_dir)
+            && dmeta.file_type().is_symlink()
+        {
+            return DoctorCheck {
+                name: "binary_integrity",
+                ok: false,
+                detail: format!(
+                    "binary directory '{}' must not be a symlink",
+                    bin_dir.display()
+                ),
+            };
+        }
         let mut present = Vec::new();
         let mut writable = Vec::new();
         for name in [
@@ -350,11 +391,31 @@ fn check_binaries_health() -> DoctorCheck {
         ] {
             let p = bin_dir.join(name);
             if let Ok(meta) = fs::symlink_metadata(&p) {
-                if meta.file_type().is_symlink() {
+                if meta.file_type().is_symlink() || !meta.file_type().is_file() {
                     return DoctorCheck {
                         name: "binary_integrity",
                         ok: false,
-                        detail: format!("installed binary '{}' must not be a symlink", p.display()),
+                        detail: format!(
+                            "installed binary '{}' must be a regular non-symlink file",
+                            p.display()
+                        ),
+                    };
+                }
+                let Ok(bytes) = fs::read(&p) else {
+                    return DoctorCheck {
+                        name: "binary_integrity",
+                        ok: false,
+                        detail: format!("installed binary '{}' is unreadable", p.display()),
+                    };
+                };
+                if !crate::enforcement_state::is_valid_host_native_executable(&bytes) {
+                    return DoctorCheck {
+                        name: "binary_integrity",
+                        ok: false,
+                        detail: format!(
+                            "installed binary '{}' is not a valid native host executable",
+                            p.display()
+                        ),
                     };
                 }
                 #[cfg(unix)]
@@ -1309,38 +1370,874 @@ fn pin_codex_notify_toml(tpl: &str, abs_guard_bin: Option<&Path>) -> Result<Stri
     Ok(tpl.replacen("notify = [\"agent-guard\", \"on-stop\"]", &replacement, 1))
 }
 
-/// Merges `template_json` over an optional pre-existing `existing_json`, preserving harmless
-/// user-specific top-level preferences (`theme`, `model`, `statusLine`, `preferredNotifChannel`, etc.)
-/// while unconditionally enforcing `dotagent`'s security-critical keys (`hooks`, `permissions`,
-/// `mcpServers`, `autoMemoryEnabled`, `context`, `tools`, `security`, `env`).
+fn first_shell_executable_name(cmd: &str) -> Option<String> {
+    let s = cmd.trim_start();
+    if s.is_empty() {
+        return None;
+    }
+    let bytes = s.as_bytes();
+    let mut tok = String::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b.is_ascii_whitespace() {
+            break;
+        }
+        if b == b'\'' {
+            i += 1;
+            while i < bytes.len() && bytes[i] != b'\'' {
+                tok.push(bytes[i] as char);
+                i += 1;
+            }
+            if i < bytes.len() {
+                i += 1;
+            }
+        } else if b == b'"' {
+            i += 1;
+            while i < bytes.len() && bytes[i] != b'"' {
+                if bytes[i] == b'\\' && i + 1 < bytes.len() {
+                    i += 1;
+                }
+                tok.push(bytes[i] as char);
+                i += 1;
+            }
+            if i < bytes.len() {
+                i += 1;
+            }
+        } else {
+            tok.push(b as char);
+            i += 1;
+        }
+    }
+    Path::new(&tok)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .map(ToString::to_string)
+}
+
+fn is_agent_guard_hook_item(item: &JsonValue) -> bool {
+    if item
+        .get("name")
+        .and_then(JsonValue::as_str)
+        .is_some_and(|n| n == "agent-guard" || n.starts_with("agent-guard-"))
+    {
+        return true;
+    }
+    item.get("command")
+        .and_then(JsonValue::as_str)
+        .and_then(first_shell_executable_name)
+        .is_some_and(|exe| exe == "agent-guard" || exe == "dotagent")
+}
+
+fn strip_agent_guard_from_grouped_event(arr: &[JsonValue]) -> Result<Vec<JsonValue>, String> {
+    let mut out = Vec::new();
+    for g in arr {
+        let Some(g_obj) = g.as_object() else {
+            return Err(
+                "existing settings JSON contains a non-object hook group entry (refusing destructive overwrite)"
+                    .to_string(),
+            );
+        };
+        let Some(inner) = g.get("hooks").and_then(JsonValue::as_array) else {
+            return Err(
+                "existing settings JSON hook group is missing 'hooks' array (refusing destructive overwrite)"
+                    .to_string(),
+            );
+        };
+        let rem_inner: Vec<JsonValue> = inner
+            .iter()
+            .filter(|it| !is_agent_guard_hook_item(it))
+            .cloned()
+            .collect();
+        if !rem_inner.is_empty() {
+            let mut new_g = Vec::with_capacity(g_obj.len());
+            for (k, v) in g_obj {
+                if k == "hooks" {
+                    new_g.push((k.clone(), JsonValue::Array(rem_inner.clone())));
+                } else {
+                    new_g.push((k.clone(), v.clone()));
+                }
+            }
+            out.push(JsonValue::Object(new_g));
+        }
+    }
+    Ok(out)
+}
+
+fn strip_agent_guard_from_cursor_event(arr: &[JsonValue]) -> Result<Vec<JsonValue>, String> {
+    let mut out = Vec::new();
+    for item in arr {
+        if item.as_object().is_none() || item.get("command").and_then(JsonValue::as_str).is_none() {
+            return Err(
+                "existing Cursor hooks.json contains a malformed hook entry (refusing destructive overwrite)"
+                    .to_string(),
+            );
+        }
+        if !is_agent_guard_hook_item(item) {
+            out.push(item.clone());
+        }
+    }
+    Ok(out)
+}
+
+/// Merges `template_raw` over an optional pre-existing `existing_raw` (`settings.json`),
+/// failing closed on malformed/non-object JSON, preserving user top-level preferences AND
+/// pre-existing sibling hook entries inside `hooks`, while enforcing `dotagent`'s security keys.
 fn merge_settings_json_preserving_user_prefs(
     existing_raw: Option<&str>,
     template_raw: &str,
     abs_guard_bin: Option<&Path>,
     adapter_tag: Option<&str>,
-) -> Result<String, String> {
+) -> Result<(String, JsonValue), String> {
     let template_parsed = JsonValue::parse(template_raw)
         .map_err(|e| format!("invalid dist settings JSON template: {e}"))?;
     let pinned_template = pin_hook_binary_in_json(&template_parsed, abs_guard_bin, adapter_tag)?;
     let Some(template_obj) = pinned_template.as_object() else {
-        return Ok(format!("{}\n", pinned_template.to_json_string()));
+        return Err("dist settings JSON template root must be a JSON object".to_string());
     };
 
+    let mut existing_hooks_opt: Option<Vec<(String, JsonValue)>> = None;
     let mut merged: Vec<(String, JsonValue)> = Vec::new();
-    if let Some(raw) = existing_raw
-        && let Ok(existing_val) = JsonValue::parse(raw)
-        && let Some(existing_obj) = existing_val.as_object()
-    {
+    if let Some(raw) = existing_raw {
+        let existing_val = JsonValue::parse(raw).map_err(|e| {
+            format!("existing settings JSON is malformed (refusing destructive overwrite): {e}")
+        })?;
+        let Some(existing_obj) = existing_val.as_object() else {
+            return Err(
+                "existing settings JSON root must be a JSON object (refusing destructive overwrite)"
+                    .to_string(),
+            );
+        };
         for (k, v) in existing_obj {
-            if !template_obj.iter().any(|(tk, _)| tk == k) {
+            if k == "hooks" {
+                let Some(h_obj) = v.as_object() else {
+                    return Err(
+                        "existing settings JSON 'hooks' must be a JSON object (refusing destructive overwrite)"
+                            .to_string(),
+                    );
+                };
+                existing_hooks_opt = Some(h_obj.to_vec());
+            } else if !template_obj.iter().any(|(tk, _)| tk == k) {
                 merged.push((k.clone(), v.clone()));
             }
         }
     }
+
     for (tk, tv) in template_obj {
-        merged.push((tk.clone(), tv.clone()));
+        if tk == "hooks"
+            && let Some(tpl_hooks) = tv.as_object()
+            && let Some(ref ex_hooks) = existing_hooks_opt
+        {
+            let mut merged_hooks: Vec<(String, JsonValue)> = Vec::new();
+            for (ev, tpl_ev_val) in tpl_hooks {
+                let mut combined = tpl_ev_val
+                    .as_array()
+                    .map(<[JsonValue]>::to_vec)
+                    .unwrap_or_default();
+                if let Some((_, ex_ev_val)) = ex_hooks.iter().find(|(k, _)| k == ev) {
+                    let Some(ex_arr) = ex_ev_val.as_array() else {
+                        return Err(format!(
+                            "existing settings JSON 'hooks.{ev}' must be an array (refusing destructive overwrite)"
+                        ));
+                    };
+                    combined.extend(strip_agent_guard_from_grouped_event(ex_arr)?);
+                }
+                merged_hooks.push((ev.clone(), JsonValue::Array(combined)));
+            }
+            for (ex_ev, ex_ev_val) in ex_hooks {
+                if !tpl_hooks.iter().any(|(ev, _)| ev == ex_ev) {
+                    let Some(ex_arr) = ex_ev_val.as_array() else {
+                        return Err(format!(
+                            "existing settings JSON 'hooks.{ex_ev}' must be an array (refusing destructive overwrite)"
+                        ));
+                    };
+                    let rem = strip_agent_guard_from_grouped_event(ex_arr)?;
+                    if !rem.is_empty() {
+                        merged_hooks.push((ex_ev.clone(), JsonValue::Array(rem)));
+                    }
+                }
+            }
+            merged.push((tk.clone(), JsonValue::Object(merged_hooks)));
+        } else {
+            merged.push((tk.clone(), tv.clone()));
+        }
     }
-    Ok(format!("{}\n", JsonValue::Object(merged).to_json_string()))
+
+    let mut pretty = String::new();
+    format_json_pretty_2space(&JsonValue::Object(merged), 0, &mut pretty);
+    pretty.push('\n');
+    Ok((pretty, pinned_template))
+}
+
+fn merge_cursor_hooks_json_preserving_siblings(
+    existing_raw: Option<&str>,
+    template_raw: &str,
+    abs_guard_bin: Option<&Path>,
+) -> Result<(String, JsonValue), String> {
+    let template_parsed = JsonValue::parse(template_raw)
+        .map_err(|e| format!("invalid dist/cursor/hooks.json: {e}"))?;
+    let pinned_template = pin_hook_binary_in_json(&template_parsed, abs_guard_bin, Some("cursor"))?;
+    let Some(template_obj) = pinned_template.as_object() else {
+        return Err("dist/cursor/hooks.json root must be a JSON object".to_string());
+    };
+    let Some(tpl_hooks) = pinned_template.get("hooks").and_then(JsonValue::as_object) else {
+        return Err("dist/cursor/hooks.json missing 'hooks' object".to_string());
+    };
+
+    let mut extra_top: Vec<(String, JsonValue)> = Vec::new();
+    let mut existing_hooks_opt: Option<Vec<(String, JsonValue)>> = None;
+    if let Some(raw) = existing_raw {
+        let existing_val = JsonValue::parse(raw).map_err(|e| {
+            format!("existing Cursor hooks.json is malformed (refusing destructive overwrite): {e}")
+        })?;
+        let Some(existing_obj) = existing_val.as_object() else {
+            return Err(
+                "existing Cursor hooks.json root must be a JSON object (refusing destructive overwrite)"
+                    .to_string(),
+            );
+        };
+        for (k, v) in existing_obj {
+            if k == "hooks" {
+                let Some(h_obj) = v.as_object() else {
+                    return Err(
+                        "existing Cursor hooks.json 'hooks' must be a JSON object (refusing destructive overwrite)"
+                            .to_string(),
+                    );
+                };
+                existing_hooks_opt = Some(h_obj.to_vec());
+            } else if !template_obj.iter().any(|(tk, _)| tk == k) {
+                extra_top.push((k.clone(), v.clone()));
+            }
+        }
+    }
+
+    let mut merged_hooks: Vec<(String, JsonValue)> = Vec::new();
+    for (ev, tpl_ev_val) in tpl_hooks {
+        let mut combined = tpl_ev_val
+            .as_array()
+            .map(<[JsonValue]>::to_vec)
+            .unwrap_or_default();
+        if let Some(ref ex_hooks) = existing_hooks_opt
+            && let Some((_, ex_ev_val)) = ex_hooks.iter().find(|(k, _)| k == ev)
+        {
+            let Some(ex_arr) = ex_ev_val.as_array() else {
+                return Err(format!(
+                    "existing Cursor hooks.json 'hooks.{ev}' must be an array (refusing destructive overwrite)"
+                ));
+            };
+            combined.extend(strip_agent_guard_from_cursor_event(ex_arr)?);
+        }
+        merged_hooks.push((ev.clone(), JsonValue::Array(combined)));
+    }
+    if let Some(ref ex_hooks) = existing_hooks_opt {
+        for (ex_ev, ex_ev_val) in ex_hooks {
+            if !tpl_hooks.iter().any(|(ev, _)| ev == ex_ev) {
+                let Some(ex_arr) = ex_ev_val.as_array() else {
+                    return Err(format!(
+                        "existing Cursor hooks.json 'hooks.{ex_ev}' must be an array (refusing destructive overwrite)"
+                    ));
+                };
+                let rem = strip_agent_guard_from_cursor_event(ex_arr)?;
+                if !rem.is_empty() {
+                    merged_hooks.push((ex_ev.clone(), JsonValue::Array(rem)));
+                }
+            }
+        }
+    }
+
+    let mut out_obj = Vec::new();
+    for (tk, tv) in template_obj {
+        if tk == "hooks" {
+            for (ek, ev) in &extra_top {
+                out_obj.push((ek.clone(), ev.clone()));
+            }
+            out_obj.push(("hooks".to_string(), JsonValue::Object(merged_hooks.clone())));
+        } else {
+            out_obj.push((tk.clone(), tv.clone()));
+        }
+    }
+
+    let mut pretty = String::new();
+    format_json_pretty_2space(&JsonValue::Object(out_obj), 0, &mut pretty);
+    pretty.push('\n');
+    Ok((pretty, pinned_template))
+}
+
+fn extract_user_part_from_merged_json(
+    parsed: &JsonValue,
+    managed_tpl: &JsonValue,
+    is_cursor_hooks: bool,
+) -> Result<Vec<(String, JsonValue)>, String> {
+    let Some(cur_obj) = parsed.as_object() else {
+        return Err("JSON root must be an object".to_string());
+    };
+    let Some(tpl_obj) = managed_tpl.as_object() else {
+        return Err("managed template root must be an object".to_string());
+    };
+
+    let mut user_top: Vec<(String, JsonValue)> = Vec::new();
+    let mut rem_hooks: Vec<(String, JsonValue)> = Vec::new();
+    for (k, v) in cur_obj {
+        if k == "hooks" {
+            let Some(h_obj) = v.as_object() else {
+                return Err("'hooks' must be an object".to_string());
+            };
+            for (ev, ev_val) in h_obj {
+                let Some(arr) = ev_val.as_array() else {
+                    return Err(format!("'hooks.{ev}' must be an array"));
+                };
+                let rem = if is_cursor_hooks {
+                    strip_agent_guard_from_cursor_event(arr)?
+                } else {
+                    strip_agent_guard_from_grouped_event(arr)?
+                };
+                if !rem.is_empty() {
+                    rem_hooks.push((ev.clone(), JsonValue::Array(rem)));
+                }
+            }
+        } else if !tpl_obj.iter().any(|(tk, _)| tk == k) {
+            user_top.push((k.clone(), v.clone()));
+        }
+    }
+
+    if is_cursor_hooks {
+        if user_top.is_empty() && rem_hooks.is_empty() {
+            Ok(Vec::new())
+        } else {
+            let mut out = vec![("version".to_string(), JsonValue::Uint(1))];
+            out.extend(user_top);
+            out.push(("hooks".to_string(), JsonValue::Object(rem_hooks)));
+            Ok(out)
+        }
+    } else {
+        if !rem_hooks.is_empty() {
+            user_top.push(("hooks".to_string(), JsonValue::Object(rem_hooks)));
+        }
+        Ok(user_top)
+    }
+}
+
+fn verify_managed_json_intact_and_extract_user_part(
+    current_bytes: &[u8],
+    managed_tpl: &JsonValue,
+    is_cursor_hooks: bool,
+    target: &Path,
+) -> Result<Vec<(String, JsonValue)>, String> {
+    let raw = std::str::from_utf8(current_bytes).map_err(|_| {
+        format!(
+            "managed JSON '{}' contains non-UTF-8 bytes",
+            target.display()
+        )
+    })?;
+    let parsed = JsonValue::parse(raw)
+        .map_err(|e| format!("managed JSON '{}' is malformed: {e}", target.display()))?;
+    let Some(cur_obj) = parsed.as_object() else {
+        return Err(format!(
+            "managed JSON '{}' root was modified to non-object",
+            target.display()
+        ));
+    };
+    let Some(tpl_obj) = managed_tpl.as_object() else {
+        return Err("invalid managed_group in provenance manifest".to_string());
+    };
+
+    for (tk, tv) in tpl_obj {
+        if tk == "hooks" {
+            let Some(tpl_hooks) = tv.as_object() else {
+                continue;
+            };
+            let Some(cur_hooks) = cur_obj
+                .iter()
+                .find(|(k, _)| k == "hooks")
+                .and_then(|(_, v)| v.as_object())
+            else {
+                return Err(format!(
+                    "managed 'hooks' section in '{}' was removed or modified externally",
+                    target.display()
+                ));
+            };
+            for (ev, tpl_ev_val) in tpl_hooks {
+                let Some(tpl_arr) = tpl_ev_val.as_array() else {
+                    continue;
+                };
+                let Some(cur_arr) = cur_hooks
+                    .iter()
+                    .find(|(k, _)| k == ev)
+                    .and_then(|(_, v)| v.as_array())
+                else {
+                    return Err(format!(
+                        "managed 'hooks.{ev}' array in '{}' was removed externally",
+                        target.display()
+                    ));
+                };
+                for req_item in tpl_arr {
+                    if !cur_arr.iter().any(|x| x == req_item) {
+                        return Err(format!(
+                            "managed 'agent-guard' hook in '{}' ('hooks.{ev}') was modified or removed externally",
+                            target.display()
+                        ));
+                    }
+                }
+                if is_cursor_hooks {
+                    for item in cur_arr {
+                        if is_agent_guard_hook_item(item) && !tpl_arr.iter().any(|x| x == item) {
+                            return Err(format!(
+                                "managed 'agent-guard' hook in '{}' ('hooks.{ev}') was altered externally",
+                                target.display()
+                            ));
+                        }
+                    }
+                } else {
+                    for g in cur_arr {
+                        if let Some(inner) = g.get("hooks").and_then(JsonValue::as_array)
+                            && inner.iter().any(is_agent_guard_hook_item)
+                            && !tpl_arr.iter().any(|x| x == g)
+                        {
+                            return Err(format!(
+                                "managed 'agent-guard' hook group in '{}' ('hooks.{ev}') was altered externally",
+                                target.display()
+                            ));
+                        }
+                    }
+                }
+            }
+        } else {
+            let cur_v = cur_obj.iter().find(|(k, _)| k == tk).map(|(_, v)| v);
+            if cur_v != Some(tv) {
+                return Err(format!(
+                    "managed security setting '{tk}' in '{}' was modified or removed externally",
+                    target.display()
+                ));
+            }
+        }
+    }
+
+    extract_user_part_from_merged_json(&parsed, managed_tpl, is_cursor_hooks)
+        .map_err(|e| format!("invalid structure in '{}': {e}", target.display()))
+}
+
+const BUNDLE_PROVENANCE_FILE: &str = ".dotagent-manifest.json";
+const BUNDLE_PROVENANCE_FORMAT: &str = "dotagent.bundle.provenance.v1";
+
+#[derive(Debug, Clone, PartialEq)]
+struct BundleProvenanceManifest {
+    created_dirs: Vec<String>,
+    entries: Vec<FileProvenanceEntry>,
+}
+
+fn is_valid_created_dir_rel(rel: &str) -> bool {
+    rel.is_empty() || is_safe_manifest_rel_path(rel)
+}
+
+impl BundleProvenanceManifest {
+    fn parse(raw: &str, allowed_rels: &[String]) -> Result<Self, String> {
+        let parsed = JsonValue::parse(raw)
+            .map_err(|e| format!("invalid bundle provenance manifest JSON: {e}"))?;
+        if parsed.get("format").and_then(JsonValue::as_str) != Some(BUNDLE_PROVENANCE_FORMAT) {
+            return Err("unrecognized bundle provenance manifest format".to_string());
+        }
+        let dirs_arr = parsed
+            .get("created_dirs")
+            .and_then(JsonValue::as_array)
+            .ok_or("missing 'created_dirs' array in bundle provenance manifest")?;
+        let mut created_dirs = Vec::with_capacity(dirs_arr.len());
+        for d in dirs_arr {
+            let s = d
+                .as_str()
+                .filter(|s| is_valid_created_dir_rel(s))
+                .ok_or("invalid directory entry in 'created_dirs'")?;
+            created_dirs.push(s.to_string());
+        }
+        let arr = parsed
+            .get("entries")
+            .and_then(JsonValue::as_array)
+            .ok_or("missing 'entries' array in bundle provenance manifest")?;
+        if arr.is_empty() {
+            return Err("bundle provenance manifest 'entries' cannot be empty".to_string());
+        }
+        let mut seen = std::collections::BTreeSet::new();
+        let mut entries = Vec::with_capacity(arr.len());
+        for item in arr {
+            let rel_path = item
+                .get("rel_path")
+                .and_then(JsonValue::as_str)
+                .filter(|s| is_safe_manifest_rel_path(s) && allowed_rels.iter().any(|a| a == *s))
+                .ok_or("invalid or unexpected 'rel_path' in bundle provenance manifest")?
+                .to_string();
+            if !seen.insert(rel_path.clone()) {
+                return Err(format!(
+                    "duplicate provenance entry for '{rel_path}' in manifest"
+                ));
+            }
+            let pre_existing = item
+                .get("pre_existing")
+                .and_then(JsonValue::as_bool)
+                .ok_or("missing boolean 'pre_existing' in provenance manifest")?;
+            let orig_mode = match item.get("orig_mode") {
+                None | Some(JsonValue::Null) => None,
+                Some(v) => {
+                    let m = v
+                        .as_u64()
+                        .filter(|&m| m <= 0o777)
+                        .ok_or("invalid 'orig_mode' in provenance manifest")?;
+                    Some(m as u32)
+                }
+            };
+            let orig_sha256 = match item.get("orig_sha256") {
+                None | Some(JsonValue::Null) => None,
+                Some(v) => {
+                    let s = v
+                        .as_str()
+                        .filter(|s| is_valid_sha256_hex(s))
+                        .ok_or("invalid 'orig_sha256' in provenance manifest")?;
+                    Some(s.to_ascii_lowercase())
+                }
+            };
+            if pre_existing && orig_sha256.is_none() {
+                return Err(format!(
+                    "pre-existing provenance entry '{rel_path}' is missing 'orig_sha256'"
+                ));
+            }
+            let deployed_sha256 = item
+                .get("deployed_sha256")
+                .and_then(JsonValue::as_str)
+                .filter(|s| is_valid_sha256_hex(s))
+                .ok_or("invalid 'deployed_sha256' in provenance manifest")?
+                .to_ascii_lowercase();
+            let managed_group = match item.get("managed_group") {
+                None | Some(JsonValue::Null) => None,
+                Some(v) if v.as_object().is_some() => Some(v.clone()),
+                Some(_) => {
+                    return Err(
+                        "invalid non-object 'managed_group' in provenance manifest".to_string()
+                    );
+                }
+            };
+            entries.push(FileProvenanceEntry {
+                rel_path,
+                pre_existing,
+                orig_mode,
+                orig_sha256,
+                deployed_sha256,
+                managed_group,
+            });
+        }
+        Ok(Self {
+            created_dirs,
+            entries,
+        })
+    }
+
+    fn serialize(&self) -> String {
+        let dirs: Vec<JsonValue> = self
+            .created_dirs
+            .iter()
+            .map(|d| JsonValue::Str(d.clone()))
+            .collect();
+        let items: Vec<JsonValue> = self
+            .entries
+            .iter()
+            .map(|e| {
+                JsonValue::Object(vec![
+                    ("rel_path".to_string(), JsonValue::Str(e.rel_path.clone())),
+                    ("pre_existing".to_string(), JsonValue::Bool(e.pre_existing)),
+                    (
+                        "orig_mode".to_string(),
+                        e.orig_mode
+                            .map_or(JsonValue::Null, |m| JsonValue::Uint(u64::from(m))),
+                    ),
+                    (
+                        "orig_sha256".to_string(),
+                        e.orig_sha256
+                            .as_ref()
+                            .map_or(JsonValue::Null, |s| JsonValue::Str(s.clone())),
+                    ),
+                    (
+                        "deployed_sha256".to_string(),
+                        JsonValue::Str(e.deployed_sha256.clone()),
+                    ),
+                    (
+                        "managed_group".to_string(),
+                        e.managed_group.clone().unwrap_or(JsonValue::Null),
+                    ),
+                ])
+            })
+            .collect();
+        let doc = JsonValue::Object(vec![
+            (
+                "format".to_string(),
+                JsonValue::Str(BUNDLE_PROVENANCE_FORMAT.to_string()),
+            ),
+            ("created_dirs".to_string(), JsonValue::Array(dirs)),
+            ("entries".to_string(), JsonValue::Array(items)),
+        ]);
+        let mut out = String::new();
+        format_json_pretty_2space(&doc, 0, &mut out);
+        out.push('\n');
+        out
+    }
+
+    fn entry_for(&self, rel_path: &str) -> Option<&FileProvenanceEntry> {
+        self.entries.iter().find(|e| e.rel_path == rel_path)
+    }
+}
+
+fn workspace_managed_rel_paths() -> Vec<String> {
+    let mut v = vec![
+        "AGENTS.md".to_string(),
+        ".ignore".to_string(),
+        ".cursorignore".to_string(),
+        ".codex/config.toml".to_string(),
+        ".claude/settings.json".to_string(),
+        ".cursor/hooks.json".to_string(),
+    ];
+    for af in AGENT_MD_FILES {
+        for sub in [".claude/agents", ".cursor/agents", ".codex/agents"] {
+            v.push(format!("{sub}/{af}"));
+        }
+    }
+    v
+}
+
+fn gemini_managed_rel_paths() -> Vec<String> {
+    let mut v = vec!["GEMINI.md".to_string(), "settings.json".to_string()];
+    for af in AGENT_MD_FILES {
+        v.push(format!("agents/{af}"));
+    }
+    v
+}
+
+#[allow(clippy::too_many_arguments)]
+fn write_bundle_provenance_file(
+    target: &Path,
+    rel_path: &str,
+    new_bytes: &[u8],
+    managed_group: Option<JsonValue>,
+    prior_entry: Option<&FileProvenanceEntry>,
+    mode: u32,
+    use_cp_semantics: bool,
+    journal: &mut RollbackJournal,
+    log: &mut Vec<String>,
+) -> Result<FileProvenanceEntry, String> {
+    let existing_meta = validate_optional_regular_file_lstat(target, "target file")?;
+    let bak = backup_path_for(target);
+    let existing_bak = validate_optional_regular_file_lstat(&bak, "backup file")?;
+
+    #[cfg(unix)]
+    let current_disk_mode = existing_meta.as_ref().map(|m| {
+        use std::os::unix::fs::PermissionsExt;
+        m.permissions().mode() & 0o777
+    });
+    #[cfg(not(unix))]
+    let current_disk_mode: Option<u32> = None;
+
+    let deployed_sha256 = crate::crypto::sha256_hex(new_bytes);
+    let is_cursor_hooks = rel_path == ".cursor/hooks.json";
+
+    if let Some(prior) = prior_entry {
+        if prior.pre_existing && existing_bak.is_none() {
+            return Err(format!(
+                "missing required backup '{}' for pre-existing '{}' during re-activation",
+                bak.display(),
+                target.display()
+            ));
+        }
+        if existing_meta.is_some() {
+            let existing_bytes = fs::read(target)
+                .map_err(|e| format!("failed reading '{}': {e}", target.display()))?;
+            let actual_sha = crate::crypto::sha256_hex(&existing_bytes);
+            if let Some(ref exp_tpl) = prior.managed_group {
+                let _ = verify_managed_json_intact_and_extract_user_part(
+                    &existing_bytes,
+                    exp_tpl,
+                    is_cursor_hooks,
+                    target,
+                )?;
+            } else if actual_sha != prior.deployed_sha256 {
+                return Err(format!(
+                    "managed file '{}' was modified externally; deactivate or restore before re-activating",
+                    target.display()
+                ));
+            }
+            journal.overwritten_files.push((
+                target.to_path_buf(),
+                existing_bytes,
+                current_disk_mode,
+            ));
+        } else if prior.pre_existing {
+            return Err(format!(
+                "pre-existing managed file '{}' was removed externally; preserving backup '{}'",
+                target.display(),
+                bak.display()
+            ));
+        } else {
+            journal.created_files.push(target.to_path_buf());
+        }
+
+        write_target_bytes_with_mode(target, new_bytes, mode, use_cp_semantics)?;
+        log.push(format!(
+            "[deploy] installed '{}' (mode {:04o}, {} bytes)",
+            target.display(),
+            mode,
+            new_bytes.len()
+        ));
+        return Ok(FileProvenanceEntry {
+            rel_path: rel_path.to_string(),
+            pre_existing: prior.pre_existing,
+            orig_mode: prior.orig_mode,
+            orig_sha256: prior.orig_sha256.clone(),
+            deployed_sha256,
+            managed_group,
+        });
+    }
+
+    if existing_bak.is_some() {
+        return Err(format!(
+            "orphaned backup '{}' exists without provenance manifest; refusing to overwrite original backup",
+            bak.display()
+        ));
+    }
+
+    let (pre_existing, orig_mode, orig_sha256) = if existing_meta.is_some() {
+        let existing_bytes =
+            fs::read(target).map_err(|e| format!("failed reading '{}': {e}", target.display()))?;
+        let orig_sha = crate::crypto::sha256_hex(&existing_bytes);
+        fs::write(&bak, &existing_bytes).map_err(|e| {
+            format!(
+                "failed backing up '{}' to '{}': {e}",
+                target.display(),
+                bak.display()
+            )
+        })?;
+        #[cfg(unix)]
+        if let Some(m) = current_disk_mode
+            && !use_cp_semantics
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&bak, fs::Permissions::from_mode(m)).map_err(|e| {
+                format!(
+                    "failed preserving mode {:04o} on backup '{}': {e}",
+                    m,
+                    bak.display()
+                )
+            })?;
+        }
+        #[cfg(unix)]
+        if let Some(m) = current_disk_mode
+            && use_cp_semantics
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = fs::set_permissions(&bak, fs::Permissions::from_mode(m));
+        }
+        journal.created_backups.push(bak.clone());
+        log.push(format!(
+            "[backup] saved pre-existing '{}' -> '{}'",
+            target.display(),
+            bak.display()
+        ));
+        journal
+            .overwritten_files
+            .push((target.to_path_buf(), existing_bytes, current_disk_mode));
+        (true, current_disk_mode, Some(orig_sha))
+    } else {
+        journal.created_files.push(target.to_path_buf());
+        (false, None, None)
+    };
+
+    write_target_bytes_with_mode(target, new_bytes, mode, use_cp_semantics)?;
+    log.push(format!(
+        "[deploy] installed '{}' (mode {:04o}, {} bytes)",
+        target.display(),
+        mode,
+        new_bytes.len()
+    ));
+    Ok(FileProvenanceEntry {
+        rel_path: rel_path.to_string(),
+        pre_existing,
+        orig_mode,
+        orig_sha256,
+        deployed_sha256,
+        managed_group,
+    })
+}
+
+fn write_target_bytes_with_mode(
+    target: &Path,
+    new_bytes: &[u8],
+    mode: u32,
+    use_cp_semantics: bool,
+) -> Result<(), String> {
+    if use_cp_semantics {
+        if target.exists() {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = fs::set_permissions(target, fs::Permissions::from_mode(0o600));
+            }
+        }
+        fs::write(target, new_bytes)
+            .map_err(|e| format!("failed writing '{}': {e}", target.display()))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = fs::set_permissions(target, fs::Permissions::from_mode(mode));
+        }
+    } else {
+        if target.exists() {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = fs::set_permissions(target, fs::Permissions::from_mode(0o600));
+            }
+            let _ = fs::remove_file(target);
+        }
+        fs::write(target, new_bytes)
+            .map_err(|e| format!("failed writing '{}': {e}", target.display()))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(target, fs::Permissions::from_mode(mode)).map_err(|e| {
+                format!(
+                    "failed setting mode {:04o} on '{}': {e}",
+                    mode,
+                    target.display()
+                )
+            })?;
+        }
+    }
+    Ok(())
+}
+
+fn write_bundle_manifest_file(
+    manifest_path: &Path,
+    manifest: &BundleProvenanceManifest,
+    mode: u32,
+    use_cp_semantics: bool,
+    journal: &mut RollbackJournal,
+) -> Result<(), String> {
+    if let Some(mmeta) =
+        validate_optional_regular_file_lstat(manifest_path, "bundle provenance manifest")?
+    {
+        let prev = fs::read(manifest_path)
+            .map_err(|e| format!("failed reading '{}': {e}", manifest_path.display()))?;
+        #[cfg(unix)]
+        let prev_mode = {
+            use std::os::unix::fs::PermissionsExt;
+            Some(mmeta.permissions().mode() & 0o777)
+        };
+        #[cfg(not(unix))]
+        let prev_mode: Option<u32> = {
+            let _ = &mmeta;
+            None
+        };
+        journal
+            .overwritten_files
+            .push((manifest_path.to_path_buf(), prev, prev_mode));
+    } else {
+        journal.created_files.push(manifest_path.to_path_buf());
+    }
+    let body = manifest.serialize();
+    write_target_bytes_with_mode(manifest_path, body.as_bytes(), mode, use_cp_semantics)
 }
 
 fn ensure_shell_rc_path(
@@ -1356,11 +2253,16 @@ fn ensure_shell_rc_path(
     }
     for rc_name in [".bashrc", ".zshenv"] {
         let rc_path = home.join(rc_name);
-        reject_if_symlink(&rc_path, rc_name)?;
-        if rc_name == ".bashrc" && !rc_path.exists() {
+        let rc_meta = validate_optional_regular_file_lstat(&rc_path, rc_name)?;
+        if rc_name == ".bashrc" && rc_meta.is_none() {
             continue;
         }
-        let existing = fs::read_to_string(&rc_path).unwrap_or_default();
+        let existing = if rc_meta.is_some() {
+            fs::read_to_string(&rc_path)
+                .map_err(|e| format!("failed reading '{}': {e}", rc_path.display()))?
+        } else {
+            String::new()
+        };
         if existing.contains(".local/bin") {
             continue;
         }
@@ -1427,6 +2329,224 @@ fn enforce_global_git_settings(dry_run: bool, log: &mut Vec<String>) -> Result<(
     Ok(())
 }
 
+fn deploy_gemini_home_plane(
+    dotagent_root: &Path,
+    home: &Path,
+    abs_guard_bin: Option<&Path>,
+    dry_run: bool,
+    log: &mut Vec<String>,
+) -> Result<Option<RollbackJournal>, String> {
+    validate_existing_regular_dir_lstat(home, "HOME directory")?;
+    let gemini_dir = home.join(".gemini");
+    let gemini_agents = gemini_dir.join("agents");
+    let gemini_existed = validate_optional_dir_lstat(&gemini_dir, "Gemini directory")?;
+    let agents_existed = if gemini_existed {
+        validate_optional_dir_lstat(&gemini_agents, "Gemini agents directory")?
+    } else {
+        false
+    };
+
+    let allowed_rels = gemini_managed_rel_paths();
+    let manifest_path = gemini_dir.join(BUNDLE_PROVENANCE_FILE);
+    let prior_manifest = if gemini_existed
+        && validate_optional_regular_file_lstat(&manifest_path, "Gemini provenance manifest")?
+            .is_some()
+    {
+        let raw = fs::read_to_string(&manifest_path)
+            .map_err(|e| format!("failed reading '{}': {e}", manifest_path.display()))?;
+        Some(BundleProvenanceManifest::parse(&raw, &allowed_rels)?)
+    } else {
+        None
+    };
+
+    let mut staged: Vec<(String, Vec<u8>, Option<JsonValue>)> =
+        Vec::with_capacity(allowed_rels.len());
+    let gemini_md = fs::read(dotagent_root.join("dist/gemini/GEMINI.md"))
+        .map_err(|e| format!("missing dist/gemini/GEMINI.md: {e}"))?;
+    staged.push(("GEMINI.md".to_string(), gemini_md, None));
+
+    let gemini_settings_tpl = fs::read_to_string(dotagent_root.join("dist/gemini/settings.json"))
+        .map_err(|e| format!("missing dist/gemini/settings.json: {e}"))?;
+    let gemini_settings_dst = gemini_dir.join("settings.json");
+    let existing_gemini = if gemini_existed
+        && validate_optional_regular_file_lstat(&gemini_settings_dst, "Gemini settings.json")?
+            .is_some()
+    {
+        Some(fs::read_to_string(&gemini_settings_dst).map_err(|e| {
+            format!(
+                "failed reading existing '{}': {e}",
+                gemini_settings_dst.display()
+            )
+        })?)
+    } else {
+        None
+    };
+    let (merged_gemini, pinned_gemini_tpl) = merge_settings_json_preserving_user_prefs(
+        existing_gemini.as_deref(),
+        &gemini_settings_tpl,
+        abs_guard_bin,
+        Some("gemini"),
+    )?;
+    staged.push((
+        "settings.json".to_string(),
+        merged_gemini.into_bytes(),
+        Some(pinned_gemini_tpl),
+    ));
+
+    for af in AGENT_MD_FILES {
+        let rel = format!("agents/{af}");
+        let dst = gemini_dir.join(&rel);
+        if agents_existed {
+            let _ = validate_optional_regular_file_lstat(&dst, "Gemini agent")?;
+        }
+        let bytes = fs::read(dotagent_root.join("dist/gemini/agents").join(af))
+            .map_err(|e| format!("missing dist/gemini/agents/{af}: {e}"))?;
+        staged.push((rel, bytes, None));
+    }
+
+    if gemini_existed {
+        let _ = validate_optional_regular_file_lstat(
+            &gemini_dir.join("GEMINI.md"),
+            "Gemini GEMINI.md",
+        )?;
+        for (rel, _, _) in &staged {
+            let dst = gemini_dir.join(rel);
+            let _ = validate_optional_regular_file_lstat(&backup_path_for(&dst), "Gemini backup")?;
+        }
+    }
+
+    if dry_run {
+        for (rel, bytes, _) in &staged {
+            let dst = gemini_dir.join(rel);
+            log.push(format!(
+                "[dry-run] would deploy '{}' (mode 0644, {} bytes)",
+                dst.display(),
+                bytes.len()
+            ));
+        }
+        return Ok(None);
+    }
+
+    let mut journal = RollbackJournal::default();
+    let mut created_dirs = prior_manifest
+        .as_ref()
+        .map(|m| m.created_dirs.clone())
+        .unwrap_or_default();
+
+    let run_res = (|| -> Result<(), String> {
+        if !gemini_existed {
+            fs::create_dir(&gemini_dir)
+                .map_err(|e| format!("failed creating '{}': {e}", gemini_dir.display()))?;
+            journal.created_dirs.push(gemini_dir.clone());
+            if !created_dirs.iter().any(|d| d.is_empty()) {
+                created_dirs.push(String::new());
+            }
+        }
+        if !agents_existed {
+            fs::create_dir(&gemini_agents)
+                .map_err(|e| format!("failed creating '{}': {e}", gemini_agents.display()))?;
+            journal.created_dirs.push(gemini_agents.clone());
+            if !created_dirs.iter().any(|d| d == "agents") {
+                created_dirs.push("agents".to_string());
+            }
+        }
+
+        let mut entries = Vec::with_capacity(staged.len());
+        for (rel, bytes, mg) in staged {
+            let dst = gemini_dir.join(&rel);
+            let prior_e = prior_manifest.as_ref().and_then(|m| m.entry_for(&rel));
+            let entry = write_bundle_provenance_file(
+                &dst,
+                &rel,
+                &bytes,
+                mg,
+                prior_e,
+                0o644,
+                true,
+                &mut journal,
+                log,
+            )?;
+            entries.push(entry);
+        }
+        let new_manifest = BundleProvenanceManifest {
+            created_dirs,
+            entries,
+        };
+        write_bundle_manifest_file(&manifest_path, &new_manifest, 0o644, true, &mut journal)?;
+        Ok(())
+    })();
+
+    if let Err(e) = run_res {
+        journal.rollback();
+        return Err(e);
+    }
+    Ok(Some(journal))
+}
+
+fn deploy_canonical_dotagent_mirrors(
+    dotagent_root: &Path,
+    dry_run: bool,
+    log: &mut Vec<String>,
+) -> Result<(), String> {
+    let subdirs = [
+        ".claude",
+        ".claude/agents",
+        ".cursor",
+        ".cursor/agents",
+        ".codex",
+        ".codex/agents",
+    ];
+    for sub in subdirs {
+        let _ = validate_optional_dir_lstat(&dotagent_root.join(sub), "harness directory")?;
+    }
+    if !dry_run {
+        for sub in [".claude/agents", ".cursor/agents", ".codex/agents"] {
+            fs::create_dir_all(dotagent_root.join(sub)).map_err(|e| {
+                format!(
+                    "failed creating '{}': {e}",
+                    dotagent_root.join(sub).display()
+                )
+            })?;
+        }
+    }
+    let pairs: &[(&str, &str)] = &[
+        ("dist/AGENTS.md", "AGENTS.md"),
+        ("dist/.ignore", ".ignore"),
+        ("dist/cursor/.cursorignore", ".cursorignore"),
+        ("dist/codex/config.toml", ".codex/config.toml"),
+        ("dist/claude/settings.json", ".claude/settings.json"),
+        ("dist/cursor/hooks.json", ".cursor/hooks.json"),
+    ];
+    for &(src_rel, dst_rel) in pairs {
+        let dst = dotagent_root.join(dst_rel);
+        let _ = validate_optional_regular_file_lstat(&dst, "harness mirror")?;
+        let bytes = fs::read(dotagent_root.join(src_rel))
+            .map_err(|e| format!("missing '{src_rel}': {e}"))?;
+        if !dry_run && dst.is_file() && fs::read(&dst).ok().as_deref() == Some(bytes.as_slice()) {
+            continue;
+        }
+        write_with_nondestructive_backup(&dst, &bytes, 0o644, false, dry_run, log)?;
+    }
+    for af in AGENT_MD_FILES {
+        for (dist_sub, dst_sub) in [
+            ("dist/claude/agents", ".claude/agents"),
+            ("dist/cursor/agents", ".cursor/agents"),
+            ("dist/codex/agents", ".codex/agents"),
+        ] {
+            let dst = dotagent_root.join(dst_sub).join(af);
+            let _ = validate_optional_regular_file_lstat(&dst, "harness agent mirror")?;
+            let bytes = fs::read(dotagent_root.join(dist_sub).join(af))
+                .map_err(|e| format!("missing '{dist_sub}/{af}': {e}"))?;
+            if !dry_run && dst.is_file() && fs::read(&dst).ok().as_deref() == Some(bytes.as_slice())
+            {
+                continue;
+            }
+            write_with_nondestructive_backup(&dst, &bytes, 0o644, false, dry_run, log)?;
+        }
+    }
+    Ok(())
+}
+
 fn deploy_workspace_bundle(
     dotagent_root: &Path,
     target_root: &Path,
@@ -1436,112 +2556,115 @@ fn deploy_workspace_bundle(
     dry_run: bool,
     log: &mut Vec<String>,
 ) -> Result<(), String> {
-    let dirs = [
-        target_root.to_path_buf(),
-        target_root.join(".claude"),
-        target_root.join(".claude/agents"),
-        target_root.join(".cursor"),
-        target_root.join(".cursor/agents"),
-        target_root.join(".codex"),
-        target_root.join(".codex/agents"),
-    ];
-    for d in &dirs {
-        reject_if_symlink(d, "harness directory")?;
+    verify_all_dist_manifest_sources(dotagent_root)?;
+    if !is_external {
+        return deploy_canonical_dotagent_mirrors(dotagent_root, dry_run, log);
     }
 
-    let mut check_targets = vec![
-        target_root.join("AGENTS.md"),
-        target_root.join(".ignore"),
-        target_root.join(".cursorignore"),
-        target_root.join(".claude/settings.json"),
-        target_root.join(".cursor/hooks.json"),
-        target_root.join(".codex/config.toml"),
-    ];
-    for af in AGENT_MD_FILES {
-        check_targets.push(target_root.join(".claude/agents").join(af));
-        check_targets.push(target_root.join(".cursor/agents").join(af));
-        check_targets.push(target_root.join(".codex/agents").join(af));
-    }
-    for t in &check_targets {
-        reject_if_symlink(t, "harness target")?;
-    }
-
+    validate_existing_regular_dir_lstat(target_root, "target workspace")?;
     if !dry_run {
-        for sub in [".claude/agents", ".cursor/agents", ".codex/agents"] {
-            fs::create_dir_all(target_root.join(sub)).map_err(|e| {
-                format!("failed creating '{}': {e}", target_root.join(sub).display())
-            })?;
+        let pre_failures = crate::antigravity_adapter::audit_workspace_scoped(target_root);
+        if !pre_failures.is_empty() {
+            return Err(format!(
+                "target workspace '{}' failed security audit: {}",
+                target_root.display(),
+                pre_failures.join("; ")
+            ));
         }
     }
 
-    let copy_pairs: &[(&str, &str)] = &[
+    let dir_rels = [
+        ".claude",
+        ".claude/agents",
+        ".cursor",
+        ".cursor/agents",
+        ".codex",
+        ".codex/agents",
+    ];
+    let mut dir_existed = Vec::with_capacity(dir_rels.len());
+    for rel_d in &dir_rels {
+        let existed = validate_optional_dir_lstat(&target_root.join(rel_d), "harness directory")?;
+        dir_existed.push((*rel_d, existed));
+    }
+
+    let allowed_rels = workspace_managed_rel_paths();
+    let manifest_path = target_root.join(BUNDLE_PROVENANCE_FILE);
+    let prior_manifest =
+        if validate_optional_regular_file_lstat(&manifest_path, "workspace provenance manifest")?
+            .is_some()
+        {
+            let raw = fs::read_to_string(&manifest_path)
+                .map_err(|e| format!("failed reading '{}': {e}", manifest_path.display()))?;
+            Some(BundleProvenanceManifest::parse(&raw, &allowed_rels)?)
+        } else {
+            None
+        };
+
+    let mut staged: Vec<(String, Vec<u8>, Option<JsonValue>)> =
+        Vec::with_capacity(allowed_rels.len());
+    for &(src_rel, dst_rel) in &[
         ("dist/AGENTS.md", "AGENTS.md"),
         ("dist/.ignore", ".ignore"),
         ("dist/cursor/.cursorignore", ".cursorignore"),
-    ];
-    for &(src_rel, dst_rel) in copy_pairs {
+    ] {
         let bytes = fs::read(dotagent_root.join(src_rel))
-            .map_err(|e| format!("missing '{}': {e}", src_rel))?;
-        write_with_nondestructive_backup(
-            &target_root.join(dst_rel),
-            &bytes,
-            mode,
-            false,
-            dry_run,
-            log,
-        )?;
+            .map_err(|e| format!("missing '{src_rel}': {e}"))?;
+        staged.push((dst_rel.to_string(), bytes, None));
     }
 
     let codex_tpl = fs::read_to_string(dotagent_root.join("dist/codex/config.toml"))
         .map_err(|e| format!("missing 'dist/codex/config.toml': {e}"))?;
-    let codex_bytes = if is_external {
-        pin_codex_notify_toml(&codex_tpl, abs_guard_bin)?.into_bytes()
-    } else {
-        codex_tpl.into_bytes()
-    };
-    write_with_nondestructive_backup(
-        &target_root.join(".codex/config.toml"),
-        &codex_bytes,
-        mode,
-        false,
-        dry_run,
-        log,
-    )?;
+    let codex_bytes = pin_codex_notify_toml(&codex_tpl, abs_guard_bin)?.into_bytes();
+    staged.push((".codex/config.toml".to_string(), codex_bytes, None));
 
-    // Claude settings.json: preserve custom user top-level preferences & pin absolute binary on external workspaces
     let claude_tpl = fs::read_to_string(dotagent_root.join("dist/claude/settings.json"))
         .map_err(|e| format!("missing dist/claude/settings.json: {e}"))?;
     let claude_dst = target_root.join(".claude/settings.json");
-    let claude_bytes = if is_external {
-        let existing_raw = fs::read_to_string(&claude_dst).ok();
-        merge_settings_json_preserving_user_prefs(
-            existing_raw.as_deref(),
-            &claude_tpl,
-            abs_guard_bin,
-            Some("claude"),
-        )?
-        .into_bytes()
+    let existing_claude = if dir_existed[0].1
+        && validate_optional_regular_file_lstat(&claude_dst, "Claude settings.json")?.is_some()
+    {
+        Some(
+            fs::read_to_string(&claude_dst)
+                .map_err(|e| format!("failed reading existing '{}': {e}", claude_dst.display()))?,
+        )
     } else {
-        claude_tpl.into_bytes()
+        None
     };
-    write_with_nondestructive_backup(&claude_dst, &claude_bytes, mode, false, dry_run, log)?;
+    let (merged_claude, pinned_claude_tpl) = merge_settings_json_preserving_user_prefs(
+        existing_claude.as_deref(),
+        &claude_tpl,
+        abs_guard_bin,
+        Some("claude"),
+    )?;
+    staged.push((
+        ".claude/settings.json".to_string(),
+        merged_claude.into_bytes(),
+        Some(pinned_claude_tpl),
+    ));
 
-    // Cursor hooks.json: pin absolute binary on external workspaces so GUI Cursor finds agent-guard without ~/.bashrc
     let cursor_tpl = fs::read_to_string(dotagent_root.join("dist/cursor/hooks.json"))
         .map_err(|e| format!("missing dist/cursor/hooks.json: {e}"))?;
     let cursor_dst = target_root.join(".cursor/hooks.json");
-    let cursor_bytes = if is_external && abs_guard_bin.is_some() {
-        let parsed = JsonValue::parse(&cursor_tpl)
-            .map_err(|e| format!("invalid dist/cursor/hooks.json: {e}"))?;
-        format!(
-            "{}\n",
-            pin_hook_binary_in_json(&parsed, abs_guard_bin, Some("cursor"))?.to_json_string()
+    let existing_cursor = if dir_existed[2].1
+        && validate_optional_regular_file_lstat(&cursor_dst, "Cursor hooks.json")?.is_some()
+    {
+        Some(
+            fs::read_to_string(&cursor_dst)
+                .map_err(|e| format!("failed reading existing '{}': {e}", cursor_dst.display()))?,
         )
-        .into_bytes()
     } else {
-        cursor_tpl.into_bytes()
+        None
     };
-    write_with_nondestructive_backup(&cursor_dst, &cursor_bytes, mode, false, dry_run, log)?;
+    let (merged_cursor, pinned_cursor_tpl) = merge_cursor_hooks_json_preserving_siblings(
+        existing_cursor.as_deref(),
+        &cursor_tpl,
+        abs_guard_bin,
+    )?;
+    staged.push((
+        ".cursor/hooks.json".to_string(),
+        merged_cursor.into_bytes(),
+        Some(pinned_cursor_tpl),
+    ));
 
     for af in AGENT_MD_FILES {
         for (dist_sub, dst_sub) in [
@@ -1551,29 +2674,102 @@ fn deploy_workspace_bundle(
         ] {
             let bytes = fs::read(dotagent_root.join(dist_sub).join(af))
                 .map_err(|e| format!("missing '{dist_sub}/{af}': {e}"))?;
-            write_with_nondestructive_backup(
-                &target_root.join(dst_sub).join(af),
-                &bytes,
-                mode,
-                false,
-                dry_run,
-                log,
+            staged.push((format!("{dst_sub}/{af}"), bytes, None));
+        }
+    }
+
+    for (rel, _, _) in &staged {
+        let dst = target_root.join(rel);
+        let parent_exists = dst.parent().is_some_and(|p| p == target_root || p.is_dir());
+        if parent_exists {
+            let _ = validate_optional_regular_file_lstat(&dst, "harness target")?;
+            let _ = validate_optional_regular_file_lstat(
+                &backup_path_for(&dst),
+                "harness target backup",
             )?;
         }
     }
 
-    if is_external {
+    if dry_run {
+        for (rel, bytes, _) in &staged {
+            log.push(format!(
+                "[dry-run] would deploy '{}' (mode {:04o}, {} bytes)",
+                target_root.join(rel).display(),
+                mode,
+                bytes.len()
+            ));
+        }
         deploy_antigravity_workspace_plane(
             dotagent_root,
             target_root,
             abs_guard_bin,
             None,
             mode,
-            dry_run,
+            true,
             log,
         )?;
+        return Ok(());
     }
 
+    let mut journal = RollbackJournal::default();
+    let mut created_dirs = prior_manifest
+        .as_ref()
+        .map(|m| m.created_dirs.clone())
+        .unwrap_or_default();
+
+    let run_res = (|| -> Result<(), String> {
+        for &(rel_d, existed) in &dir_existed {
+            if !existed {
+                let dp = target_root.join(rel_d);
+                fs::create_dir(&dp)
+                    .map_err(|e| format!("failed creating '{}': {e}", dp.display()))?;
+                journal.created_dirs.push(dp);
+                if !created_dirs.iter().any(|d| d == rel_d) {
+                    created_dirs.push(rel_d.to_string());
+                }
+            }
+        }
+
+        let mut entries = Vec::with_capacity(staged.len());
+        for (rel, bytes, mg) in staged {
+            let dst = target_root.join(&rel);
+            let prior_e = prior_manifest.as_ref().and_then(|m| m.entry_for(&rel));
+            let entry = write_bundle_provenance_file(
+                &dst,
+                &rel,
+                &bytes,
+                mg,
+                prior_e,
+                mode,
+                false,
+                &mut journal,
+                log,
+            )?;
+            entries.push(entry);
+        }
+
+        let new_manifest = BundleProvenanceManifest {
+            created_dirs,
+            entries,
+        };
+        write_bundle_manifest_file(&manifest_path, &new_manifest, mode, false, &mut journal)?;
+
+        deploy_antigravity_workspace_plane(
+            dotagent_root,
+            target_root,
+            abs_guard_bin,
+            None,
+            mode,
+            false,
+            log,
+        )?;
+        Ok(())
+    })();
+
+    if let Err(e) = run_res {
+        journal.rollback();
+        return Err(e);
+    }
     Ok(())
 }
 
@@ -1585,17 +2781,61 @@ pub(crate) fn execute_activate(
     dry_run: bool,
 ) -> Result<Vec<String>, String> {
     let mut log = Vec::new();
-    reject_if_symlink(&dotagent_root.join("AGENTS.md"), "root AGENTS.md")?;
+    validate_existing_regular_dir_lstat(home, "HOME directory")?;
+    validate_existing_regular_dir_lstat(target_ws, "target workspace")?;
+    verify_all_dist_manifest_sources(dotagent_root)?;
+
+    let canon_dotagent =
+        fs::canonicalize(dotagent_root).unwrap_or_else(|_| dotagent_root.to_path_buf());
+    let canon_target = fs::canonicalize(target_ws).unwrap_or_else(|_| target_ws.to_path_buf());
+    let is_external_target = canon_target != canon_dotagent;
+
+    let verified_guard_buf: Option<PathBuf> = if is_external_target {
+        Some(resolve_verified_guard_binary(bin_dir)?)
+    } else {
+        let _ = validate_optional_dir_lstat(bin_dir, "guard binary directory")?;
+        if fs::symlink_metadata(bin_dir.join("agent-guard")).is_ok()
+            || fs::symlink_metadata(bin_dir.join("dotagent")).is_ok()
+        {
+            Some(resolve_verified_guard_binary(bin_dir)?)
+        } else if let Ok(cur_exe) = std::env::current_exe()
+            && cur_exe
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n == "agent-guard" || n == "dotagent")
+        {
+            Some(verify_guard_binary_path(&cur_exe)?)
+        } else {
+            None
+        }
+    };
+    let abs_guard_opt = verified_guard_buf.as_deref();
+
+    if is_external_target && !dry_run {
+        let pre_failures = crate::antigravity_adapter::audit_workspace_scoped(target_ws);
+        if !pre_failures.is_empty() {
+            return Err(format!(
+                "target workspace '{}' failed security audit: {}",
+                target_ws.display(),
+                pre_failures.join("; ")
+            ));
+        }
+    }
 
     // 1. State directory (0700) & shell PATH wiring (.bashrc + .zshenv)
-    let state_sessions = home.join(".local/state/agent-guard/sessions");
+    let local_dir = home.join(".local");
+    let local_state = local_dir.join("state");
+    let state_root = local_state.join("agent-guard");
+    let state_sessions = state_root.join("sessions");
+    for sd in [&local_dir, &local_state, &state_root, &state_sessions] {
+        let _ = validate_optional_dir_lstat(sd, "agent-guard state directory")?;
+    }
     if !dry_run {
         fs::create_dir_all(&state_sessions)
             .map_err(|e| format!("failed creating '{}': {e}", state_sessions.display()))?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let state_root = home.join(".local/state/agent-guard");
             let _ = fs::set_permissions(&state_root, fs::Permissions::from_mode(0o700));
             let _ = fs::set_permissions(&state_sessions, fs::Permissions::from_mode(0o700));
         }
@@ -1605,88 +2845,38 @@ pub(crate) fn execute_activate(
     // 2. Enforce all 19 global Git hardening keys (preserving user.name & user.email)
     enforce_global_git_settings(dry_run, &mut log)?;
 
-    // Resolve installed absolute `agent-guard` binary path (falling back to current_exe if invoked standalone)
-    let installed_guard = bin_dir.join("agent-guard");
-    let fallback_exe = std::env::current_exe().ok().filter(|p| {
-        p.file_name()
-            .and_then(|n| n.to_str())
-            .is_some_and(|n| n == "agent-guard" || n == "dotagent")
-    });
-    let abs_guard_opt = if installed_guard.is_file() {
-        Some(installed_guard.as_path())
-    } else {
-        fallback_exe.as_deref()
-    };
+    if !dry_run && let Err(errs) = audit_repository(dotagent_root) {
+        return Err(format!(
+            "dotagent repository audit failed: {}",
+            errs.join("; ")
+        ));
+    }
 
     // 3. Deploy ~/.gemini global constitution, merged settings.json, and 7 subagents
-    let gemini_dir = home.join(".gemini");
-    let gemini_agents = gemini_dir.join("agents");
-    for gp in [
-        gemini_dir.clone(),
-        gemini_agents.clone(),
-        gemini_dir.join("GEMINI.md"),
-        gemini_dir.join("settings.json"),
-    ] {
-        reject_if_symlink(&gp, "Gemini path")?;
-    }
-    if !dry_run {
-        fs::create_dir_all(&gemini_agents)
-            .map_err(|e| format!("failed creating '{}': {e}", gemini_agents.display()))?;
-    }
-    for af in AGENT_MD_FILES {
-        let dst = gemini_agents.join(af);
-        reject_if_symlink(&dst, "Gemini agent")?;
-        let bytes = fs::read(dotagent_root.join("dist/gemini/agents").join(af))
-            .map_err(|e| format!("missing dist/gemini/agents/{af}: {e}"))?;
-        write_with_nondestructive_backup(&dst, &bytes, 0o644, true, dry_run, &mut log)?;
-    }
-    let gemini_md = fs::read(dotagent_root.join("dist/gemini/GEMINI.md"))
-        .map_err(|e| format!("missing dist/gemini/GEMINI.md: {e}"))?;
-    write_with_nondestructive_backup(
-        &gemini_dir.join("GEMINI.md"),
-        &gemini_md,
-        0o644,
-        true,
-        dry_run,
-        &mut log,
-    )?;
+    let mut gemini_journal =
+        deploy_gemini_home_plane(dotagent_root, home, abs_guard_opt, dry_run, &mut log)?;
 
-    let gemini_settings_tpl = fs::read_to_string(dotagent_root.join("dist/gemini/settings.json"))
-        .map_err(|e| format!("missing dist/gemini/settings.json: {e}"))?;
-    let gemini_settings_dst = gemini_dir.join("settings.json");
-    let existing_gemini = fs::read_to_string(&gemini_settings_dst).ok();
-    let merged_gemini = merge_settings_json_preserving_user_prefs(
-        existing_gemini.as_deref(),
-        &gemini_settings_tpl,
-        abs_guard_opt,
-        Some("gemini"),
-    )?;
-    write_with_nondestructive_backup(
-        &gemini_settings_dst,
-        merged_gemini.as_bytes(),
-        0o644,
-        true,
-        dry_run,
-        &mut log,
-    )?;
-
-    // 4. Deploy canonical mirrors in dotagent_root (0644, unpinned so manifest SHA-256 stays exact)
-    deploy_workspace_bundle(
-        dotagent_root,
-        dotagent_root,
-        0o644,
-        false,
-        None,
-        dry_run,
-        &mut log,
-    )?;
-
-    // 5. Deploy external target_ws (0444 read-only control plane, non-destructive backups + pinned binary path)
-    let canon_dotagent =
-        fs::canonicalize(dotagent_root).unwrap_or_else(|_| dotagent_root.to_path_buf());
-    let canon_target = fs::canonicalize(target_ws).unwrap_or_else(|_| target_ws.to_path_buf());
-    if canon_target != canon_dotagent {
-        deploy_workspace_bundle(
+    // 4. Deploy canonical mirrors in dotagent_root ONLY when activating dotagent_root itself
+    //    (never write into read-only release bundles like ~/.local/share/dotagent).
+    if !is_external_target {
+        if let Err(e) = deploy_workspace_bundle(
+            dotagent_root,
+            dotagent_root,
+            0o644,
+            false,
+            None,
+            dry_run,
+            &mut log,
+        ) {
+            if let Some(ref mut gj) = gemini_journal {
+                gj.rollback();
+            }
+            return Err(e);
+        }
+        invalidate_or_purge_swarm_state(dotagent_root, false, dry_run, &mut log)?;
+    } else {
+        // 5. Deploy external target_ws (0444 read-only control plane, provenance backups + pinned binary path)
+        if let Err(e) = deploy_workspace_bundle(
             dotagent_root,
             target_ws,
             0o444,
@@ -1694,31 +2884,26 @@ pub(crate) fn execute_activate(
             abs_guard_opt,
             dry_run,
             &mut log,
-        )?;
-    }
-
-    // 6. Explicitly invalidate any pre-v2 unprefixed HMAC swarm state on upgrade
-    invalidate_or_purge_swarm_state(dotagent_root, false, dry_run, &mut log)?;
-    if canon_target != canon_dotagent {
+        ) {
+            if let Some(ref mut gj) = gemini_journal {
+                gj.rollback();
+            }
+            return Err(e);
+        }
         invalidate_or_purge_swarm_state(target_ws, false, dry_run, &mut log)?;
-    }
-
-    // 7. Live repository security audit on dotagent_root AND target_ws (if target_ws is a git repo)
-    if !dry_run {
-        if let Err(errs) = audit_repository(dotagent_root) {
+        if !dry_run
+            && target_ws.join(".git").exists()
+            && let Err(errs) = audit_repository(target_ws)
+        {
+            let _ = execute_workspace_only_deactivate(target_ws, false);
+            if let Some(ref mut gj) = gemini_journal {
+                gj.rollback();
+            }
             return Err(format!(
-                "dotagent repository audit failed: {}",
+                "target workspace '{}' failed security audit: {}",
+                target_ws.display(),
                 errs.join("; ")
             ));
-        }
-        if canon_target != canon_dotagent && target_ws.join(".git").exists() {
-            if let Err(errs) = audit_repository(target_ws) {
-                return Err(format!(
-                    "target workspace '{}' failed security audit: {}",
-                    target_ws.display(),
-                    errs.join("; ")
-                ));
-            }
         }
     }
 
@@ -1746,36 +2931,28 @@ pub(crate) fn activate_external_workspace_only(
         return Ok(log);
     }
 
-    let installed_guard = bin_dir.join("agent-guard");
-    let fallback_exe = std::env::current_exe().ok().filter(|p| {
-        p.file_name()
-            .and_then(|n| n.to_str())
-            .is_some_and(|n| n == "agent-guard" || n == "dotagent")
-    });
-    let abs_guard_opt = if installed_guard.is_file() {
-        Some(installed_guard.as_path())
-    } else {
-        fallback_exe.as_deref()
-    };
+    let verified_guard = resolve_verified_guard_binary(bin_dir)?;
 
     deploy_workspace_bundle(
         dotagent_root,
         target_ws,
         0o444,
         true,
-        abs_guard_opt,
+        Some(verified_guard.as_path()),
         dry_run,
         &mut log,
     )?;
     invalidate_or_purge_swarm_state(target_ws, false, dry_run, &mut log)?;
-    if !dry_run && target_ws.join(".git").exists() {
-        if let Err(errs) = audit_repository(target_ws) {
-            return Err(format!(
-                "target workspace '{}' failed security audit: {}",
-                target_ws.display(),
-                errs.join("; ")
-            ));
-        }
+    if !dry_run
+        && target_ws.join(".git").exists()
+        && let Err(errs) = audit_repository(target_ws)
+    {
+        let _ = execute_workspace_only_deactivate(target_ws, false);
+        return Err(format!(
+            "target workspace '{}' failed security audit: {}",
+            target_ws.display(),
+            errs.join("; ")
+        ));
     }
     Ok(log)
 }
@@ -1859,29 +3036,394 @@ fn invalidate_or_purge_swarm_state(
     Ok(())
 }
 
+struct ValidatedBundleDeactivation {
+    root: PathBuf,
+    manifest_path: PathBuf,
+    created_dirs: Vec<String>,
+    actions: Vec<PlannedDeactivation>,
+}
+
+fn plan_bundle_deactivation(
+    root: &Path,
+    allowed_rels: &[String],
+    plane_label: &str,
+    root_must_exist: bool,
+) -> Result<Option<ValidatedBundleDeactivation>, String> {
+    if root_must_exist {
+        validate_existing_regular_dir_lstat(root, plane_label)?;
+    } else if !validate_optional_dir_lstat(root, plane_label)? {
+        return Ok(None);
+    }
+
+    let manifest_path = root.join(BUNDLE_PROVENANCE_FILE);
+    let manifest_meta =
+        validate_optional_regular_file_lstat(&manifest_path, "bundle provenance manifest")?;
+
+    if manifest_meta.is_none() {
+        for rel in allowed_rels {
+            let t = root.join(rel);
+            let parent_ok = match t.parent() {
+                Some(p) if p != root => validate_optional_dir_lstat(p, "harness directory")?,
+                _ => true,
+            };
+            if parent_ok {
+                let bak = backup_path_for(&t);
+                if validate_optional_regular_file_lstat(&bak, "bundle backup")?.is_some() {
+                    return Err(format!(
+                        "{plane_label} backup '{}' exists without provenance manifest '{}'; preserving backup and refusing destructive cleanup",
+                        bak.display(),
+                        manifest_path.display()
+                    ));
+                }
+            }
+        }
+        return Ok(None);
+    }
+
+    let raw_manifest = fs::read_to_string(&manifest_path)
+        .map_err(|e| format!("failed reading '{}': {e}", manifest_path.display()))?;
+    let manifest = BundleProvenanceManifest::parse(&raw_manifest, allowed_rels)?;
+
+    let mut actions = Vec::with_capacity(manifest.entries.len());
+    for entry in &manifest.entries {
+        let target = root.join(&entry.rel_path);
+        if let Some(parent) = target.parent()
+            && parent != root
+        {
+            validate_existing_regular_dir_lstat(parent, "managed parent directory")?;
+        }
+        let Some(tmeta) = validate_optional_regular_file_lstat(&target, "managed bundle file")?
+        else {
+            return Err(format!(
+                "managed {plane_label} file '{}' was removed outside deactivation; preserving backups and provenance manifest",
+                target.display()
+            ));
+        };
+        let current_bytes =
+            fs::read(&target).map_err(|e| format!("failed reading '{}': {e}", target.display()))?;
+        let current_sha = crate::crypto::sha256_hex(&current_bytes);
+        #[cfg(unix)]
+        let current_mode = {
+            use std::os::unix::fs::PermissionsExt;
+            Some(tmeta.permissions().mode() & 0o777)
+        };
+        #[cfg(not(unix))]
+        let current_mode: Option<u32> = {
+            let _ = &tmeta;
+            None
+        };
+
+        let is_cursor_hooks = entry.rel_path == ".cursor/hooks.json";
+        if let Some(ref exp_tpl) = entry.managed_group {
+            let user_remaining = verify_managed_json_intact_and_extract_user_part(
+                &current_bytes,
+                exp_tpl,
+                is_cursor_hooks,
+                &target,
+            )?;
+            if entry.pre_existing {
+                let bak = backup_path_for(&target);
+                let Some(bmeta) =
+                    validate_optional_regular_file_lstat(&bak, "managed JSON backup")?
+                else {
+                    return Err(format!(
+                        "missing required backup '{}' for pre-existing '{}'",
+                        bak.display(),
+                        target.display()
+                    ));
+                };
+                let bak_bytes = fs::read(&bak)
+                    .map_err(|e| format!("failed reading '{}': {e}", bak.display()))?;
+                if let Some(ref exp_orig) = entry.orig_sha256
+                    && crate::crypto::sha256_hex(&bak_bytes) != *exp_orig
+                {
+                    return Err(format!(
+                        "backup integrity mismatch on '{}'; refusing destructive restore",
+                        bak.display()
+                    ));
+                }
+                #[cfg(unix)]
+                let bak_mode = {
+                    use std::os::unix::fs::PermissionsExt;
+                    Some(bmeta.permissions().mode() & 0o777)
+                };
+                #[cfg(not(unix))]
+                let bak_mode: Option<u32> = {
+                    let _ = &bmeta;
+                    None
+                };
+                let restore_mode = entry.orig_mode.or(bak_mode);
+                let orig_user = std::str::from_utf8(&bak_bytes)
+                    .ok()
+                    .and_then(|s| JsonValue::parse(s).ok())
+                    .and_then(|v| {
+                        extract_user_part_from_merged_json(&v, exp_tpl, is_cursor_hooks).ok()
+                    });
+
+                if current_sha == entry.deployed_sha256
+                    && orig_user.as_ref() == Some(&user_remaining)
+                {
+                    actions.push(PlannedDeactivation::RestoreBackup {
+                        target,
+                        bak,
+                        bytes: bak_bytes,
+                        mode: restore_mode,
+                    });
+                } else {
+                    let mut updated = String::new();
+                    format_json_pretty_2space(
+                        &JsonValue::Object(user_remaining.clone()),
+                        0,
+                        &mut updated,
+                    );
+                    updated.push('\n');
+                    actions.push(PlannedDeactivation::RewriteHooks {
+                        target,
+                        bak_to_remove: Some(bak),
+                        content: updated,
+                        mode: restore_mode.or(current_mode),
+                        remaining_count: user_remaining.len(),
+                    });
+                }
+            } else if user_remaining.is_empty() {
+                actions.push(PlannedDeactivation::RemoveCreated { target });
+            } else {
+                let mut updated = String::new();
+                format_json_pretty_2space(
+                    &JsonValue::Object(user_remaining.clone()),
+                    0,
+                    &mut updated,
+                );
+                updated.push('\n');
+                let mode = match current_mode {
+                    Some(0o444) | None => Some(0o644),
+                    other => other,
+                };
+                actions.push(PlannedDeactivation::RewriteHooks {
+                    target,
+                    bak_to_remove: None,
+                    content: updated,
+                    mode,
+                    remaining_count: user_remaining.len(),
+                });
+            }
+        } else {
+            if current_sha != entry.deployed_sha256 {
+                return Err(format!(
+                    "managed {plane_label} file '{}' was modified externally; preserving backups and provenance manifest",
+                    target.display()
+                ));
+            }
+            if entry.pre_existing {
+                let bak = backup_path_for(&target);
+                let Some(bmeta) = validate_optional_regular_file_lstat(&bak, "bundle backup")?
+                else {
+                    return Err(format!(
+                        "missing required backup '{}' for pre-existing '{}'",
+                        bak.display(),
+                        target.display()
+                    ));
+                };
+                let bak_bytes = fs::read(&bak)
+                    .map_err(|e| format!("failed reading '{}': {e}", bak.display()))?;
+                if let Some(ref exp_orig) = entry.orig_sha256
+                    && crate::crypto::sha256_hex(&bak_bytes) != *exp_orig
+                {
+                    return Err(format!(
+                        "backup integrity mismatch on '{}'; refusing destructive restore",
+                        bak.display()
+                    ));
+                }
+                #[cfg(unix)]
+                let bak_mode = {
+                    use std::os::unix::fs::PermissionsExt;
+                    Some(bmeta.permissions().mode() & 0o777)
+                };
+                #[cfg(not(unix))]
+                let bak_mode: Option<u32> = {
+                    let _ = &bmeta;
+                    None
+                };
+                actions.push(PlannedDeactivation::RestoreBackup {
+                    target,
+                    bak,
+                    bytes: bak_bytes,
+                    mode: entry.orig_mode.or(bak_mode),
+                });
+            } else {
+                actions.push(PlannedDeactivation::RemoveCreated { target });
+            }
+        }
+    }
+
+    Ok(Some(ValidatedBundleDeactivation {
+        root: root.to_path_buf(),
+        manifest_path,
+        created_dirs: manifest.created_dirs,
+        actions,
+    }))
+}
+
+fn execute_bundle_deactivation(
+    plan: ValidatedBundleDeactivation,
+    use_cp_semantics: bool,
+    dry_run: bool,
+) -> Result<Vec<String>, String> {
+    let mut log = Vec::new();
+    if dry_run {
+        for action in &plan.actions {
+            match action {
+                PlannedDeactivation::RestoreBackup { target, bak, .. } => {
+                    log.push(format!(
+                        "[dry-run] would restore '{}' -> '{}'",
+                        bak.display(),
+                        target.display()
+                    ));
+                }
+                PlannedDeactivation::RewriteHooks {
+                    target,
+                    remaining_count,
+                    ..
+                } => {
+                    log.push(format!(
+                        "[dry-run] would strip dotagent entries from '{}' while preserving {} user entry/group(s)",
+                        target.display(),
+                        remaining_count
+                    ));
+                }
+                PlannedDeactivation::RemoveCreated { target } => {
+                    log.push(format!(
+                        "[dry-run] would remove deployed '{}'",
+                        target.display()
+                    ));
+                }
+            }
+        }
+        log.push(format!(
+            "[dry-run] would remove provenance manifest '{}'",
+            plan.manifest_path.display()
+        ));
+        return Ok(log);
+    }
+
+    for action in plan.actions {
+        match action {
+            PlannedDeactivation::RestoreBackup {
+                target,
+                bak,
+                bytes,
+                mode,
+            } => {
+                write_target_bytes_with_mode(
+                    &target,
+                    &bytes,
+                    mode.unwrap_or(0o644),
+                    use_cp_semantics,
+                )?;
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    let _ = fs::set_permissions(&bak, fs::Permissions::from_mode(0o600));
+                }
+                fs::remove_file(&bak)
+                    .map_err(|e| format!("failed removing backup '{}': {e}", bak.display()))?;
+                log.push(format!(
+                    "[restore] restored pre-existing '{}' from backup",
+                    target.display()
+                ));
+            }
+            PlannedDeactivation::RewriteHooks {
+                target,
+                bak_to_remove,
+                content,
+                mode,
+                remaining_count,
+            } => {
+                write_target_bytes_with_mode(
+                    &target,
+                    content.as_bytes(),
+                    mode.unwrap_or(0o644),
+                    use_cp_semantics,
+                )?;
+                if let Some(bak) = bak_to_remove {
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::PermissionsExt;
+                        let _ = fs::set_permissions(&bak, fs::Permissions::from_mode(0o600));
+                    }
+                    fs::remove_file(&bak)
+                        .map_err(|e| format!("failed removing backup '{}': {e}", bak.display()))?;
+                }
+                log.push(format!(
+                    "[restore] removed dotagent managed settings from '{}' while preserving {} user entry/group(s)",
+                    target.display(),
+                    remaining_count
+                ));
+            }
+            PlannedDeactivation::RemoveCreated { target } => {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    let _ = fs::set_permissions(&target, fs::Permissions::from_mode(0o600));
+                }
+                fs::remove_file(&target)
+                    .map_err(|e| format!("failed removing '{}': {e}", target.display()))?;
+                log.push(format!("[remove] removed deployed '{}'", target.display()));
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(&plan.manifest_path, fs::Permissions::from_mode(0o600));
+    }
+    fs::remove_file(&plan.manifest_path).map_err(|e| {
+        format!(
+            "failed removing provenance manifest '{}': {e}",
+            plan.manifest_path.display()
+        )
+    })?;
+    for rel_d in plan.created_dirs.iter().rev() {
+        let dp = if rel_d.is_empty() {
+            plan.root.clone()
+        } else {
+            plan.root.join(rel_d)
+        };
+        let _ = fs::remove_dir(&dp);
+    }
+    Ok(log)
+}
+
 pub fn execute_deactivate(
     home: &Path,
     target_ws: &Path,
     dry_run: bool,
 ) -> Result<Vec<String>, String> {
-    let mut managed = vec![
-        target_ws.join("AGENTS.md"),
-        target_ws.join(".ignore"),
-        target_ws.join(".cursorignore"),
-        target_ws.join(".claude/settings.json"),
-        target_ws.join(".cursor/hooks.json"),
-        target_ws.join(".codex/config.toml"),
-        home.join(".gemini/GEMINI.md"),
-        home.join(".gemini/settings.json"),
-    ];
-    for af in AGENT_MD_FILES {
-        managed.push(target_ws.join(".claude/agents").join(af));
-        managed.push(target_ws.join(".cursor/agents").join(af));
-        managed.push(target_ws.join(".codex/agents").join(af));
-        managed.push(home.join(".gemini/agents").join(af));
-    }
+    validate_existing_regular_dir_lstat(home, "HOME directory")?;
+    let ws_plan =
+        plan_bundle_deactivation(target_ws, &workspace_managed_rel_paths(), "workspace", true)?;
+    let gemini_dir = home.join(".gemini");
+    let gemini_plan = plan_bundle_deactivation(
+        &gemini_dir,
+        &gemini_managed_rel_paths(),
+        "Gemini home",
+        false,
+    )?;
+    // Pre-validate Antigravity plane before mutating any plane so cross-plane deactivation is atomic.
+    let _ = execute_antigravity_deactivate(target_ws, true)?;
 
-    let mut log = deactivate_managed_list(&managed, dry_run)?;
+    let mut log = Vec::new();
+    match ws_plan {
+        Some(p) => log.extend(execute_bundle_deactivation(p, false, dry_run)?),
+        None => log.push(format!(
+            "[deactivate] No managed workspace bundle provenance in '{}'.",
+            target_ws.display()
+        )),
+    }
+    if let Some(gp) = gemini_plan {
+        log.extend(execute_bundle_deactivation(gp, true, dry_run)?);
+    }
     let ag_lines = execute_antigravity_deactivate(target_ws, dry_run)?;
     log.extend(ag_lines);
     log.push(format!(
@@ -1895,99 +3437,24 @@ pub fn execute_workspace_only_deactivate(
     target_ws: &Path,
     dry_run: bool,
 ) -> Result<Vec<String>, String> {
-    let mut managed = vec![
-        target_ws.join("AGENTS.md"),
-        target_ws.join(".ignore"),
-        target_ws.join(".cursorignore"),
-        target_ws.join(".claude/settings.json"),
-        target_ws.join(".cursor/hooks.json"),
-        target_ws.join(".codex/config.toml"),
-    ];
-    for af in AGENT_MD_FILES {
-        managed.push(target_ws.join(".claude/agents").join(af));
-        managed.push(target_ws.join(".cursor/agents").join(af));
-        managed.push(target_ws.join(".codex/agents").join(af));
+    let ws_plan =
+        plan_bundle_deactivation(target_ws, &workspace_managed_rel_paths(), "workspace", true)?;
+    let _ = execute_antigravity_deactivate(target_ws, true)?;
+
+    let mut log = Vec::new();
+    match ws_plan {
+        Some(p) => log.extend(execute_bundle_deactivation(p, false, dry_run)?),
+        None => log.push(format!(
+            "[deactivate] No managed workspace bundle provenance in '{}'.",
+            target_ws.display()
+        )),
     }
-    let mut log = deactivate_managed_list(&managed, dry_run)?;
     let ag_lines = execute_antigravity_deactivate(target_ws, dry_run)?;
     log.extend(ag_lines);
     log.push(format!(
         "[deactivate] Completed workspace-only deactivation for '{}'.",
         target_ws.display()
     ));
-    Ok(log)
-}
-
-fn deactivate_managed_list(managed: &[PathBuf], dry_run: bool) -> Result<Vec<String>, String> {
-    let mut log = Vec::new();
-    for target in managed {
-        reject_if_symlink(target, "managed file")?;
-        let bak = backup_path_for(target);
-        reject_if_symlink(&bak, "backup file")?;
-
-        if let Ok(bmeta) = fs::symlink_metadata(&bak) {
-            if !bmeta.file_type().is_file() {
-                return Err(format!(
-                    "refusing unexpected non-regular backup object '{}'",
-                    bak.display()
-                ));
-            }
-            if dry_run {
-                log.push(format!(
-                    "[dry-run] would restore backup '{}' -> '{}'",
-                    bak.display(),
-                    target.display()
-                ));
-            } else {
-                #[cfg(unix)]
-                if target.exists() {
-                    use std::os::unix::fs::PermissionsExt;
-                    let _ = fs::set_permissions(target, fs::Permissions::from_mode(0o600));
-                }
-                let bytes = fs::read(&bak)
-                    .map_err(|e| format!("failed reading backup '{}': {e}", bak.display()))?;
-                fs::write(target, bytes)
-                    .map_err(|e| format!("failed restoring '{}': {e}", target.display()))?;
-                #[cfg(unix)]
-                {
-                    let _ = fs::set_permissions(target, bmeta.permissions());
-                }
-                let _ = fs::remove_file(&bak);
-                log.push(format!(
-                    "[restore] restored pre-existing '{}' from backup",
-                    target.display()
-                ));
-            }
-        } else if target.is_file() {
-            #[cfg(unix)]
-            let is_deployed_ro = {
-                use std::os::unix::fs::PermissionsExt;
-                fs::metadata(target)
-                    .map(|m| (m.permissions().mode() & 0o777) == 0o444)
-                    .unwrap_or(false)
-            };
-            #[cfg(not(unix))]
-            let is_deployed_ro = false;
-
-            if is_deployed_ro {
-                if dry_run {
-                    log.push(format!(
-                        "[dry-run] would remove deployed 0444 file '{}'",
-                        target.display()
-                    ));
-                } else {
-                    #[cfg(unix)]
-                    {
-                        use std::os::unix::fs::PermissionsExt;
-                        let _ = fs::set_permissions(target, fs::Permissions::from_mode(0o600));
-                    }
-                    fs::remove_file(target)
-                        .map_err(|e| format!("failed removing '{}': {e}", target.display()))?;
-                    log.push(format!("[remove] removed deployed '{}'", target.display()));
-                }
-            }
-        }
-    }
     Ok(log)
 }
 
@@ -2141,11 +3608,27 @@ fn verify_guard_binary_path(candidate: &Path) -> Result<PathBuf, String> {
             ));
         }
     }
+    let mut header = Vec::with_capacity(4096);
+    {
+        use std::io::Read;
+        let f = fs::File::open(&abs)
+            .map_err(|e| format!("failed opening agent-guard binary '{}': {e}", abs.display()))?;
+        f.take(4096)
+            .read_to_end(&mut header)
+            .map_err(|e| format!("failed reading agent-guard binary '{}': {e}", abs.display()))?;
+    }
+    if !crate::enforcement_state::is_valid_host_native_executable(&header) {
+        return Err(format!(
+            "agent-guard binary '{}' is not a valid native executable for this host OS/arch",
+            abs.display()
+        ));
+    }
     let _ = quote_antigravity_path_arg(&abs, "agent-guard binary path")?;
     Ok(abs)
 }
 
 fn resolve_verified_guard_binary(bin_dir: &Path) -> Result<PathBuf, String> {
+    validate_existing_regular_dir_lstat(bin_dir, "guard binary directory")?;
     let primary = bin_dir.join("agent-guard");
     if fs::symlink_metadata(&primary).is_ok() {
         return verify_guard_binary_path(&primary);
@@ -2154,18 +3637,127 @@ fn resolve_verified_guard_binary(bin_dir: &Path) -> Result<PathBuf, String> {
     if fs::symlink_metadata(&secondary).is_ok() {
         return verify_guard_binary_path(&secondary);
     }
-    if let Ok(cur_exe) = std::env::current_exe()
-        && cur_exe
-            .file_name()
-            .and_then(|n| n.to_str())
-            .is_some_and(|n| n == "agent-guard" || n == "dotagent")
-    {
-        return verify_guard_binary_path(&cur_exe);
-    }
     Err(format!(
         "verified 'agent-guard' binary not found in '{}' (build and install binaries first or pass --bin-dir <dir>)",
         bin_dir.display()
     ))
+}
+
+fn is_safe_manifest_rel_path(rel: &str) -> bool {
+    !rel.is_empty()
+        && !rel.starts_with('/')
+        && !rel.ends_with('/')
+        && !rel.contains('\\')
+        && rel
+            .split('/')
+            .all(|seg| !seg.is_empty() && seg != "." && seg != "..")
+}
+
+fn verify_all_dist_manifest_sources(dotagent_root: &Path) -> Result<(), String> {
+    validate_existing_regular_dir_lstat(dotagent_root, "dotagent bundle root")?;
+    validate_existing_regular_dir_lstat(&dotagent_root.join("dist"), "dist directory")?;
+    let verify_dir = dotagent_root.join("dist-verify");
+    validate_existing_regular_dir_lstat(&verify_dir, "dist-verify directory")?;
+
+    let manifest_path = verify_dir.join("manifest.sha256");
+    if validate_optional_regular_file_lstat(&manifest_path, "dist-verify/manifest.sha256")?
+        .is_none()
+    {
+        return Err(
+            "missing required bundle integrity manifest 'dist-verify/manifest.sha256'".to_string(),
+        );
+    }
+    let raw_manifest = fs::read_to_string(&manifest_path)
+        .map_err(|e| format!("failed reading '{}': {e}", manifest_path.display()))?;
+    let mut expected_hashes = std::collections::BTreeMap::new();
+    for (line_idx, line) in raw_manifest.lines().enumerate() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let mut parts = trimmed.split_whitespace();
+        let (Some(h), Some(rel), None) = (parts.next(), parts.next(), parts.next()) else {
+            return Err(format!(
+                "malformed entry at line {} in 'dist-verify/manifest.sha256'",
+                line_idx + 1
+            ));
+        };
+        if h.len() != 64 || !h.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err(format!(
+                "invalid SHA-256 digest for '{rel}' at line {} in 'dist-verify/manifest.sha256'",
+                line_idx + 1
+            ));
+        }
+        if !is_safe_manifest_rel_path(rel) {
+            return Err(format!(
+                "unsafe path '{rel}' at line {} in 'dist-verify/manifest.sha256'",
+                line_idx + 1
+            ));
+        }
+        if expected_hashes
+            .insert(rel.to_string(), h.to_ascii_lowercase())
+            .is_some()
+        {
+            return Err(format!(
+                "duplicate SHA-256 entry for '{rel}' in 'dist-verify/manifest.sha256'"
+            ));
+        }
+    }
+    if expected_hashes.is_empty() {
+        return Err("bundle integrity manifest 'dist-verify/manifest.sha256' is empty".to_string());
+    }
+
+    let mut required = vec![
+        "dist/AGENTS.md".to_string(),
+        "dist/.ignore".to_string(),
+        "dist/cursor/.cursorignore".to_string(),
+        "dist/codex/config.toml".to_string(),
+        "dist/claude/settings.json".to_string(),
+        "dist/cursor/hooks.json".to_string(),
+        "dist/gemini/GEMINI.md".to_string(),
+        "dist/gemini/settings.json".to_string(),
+        "dist/antigravity/hooks.json".to_string(),
+        "dist/gitconfig.hardened".to_string(),
+    ];
+    for af in AGENT_MD_FILES {
+        for sub in [
+            "dist/claude/agents",
+            "dist/cursor/agents",
+            "dist/codex/agents",
+            "dist/gemini/agents",
+            "dist/antigravity/agents",
+        ] {
+            required.push(format!("{sub}/{af}"));
+        }
+    }
+    for req in &required {
+        if !expected_hashes.contains_key(req) {
+            return Err(format!(
+                "bundle manifest missing required SHA-256 entry for '{req}'"
+            ));
+        }
+    }
+
+    for (rel, exp) in &expected_hashes {
+        let mut cur = dotagent_root.to_path_buf();
+        let parts: Vec<&str> = rel.split('/').collect();
+        for dir_seg in &parts[..parts.len().saturating_sub(1)] {
+            cur.push(dir_seg);
+            validate_existing_regular_dir_lstat(&cur, "bundle parent directory")?;
+        }
+        let full = dotagent_root.join(rel);
+        if validate_optional_regular_file_lstat(&full, rel)?.is_none() {
+            return Err(format!("missing bundle artifact '{rel}'"));
+        }
+        let bytes = fs::read(&full).map_err(|e| format!("failed reading '{rel}': {e}"))?;
+        let actual = crate::crypto::sha256_hex(&bytes);
+        if &actual != exp {
+            return Err(format!(
+                "bundle integrity mismatch on '{rel}': expected {exp}, got {actual}"
+            ));
+        }
+    }
+    Ok(())
 }
 
 type AntigravityDistBundle = (String, Vec<(&'static str, Vec<u8>)>);
@@ -3431,8 +5023,22 @@ pub fn execute_antigravity_deactivate(
                     None
                 };
                 let restore_mode = entry.orig_mode.or(bak_mode);
+                let orig_siblings_match = std::str::from_utf8(&bak_bytes)
+                    .ok()
+                    .and_then(|s| JsonValue::parse(s).ok())
+                    .and_then(|v| {
+                        v.as_object().map(|obj| {
+                            let orig_rem: Vec<(String, JsonValue)> = obj
+                                .iter()
+                                .filter(|(k, _)| k != "dotagent-guard")
+                                .cloned()
+                                .collect();
+                            orig_rem == remaining
+                        })
+                    })
+                    .unwrap_or(false);
 
-                if current_sha == entry.deployed_sha256 {
+                if current_sha == entry.deployed_sha256 && orig_siblings_match {
                     plan.push(PlannedDeactivation::RestoreBackup {
                         target,
                         bak,
@@ -3451,7 +5057,7 @@ pub fn execute_antigravity_deactivate(
                         target,
                         bak_to_remove: Some(bak),
                         content: updated,
-                        mode: current_mode.or(restore_mode),
+                        mode: restore_mode.or(current_mode),
                         remaining_count: remaining.len(),
                     });
                 }

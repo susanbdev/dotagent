@@ -56,8 +56,6 @@ class ActivateTests(unittest.TestCase):
         result = self.run_activate("--from-prebuilt", self.prebuilt, "--prebuilt-sums", self.write_sums(), self.home)
         self.assertEqual(result.returncode, 0, result.stderr)
         for name in fx.BINARIES:
-            if name == "agent-guard-sh":
-                continue
             self.assertEqual(fx.mode_of(os.path.join(self.home, ".local", "bin", name)), 0o555, name)
         with open(os.path.join(self.home, ".stub.log"), encoding="ascii") as handle:
             log = handle.read()

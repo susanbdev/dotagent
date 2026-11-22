@@ -74,7 +74,7 @@ verify_attestations() {
     local tag="$1" dir="$2" digest="$3" asset
     for asset in "${dir}"/*; do
         case "${asset##*/}" in
-            *.sshsig|SHA256SUMS.macos) continue ;;
+            *.sig|*.sshsig|SHA256SUMS.macos|dotagent-"${tag}"-universal-apple-darwin.pkg) continue ;;
         esac
         note "attestation: ${asset##*/}"
         gh attestation verify "${asset}" --repo "${REPO}" \
@@ -201,14 +201,22 @@ pem_spki() {
 }
 
 sign_file() {
-    local file="$1" pub_pem="$2" slot="${DOTAGENT_PIV_SLOT:-9a}"
+    local file="$1" pub_pem="$2" slot="${DOTAGENT_PIV_SLOT:-9a}" piv_id
     rm -f "${file}.sig" "${file}.sha256"
     if command -v yubico-piv-tool >/dev/null 2>&1; then
         openssl dgst -sha256 -binary -out "${file}.sha256" "${file}"
         yubico-piv-tool -s "${slot}" -a verify-pin -a sign -A ECCP256 -i "${file}.sha256" -o "${file}.sig"
         rm -f "${file}.sha256"
     elif command -v pkcs11-tool >/dev/null 2>&1; then
-        pkcs11-tool --sign --login --mechanism ECDSA-SHA256 --input-file "${file}" --output-file "${file}.sig"
+        case "${slot}" in
+            9a) piv_id="01" ;;
+            9c) piv_id="02" ;;
+            9d) piv_id="03" ;;
+            9e) piv_id="04" ;;
+            *) piv_id="${slot}" ;;
+        esac
+        pkcs11-tool --sign --login --id "${piv_id}" --mechanism ECDSA-SHA256 \
+            --signature-format openssl --input-file "${file}" --output-file "${file}.sig"
     else
         die "install yubico-piv-tool or pkcs11-tool (OpenSC) to sign with your YubiKey PIV slot"
     fi
@@ -222,7 +230,7 @@ main() {
     [[ "${tag}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "tag must look like v1.2.3"
     for t in git gh openssl tar cut tr grep sed; do require_tool "${t}"; done
 
-    cd "$(dirname "${BASH_SOURCE[0]}")/.."
+    cd -P -- "$(dirname "${BASH_SOURCE[0]}")/.."
     local signer_pub="${DOTAGENT_SIGNER_PUB:-packaging/release-signer.pub}"
     [[ -f "${signer_pub}" ]] || die "missing signer pubkey ${signer_pub}"
     local expected_spki
@@ -234,6 +242,7 @@ main() {
     source_digest="$(git rev-parse "${tag}^{commit}")"
 
     local state="${HOME}/.local/state/dotagent-release" dir
+    [[ ! -L "${state}" ]] || die "state path ${state} must not be a symlink"
     mkdir -p "${state}"
     chmod 0700 "${state}"
     dir="${state}/${tag}"

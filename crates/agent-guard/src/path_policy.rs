@@ -1135,6 +1135,7 @@ fn check_immutable_control_plane(repo_rel: &str) -> Result<(), PathViolation> {
         "agents.md"
             | "review.md"
             | ".agent-policy.json"
+            | ".dotagent-manifest.json"
             | ".dotagent-smoke.toml"
             | ".gitconfig"
             | ".gitattributes"
@@ -1145,6 +1146,7 @@ fn check_immutable_control_plane(repo_rel: &str) -> Result<(), PathViolation> {
     ) || matches!(
         file_name,
         ".gitattributes"
+            | ".dotagent-manifest.json"
             | ".dotagent-smoke.toml"
             | ".envrc"
             | ".npmrc"
@@ -1158,7 +1160,8 @@ fn check_immutable_control_plane(repo_rel: &str) -> Result<(), PathViolation> {
             | ".breadcrumbs.jsonl"
             | "plan.lock.json"
             | "work_ledger.jsonl"
-    ) {
+    ) || file_name.ends_with(".dotagent.bak")
+    {
         return Err(PathViolation {
             code: "IMMUTABLE_CONTROL_PLANE",
             detail: format!(
