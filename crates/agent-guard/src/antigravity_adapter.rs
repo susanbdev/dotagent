@@ -9,15 +9,19 @@
 //! Responsibilities strictly bounded to protocol translation:
 //! `Antigravity stdin JSON -> typed normalized request -> authoritative agent-guard engine -> Antigravity stdout JSON`.
 //!
-//! Security invariants:
-//! - Bounded input (`<= 256 KiB`), strict UTF-8, and RFC 7493 duplicate-key-rejecting JSON parsing.
-//! - Mandatory validation of `conversationId`, `workspacePaths`, `toolCall.name`, `toolCall.args`, and lifecycle fields.
-//! - Fail-closed workspace identity verification across single and multi-workspace payloads.
-//! - Zero duplicated command/path/Unicode/ledger policy logic: delegates all security decisions to
-//!   `handle_pre_tool_hook`, `handle_post_tool_hook`, `handle_post_edit_with_session`, and `handle_user_prompt_hook`.
-//! - Host-compatible exit code `0` for all valid protocol responses (including authoritative `deny` and
-//!   `terminate` verdicts) so the Antigravity host parses and enforces denials rather than treating a
-//!   non-zero subprocess exit as a failed hook. Diagnostics are written exclusively to `stderr`.
+//! Two-capability verification boundary:
+//! - **Capability 1 -- Rust Security Kernel & Protocol Adapter (`verified`):** Direct CLI and wire-contract
+//!   suites verify bounded input (`<= 256 KiB`), strict UTF-8, RFC 7493 duplicate-key-rejecting JSON,
+//!   fail-closed `conversationId`/`workspacePaths`/`toolCall` validation, delegation to `handle_pre_tool_hook`,
+//!   `handle_post_tool_hook`, `handle_post_edit_with_session`, and `handle_user_prompt_hook`, and exit-`0`
+//!   Antigravity decision emission (`allow`, `overwrite`, `deny`, `terminate`, `block`) with diagnostics on `stderr`.
+//! - **Capability 2 -- Host Runtime Mediation (`requires observed live tool-call traversal`):** Static
+//!   deployment of `.agents/hooks.json` and `agent-guard` never proves runtime protection on its own.
+//!   - **Antigravity Remote Agents:** **Not enforced in the tested configuration** (prohibited shell and native
+//!     file canary operations executed with zero observed adapter trace records; this proves enforcement did not
+//!     occur in the tested session without establishing whether the host failed configuration discovery, omitted
+//!     hook dispatch, or intentionally excludes hooks in that execution mode).
+//!   - **Local Antigravity IDE / CLI:** **Unverified** until dedicated live host mediation is tested and observed.
 
 use std::fs;
 use std::io::{self, Read, Write};

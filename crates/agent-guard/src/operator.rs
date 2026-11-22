@@ -61,13 +61,48 @@ struct DoctorCheck {
 }
 
 pub fn run_doctor_cli(args: &[String], cwd: &Path) -> ExitCode {
-    let json_mode = args.iter().any(|a| a == "--json");
-    let allow_degraded = args.iter().any(|a| a == "--allow-degraded");
-    let target_dir = args
-        .iter()
-        .find(|a| !a.starts_with('-'))
-        .map(PathBuf::from)
-        .unwrap_or_else(|| resolve_repo_root(cwd));
+    let mut json_mode = false;
+    let mut allow_degraded = false;
+    let mut require_mediation = false;
+    let mut session_override: Option<String> = None;
+    let mut target_dir_opt: Option<PathBuf> = None;
+
+    let mut i = 0usize;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--json" => {
+                json_mode = true;
+                i += 1;
+            }
+            "--allow-degraded" => {
+                allow_degraded = true;
+                i += 1;
+            }
+            "--require-mediation" => {
+                require_mediation = true;
+                i += 1;
+            }
+            "--session" => {
+                let Some(sid) = args.get(i + 1) else {
+                    eprintln!("[doctor] missing session id after --session");
+                    return ExitCode::from(2);
+                };
+                session_override = Some(sid.clone());
+                i += 2;
+            }
+            other if !other.starts_with('-') && target_dir_opt.is_none() => {
+                target_dir_opt = Some(PathBuf::from(other));
+                i += 1;
+            }
+            other => {
+                eprintln!(
+                    "[doctor] unrecognized argument '{other}' (usage: `dotagent doctor [--json] [--allow-degraded] [--require-mediation] [--session <id>] [workspace]`)"
+                );
+                return ExitCode::from(2);
+            }
+        }
+    }
+    let target_dir = target_dir_opt.unwrap_or_else(|| resolve_repo_root(cwd));
 
     let mut checks = Vec::with_capacity(7);
 
@@ -140,7 +175,10 @@ pub fn run_doctor_cli(args: &[String], cwd: &Path) -> ExitCode {
     }
 
     // 6. State directory & active session circuit-breaker health
-    checks.push(check_session_state_health(&target_dir));
+    checks.push(check_session_state_health(
+        &target_dir,
+        session_override.as_deref(),
+    ));
 
     // 7. Swarm coordinator & plan lock status (informational)
     let plan_locked = plan_lock_state_path(&target_dir)
@@ -158,7 +196,21 @@ pub fn run_doctor_cli(args: &[String], cwd: &Path) -> ExitCode {
         ),
     });
 
-    let all_ok = checks.iter().all(|c| c.ok);
+    let static_ok = checks.iter().all(|c| c.ok);
+    let (sid, mediated_calls) = probe_session_mediation(&target_dir, session_override.as_deref());
+    let mediation_observed = mediated_calls > 0;
+    let runtime_protected = static_ok && mediation_observed;
+    let overall_ok = if require_mediation {
+        runtime_protected
+    } else {
+        static_ok
+    };
+    let mediation_status = if mediation_observed {
+        "observed"
+    } else {
+        "unverified"
+    };
+
     if json_mode {
         let items: Vec<JsonValue> = checks
             .iter()
@@ -171,7 +223,23 @@ pub fn run_doctor_cli(args: &[String], cwd: &Path) -> ExitCode {
             })
             .collect();
         let report = JsonValue::Object(vec![
-            ("healthy".to_string(), JsonValue::Bool(all_ok)),
+            ("healthy".to_string(), JsonValue::Bool(overall_ok)),
+            (
+                "static_controls_healthy".to_string(),
+                JsonValue::Bool(static_ok),
+            ),
+            (
+                "host_mediation".to_string(),
+                JsonValue::Str(mediation_status.to_string()),
+            ),
+            (
+                "mediated_tool_calls".to_string(),
+                JsonValue::Uint(mediated_calls),
+            ),
+            (
+                "runtime_protected".to_string(),
+                JsonValue::Bool(runtime_protected),
+            ),
             (
                 "workspace".to_string(),
                 JsonValue::Str(target_dir.display().to_string()),
@@ -189,16 +257,31 @@ pub fn run_doctor_cli(args: &[String], cwd: &Path) -> ExitCode {
             let tag = if c.ok { "[PASS]" } else { "[FAIL]" };
             println!("  {tag} {:<22} {}", c.name, c.detail);
         }
-        if all_ok {
-            println!("Result: HEALTHY (all required zero-trust controls verified)");
+        if static_ok {
+            println!(
+                "Static controls: HEALTHY (kernel and configuration verified; does not prove live host mediation)"
+            );
         } else {
             eprintln!(
-                "Result: UNHEALTHY (one or more required security controls failed; run `dotagent explain <CODE>` for guidance)"
+                "Static controls: UNHEALTHY (one or more required security controls failed; run `dotagent explain <CODE>` for guidance)"
+            );
+        }
+        if mediation_observed {
+            println!(
+                "Host mediation:  OBSERVED ({mediated_calls} mediated tool call(s) recorded for session '{sid}')"
+            );
+        } else if require_mediation {
+            eprintln!(
+                "Host mediation:  UNVERIFIED (0 mediated tool calls observed for session '{sid}'; failing --require-mediation because config/binary presence alone does not protect a runtime)"
+            );
+        } else {
+            println!(
+                "Host mediation:  UNVERIFIED (0 mediated tool calls observed for session '{sid}'; config/binary presence alone does not protect a runtime)"
             );
         }
     }
 
-    if all_ok {
+    if overall_ok {
         ExitCode::SUCCESS
     } else {
         ExitCode::from(2)
@@ -272,7 +355,24 @@ fn check_binaries_health() -> DoctorCheck {
     }
 }
 
-fn check_session_state_health(repo_root: &Path) -> DoctorCheck {
+fn resolve_doctor_session_id(session_override: Option<&str>) -> String {
+    match session_override {
+        Some(s) if !s.trim().is_empty() => s.trim().to_string(),
+        _ => std::env::var("AGENT_GUARD_SESSION_ID").unwrap_or_else(|_| "default".to_string()),
+    }
+}
+
+fn probe_session_mediation(repo_root: &Path, session_override: Option<&str>) -> (String, u64) {
+    let sid = resolve_doctor_session_id(session_override);
+    let session_file = crate::traversal_ledger::session_ledger_path(repo_root, &sid);
+    if !session_file.is_file() {
+        return (sid, 0);
+    }
+    let ledger = SessionLedger::load_or_create(repo_root, &sid);
+    (sid, ledger.tool_calls as u64)
+}
+
+fn check_session_state_health(repo_root: &Path, session_override: Option<&str>) -> DoctorCheck {
     let base = state_base_dir();
     if let Ok(meta) = fs::symlink_metadata(&base)
         && meta.file_type().is_symlink()
@@ -283,13 +383,13 @@ fn check_session_state_health(repo_root: &Path) -> DoctorCheck {
             detail: format!("state directory '{}' is a symlink", base.display()),
         };
     }
-    let sid = std::env::var("AGENT_GUARD_SESSION_ID").unwrap_or_else(|_| "default".to_string());
+    let sid = resolve_doctor_session_id(session_override);
     let session_file = crate::traversal_ledger::session_ledger_path(repo_root, &sid);
     if !session_file.exists() {
         return DoctorCheck {
             name: "session_state",
             ok: true,
-            detail: format!("clean (session='{sid}', no active halts)"),
+            detail: format!("clean (session='{sid}', no active halts, mediated_calls=0)"),
         };
     }
     let ledger = SessionLedger::load_or_create(repo_root, &sid);
@@ -2573,7 +2673,7 @@ pub fn execute_antigravity_activate_with_trace(
     )?;
 
     log.push(format!(
-        "[activate] Workspace-scoped Antigravity hooks active for '{}' (pinned binary='{}', global config untouched).",
+        "[activate] Installed workspace Antigravity hook configuration for '{}' (pinned binary='{}', global config untouched; host_mediation=unverified until live tool-call traversal is observed; Antigravity Remote Agents is not enforced in tested configuration).",
         target_ws.display(),
         verified_guard.display()
     ));
@@ -2610,7 +2710,7 @@ fn activate_workspace_scoped_all(
         }
     }
     log.push(format!(
-        "[activate] Workspace-scoped harness bundle active for '{}' (global config untouched).",
+        "[activate] Installed workspace-scoped harness configuration for '{}' (global config untouched; host_mediation=unverified until live tool-call traversal is observed).",
         target_ws.display()
     ));
     Ok(log)

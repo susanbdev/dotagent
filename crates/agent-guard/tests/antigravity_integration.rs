@@ -1406,3 +1406,183 @@ fn test_23_authoritative_plugin_lattice_exact_match_denial_for_shell_and_file_to
         }
     }
 }
+
+#[test]
+fn test_24_deployed_config_and_binary_never_report_runtime_protected_until_live_mediation_observed()
+{
+    let ws = IsolatedWorkspace::create("mediation_gate");
+    fs::write(ws.repo_dir.join(".git/config"), "[core]\n\tbare = false\n")
+        .expect("write .git/config");
+    let dotagent_root = repo_root_of_dotagent();
+    let hardened_gitconfig = dotagent_root.join("dist/gitconfig.hardened");
+    let bin_dir = agent_guard_bin_path()
+        .parent()
+        .expect("bin parent")
+        .to_path_buf();
+
+    // 1. Deploy Antigravity hook config and verify activation never claims live runtime protection
+    let act_lines = execute_antigravity_activate(&bin_dir, &dotagent_root, &ws.repo_dir, false)
+        .expect("activate antigravity config");
+    let joined_act = act_lines.join("\n");
+    assert!(
+        joined_act.contains("host_mediation=unverified"),
+        "activation must report host_mediation=unverified: {joined_act}"
+    );
+    assert!(
+        joined_act.contains("Antigravity Remote Agents is not enforced in tested configuration"),
+        "activation must document Remote Agents status: {joined_act}"
+    );
+    assert!(
+        !joined_act.contains("hooks active"),
+        "activation must not claim hooks are active from static file installation: {joined_act}"
+    );
+    assert!(ws.repo_dir.join(".agents/hooks.json").is_file());
+
+    // 2. With config + binary deployed on disk but 0 live tool calls mediated:
+    //    - `doctor --json` reports `static_controls_healthy = true`, `host_mediation = "unverified"`, `runtime_protected = false`.
+    //    - `doctor --json --require-mediation` fails closed with exit code 2!
+    let git_env_val = hardened_gitconfig.to_string_lossy().into_owned();
+    let doc_env = [
+        ("GIT_CONFIG_GLOBAL", git_env_val.as_str()),
+        ("GIT_CONFIG_NOSYSTEM", "1"),
+    ];
+    let (doc_code, doc_out, doc_err) = invoke_guard_cli(
+        &ws,
+        &[
+            "doctor",
+            "--json",
+            "--allow-degraded",
+            "--session",
+            "conv_med_24",
+            &ws.repo_dir.to_string_lossy(),
+        ],
+        b"",
+        &doc_env,
+    );
+    assert_eq!(
+        doc_code, 0,
+        "static doctor failed: out={doc_out} err={doc_err}"
+    );
+    let doc_json = JsonValue::parse(doc_out.trim()).expect("doctor json");
+    assert_eq!(
+        doc_json
+            .get("static_controls_healthy")
+            .and_then(JsonValue::as_bool),
+        Some(true)
+    );
+    assert_eq!(
+        doc_json.get("host_mediation").and_then(JsonValue::as_str),
+        Some("unverified")
+    );
+    assert_eq!(
+        doc_json
+            .get("mediated_tool_calls")
+            .and_then(JsonValue::as_u64),
+        Some(0)
+    );
+    assert_eq!(
+        doc_json
+            .get("runtime_protected")
+            .and_then(JsonValue::as_bool),
+        Some(false),
+        "static config and executable existence alone must never report runtime_protected=true"
+    );
+
+    let (req_code_before, req_out_before, _) = invoke_guard_cli(
+        &ws,
+        &[
+            "doctor",
+            "--json",
+            "--allow-degraded",
+            "--require-mediation",
+            "--session",
+            "conv_med_24",
+            &ws.repo_dir.to_string_lossy(),
+        ],
+        b"",
+        &doc_env,
+    );
+    assert_eq!(
+        req_code_before, 2,
+        "--require-mediation must fail closed before live mediation occurs: {req_out_before}"
+    );
+    let req_json_before = JsonValue::parse(req_out_before.trim()).expect("req_before json");
+    assert_eq!(
+        req_json_before.get("healthy").and_then(JsonValue::as_bool),
+        Some(false)
+    );
+    assert_eq!(
+        req_json_before
+            .get("runtime_protected")
+            .and_then(JsonValue::as_bool),
+        Some(false)
+    );
+
+    // 3. Only after a real PreToolUse call traverses `agent-guard` for `conv_med_24` does `runtime_protected` become true!
+    let live_call = format!(
+        r#"{{"conversationId":"conv_med_24","workspacePaths":[{}],"toolCall":{{"name":"view_file","args":{{"AbsolutePath":"{}/src/lib.rs","StartLine":1,"EndLine":5}}}},"stepIdx":0}}"#,
+        ws.ws_json(),
+        ws.repo_dir.display()
+    );
+    let (h_code, h_out, _) = invoke_guard_cli(
+        &ws,
+        &[
+            "antigravity-hook",
+            "PreToolUse",
+            "--workspace",
+            &ws.repo_dir.to_string_lossy(),
+        ],
+        live_call.as_bytes(),
+        &doc_env,
+    );
+    assert_eq!(h_code, 0);
+    assert_eq!(
+        JsonValue::parse(h_out.trim())
+            .expect("hook json")
+            .get("decision")
+            .and_then(JsonValue::as_str),
+        Some("allow")
+    );
+
+    let (req_code_after, req_out_after, req_err_after) = invoke_guard_cli(
+        &ws,
+        &[
+            "doctor",
+            "--json",
+            "--allow-degraded",
+            "--require-mediation",
+            "--session",
+            "conv_med_24",
+            &ws.repo_dir.to_string_lossy(),
+        ],
+        b"",
+        &doc_env,
+    );
+    assert_eq!(
+        req_code_after, 0,
+        "--require-mediation must pass once live mediation is observed: out={req_out_after} err={req_err_after}"
+    );
+    let req_json_after = JsonValue::parse(req_out_after.trim()).expect("req_after json");
+    assert_eq!(
+        req_json_after.get("healthy").and_then(JsonValue::as_bool),
+        Some(true)
+    );
+    assert_eq!(
+        req_json_after
+            .get("host_mediation")
+            .and_then(JsonValue::as_str),
+        Some("observed")
+    );
+    assert_eq!(
+        req_json_after
+            .get("mediated_tool_calls")
+            .and_then(JsonValue::as_u64),
+        Some(1)
+    );
+    assert_eq!(
+        req_json_after
+            .get("runtime_protected")
+            .and_then(JsonValue::as_bool),
+        Some(true)
+    );
+}
