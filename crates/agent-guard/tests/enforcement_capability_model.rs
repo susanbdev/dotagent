@@ -1456,9 +1456,19 @@ fn test_16_strict_hook_token_parsing_post_tool_use_check_quoted_paths_and_witnes
 
     // 16d: Legacy `pre-tool` Gemini denial (`BeforeTool`) must NOT cross-populate a pending `claude` challenge!
     fs::create_dir_all(spaced_ws.join(".claude")).expect("mkdir .claude");
+    let gbin = sb.bin_dir.join("agent-guard");
+    let gbin_d = gbin.display();
     let claude_cfg = format!(
-        "{{\"hooks\":{{\"PreToolUse\":[{{\"matcher\":\"*\",\"hooks\":[{{\"type\":\"command\",\"command\":\"{} pre-tool\"}}]}}]}}}}\n",
-        sb.bin_dir.join("agent-guard").display()
+        concat!(
+            "{{\"hooks\":{{",
+            "\"UserPromptSubmit\":[{{\"hooks\":[{{\"type\":\"command\",\"command\":\"{0} user-prompt\"}}]}}],",
+            "\"PreToolUse\":[{{\"matcher\":\"*\",\"hooks\":[{{\"type\":\"command\",\"command\":\"{0} pre-tool\"}}]}}],",
+            "\"PostToolUse\":[{{\"matcher\":\"*\",\"hooks\":[{{\"type\":\"command\",\"command\":\"{0} post-tool\"}}]}}],",
+            "\"PreCompact\":[{{\"hooks\":[{{\"type\":\"command\",\"command\":\"{0} pre-compact\"}}]}}],",
+            "\"Stop\":[{{\"hooks\":[{{\"type\":\"command\",\"command\":\"{0} on-stop\"}}]}}]",
+            "}}}}\n"
+        ),
+        gbin_d
     );
     fs::write(spaced_ws.join(".claude/settings.json"), claude_cfg).expect("write claude settings");
     let obs_seed = [0x42u8; 32];
@@ -1537,6 +1547,402 @@ fn test_16_strict_hook_token_parsing_post_tool_use_check_quoted_paths_and_witnes
     assert_eq!(
         JsonValue::parse(cc_out.trim())
             .expect("cc json")
+            .get("code")
+            .and_then(JsonValue::as_str),
+        Some("HOOK_NOT_INVOKED")
+    );
+}
+
+#[test]
+fn test_17_phase2_multi_harness_sandbox_probe_and_witness_regressions() {
+    let sb = CapabilitySandbox::create("t17_phase2_reg");
+    let snap = ProbeSnapshot {
+        execution_mode: ExecutionMode::LocalHost,
+        kernel_fs_mode: KernelSandboxMode::LinuxLandlockEnforced,
+        seccomp_net: Some(true),
+        netns_unshare: true,
+        binary_version_override: None,
+    };
+
+    // 17a: Paths containing BOTH spaces and apostrophes (`'`) activate and validate cleanly across all 5 adapters!
+    let apos_ws = sb.base.join("alice's repo");
+    let apos_bin = sb.base.join("alice's bin");
+    let apos_home = sb.base.join("alice's home");
+    fs::create_dir_all(apos_ws.join(".git")).expect("mkdir apos .git");
+    fs::create_dir_all(&apos_bin).expect("mkdir apos bin");
+    fs::create_dir_all(&apos_home).expect("mkdir apos home");
+    fs::write(apos_ws.join("AGENTS.md"), "# AGENTS.md\n").expect("write apos AGENTS.md");
+    for name in ["agent-guard", "dotagent"] {
+        let src = if name == "agent-guard" {
+            PathBuf::from(env!("CARGO_BIN_EXE_agent-guard"))
+        } else {
+            PathBuf::from(env!("CARGO_BIN_EXE_dotagent"))
+        };
+        let dst = apos_bin.join(name);
+        fs::copy(src, &dst).expect("copy bin");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&dst, fs::Permissions::from_mode(0o755)).expect("chmod 0755");
+        }
+    }
+
+    let act_out = Command::new(apos_bin.join("dotagent"))
+        .args(["activate", "--dotagent-root"])
+        .arg(sb.dotagent_root())
+        .arg("--workspace")
+        .arg(&apos_ws)
+        .arg("--bin-dir")
+        .arg(&apos_bin)
+        .env("HOME", &apos_home)
+        .env("AGENT_GUARD_STATE_DIR", &sb.state_dir)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .output()
+        .expect("activate all on apostrophe paths");
+    assert!(
+        act_out.status.success(),
+        "activate failed: {}",
+        String::from_utf8_lossy(&act_out.stderr)
+    );
+
+    for ad in ["antigravity", "claude", "cursor", "codex", "gemini"] {
+        let st_out = Command::new(apos_bin.join("dotagent"))
+            .args([
+                "status",
+                "--json",
+                "--execution-mode",
+                "local",
+                "--adapter",
+                ad,
+                "--bin-dir",
+            ])
+            .arg(&apos_bin)
+            .arg(&apos_ws)
+            .env("HOME", &apos_home)
+            .env("AGENT_GUARD_STATE_DIR", &sb.state_dir)
+            .output()
+            .expect("status adapter");
+        assert!(
+            st_out.status.success(),
+            "status failed for {ad}: {}",
+            String::from_utf8_lossy(&st_out.stderr)
+        );
+        let sj = JsonValue::parse(&String::from_utf8_lossy(&st_out.stdout)).expect("parse status");
+        assert_eq!(
+            sj.get("configured")
+                .and_then(|v| v.get("state"))
+                .and_then(JsonValue::as_str),
+            Some("valid"),
+            "adapter {ad} should be valid on apostrophe path: {}",
+            String::from_utf8_lossy(&st_out.stdout)
+        );
+        if ad == "codex" {
+            assert_eq!(
+                sj.get("host_enforced")
+                    .and_then(|v| v.get("reason_code"))
+                    .and_then(JsonValue::as_str),
+                Some("ADAPTER_LACKS_PRETOOL_HOOK")
+            );
+        }
+    }
+
+    // 17b: Missing/disabled hooks and invalid Codex TOML are rejected across claude, cursor, gemini, codex, and antigravity!
+    let cached_inst = agent_guard::enforcement_state::evaluate_install_state(&apos_bin, "2.1.0");
+    let other_ws = sb.base.join("other_ws");
+    fs::create_dir_all(other_ws.join(".git")).expect("mkdir other .git");
+    fs::create_dir_all(other_ws.join(".agents")).expect("mkdir other .agents");
+    fs::write(other_ws.join("AGENTS.md"), "# AGENTS.md\n").expect("other AGENTS.md");
+    // Copying apos_ws's `.agents/hooks.json` into `other_ws` must fail with `CONFIG_WORKSPACE_MISMATCH`
+    fs::copy(
+        apos_ws.join(".agents/hooks.json"),
+        other_ws.join(".agents/hooks.json"),
+    )
+    .expect("copy hooks.json across workspaces");
+    let cfg_ws_mismatch = agent_guard::enforcement_state::evaluate_config_state(
+        &other_ws,
+        "antigravity",
+        &cached_inst,
+    );
+    assert!(matches!(
+        cfg_ws_mismatch,
+        ConfigState::Invalid {
+            reason_code: "CONFIG_WORKSPACE_MISMATCH",
+            ..
+        }
+    ));
+
+    // Claude `disableAllHooks: true` and missing `PostToolUse` fail closed
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        for rel in [
+            ".claude/settings.json",
+            ".cursor/hooks.json",
+            ".codex/config.toml",
+        ] {
+            fs::set_permissions(apos_ws.join(rel), fs::Permissions::from_mode(0o644))
+                .expect("chmod writable");
+        }
+    }
+    fs::write(
+        apos_ws.join(".claude/settings.json"),
+        format!(
+            "{{\"disableAllHooks\":true,\"_note\":\"{}\"}}\n",
+            apos_bin.join("agent-guard").display()
+        ),
+    )
+    .expect("write disabled claude");
+    let cfg_claude_dis =
+        agent_guard::enforcement_state::evaluate_config_state(&apos_ws, "claude", &cached_inst);
+    assert!(matches!(
+        cfg_claude_dis,
+        ConfigState::Invalid {
+            reason_code: "CONFIG_HOOKS_DISABLED",
+            ..
+        }
+    ));
+
+    // Cursor missing `afterShellExecution` fails closed
+    fs::write(
+        apos_ws.join(".cursor/hooks.json"),
+        format!(
+            "{{\"version\":1,\"hooks\":{{\"beforeShellExecution\":[{{\"command\":\"'{}' pre-tool\"}}]}}}}\n",
+            apos_bin.join("agent-guard").display()
+        ),
+    )
+    .expect("write incomplete cursor");
+    let cfg_cursor_inc =
+        agent_guard::enforcement_state::evaluate_config_state(&apos_ws, "cursor", &cached_inst);
+    assert!(matches!(
+        cfg_cursor_inc,
+        ConfigState::Invalid {
+            reason_code: "CONFIG_PROTOCOL_INCOMPATIBLE",
+            ..
+        }
+    ));
+
+    // Codex malformed TOML and `danger-full-access` fail closed
+    fs::write(apos_ws.join(".codex/config.toml"), ":::not valid toml[[[\n")
+        .expect("write bad toml");
+    let cfg_codex_bad =
+        agent_guard::enforcement_state::evaluate_config_state(&apos_ws, "codex", &cached_inst);
+    assert!(matches!(
+        cfg_codex_bad,
+        ConfigState::Invalid {
+            reason_code: "CONFIG_MALFORMED_TOML",
+            ..
+        }
+    ));
+    fs::write(
+        apos_ws.join(".codex/config.toml"),
+        "sandbox_mode = \"danger-full-access\"\nnotify = [\"agent-guard\", \"on-stop\"]\n",
+    )
+    .expect("write danger codex");
+    let cfg_codex_danger =
+        agent_guard::enforcement_state::evaluate_config_state(&apos_ws, "codex", &cached_inst);
+    assert!(matches!(
+        cfg_codex_danger,
+        ConfigState::Invalid {
+            reason_code: "CONFIG_HOOKS_DISABLED",
+            ..
+        }
+    ));
+
+    // Non-ELF/Mach-O shell script masquerading as `agent-guard` fails `InstallState` (`BINARY_INVALID_FORMAT`)
+    let fake_bin_dir = sb.base.join("fake_bin");
+    fs::create_dir_all(&fake_bin_dir).expect("mkdir fake_bin");
+    let fake_guard = fake_bin_dir.join("agent-guard");
+    fs::write(&fake_guard, b"#!/bin/sh\nexit 0\n").expect("write fake script");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&fake_guard, fs::Permissions::from_mode(0o555)).expect("chmod 0555");
+    }
+    let rep_fake_bin = evaluate_enforcement_report(
+        &sb.repo_dir,
+        &fake_bin_dir,
+        "antigravity",
+        None,
+        None,
+        &snap,
+    );
+    assert!(matches!(
+        rep_fake_bin.installed,
+        InstallState::IntegrityFailed {
+            reason_code: "BINARY_INVALID_FORMAT",
+            ..
+        }
+    ));
+
+    // 17c: Ancestor rogue `agent-guard` executable above `current_exe` is NEVER executed by sandbox probes!
+    let probe_tree = sb.base.join("probe_anc");
+    let child_bin_dir = probe_tree.join("nested/bin");
+    fs::create_dir_all(&child_bin_dir).expect("mkdir nested/bin");
+    let marker_file = probe_tree.join("rogue_executed.marker");
+    let rogue_anc = probe_tree.join("agent-guard");
+    fs::write(
+        &rogue_anc,
+        format!(
+            "#!/bin/sh\nprintf 'pwned' > '{}'\necho linux-landlock-enforced\n",
+            marker_file.display()
+        ),
+    )
+    .expect("write rogue ancestor");
+    fs::copy(
+        sb.bin_dir.join("agent-guard"),
+        child_bin_dir.join("agent-guard"),
+    )
+    .expect("copy nested real guard");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&rogue_anc, fs::Permissions::from_mode(0o755)).expect("chmod rogue");
+        fs::set_permissions(
+            child_bin_dir.join("agent-guard"),
+            fs::Permissions::from_mode(0o755),
+        )
+        .expect("chmod nested guard");
+    }
+    let sbx_st = Command::new(child_bin_dir.join("agent-guard"))
+        .arg("sandbox-status")
+        .output()
+        .expect("run nested sandbox-status");
+    assert!(sbx_st.status.success());
+    assert!(
+        !marker_file.exists(),
+        "rogue ancestor binary MUST NEVER be executed during sandbox probes"
+    );
+
+    // 17d: Relative `--bin-dir`, ambiguous multi-adapter payload rejection, session_id canary smuggling rejection,
+    //      `UnsupportedHost` rejection even with `--external-observer`, and harness env marker block!
+    sb.activate_antigravity();
+    let obs_seed = [0x77u8; 32];
+    let obs_pk = agent_guard::enforcement_state::derive_observer_pubkey_hex(&obs_seed);
+
+    // Ambient harness marker (`CLAUDECODE=1`) blocks `verify-enforcement`
+    let (env_blk, env_out, _) = sb.run_cli(
+        &[
+            "verify-enforcement",
+            "begin",
+            "--json",
+            "--execution-mode",
+            "local",
+            "--observer-pubkey",
+            &obs_pk,
+            "--bin-dir",
+            "../bin",
+            ".",
+        ],
+        b"",
+        &[("CLAUDECODE", "1")],
+    );
+    assert_eq!(env_blk, 2);
+    assert_eq!(
+        JsonValue::parse(env_out.trim())
+            .expect("env json")
+            .get("code")
+            .and_then(JsonValue::as_str),
+        Some("SANDBOX_FORBIDDEN")
+    );
+
+    // `UnsupportedHost` rejected even with `--external-observer`
+    let (unsup_c, unsup_out, _) = sb.run_cli(
+        &[
+            "verify-enforcement",
+            "begin",
+            "--json",
+            "--external-observer",
+            "--execution-mode",
+            "unsupported",
+            "--observer-pubkey",
+            &obs_pk,
+            "--bin-dir",
+            "../bin",
+            ".",
+        ],
+        b"",
+        &[],
+    );
+    assert_eq!(unsup_c, 2);
+    assert_eq!(
+        JsonValue::parse(unsup_out.trim())
+            .expect("unsup json")
+            .get("code")
+            .and_then(JsonValue::as_str),
+        Some("UNSUPPORTED_EXECUTION_MODE")
+    );
+
+    // Relative `--bin-dir ../bin` succeeds in `begin`
+    let (rel_c, rel_out, rel_err) = sb.run_cli(
+        &[
+            "verify-enforcement",
+            "begin",
+            "--json",
+            "--execution-mode",
+            "local",
+            "--observer-pubkey",
+            &obs_pk,
+            "--bin-dir",
+            "../bin",
+            ".",
+        ],
+        b"",
+        &[],
+    );
+    assert_eq!(rel_c, 0, "relative --bin-dir begin failed: {rel_err}");
+    let rel_j = JsonValue::parse(rel_out.trim()).expect("rel json");
+    let rel_cid = rel_j
+        .get("challenge_id")
+        .and_then(JsonValue::as_str)
+        .expect("rel cid");
+    let rel_canary = rel_j
+        .get("canary_rel_path")
+        .and_then(JsonValue::as_str)
+        .expect("rel canary");
+
+    // Smuggling `rel_canary` in `conversationId` while denying an unrelated `.env` read must NOT mint a witness!
+    let smuggled = format!(
+        r#"{{"conversationId":"smuggle_{rel_canary}","workspacePaths":[{}],"toolName":"view_file","parameters":{{"AbsolutePath":"{}/.env"}}}}"#,
+        sb.ws_json(),
+        sb.repo_dir.display()
+    );
+    let _ = sb.run_cli(
+        &["antigravity-hook", "PreToolUse"],
+        smuggled.as_bytes(),
+        &[],
+    );
+    let rel_sig = agent_guard::enforcement_state::sign_observer_verdict(
+        &obs_seed,
+        rel_cid,
+        "antigravity",
+        &sb.repo_dir,
+        rel_canary,
+        true,
+    );
+    let (sm_c, sm_out, _) = sb.run_cli(
+        &[
+            "verify-enforcement",
+            "complete",
+            "--json",
+            "--execution-mode",
+            "local",
+            "--bin-dir",
+            "../bin",
+            "--challenge",
+            rel_cid,
+            "--host-prevented-execution",
+            "true",
+            "--observer-sig",
+            &rel_sig,
+            ".",
+        ],
+        b"",
+        &[],
+    );
+    assert_eq!(sm_c, 2);
+    assert_eq!(
+        JsonValue::parse(sm_out.trim())
+            .expect("sm json")
             .get("code")
             .and_then(JsonValue::as_str),
         Some("HOOK_NOT_INVOKED")

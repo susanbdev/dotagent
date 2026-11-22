@@ -1261,6 +1261,13 @@ pub fn evaluate_install_state(bin_dir: &Path, version_str: &str) -> InstallState
             detail: "agent-guard binary is 0 bytes".to_string(),
         };
     }
+    if !is_native_executable_magic(&bytes) {
+        return InstallState::IntegrityFailed {
+            binary_path: canon.display().to_string(),
+            reason_code: "BINARY_INVALID_FORMAT",
+            detail: "agent-guard binary is not a native ELF or Mach-O executable".to_string(),
+        };
+    }
     let digest = sha256_hex(&bytes);
     InstallState::Verified {
         binary_path: canon.display().to_string(),
@@ -1269,10 +1276,38 @@ pub fn evaluate_install_state(bin_dir: &Path, version_str: &str) -> InstallState
     }
 }
 
+fn is_native_executable_magic(bytes: &[u8]) -> bool {
+    if bytes.len() < 4 {
+        return false;
+    }
+    matches!(
+        &bytes[..4],
+        b"\x7fELF"
+            | [0xfe, 0xed, 0xfa, 0xce]
+            | [0xce, 0xfa, 0xed, 0xfe]
+            | [0xfe, 0xed, 0xfa, 0xcf]
+            | [0xcf, 0xfa, 0xed, 0xfe]
+            | [0xca, 0xfe, 0xba, 0xbe]
+            | [0xbe, 0xba, 0xfe, 0xca]
+    )
+}
+
+fn binary_token_matches(first_token: &str, verified_bin_canon: Option<&Path>) -> bool {
+    let first_path = Path::new(first_token);
+    if !first_path.is_absolute() {
+        return false;
+    }
+    let Some(exp_bin) = verified_bin_canon else {
+        return false;
+    };
+    fs::canonicalize(first_path).ok().as_deref() == Some(exp_bin)
+}
+
 fn validate_antigravity_command_list(
     hooks_arr: &[JsonValue],
     expected_event: &str,
     verified_bin_canon: Option<&Path>,
+    expected_ws_canon: Option<&Path>,
 ) -> Result<bool, (&'static str, String)> {
     if hooks_arr.is_empty() {
         return Err((
@@ -1308,7 +1343,7 @@ fn validate_antigravity_command_list(
                 format!("Antigravity '{expected_event}' hook missing string 'command'"),
             ));
         };
-        let tokens = tokenize_antigravity_hook_command(cmd)?;
+        let tokens = tokenize_hook_command(cmd, "Antigravity")?;
         if tokens.len() < 3
             || tokens[1] != "antigravity-hook"
             || tokens[2].as_str() != expected_event
@@ -1336,13 +1371,28 @@ fn validate_antigravity_command_list(
             match flag {
                 "--workspace" if !seen_ws => {
                     seen_ws = true;
-                    if !Path::new(val).is_absolute() {
+                    let ws_arg = Path::new(val);
+                    if !ws_arg.is_absolute() {
                         return Err((
                             "CONFIG_PROTOCOL_INCOMPATIBLE",
                             format!(
                                 "Antigravity '{expected_event}' --workspace argument must be an absolute path"
                             ),
                         ));
+                    }
+                    if let Some(exp_ws) = expected_ws_canon {
+                        let arg_canon =
+                            fs::canonicalize(ws_arg).unwrap_or_else(|_| ws_arg.to_path_buf());
+                        if arg_canon != exp_ws {
+                            return Err((
+                                "CONFIG_WORKSPACE_MISMATCH",
+                                format!(
+                                    "Antigravity '{expected_event}' --workspace '{}' does not match inspected workspace '{}'",
+                                    ws_arg.display(),
+                                    exp_ws.display()
+                                ),
+                            ));
+                        }
                     }
                 }
                 "--trace-log" if !seen_trace => {
@@ -1368,31 +1418,26 @@ fn validate_antigravity_command_list(
             idx += 2;
         }
 
-        let first_path = Path::new(&tokens[0]);
-        if !first_path.is_absolute() {
+        if !binary_token_matches(&tokens[0], verified_bin_canon) {
             all_bins_match = false;
-        } else if let Some(exp_bin) = verified_bin_canon {
-            let tok_canon = fs::canonicalize(first_path).ok();
-            if tok_canon.as_deref() != Some(exp_bin) {
-                all_bins_match = false;
-            }
         }
     }
     Ok(all_bins_match)
 }
 
-fn tokenize_antigravity_hook_command(cmd: &str) -> Result<Vec<String>, (&'static str, String)> {
+fn tokenize_hook_command(cmd: &str, label: &str) -> Result<Vec<String>, (&'static str, String)> {
     if cmd.trim().is_empty() || cmd.bytes().any(|b| b < 0x20 || b == 0x7f) {
         return Err((
             "CONFIG_PROTOCOL_INCOMPATIBLE",
-            "Antigravity hook command is empty or contains control characters".to_string(),
+            format!("{label} hook command is empty or contains control characters"),
         ));
     }
     let mut tokens = Vec::new();
     let mut cur = String::new();
     let mut in_token = false;
     let mut in_single = false;
-    for ch in cmd.chars() {
+    let mut chars = cmd.chars().peekable();
+    while let Some(ch) = chars.next() {
         if in_single {
             if ch == '\'' {
                 in_single = false;
@@ -1402,6 +1447,10 @@ fn tokenize_antigravity_hook_command(cmd: &str) -> Result<Vec<String>, (&'static
         } else if ch == '\'' {
             in_single = true;
             in_token = true;
+        } else if ch == '\\' && chars.peek() == Some(&'\'') {
+            let _ = chars.next();
+            cur.push('\'');
+            in_token = true;
         } else if ch == ' ' || ch == '\t' {
             if in_token {
                 tokens.push(std::mem::take(&mut cur));
@@ -1409,11 +1458,28 @@ fn tokenize_antigravity_hook_command(cmd: &str) -> Result<Vec<String>, (&'static
             }
         } else if matches!(
             ch,
-            ';' | '|' | '&' | '`' | '$' | '<' | '>' | '(' | ')' | '\\' | '"'
+            ';' | '|'
+                | '&'
+                | '`'
+                | '$'
+                | '<'
+                | '>'
+                | '('
+                | ')'
+                | '\\'
+                | '"'
+                | '*'
+                | '?'
+                | '['
+                | ']'
+                | '~'
+                | '#'
+                | '{'
+                | '}'
         ) {
             return Err((
                 "CONFIG_PROTOCOL_INCOMPATIBLE",
-                format!("Antigravity hook command contains disallowed shell metacharacter '{ch}'"),
+                format!("{label} hook command contains disallowed shell metacharacter '{ch}'"),
             ));
         } else {
             cur.push(ch);
@@ -1423,13 +1489,357 @@ fn tokenize_antigravity_hook_command(cmd: &str) -> Result<Vec<String>, (&'static
     if in_single {
         return Err((
             "CONFIG_PROTOCOL_INCOMPATIBLE",
-            "Antigravity hook command has an unclosed single quote".to_string(),
+            format!("{label} hook command has an unclosed single quote"),
         ));
     }
     if in_token {
         tokens.push(cur);
     }
     Ok(tokens)
+}
+
+fn validate_standard_hook_command_entry(
+    cmd: &str,
+    adapter_id: &str,
+    expected_subcmd: &str,
+    verified_bin_canon: Option<&Path>,
+) -> Result<(bool, bool), (&'static str, String)> {
+    let Ok(tokens) = tokenize_hook_command(cmd, adapter_id) else {
+        return Ok((false, false));
+    };
+    if tokens.len() < 2 || tokens[1].as_str() != expected_subcmd {
+        return Ok((false, false));
+    }
+    let rest_valid = match &tokens[2..] {
+        [] => true,
+        [flag, val] if flag == "--adapter" && val == adapter_id => true,
+        _ => false,
+    };
+    if !rest_valid {
+        return Err((
+            "CONFIG_PROTOCOL_INCOMPATIBLE",
+            format!(
+                "{adapter_id} '{expected_subcmd}' command contains unsupported arguments in '{cmd}'"
+            ),
+        ));
+    }
+    let is_guard_cmd = Path::new(&tokens[0])
+        .file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| n == "agent-guard");
+    if !is_guard_cmd {
+        return Ok((false, false));
+    }
+    Ok((true, binary_token_matches(&tokens[0], verified_bin_canon)))
+}
+
+fn validate_nested_hook_event(
+    hooks_root: &JsonValue,
+    adapter_id: &str,
+    event_key: &str,
+    expected_subcmd: &str,
+    wildcard_matchers: Option<&[&str]>,
+    verified_bin_canon: Option<&Path>,
+) -> Result<bool, (&'static str, String)> {
+    let Some(groups) = hooks_root.get(event_key).and_then(JsonValue::as_array) else {
+        return Err((
+            "CONFIG_PROTOCOL_INCOMPATIBLE",
+            format!("missing required 'hooks.{event_key}' array"),
+        ));
+    };
+    let mut found_managed = false;
+    let mut all_matched = verified_bin_canon.is_some();
+    for g in groups {
+        if let Some(allowed_wildcards) = wildcard_matchers {
+            let m = g.get("matcher").and_then(JsonValue::as_str).unwrap_or("");
+            if !allowed_wildcards.contains(&m) {
+                continue;
+            }
+        }
+        let Some(inner) = g.get("hooks").and_then(JsonValue::as_array) else {
+            return Err((
+                "CONFIG_PROTOCOL_INCOMPATIBLE",
+                format!("'{event_key}' entry missing 'hooks' array"),
+            ));
+        };
+        for item in inner {
+            if item.get("type").and_then(JsonValue::as_str) != Some("command") {
+                continue;
+            }
+            let Some(cmd) = item.get("command").and_then(JsonValue::as_str) else {
+                return Err((
+                    "CONFIG_PROTOCOL_INCOMPATIBLE",
+                    format!("'{event_key}' command hook missing string 'command'"),
+                ));
+            };
+            let (is_ours, bin_ok) = validate_standard_hook_command_entry(
+                cmd,
+                adapter_id,
+                expected_subcmd,
+                verified_bin_canon,
+            )?;
+            if is_ours {
+                found_managed = true;
+                all_matched &= bin_ok;
+            }
+        }
+    }
+    if !found_managed {
+        let code = if wildcard_matchers.is_some() {
+            "CONFIG_INCOMPLETE_MATCHER"
+        } else {
+            "CONFIG_PROTOCOL_INCOMPATIBLE"
+        };
+        return Err((
+            code,
+            format!(
+                "{adapter_id} '{event_key}' is missing required 'agent-guard {expected_subcmd}' handler"
+            ),
+        ));
+    }
+    Ok(all_matched)
+}
+
+fn validate_cursor_hook_event(
+    hooks_root: &JsonValue,
+    event_key: &str,
+    expected_subcmd: &str,
+    verified_bin_canon: Option<&Path>,
+) -> Result<bool, (&'static str, String)> {
+    let Some(items) = hooks_root.get(event_key).and_then(JsonValue::as_array) else {
+        return Err((
+            "CONFIG_PROTOCOL_INCOMPATIBLE",
+            format!("missing required Cursor 'hooks.{event_key}' array"),
+        ));
+    };
+    let mut found_managed = false;
+    let mut all_matched = verified_bin_canon.is_some();
+    for item in items {
+        let Some(cmd) = item.get("command").and_then(JsonValue::as_str) else {
+            return Err((
+                "CONFIG_PROTOCOL_INCOMPATIBLE",
+                format!("Cursor '{event_key}' entry missing string 'command'"),
+            ));
+        };
+        let (is_ours, bin_ok) = validate_standard_hook_command_entry(
+            cmd,
+            "cursor",
+            expected_subcmd,
+            verified_bin_canon,
+        )?;
+        if is_ours {
+            found_managed = true;
+            all_matched &= bin_ok;
+        }
+    }
+    if !found_managed {
+        return Err((
+            "CONFIG_PROTOCOL_INCOMPATIBLE",
+            format!(
+                "Cursor '{event_key}' is missing required 'agent-guard {expected_subcmd}' handler"
+            ),
+        ));
+    }
+    Ok(all_matched)
+}
+
+fn strip_toml_line_comment(line: &str) -> Result<&str, String> {
+    let mut in_double = false;
+    let mut in_single = false;
+    let mut escaped = false;
+    for (idx, ch) in line.char_indices() {
+        if in_double {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == '"' {
+                in_double = false;
+            }
+        } else if in_single {
+            if ch == '\'' {
+                in_single = false;
+            }
+        } else if ch == '"' {
+            in_double = true;
+        } else if ch == '\'' {
+            in_single = true;
+        } else if ch == '#' {
+            return Ok(&line[..idx]);
+        }
+    }
+    if in_double || in_single {
+        return Err("unclosed string literal in TOML line".to_string());
+    }
+    Ok(line)
+}
+
+fn validate_codex_config_toml(
+    raw_toml: &str,
+    verified_bin_canon: Option<&Path>,
+) -> Result<bool, (&'static str, String)> {
+    let mut section = String::new();
+    let mut sandbox_mode: Option<String> = None;
+    let mut approval_policy: Option<String> = None;
+    let mut notify_tokens: Option<Vec<String>> = None;
+    let mut network_access: Option<bool> = None;
+
+    for (lineno, raw_line) in raw_toml.lines().enumerate() {
+        let stripped = strip_toml_line_comment(raw_line)
+            .map_err(|e| ("CONFIG_MALFORMED_TOML", format!("line {}: {e}", lineno + 1)))?;
+        let line = stripped.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if line.starts_with('[') {
+            if !line.ends_with(']') || line.len() < 3 {
+                return Err((
+                    "CONFIG_MALFORMED_TOML",
+                    format!("line {}: malformed TOML table header", lineno + 1),
+                ));
+            }
+            section = line[1..line.len() - 1].trim().to_string();
+            if section.is_empty() || section.starts_with('[') || section.ends_with(']') {
+                return Err((
+                    "CONFIG_MALFORMED_TOML",
+                    format!(
+                        "line {}: unsupported or empty TOML table header",
+                        lineno + 1
+                    ),
+                ));
+            }
+            continue;
+        }
+        let Some((raw_k, raw_v)) = line.split_once('=') else {
+            return Err((
+                "CONFIG_MALFORMED_TOML",
+                format!("line {}: expected key = value assignment", lineno + 1),
+            ));
+        };
+        let key = raw_k.trim();
+        let val = raw_v.trim();
+        if key.is_empty() || val.is_empty() {
+            return Err((
+                "CONFIG_MALFORMED_TOML",
+                format!("line {}: empty TOML key or value", lineno + 1),
+            ));
+        }
+        if section.is_empty() {
+            match key {
+                "sandbox_mode" => {
+                    let s = JsonValue::parse(val)
+                        .ok()
+                        .and_then(|v| v.as_str().map(str::to_string))
+                        .ok_or_else(|| {
+                            (
+                                "CONFIG_MALFORMED_TOML",
+                                "sandbox_mode must be a quoted string".to_string(),
+                            )
+                        })?;
+                    sandbox_mode = Some(s);
+                }
+                "approval_policy" => {
+                    let s = JsonValue::parse(val)
+                        .ok()
+                        .and_then(|v| v.as_str().map(str::to_string))
+                        .ok_or_else(|| {
+                            (
+                                "CONFIG_MALFORMED_TOML",
+                                "approval_policy must be a quoted string".to_string(),
+                            )
+                        })?;
+                    approval_policy = Some(s);
+                }
+                "notify" => {
+                    let arr = JsonValue::parse(val)
+                        .ok()
+                        .and_then(|v| {
+                            v.as_array().and_then(|items| {
+                                items
+                                    .iter()
+                                    .map(|i| i.as_str().map(str::to_string))
+                                    .collect::<Option<Vec<String>>>()
+                            })
+                        })
+                        .ok_or_else(|| {
+                            (
+                                "CONFIG_MALFORMED_TOML",
+                                "notify must be an array of strings".to_string(),
+                            )
+                        })?;
+                    notify_tokens = Some(arr);
+                }
+                _ => {}
+            }
+        } else if section == "sandbox_workspace_write" && key == "network_access" {
+            match val {
+                "false" => network_access = Some(false),
+                "true" => network_access = Some(true),
+                _ => {
+                    return Err((
+                        "CONFIG_MALFORMED_TOML",
+                        "sandbox_workspace_write.network_access must be a boolean".to_string(),
+                    ));
+                }
+            }
+        }
+    }
+
+    if approval_policy.as_deref() == Some("never") {
+        return Err((
+            "CONFIG_HOOKS_DISABLED",
+            "Codex approval_policy = 'never' is forbidden".to_string(),
+        ));
+    }
+    match sandbox_mode.as_deref() {
+        Some("workspace-write") => {
+            if network_access != Some(false) {
+                return Err((
+                    "CONFIG_PROTOCOL_INCOMPATIBLE",
+                    "Codex workspace-write mode requires [sandbox_workspace_write] network_access = false".to_string(),
+                ));
+            }
+        }
+        Some("read-only") => {}
+        Some(other) => {
+            return Err((
+                "CONFIG_HOOKS_DISABLED",
+                format!("Codex sandbox_mode '{other}' weakens zero-trust containment"),
+            ));
+        }
+        None => {
+            return Err((
+                "CONFIG_PROTOCOL_INCOMPATIBLE",
+                "Codex config.toml is missing required sandbox_mode".to_string(),
+            ));
+        }
+    }
+
+    let Some(notify) = notify_tokens else {
+        return Err((
+            "CONFIG_PROTOCOL_INCOMPATIBLE",
+            "Codex config.toml is missing required notify = [<agent-guard>, \"on-stop\"]"
+                .to_string(),
+        ));
+    };
+    if notify.len() < 2 || notify[1] != "on-stop" {
+        return Err((
+            "CONFIG_PROTOCOL_INCOMPATIBLE",
+            "Codex notify command must invoke '<agent-guard> on-stop'".to_string(),
+        ));
+    }
+    let tail_ok = match &notify[2..] {
+        [] => true,
+        [f, v] if f == "--adapter" && v == "codex" => true,
+        _ => false,
+    };
+    if !tail_ok {
+        return Err((
+            "CONFIG_PROTOCOL_INCOMPATIBLE",
+            "Codex notify array contains unsupported arguments".to_string(),
+        ));
+    }
+    Ok(binary_token_matches(&notify[0], verified_bin_canon))
 }
 
 /// Evaluates Property 2 (`ConfigState`) without inferring runtime invocation or enforcement.
@@ -1442,6 +1852,7 @@ pub fn evaluate_config_state(
         InstallState::Verified { binary_path, .. } => Some(PathBuf::from(binary_path)),
         _ => None,
     };
+    let expected_ws_canon = fs::canonicalize(workspace).ok();
 
     match adapter_id {
         "antigravity" => {
@@ -1598,6 +2009,7 @@ pub fn evaluate_config_state(
                         inner_hooks,
                         tool_ev,
                         verified_bin_canon.as_deref(),
+                        expected_ws_canon.as_deref(),
                     ) {
                         Ok(matched) => all_bins_match &= matched,
                         Err((code, detail)) => {
@@ -1633,6 +2045,7 @@ pub fn evaluate_config_state(
                     arr,
                     direct_ev,
                     verified_bin_canon.as_deref(),
+                    expected_ws_canon.as_deref(),
                 ) {
                     Ok(matched) => all_bins_match &= matched,
                     Err((code, detail)) => {
@@ -1731,27 +2144,231 @@ pub fn evaluate_config_state(
                     detail: "integration config contains invalid UTF-8".to_string(),
                 };
             };
-            if adapter_id != "codex" && JsonValue::parse(text).is_err() {
-                return ConfigState::Invalid {
-                    adapter_id: adapter_id.to_string(),
-                    config_rel_path: Some(rel_label),
-                    reason_code: "CONFIG_MALFORMED_JSON",
-                    detail: "integration config contains malformed JSON".to_string(),
-                };
-            }
-            let bin_matches = match verified_bin_canon {
-                Some(ref bin) => {
-                    adapter_id == "codex" || text.contains(&bin.to_string_lossy().into_owned())
+
+            let bin_matches = match adapter_id {
+                "codex" => match validate_codex_config_toml(text, verified_bin_canon.as_deref()) {
+                    Ok(matched) => matched,
+                    Err((code, detail)) => {
+                        return ConfigState::Invalid {
+                            adapter_id: adapter_id.to_string(),
+                            config_rel_path: Some(rel_label),
+                            reason_code: code,
+                            detail,
+                        };
+                    }
+                },
+                "claude" => {
+                    let parsed = match JsonValue::parse(text) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            return ConfigState::Invalid {
+                                adapter_id: adapter_id.to_string(),
+                                config_rel_path: Some(rel_label),
+                                reason_code: "CONFIG_MALFORMED_JSON",
+                                detail: format!("malformed Claude settings.json: {e}"),
+                            };
+                        }
+                    };
+                    if parsed.as_object().is_none() {
+                        return ConfigState::Invalid {
+                            adapter_id: adapter_id.to_string(),
+                            config_rel_path: Some(rel_label),
+                            reason_code: "CONFIG_PROTOCOL_INCOMPATIBLE",
+                            detail: "Claude settings.json root must be a JSON object".to_string(),
+                        };
+                    }
+                    if parsed.get("disableAllHooks").and_then(JsonValue::as_bool) == Some(true) {
+                        return ConfigState::Invalid {
+                            adapter_id: adapter_id.to_string(),
+                            config_rel_path: Some(rel_label),
+                            reason_code: "CONFIG_HOOKS_DISABLED",
+                            detail: "Claude 'disableAllHooks' is true".to_string(),
+                        };
+                    }
+                    let Some(hooks_obj) = parsed.get("hooks").filter(|v| v.as_object().is_some())
+                    else {
+                        return ConfigState::Invalid {
+                            adapter_id: adapter_id.to_string(),
+                            config_rel_path: Some(rel_label),
+                            reason_code: "CONFIG_PROTOCOL_INCOMPATIBLE",
+                            detail: "Claude settings.json missing 'hooks' object".to_string(),
+                        };
+                    };
+                    let mut all_ok = verified_bin_canon.is_some();
+                    for (ev, sub, wc) in [
+                        ("UserPromptSubmit", "user-prompt", None),
+                        ("PreToolUse", "pre-tool", Some(&["*"][..])),
+                        ("PostToolUse", "post-tool", Some(&["*"][..])),
+                        ("PreCompact", "pre-compact", None),
+                        ("Stop", "on-stop", None),
+                    ] {
+                        match validate_nested_hook_event(
+                            hooks_obj,
+                            "claude",
+                            ev,
+                            sub,
+                            wc,
+                            verified_bin_canon.as_deref(),
+                        ) {
+                            Ok(m) => all_ok &= m,
+                            Err((code, detail)) => {
+                                return ConfigState::Invalid {
+                                    adapter_id: adapter_id.to_string(),
+                                    config_rel_path: Some(rel_label),
+                                    reason_code: code,
+                                    detail,
+                                };
+                            }
+                        }
+                    }
+                    all_ok
                 }
-                None => false,
+                "gemini" => {
+                    let parsed = match JsonValue::parse(text) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            return ConfigState::Invalid {
+                                adapter_id: adapter_id.to_string(),
+                                config_rel_path: Some(rel_label),
+                                reason_code: "CONFIG_MALFORMED_JSON",
+                                detail: format!("malformed Gemini settings.json: {e}"),
+                            };
+                        }
+                    };
+                    if parsed.as_object().is_none() {
+                        return ConfigState::Invalid {
+                            adapter_id: adapter_id.to_string(),
+                            config_rel_path: Some(rel_label),
+                            reason_code: "CONFIG_PROTOCOL_INCOMPATIBLE",
+                            detail: "Gemini settings.json root must be a JSON object".to_string(),
+                        };
+                    }
+                    if parsed
+                        .get("hooksConfig")
+                        .and_then(|v| v.get("enabled"))
+                        .and_then(JsonValue::as_bool)
+                        == Some(false)
+                        || parsed
+                            .get("tools")
+                            .and_then(|v| v.get("enableHooks"))
+                            .and_then(JsonValue::as_bool)
+                            == Some(false)
+                    {
+                        return ConfigState::Invalid {
+                            adapter_id: adapter_id.to_string(),
+                            config_rel_path: Some(rel_label),
+                            reason_code: "CONFIG_HOOKS_DISABLED",
+                            detail: "Gemini hooks are explicitly disabled in settings.json"
+                                .to_string(),
+                        };
+                    }
+                    let Some(hooks_obj) = parsed.get("hooks").filter(|v| v.as_object().is_some())
+                    else {
+                        return ConfigState::Invalid {
+                            adapter_id: adapter_id.to_string(),
+                            config_rel_path: Some(rel_label),
+                            reason_code: "CONFIG_PROTOCOL_INCOMPATIBLE",
+                            detail: "Gemini settings.json missing 'hooks' object".to_string(),
+                        };
+                    };
+                    let mut all_ok = verified_bin_canon.is_some();
+                    for (ev, sub, wc) in [
+                        ("BeforeAgent", "user-prompt", None),
+                        ("BeforeTool", "pre-tool", Some(&[".*", "*"][..])),
+                        ("AfterTool", "post-tool", Some(&[".*", "*"][..])),
+                        ("PreCompress", "pre-compact", None),
+                        ("AfterAgent", "on-stop", None),
+                    ] {
+                        match validate_nested_hook_event(
+                            hooks_obj,
+                            "gemini",
+                            ev,
+                            sub,
+                            wc,
+                            verified_bin_canon.as_deref(),
+                        ) {
+                            Ok(m) => all_ok &= m,
+                            Err((code, detail)) => {
+                                return ConfigState::Invalid {
+                                    adapter_id: adapter_id.to_string(),
+                                    config_rel_path: Some(rel_label),
+                                    reason_code: code,
+                                    detail,
+                                };
+                            }
+                        }
+                    }
+                    all_ok
+                }
+                _ => {
+                    let parsed = match JsonValue::parse(text) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            return ConfigState::Invalid {
+                                adapter_id: adapter_id.to_string(),
+                                config_rel_path: Some(rel_label),
+                                reason_code: "CONFIG_MALFORMED_JSON",
+                                detail: format!("malformed Cursor hooks.json: {e}"),
+                            };
+                        }
+                    };
+                    if parsed.get("version").and_then(JsonValue::as_u64) != Some(1) {
+                        return ConfigState::Invalid {
+                            adapter_id: adapter_id.to_string(),
+                            config_rel_path: Some(rel_label),
+                            reason_code: "CONFIG_PROTOCOL_INCOMPATIBLE",
+                            detail: "Cursor hooks.json must specify \"version\": 1".to_string(),
+                        };
+                    }
+                    let Some(hooks_obj) = parsed.get("hooks").filter(|v| v.as_object().is_some())
+                    else {
+                        return ConfigState::Invalid {
+                            adapter_id: adapter_id.to_string(),
+                            config_rel_path: Some(rel_label),
+                            reason_code: "CONFIG_PROTOCOL_INCOMPATIBLE",
+                            detail: "Cursor hooks.json missing 'hooks' object".to_string(),
+                        };
+                    };
+                    let mut all_ok = verified_bin_canon.is_some();
+                    for (ev, sub) in [
+                        ("beforeSubmitPrompt", "user-prompt"),
+                        ("beforeShellExecution", "pre-tool"),
+                        ("afterShellExecution", "post-tool"),
+                        ("beforeReadFile", "pre-tool"),
+                        ("beforeMCPExecution", "pre-tool"),
+                        ("afterMCPExecution", "post-tool"),
+                        ("preCompact", "pre-compact"),
+                        ("afterFileEdit", "post-edit"),
+                        ("stop", "on-stop"),
+                    ] {
+                        match validate_cursor_hook_event(
+                            hooks_obj,
+                            ev,
+                            sub,
+                            verified_bin_canon.as_deref(),
+                        ) {
+                            Ok(m) => all_ok &= m,
+                            Err((code, detail)) => {
+                                return ConfigState::Invalid {
+                                    adapter_id: adapter_id.to_string(),
+                                    config_rel_path: Some(rel_label),
+                                    reason_code: code,
+                                    detail,
+                                };
+                            }
+                        }
+                    }
+                    all_ok
+                }
             };
             if !bin_matches {
                 return ConfigState::Invalid {
                     adapter_id: adapter_id.to_string(),
                     config_rel_path: Some(rel_label),
                     reason_code: "CONFIG_BINARY_MISMATCH",
-                    detail: "integration config does not reference the verified agent-guard binary"
-                        .to_string(),
+                    detail:
+                        "integration config command does not pin the verified agent-guard binary"
+                            .to_string(),
                 };
             }
             ConfigState::Valid {
@@ -2332,20 +2949,62 @@ pub fn evaluate_enforcement_report(
     }
 
     let (invoked, host_enforced) = match receipt_check {
-        ReceiptCheck::Valid(rec) => (
-            InvocationState::Verified {
-                last_observed_ts_unix: rec.verified_at_unix,
-                last_event: "PreToolUse".to_string(),
-                evidence_source: EvidenceSource::ObserverVerificationReceipt,
-                trust_level: TrustLevel::ObserverVerified,
-            },
-            HostEnforcement::Verified {
-                verified_at_unix: rec.verified_at_unix,
-                challenge_id: rec.challenge_id,
-                evidence_source: EvidenceSource::ObserverVerificationReceipt,
-                trust_level: TrustLevel::ObserverVerified,
-            },
-        ),
+        ReceiptCheck::Valid(rec)
+            if !matches!(snapshot.execution_mode, ExecutionMode::UnsupportedHost(_))
+                && adapter_id != "codex" =>
+        {
+            (
+                InvocationState::Verified {
+                    last_observed_ts_unix: rec.verified_at_unix,
+                    last_event: "PreToolUse".to_string(),
+                    evidence_source: EvidenceSource::ObserverVerificationReceipt,
+                    trust_level: TrustLevel::ObserverVerified,
+                },
+                HostEnforcement::Verified {
+                    verified_at_unix: rec.verified_at_unix,
+                    challenge_id: rec.challenge_id,
+                    evidence_source: EvidenceSource::ObserverVerificationReceipt,
+                    trust_level: TrustLevel::ObserverVerified,
+                },
+            )
+        }
+        ReceiptCheck::Valid(_) => {
+            let host_state = match &snapshot.execution_mode {
+                ExecutionMode::UnsupportedHost(mode_name) => {
+                    let detail = format!(
+                        "execution mode '{mode_name}' has no verified host hook enforcement support"
+                    );
+                    limitations.push(CapabilityLimitation {
+                        capability: "host_enforced",
+                        code: "UNSUPPORTED_EXECUTION_MODE",
+                        detail: detail.clone(),
+                    });
+                    HostEnforcement::NotVerifiedForExecutionMode {
+                        execution_mode: mode_name.clone(),
+                        reason_code: "UNSUPPORTED_EXECUTION_MODE",
+                        detail,
+                    }
+                }
+                _ => {
+                    let detail = "codex integration configures OS sandbox, MCP, and on-stop notify without a synchronous PreToolUse denial hook".to_string();
+                    limitations.push(CapabilityLimitation {
+                        capability: "host_enforced",
+                        code: "ADAPTER_LACKS_PRETOOL_HOOK",
+                        detail: detail.clone(),
+                    });
+                    HostEnforcement::Unverified {
+                        reason_code: "ADAPTER_LACKS_PRETOOL_HOOK",
+                        detail,
+                    }
+                }
+            };
+            (
+                InvocationState::NoneObserved {
+                    reason_code: "NO_INVOCATIONS_OBSERVED",
+                },
+                host_state,
+            )
+        }
         ReceiptCheck::Rejected { code, detail } => {
             limitations.push(CapabilityLimitation {
                 capability: "host_enforced",
@@ -2364,13 +3023,27 @@ pub fn evaluate_enforcement_report(
             } else {
                 InvocationState::NoneObserved { reason_code: code }
             };
-            (
-                inv,
-                HostEnforcement::Unverified {
+            let host_state = match &snapshot.execution_mode {
+                ExecutionMode::AntigravityRemoteAgentsVm => {
+                    HostEnforcement::NotVerifiedForExecutionMode {
+                        execution_mode: snapshot.execution_mode.as_str().to_string(),
+                        reason_code: code,
+                        detail,
+                    }
+                }
+                ExecutionMode::UnsupportedHost(mode_name) => {
+                    HostEnforcement::NotVerifiedForExecutionMode {
+                        execution_mode: mode_name.clone(),
+                        reason_code: "UNSUPPORTED_EXECUTION_MODE",
+                        detail,
+                    }
+                }
+                ExecutionMode::LocalHost => HostEnforcement::Unverified {
                     reason_code: code,
                     detail,
                 },
-            )
+            };
+            (inv, host_state)
         }
         ReceiptCheck::Absent => {
             if let Some(malformed_msg) = diag.malformed_error {
@@ -2461,6 +3134,11 @@ pub fn evaluate_enforcement_report(
                             (
                                 "INTEGRATION_UNCONFIGURED",
                                 "host enforcement cannot be verified until valid hook configuration is installed".to_string(),
+                            )
+                        } else if adapter_id == "codex" {
+                            (
+                                "ADAPTER_LACKS_PRETOOL_HOOK",
+                                "codex integration configures OS sandbox, MCP, and on-stop notify without a synchronous PreToolUse denial hook".to_string(),
                             )
                         } else if diag.count > 0 {
                             (
@@ -2599,6 +3277,72 @@ fn hex_decode_64(hex: &str) -> Result<[u8; 64], String> {
     Ok(out)
 }
 
+fn check_observer_environment_allowed() -> Result<(), ContractError> {
+    if std::env::var("AGENT_GUARD_IN_SANDBOX").as_deref() == Ok("1")
+        || std::env::var("AGENT_GUARD_WORKER_LOCK").as_deref() == Ok("1")
+    {
+        return Err(ContractError::new(
+            "SANDBOX_FORBIDDEN",
+            "verify-enforcement cannot run inside an agent worker sandbox",
+        ));
+    }
+    for marker in [
+        "AGENT_GUARD_ROLE",
+        "ANTIGRAVITY_AGENT",
+        "CLAUDECODE",
+        "CLAUDE_CODE_ENTRYPOINT",
+        "CURSOR_TRACE_ID",
+        "CURSOR_AGENT",
+        "CODEX_SANDBOX",
+        "CODEX_ENV_SANDBOX",
+        "GEMINI_CLI",
+    ] {
+        if std::env::var_os(marker).is_some_and(|v| !v.is_empty()) {
+            return Err(ContractError::new(
+                "SANDBOX_FORBIDDEN",
+                format!(
+                    "verify-enforcement cannot run inside an active agent harness environment ({marker} set)"
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn json_value_mentions_canary(val: &JsonValue, canary_rel: &str) -> bool {
+    match val {
+        JsonValue::Str(s) => s.contains(canary_rel),
+        JsonValue::Array(items) => items
+            .iter()
+            .any(|v| json_value_mentions_canary(v, canary_rel)),
+        JsonValue::Object(entries) => entries
+            .iter()
+            .any(|(_, v)| json_value_mentions_canary(v, canary_rel)),
+        _ => false,
+    }
+}
+
+fn payload_tool_input_targets_canary(parsed: &JsonValue, canary_rel: &str) -> bool {
+    for key in [
+        "tool_input",
+        "parameters",
+        "toolInput",
+        "command",
+        "CommandLine",
+        "file_path",
+        "path",
+        "TargetFile",
+        "AbsolutePath",
+    ] {
+        if let Some(sub) = parsed.get(key)
+            && json_value_mentions_canary(sub, canary_rel)
+        {
+            return true;
+        }
+    }
+    false
+}
+
 /// Step A of Phase 4: Issues a bounded challenge bound to exact `(mode, workspace, config, binary)`
 /// digests and a pinned Ed25519 observer public key (`observer_pubkey_hex`).
 pub fn begin_verification(
@@ -2609,12 +3353,19 @@ pub fn begin_verification(
     external_observer_available: bool,
     observer_pubkey_hex: &str,
 ) -> Result<VerificationChallenge, ContractError> {
-    if std::env::var("AGENT_GUARD_IN_SANDBOX").as_deref() == Ok("1")
-        || std::env::var("AGENT_GUARD_WORKER_LOCK").as_deref() == Ok("1")
-    {
+    check_observer_environment_allowed()?;
+
+    if let ExecutionMode::UnsupportedHost(ref mode_name) = snapshot.execution_mode {
         return Err(ContractError::new(
-            "SANDBOX_FORBIDDEN",
-            "verify-enforcement cannot run inside an agent worker sandbox",
+            "UNSUPPORTED_EXECUTION_MODE",
+            format!("execution mode '{mode_name}' does not support host hook enforcement"),
+        ));
+    }
+
+    if adapter_id == "codex" {
+        return Err(ContractError::new(
+            "VERIFICATION_UNAVAILABLE",
+            "codex integration uses sandbox_mode + MCP + on-stop notify and has no synchronous PreToolUse denial hook",
         ));
     }
 
@@ -2654,12 +3405,12 @@ pub fn begin_verification(
     let observer_pubkey_norm = trimmed_pk.to_ascii_lowercase();
 
     let installed = evaluate_install_state(bin_dir, snapshot.effective_version());
-    let (bin_ver, bin_sha) = match installed {
+    let (bin_ver, bin_sha) = match &installed {
         InstallState::Verified {
             version,
             binary_sha256,
             ..
-        } => (version, binary_sha256),
+        } => (version.clone(), binary_sha256.clone()),
         InstallState::Missing { reason_code, .. } => {
             return Err(ContractError::new(
                 reason_code,
@@ -2670,18 +3421,10 @@ pub fn begin_verification(
             reason_code,
             detail,
             ..
-        } => return Err(ContractError::new(reason_code, detail)),
+        } => return Err(ContractError::new(reason_code, detail.clone())),
     };
 
-    let configured = evaluate_config_state(
-        workspace,
-        adapter_id,
-        &InstallState::Verified {
-            binary_path: bin_dir.join("agent-guard").display().to_string(),
-            version: bin_ver.clone(),
-            binary_sha256: bin_sha.clone(),
-        },
-    );
+    let configured = evaluate_config_state(workspace, adapter_id, &installed);
     let cfg_sha = match configured {
         ConfigState::Valid { config_sha256, .. } => config_sha256,
         ConfigState::Unconfigured { reason_code, .. } => {
@@ -2823,7 +3566,16 @@ pub fn record_denial_witness(
     raw_input: &[u8],
     deny_code: &str,
 ) {
+    if matches!(
+        deny_code,
+        "HOOK_INPUT_OVERFLOW" | "MALFORMED_HOOK_JSON" | "INVALID_HOOK_JSON"
+    ) {
+        return;
+    }
     let Ok(raw_str) = std::str::from_utf8(raw_input) else {
+        return;
+    };
+    let Ok(input_parsed) = JsonValue::parse(raw_str) else {
         return;
     };
     let dir = state_base_dir().join("enforcement");
@@ -2850,7 +3602,7 @@ pub fn record_denial_witness(
     let Some(canary_rel) = parsed.get("canary_rel_path").and_then(JsonValue::as_str) else {
         return;
     };
-    if !raw_str.contains(canary_rel) {
+    if !payload_tool_input_targets_canary(&input_parsed, canary_rel) {
         return;
     }
     let Some(cid) = parsed.get("challenge_id").and_then(JsonValue::as_str) else {
@@ -2973,12 +3725,17 @@ pub fn complete_verification(
     observer_sig_hex: Option<&str>,
     snapshot: &ProbeSnapshot,
 ) -> Result<VerificationReceipt, ContractError> {
-    if std::env::var("AGENT_GUARD_IN_SANDBOX").as_deref() == Ok("1")
-        || std::env::var("AGENT_GUARD_WORKER_LOCK").as_deref() == Ok("1")
-    {
+    check_observer_environment_allowed()?;
+    if let ExecutionMode::UnsupportedHost(ref mode_name) = snapshot.execution_mode {
         return Err(ContractError::new(
-            "SANDBOX_FORBIDDEN",
-            "verify-enforcement cannot run inside an agent worker sandbox",
+            "UNSUPPORTED_EXECUTION_MODE",
+            format!("execution mode '{mode_name}' does not support host hook enforcement"),
+        ));
+    }
+    if adapter_id == "codex" {
+        return Err(ContractError::new(
+            "VERIFICATION_UNAVAILABLE",
+            "codex integration has no synchronous PreToolUse denial hook",
         ));
     }
 

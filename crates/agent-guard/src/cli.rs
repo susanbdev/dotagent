@@ -121,17 +121,18 @@ pub fn run_cli_entrypoint() -> ExitCode {
             crate::antigravity_adapter::run_antigravity_hook_cli(&args[1..], &cwd)
         }
         "pre-tool" => {
-            let payload = match read_bounded_stdin_or_arg(&args[1..]) {
-                Ok(s) => s,
+            let (explicit_adapter, payload) = match read_hook_args_and_stdin(&args[1..]) {
+                Ok(v) => v,
                 Err(msg) => return emit_hook_denial("HOOK_INPUT_OVERFLOW", &msg, true),
             };
             let decision = eval_hook_preferring_hot_coord("pre-tool", &payload, &cwd, || {
                 handle_pre_tool_hook(&payload, &cwd)
             });
             if let Decision::Deny { code, .. } = &decision
-                && let Some(adapter_id) = infer_single_pre_tool_adapter(&payload)
+                && let Some(adapter_id) =
+                    resolve_pre_tool_witness_adapter(explicit_adapter, &payload)
             {
-                let ws_root = resolve_repo_root(&cwd);
+                let ws_root = resolve_hook_workspace_root(&payload, &cwd);
                 crate::enforcement_state::record_denial_witness(
                     &ws_root,
                     adapter_id,
@@ -143,8 +144,8 @@ pub fn run_cli_entrypoint() -> ExitCode {
             emit_hook_decision(decision, HookPhase::PreTool)
         }
         "post-tool" => {
-            let payload = match read_bounded_stdin_or_arg(&args[1..]) {
-                Ok(s) => s,
+            let (_, payload) = match read_hook_args_and_stdin(&args[1..]) {
+                Ok(v) => v,
                 Err(msg) => return emit_hook_denial("HOOK_INPUT_OVERFLOW", &msg, false),
             };
             let decision = eval_hook_preferring_hot_coord("post-tool", &payload, &cwd, || {
@@ -153,8 +154,8 @@ pub fn run_cli_entrypoint() -> ExitCode {
             emit_hook_decision(decision, HookPhase::PostTool)
         }
         "user-prompt" => {
-            let payload = match read_bounded_stdin_or_arg(&args[1..]) {
-                Ok(s) => s,
+            let (_, payload) = match read_hook_args_and_stdin(&args[1..]) {
+                Ok(v) => v,
                 Err(msg) => return emit_hook_denial("HOOK_INPUT_OVERFLOW", &msg, false),
             };
             emit_hook_decision(
@@ -163,8 +164,8 @@ pub fn run_cli_entrypoint() -> ExitCode {
             )
         }
         "pre-compact" => {
-            let payload = match read_bounded_stdin_or_arg(&args[1..]) {
-                Ok(s) => s,
+            let (_, payload) = match read_hook_args_and_stdin(&args[1..]) {
+                Ok(v) => v,
                 Err(msg) => return emit_hook_denial("HOOK_INPUT_OVERFLOW", &msg, false),
             };
             emit_hook_decision(
@@ -183,13 +184,14 @@ pub fn run_cli_entrypoint() -> ExitCode {
             run_read_safe(p, &args[2..], &cwd)
         }
         "post-edit" => {
-            if let Some(file) = args.get(1).filter(|a| a.as_str() != "--json") {
+            let has_hook_flag = args
+                .get(1)
+                .is_some_and(|a| matches!(a.as_str(), "--json" | "--adapter"));
+            if let Some(file) = args.get(1).filter(|_| !has_hook_flag) {
                 emit_cli_decision(handle_post_edit(file, &cwd))
-            } else if args.get(1).map(String::as_str) == Some("--json")
-                || !std::io::IsTerminal::is_terminal(&io::stdin())
-            {
-                let payload = match read_bounded_stdin_or_arg(&args[1..]) {
-                    Ok(s) => s,
+            } else if has_hook_flag || !std::io::IsTerminal::is_terminal(&io::stdin()) {
+                let (_, payload) = match read_hook_args_and_stdin(&args[1..]) {
+                    Ok(v) => v,
                     Err(msg) => return emit_hook_denial("HOOK_INPUT_OVERFLOW", &msg, false),
                 };
                 if payload.trim().is_empty() {
@@ -525,27 +527,112 @@ fn run_read_safe(raw_path: &str, extra: &[String], cwd: &Path) -> ExitCode {
     }
 }
 
+fn resolve_hook_workspace_root(raw_payload: &str, fallback_cwd: &Path) -> PathBuf {
+    if let Ok(parsed) = crate::json::JsonValue::parse(raw_payload) {
+        if let Some(cwd_s) = parsed.get("cwd").and_then(crate::json::JsonValue::as_str) {
+            let p = Path::new(cwd_s.trim());
+            if p.is_absolute() && p.is_dir() {
+                return resolve_repo_root(p);
+            }
+        }
+        if let Some(roots) = parsed
+            .get("workspace_roots")
+            .and_then(crate::json::JsonValue::as_array)
+            && let Some(first) = roots.first().and_then(crate::json::JsonValue::as_str)
+        {
+            let p = Path::new(first.trim());
+            if p.is_absolute() && p.is_dir() {
+                return resolve_repo_root(p);
+            }
+        }
+    }
+    resolve_repo_root(fallback_cwd)
+}
+
 fn infer_single_pre_tool_adapter(raw_payload: &str) -> Option<&'static str> {
     let parsed = crate::json::JsonValue::parse(raw_payload).ok()?;
-    if parsed.get("cursor_version").is_some() || parsed.get("workspace_roots").is_some() {
-        return Some("cursor");
-    }
-    match parsed
+    let has_cursor =
+        parsed.get("cursor_version").is_some() || parsed.get("workspace_roots").is_some();
+    let ev = parsed
         .get("hook_event_name")
-        .and_then(crate::json::JsonValue::as_str)
-    {
-        Some("BeforeTool") => Some("gemini"),
-        Some("PreToolUse") => Some("claude"),
+        .and_then(crate::json::JsonValue::as_str);
+    let is_gemini = ev == Some("BeforeTool");
+    let is_claude = ev == Some("PreToolUse");
+    match (has_cursor, is_gemini, is_claude) {
+        (true, false, false) => Some("cursor"),
+        (false, true, false) => Some("gemini"),
+        (false, false, true) => Some("claude"),
         _ => None,
     }
 }
 
-fn read_bounded_stdin_or_arg(extra_args: &[String]) -> Result<String, String> {
-    if extra_args.first().map(String::as_str) == Some("--json") {
-        return extra_args
-            .get(1)
-            .cloned()
-            .ok_or_else(|| "missing argument after --json".to_string());
+fn resolve_pre_tool_witness_adapter(
+    explicit_adapter: Option<&'static str>,
+    raw_payload: &str,
+) -> Option<&'static str> {
+    if let Some(exp) = explicit_adapter {
+        let Ok(parsed) = crate::json::JsonValue::parse(raw_payload) else {
+            return None;
+        };
+        let has_cursor =
+            parsed.get("cursor_version").is_some() || parsed.get("workspace_roots").is_some();
+        let ev = parsed
+            .get("hook_event_name")
+            .and_then(crate::json::JsonValue::as_str);
+        let compatible = match exp {
+            "claude" => !has_cursor && !matches!(ev, Some("BeforeTool")),
+            "gemini" => !has_cursor && !matches!(ev, Some("PreToolUse")),
+            "cursor" => !matches!(ev, Some("BeforeTool" | "PreToolUse")),
+            _ => false,
+        };
+        return compatible.then_some(exp);
+    }
+    infer_single_pre_tool_adapter(raw_payload)
+}
+
+fn read_hook_args_and_stdin(
+    extra_args: &[String],
+) -> Result<(Option<&'static str>, String), String> {
+    let mut explicit_adapter: Option<&'static str> = None;
+    let mut json_arg: Option<String> = None;
+    let mut idx = 0usize;
+    while idx < extra_args.len() {
+        match extra_args[idx].as_str() {
+            "--adapter" => {
+                let Some(raw_ad) = extra_args.get(idx + 1) else {
+                    return Err("missing argument after --adapter".to_string());
+                };
+                if explicit_adapter.is_some() {
+                    return Err("duplicate --adapter argument".to_string());
+                }
+                explicit_adapter = Some(match raw_ad.as_str() {
+                    "claude" => "claude",
+                    "gemini" => "gemini",
+                    "cursor" => "cursor",
+                    other => return Err(format!("unsupported hook --adapter '{other}'")),
+                });
+                idx += 2;
+            }
+            "--json" => {
+                let Some(raw_j) = extra_args.get(idx + 1) else {
+                    return Err("missing argument after --json".to_string());
+                };
+                if json_arg.is_some() {
+                    return Err("duplicate --json argument".to_string());
+                };
+                json_arg = Some(raw_j.clone());
+                idx += 2;
+            }
+            other => return Err(format!("unsupported hook argument '{other}'")),
+        }
+    }
+    if let Some(j) = json_arg {
+        if j.len() as u64 > MAX_HOOK_STDIN_BYTES {
+            return Err(format!(
+                "Hook --json payload exceeded {MAX_HOOK_STDIN_BYTES} bytes (token/context bomb blocked)"
+            ));
+        }
+        return Ok((explicit_adapter, j));
     }
     let mut buf = Vec::new();
     io::stdin()
@@ -557,7 +644,9 @@ fn read_bounded_stdin_or_arg(extra_args: &[String]) -> Result<String, String> {
             "Hook stdin exceeded {MAX_HOOK_STDIN_BYTES} bytes (token/context bomb blocked)"
         ));
     }
-    String::from_utf8(buf).map_err(|_| "Non-UTF-8 bytes in hook stdin".to_string())
+    let payload =
+        String::from_utf8(buf).map_err(|_| "Non-UTF-8 bytes in hook stdin".to_string())?;
+    Ok((explicit_adapter, payload))
 }
 
 fn emit_hook_decision(decision: Decision, phase: HookPhase) -> ExitCode {
@@ -670,11 +759,11 @@ fn emit_hook_denial(code: &str, reason: &str, halt_session: bool) -> ExitCode {
         )
     } else if is_recoverable_bound {
         format!(
-            "[AGENT-GUARD BOUND GUIDANCE :: {code}] {reason} — Adjust the call to stay within micro-window bounds (e.g. `offset`/`limit <= 150`, `--max-depth 2`, `git log -n 20`) or compact step context."
+            "[AGENT-GUARD BOUND GUIDANCE :: {code}] {reason} -- Adjust the call to stay within micro-window bounds (e.g. `offset`/`limit <= 150`, `--max-depth 2`, `git log -n 20`) or compact step context."
         )
     } else {
         format!(
-            "[AGENT-GUARD HARD DENY :: {code}] {reason} — STOP IMMEDIATELY. Do NOT attempt workarounds, alternate tools, or encodings. Report this block verbatim to the user."
+            "[AGENT-GUARD HARD DENY :: {code}] {reason} -- STOP IMMEDIATELY. Do NOT attempt workarounds, alternate tools, or encodings. Report this block verbatim to the user."
         )
     };
     eprintln!("{full_msg}");
@@ -892,11 +981,30 @@ fn run_on_stop(args: &[String], cwd: &Path) -> ExitCode {
     let mut receipt_out: Option<PathBuf> = None;
     let mut i = 0usize;
     while i < args.len() {
-        if args[i] == "--receipt-out" && i + 1 < args.len() {
-            receipt_out = Some(PathBuf::from(&args[i + 1]));
-            i += 2;
-        } else {
-            i += 1;
+        match args[i].as_str() {
+            "--receipt-out" => {
+                let Some(val) = args.get(i + 1) else {
+                    eprintln!("[AGENT-GUARD ON-STOP FAIL] missing path after --receipt-out");
+                    return ExitCode::from(2);
+                };
+                receipt_out = Some(PathBuf::from(val));
+                i += 2;
+            }
+            "--adapter" => {
+                let Some(ad) = args.get(i + 1) else {
+                    eprintln!("[AGENT-GUARD ON-STOP FAIL] missing value after --adapter");
+                    return ExitCode::from(2);
+                };
+                if !matches!(ad.as_str(), "claude" | "gemini" | "cursor" | "codex") {
+                    eprintln!("[AGENT-GUARD ON-STOP FAIL] unsupported --adapter '{ad}'");
+                    return ExitCode::from(2);
+                }
+                i += 2;
+            }
+            other => {
+                eprintln!("[AGENT-GUARD ON-STOP FAIL] unsupported argument '{other}'");
+                return ExitCode::from(2);
+            }
         }
     }
 
