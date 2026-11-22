@@ -1534,40 +1534,42 @@ pub fn append_audit_jsonl(
         );
     }
 
-    let repo_root = repo_root.to_path_buf();
-    let session_id = session_id.to_owned();
-    let tool = tool.to_owned();
-    let code = code.to_owned();
     let has_detail = !detail.is_empty();
-    let _ = submit_audit_task(move || {
-        let session_hash = compute_session_key_hash(&repo_root, &session_id);
-        let (safe_tool, _) = crate::feedback::scrub_high_entropy_and_secrets(&tool, 64);
-        let record = JsonValue::Object(vec![
-            (
-                "ts".to_string(),
-                ts_secs.map_or(JsonValue::Null, JsonValue::Uint),
-            ),
-            (
-                "repo".to_string(),
-                JsonValue::Str(audit_ascii(&repo_root.to_string_lossy(), 4096)),
-            ),
-            (
-                "session_id".to_string(),
-                JsonValue::Str(sanitize_session_id(&session_id)),
-            ),
-            (
-                "session_hash".to_string(),
-                JsonValue::Str(session_hash[..16].to_string()),
-            ),
-            ("tool".to_string(), JsonValue::Str(safe_tool)),
-            ("code".to_string(), JsonValue::Str(audit_ascii(&code, 128))),
-            ("halted".to_string(), JsonValue::Bool(halted)),
-            (
-                "detail".to_string(),
-                JsonValue::Str(if has_detail { "[redacted]" } else { "" }.to_string()),
-            ),
-        ]);
-        append(&record, Durability::Buffered).is_ok()
+    let _ = submit_audit_task(|| {
+        let repo_root = repo_root.to_path_buf();
+        let session_id = session_id.to_owned();
+        let tool = tool.to_owned();
+        let code = code.to_owned();
+        move || {
+            let session_hash = compute_session_key_hash(&repo_root, &session_id);
+            let (safe_tool, _) = crate::feedback::scrub_high_entropy_and_secrets(&tool, 64);
+            let record = JsonValue::Object(vec![
+                (
+                    "ts".to_string(),
+                    ts_secs.map_or(JsonValue::Null, JsonValue::Uint),
+                ),
+                (
+                    "repo".to_string(),
+                    JsonValue::Str(audit_ascii(&repo_root.to_string_lossy(), 4096)),
+                ),
+                (
+                    "session_id".to_string(),
+                    JsonValue::Str(sanitize_session_id(&session_id)),
+                ),
+                (
+                    "session_hash".to_string(),
+                    JsonValue::Str(session_hash[..16].to_string()),
+                ),
+                ("tool".to_string(), JsonValue::Str(safe_tool)),
+                ("code".to_string(), JsonValue::Str(audit_ascii(&code, 128))),
+                ("halted".to_string(), JsonValue::Bool(halted)),
+                (
+                    "detail".to_string(),
+                    JsonValue::Str(if has_detail { "[redacted]" } else { "" }.to_string()),
+                ),
+            ]);
+            append(&record, Durability::Buffered).is_ok()
+        }
     });
 }
 

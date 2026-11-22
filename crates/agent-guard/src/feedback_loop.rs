@@ -2618,25 +2618,27 @@ fn run_worktree_adversarial_copilot_and_merge(
             if spec.cluster_key.len() <= MAX_AGENTPI_EXPORT_INPUT_BYTES
                 && status.head_sha.len() <= MAX_AGENTPI_EXPORT_INPUT_BYTES
             {
-                let cluster_key = spec.cluster_key.clone();
-                let head_sha = status.head_sha;
-                let _ = submit_export(move || {
-                    let event = JsonValue::Object(vec![
-                        (
-                            "schema".to_string(),
-                            JsonValue::Str(AGENTPI_EVENT_SCHEMA.to_string()),
-                        ),
-                        (
-                            "event_type".to_string(),
-                            JsonValue::Str("loop_merge".to_string()),
-                        ),
-                        ("severity".to_string(), JsonValue::Str("INFO".to_string())),
-                        ("cluster_key".to_string(), JsonValue::Str(cluster_key)),
-                        ("issue_number".to_string(), JsonValue::Uint(issue_number)),
-                        ("pr_number".to_string(), JsonValue::Uint(pr_number)),
-                        ("head_sha".to_string(), JsonValue::Str(head_sha)),
-                    ]);
-                    write_agentpi_mirror(&event)
+                let _ = submit_export(|| {
+                    let cluster_key = spec.cluster_key.clone();
+                    let head_sha = status.head_sha;
+                    move || {
+                        let event = JsonValue::Object(vec![
+                            (
+                                "schema".to_string(),
+                                JsonValue::Str(AGENTPI_EVENT_SCHEMA.to_string()),
+                            ),
+                            (
+                                "event_type".to_string(),
+                                JsonValue::Str("loop_merge".to_string()),
+                            ),
+                            ("severity".to_string(), JsonValue::Str("INFO".to_string())),
+                            ("cluster_key".to_string(), JsonValue::Str(cluster_key)),
+                            ("issue_number".to_string(), JsonValue::Uint(issue_number)),
+                            ("pr_number".to_string(), JsonValue::Uint(pr_number)),
+                            ("head_sha".to_string(), JsonValue::Str(head_sha)),
+                        ]);
+                        write_agentpi_mirror(&event)
+                    }
                 });
             } else {
                 note_invalid_export();

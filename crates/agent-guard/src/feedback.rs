@@ -1191,9 +1191,6 @@ pub fn record_guard_denial_agentpi_signal(
     halted: bool,
     ts_unix: u64,
 ) {
-    if std::env::var("AGENT_GUARD_IN_SANDBOX").as_deref() == Ok("1") {
-        return;
-    }
     if repo_root.as_os_str().len() > MAX_AGENTPI_EXPORT_INPUT_BYTES
         || [session_id, tool, code, detail]
             .into_iter()
@@ -1202,19 +1199,21 @@ pub fn record_guard_denial_agentpi_signal(
         note_invalid_export();
         return;
     }
-    let repo_root = repo_root.to_path_buf();
-    let [session_id, tool, code, detail] = [session_id, tool, code, detail].map(str::to_owned);
-    let _ = submit_export(move || {
-        let event = guard_denial_agentpi_event(
-            &repo_root,
-            &session_id,
-            &tool,
-            &code,
-            &detail,
-            halted,
-            ts_unix,
-        );
-        write_agentpi_mirror(&event)
+    let _ = submit_export(|| {
+        let repo_root = repo_root.to_path_buf();
+        let [session_id, tool, code, detail] = [session_id, tool, code, detail].map(str::to_owned);
+        move || {
+            let event = guard_denial_agentpi_event(
+                &repo_root,
+                &session_id,
+                &tool,
+                &code,
+                &detail,
+                halted,
+                ts_unix,
+            );
+            write_agentpi_mirror(&event)
+        }
     });
 }
 
@@ -1619,8 +1618,10 @@ pub fn commit_ballot_on_host_redacted(
     let agentpi_ev = rec.to_agentpi_event_json();
     publish_agentpi_result(&agentpi_ev, sink);
     // The signed ballot journal already bounds the source fields of this projection.
-    let event = agentpi_ev.clone();
-    let _ = submit_export(move || write_agentpi_mirror(&event));
+    let _ = submit_export(|| {
+        let event = agentpi_ev.clone();
+        move || write_agentpi_mirror(&event)
+    });
     Ok(agentpi_ev)
 }
 

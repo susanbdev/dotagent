@@ -64,13 +64,7 @@ pub fn run_cli_entrypoint() -> ExitCode {
     // exec-sandbox applies kernel restrictions in-process and must start no such threads.
     let _telemetry = matches!(
         sub,
-        "coordinator"
-            | "hook-daemon"
-            | "mcp-gateway"
-            | "post-tool"
-            | "pre-compact"
-            | "pre-tool"
-            | "read-safe"
+        "coordinator" | "hook-daemon" | "mcp-gateway" | "pre-compact" | "read-safe"
     )
     .then(crate::telemetry::runtime::start_host);
     match sub {
@@ -831,6 +825,9 @@ where
             return dec;
         }
     }
+    // Delegated hooks capture observations in the existing host daemon. Only local evaluation
+    // owns a local telemetry runtime, and fallback adds no delivery handshake.
+    let _telemetry = crate::telemetry::runtime::start_host();
     local_fallback()
 }
 

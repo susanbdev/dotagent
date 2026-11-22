@@ -3,8 +3,10 @@ use std::hint::black_box;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+#[cfg(panic = "unwind")]
+use std::sync::atomic::Ordering;
 use std::sync::mpsc::{self, Sender};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Barrier, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -129,6 +131,23 @@ fn stalled_export_lane_does_not_prevent_audit_progress() {
 }
 
 #[test]
+fn a_full_lane_drops_without_creating_an_owned_snapshot() {
+    let runtime = Runtime::new(1);
+    let release = stall(&runtime.audit);
+    enqueue(&runtime.audit, || true);
+    let mut prepared = false;
+    let receipt = runtime.audit.submit_with(|| {
+        prepared = true;
+        || true
+    });
+    release.send(()).unwrap();
+    assert_eq!(receipt, Submission::Dropped(DropReason::Full));
+    assert!(!prepared);
+    assert_eq!(runtime.audit.snapshot().full, 1);
+    assert!(runtime.wait_idle(deadline()));
+}
+
+#[test]
 fn closing_is_nonblocking_and_drains_accepted_work() {
     let runtime = Runtime::new(1);
     let release = stall(&runtime.audit);
@@ -157,6 +176,53 @@ fn closing_is_nonblocking_and_drains_accepted_work() {
     assert_eq!(counts.queued, 2);
     assert_eq!(counts.persisted, 2);
     assert_eq!(counts.closed, 1);
+}
+
+#[cfg(panic = "unwind")]
+#[test]
+fn worker_panic_closes_only_its_lane_and_preserves_pending_accounting() {
+    for fail_audit in [true, false] {
+        let runtime = Runtime::new(2);
+        let (failed, healthy) = if fail_audit {
+            (&runtime.audit, &runtime.export)
+        } else {
+            (&runtime.export, &runtime.audit)
+        };
+        let (started, ready) = mpsc::channel();
+        let (release, gate) = mpsc::channel();
+        enqueue(failed, move || {
+            started.send(()).unwrap();
+            gate.recv_timeout(WATCHDOG).unwrap();
+            panic!("intentional writer fixture panic");
+        });
+        ready.recv_timeout(WATCHDOG).unwrap();
+        enqueue(failed, || true);
+        release.send(()).unwrap();
+
+        assert!(super::wait_until(deadline(), || {
+            !failed.state.running.load(Ordering::Acquire)
+        }));
+        let counts = failed.snapshot();
+        assert_eq!(counts.queued, 2);
+        assert_eq!(counts.persisted, 0);
+        assert_eq!(counts.worker_panics, 1);
+        assert_eq!(counts.worker_exits, 1);
+        assert!(counts.pending() >= 1);
+        assert!(matches!(
+            failed.submit(|| true),
+            Submission::Dropped(DropReason::Unavailable)
+        ));
+        assert_eq!(failed.snapshot().unavailable, 1);
+
+        let (finished, result) = mpsc::channel();
+        enqueue(healthy, move || finished.send(()).is_ok());
+        result
+            .recv_timeout(WATCHDOG)
+            .expect("other lane stays live");
+        runtime.close();
+        assert!(runtime.wait_stopped(deadline()));
+        assert_eq!(healthy.snapshot().persisted, 1);
+    }
 }
 
 #[cfg(unix)]
@@ -235,6 +301,7 @@ impl IsolatedState {
             .env("AGENT_GUARD_STATE_DIR", state)
             .env("DOTAGENT_RUNTIME_TEST_MODE", mode)
             .env("DOTAGENT_RUNTIME_TEST_REPO", repo)
+            .env_remove("AGENT_GUARD_SESSION_ID")
             .env_remove("DOTAGENT_TELEMETRY")
             .stdin(Stdio::null());
         command
@@ -269,15 +336,53 @@ fn actual_audit_lock_contention_is_confined_to_the_writer() {
 }
 
 #[test]
-fn post_tool_hook_allows_output_with_saturated_locked_failed_or_absent_audit() {
-    for mode in ["hook-full", "hook-lock", "hook-failure", "hook-absent"] {
+fn short_lived_producer_can_exit_with_pending_work_and_restart_without_replay() {
+    let state = IsolatedState::new("short-exit");
+    assert!(state.worker("exit-pending").status().unwrap().success());
+    let active = state.0.join("state/audit.jsonl");
+    assert!(store::open_audit_read(&active).unwrap().is_none());
+
+    assert!(state.worker("restart").status().unwrap().success());
+    let records = fixture_records(&active);
+    assert_eq!(records.len(), 1);
+    assert_eq!(
+        records[0]
+            .get("result")
+            .and_then(|result| result.get("reason_code"))
+            .and_then(JsonValue::as_str),
+        Some("AFTER_RESTART")
+    );
+}
+
+#[test]
+fn concurrent_producers_preserve_sequence_and_parent_links() {
+    let state = IsolatedState::new("ordering");
+    assert!(state.worker("ordering").status().unwrap().success());
+}
+
+#[test]
+fn stalled_observation_lanes_preserve_authoritative_writes_and_failure() {
+    let state = IsolatedState::new("authority");
+    assert!(state.worker("authority").status().unwrap().success());
+}
+
+#[test]
+fn post_tool_hook_preserves_allow_and_deny_across_audit_conditions() {
+    for mode in [
+        "hook-enabled",
+        "hook-disabled",
+        "hook-full",
+        "hook-lock",
+        "hook-failure",
+        "hook-absent",
+    ] {
         let state = IsolatedState::new(mode);
+        let mut worker = state.worker(mode);
+        if mode == "hook-disabled" {
+            worker.env("DOTAGENT_TELEMETRY", "0");
+        }
         assert!(
-            state
-                .worker(mode)
-                .status()
-                .expect("run isolated hook")
-                .success(),
+            worker.status().expect("run isolated hook").success(),
             "hook fixture failed in mode {mode}"
         );
     }
@@ -297,17 +402,209 @@ fn isolated_audit_worker() {
     let repo = PathBuf::from(std::env::var_os("DOTAGENT_RUNTIME_TEST_REPO").unwrap());
     match mode.as_str() {
         "store-lock" => exercise_audit_lock(&path),
+        "exit-pending" => exit_with_unconfirmed_admission(),
+        "restart" => exercise_restart(),
+        "ordering" => exercise_ordering(&path),
+        "authority" => exercise_authority_independence(&repo),
+        "hook-enabled" => {
+            assert!(start_global());
+            let runtime = GLOBAL.get().unwrap();
+            let release = stall(&runtime.audit);
+            let decisions = observe_hook_decisions(&repo);
+            release.send(()).unwrap();
+            assert_hook_decisions(decisions);
+            assert!(runtime.wait_idle(deadline()));
+            assert!(runtime.audit.snapshot().persisted > 1);
+        }
+        "hook-disabled" => {
+            assert!(!start_global());
+            assert_hook_decisions(observe_hook_decisions(&repo));
+            assert!(store::open_audit_read(&path).unwrap().is_none());
+        }
         "hook-full" => exercise_hook_while_audit_is_full(&repo),
         "hook-lock" => exercise_hook_while_audit_is_locked(&repo, &path),
         "hook-failure" => exercise_hook_with_failed_audit(&repo, &path),
         "hook-absent" => {
             assert!(GLOBAL.get().is_none());
-            assert!(observe_hook(&repo).is_allow());
+            assert_hook_decisions(observe_hook_decisions(&repo));
             assert!(AUDIT_OFFLINE.snapshot().unavailable > 0);
             assert!(store::open_audit_read(&path).unwrap().is_none());
         }
-        "bench-disabled" | "bench-enabled" => report_hook_benchmark(&repo, &mode),
+        "bench-disabled" | "bench-enabled" | "bench-saturated" | "bench-unavailable" => {
+            report_hook_benchmark(&repo, &mode);
+        }
         _ => panic!("unrecognized telemetry fixture mode"),
+    }
+}
+
+fn fixture_event(context: &crate::telemetry::capture::Context, reason: &'static str) -> String {
+    use crate::telemetry::capture::{Producer, emit, hook_decision};
+
+    let deadline = deadline();
+    loop {
+        let payload = hook_decision("post_tool_hook", "allow", reason, "observed", None);
+        if let Some(event_id) = emit(Producer::Guard, context, payload) {
+            return event_id;
+        }
+        assert!(Instant::now() < deadline, "fixture event was not admitted");
+        thread::yield_now();
+    }
+}
+
+fn exit_with_unconfirmed_admission() -> ! {
+    let host = super::start_host();
+    let runtime = GLOBAL.get().unwrap();
+    let _hold_until_exit = stall(&runtime.audit);
+    let _ = fixture_event(
+        &crate::telemetry::capture::Context::default(),
+        "EXIT_PENDING",
+    );
+    drop(host);
+    let counts = runtime.audit.snapshot();
+    assert_eq!(counts.queued, 2);
+    assert_eq!(counts.pending(), 2);
+    assert_eq!((counts.persisted, counts.failed), (0, 0));
+    std::process::exit(0);
+}
+
+fn exercise_restart() {
+    assert!(start_global());
+    let runtime = GLOBAL.get().unwrap();
+    assert_eq!(runtime.audit.snapshot().queued, 0);
+    let _ = fixture_event(
+        &crate::telemetry::capture::Context::default(),
+        "AFTER_RESTART",
+    );
+    assert!(runtime.wait_idle(deadline()));
+    let counts = runtime.audit.snapshot();
+    assert_eq!((counts.queued, counts.persisted, counts.failed), (1, 1, 0));
+    assert_eq!(counts.pending(), 0);
+}
+
+fn exercise_authority_independence(repo: &Path) {
+    use crate::traversal_ledger::{SessionLedger, session_ledger_path};
+
+    assert!(start_global());
+    let runtime = GLOBAL.get().unwrap();
+    let release_audit = stall(&runtime.audit);
+    let release_export = stall(&runtime.export);
+    thread::scope(|scope| {
+        let (finished, observed) = mpsc::channel();
+        scope.spawn(move || {
+            let mut ledger = SessionLedger::new(repo, "telemetry-authority-commit");
+            ledger.trip_circuit_breaker("fixture halt".to_owned());
+            ledger.save(repo).expect("persist halted security journal");
+            let halted = SessionLedger::load_or_create(repo, &ledger.session_id).halted;
+
+            let blocked_path = session_ledger_path(repo, "telemetry-authority-write-failure");
+            fs::create_dir_all(&blocked_path).expect("fixture blocks the authoritative file write");
+            let denied = matches!(
+                crate::handle_user_prompt_hook(
+                    r#"{"session_id":"telemetry-authority-write-failure"}"#,
+                    repo,
+                ),
+                crate::Decision::Deny {
+                    code: "STATE_WRITE_ERROR",
+                    ..
+                }
+            );
+            finished.send((halted, denied)).unwrap();
+        });
+        let verdicts = observed.recv_timeout(WATCHDOG);
+        release_audit.send(()).unwrap();
+        release_export.send(()).unwrap();
+        assert_eq!(verdicts.unwrap(), (true, true));
+    });
+}
+
+fn fixture_records(path: &Path) -> Vec<JsonValue> {
+    let mut audit = String::new();
+    store::open_audit_read(path)
+        .unwrap()
+        .unwrap()
+        .read_to_string(&mut audit)
+        .unwrap();
+    audit
+        .lines()
+        .map(|line| JsonValue::parse(line).unwrap())
+        .collect()
+}
+
+fn exercise_ordering(path: &Path) {
+    use crate::telemetry::capture::Context;
+
+    assert!(start_global());
+    let runtime = GLOBAL.get().unwrap();
+    let release = stall(&runtime.audit);
+    const PRODUCERS: usize = 4;
+    const EVENTS_PER_PRODUCER: usize = 6;
+    let added = thread::scope(|scope| {
+        let barrier = Arc::new(Barrier::new(PRODUCERS));
+        (0..PRODUCERS)
+            .map(|producer| {
+                let barrier = Arc::clone(&barrier);
+                scope.spawn(move || {
+                    let trace_id = format!("fixture-producer-{producer}");
+                    let mut context = Context {
+                        trace_id: Some(trace_id.clone()),
+                        ..Context::default()
+                    };
+                    barrier.wait();
+                    let mut ids = Vec::with_capacity(EVENTS_PER_PRODUCER);
+                    for _ in 0..EVENTS_PER_PRODUCER {
+                        let event_id = fixture_event(&context, "CONCURRENT_ORDERING");
+                        context.parent_event_id = Some(event_id.clone());
+                        ids.push(event_id);
+                    }
+                    (trace_id, ids)
+                })
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|producer| producer.join().unwrap())
+            .collect::<Vec<_>>()
+    });
+    release.send(()).unwrap();
+    assert!(runtime.wait_idle(deadline()));
+    let records = fixture_records(path);
+    assert_eq!(records.len(), PRODUCERS * EVENTS_PER_PRODUCER);
+    let sequence = |entry: &JsonValue| {
+        entry
+            .get("producer")
+            .and_then(|producer| producer.get("sequence"))
+            .and_then(JsonValue::as_u64)
+            .unwrap()
+    };
+    assert!(
+        records
+            .windows(2)
+            .all(|pair| sequence(&pair[0]) < sequence(&pair[1]))
+    );
+    for (trace_id, ids) in added {
+        let persisted: Vec<_> = records
+            .iter()
+            .filter(|record| {
+                record
+                    .get("correlation")
+                    .and_then(|correlation| correlation.get("trace_id"))
+                    .and_then(JsonValue::as_str)
+                    == Some(trace_id.as_str())
+            })
+            .collect();
+        assert_eq!(persisted.len(), ids.len());
+        for (index, record) in persisted.into_iter().enumerate() {
+            assert_eq!(
+                record.get("event_id").and_then(JsonValue::as_str),
+                Some(ids[index].as_str())
+            );
+            assert_eq!(
+                record
+                    .get("correlation")
+                    .and_then(|correlation| correlation.get("parent_event_id"))
+                    .and_then(JsonValue::as_str),
+                index.checked_sub(1).map(|prior| ids[prior].as_str()),
+            );
+        }
     }
 }
 
@@ -337,6 +634,19 @@ fn exercise_audit_lock(path: &Path) {
     assert_eq!(runtime.audit.snapshot().persisted, 2);
     assert!(store::open_audit_read(path).unwrap().is_some());
 
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        // Protected audit files must remain private even when the caller can write them.
+        fs::set_permissions(path, fs::Permissions::from_mode(0o644)).unwrap();
+        enqueue(&runtime.audit, || {
+            store::append(&fixture_record(), Durability::Buffered).is_ok()
+        });
+        assert!(runtime.wait_idle(deadline()));
+        assert_eq!(runtime.audit.snapshot().failed, 1);
+    }
+
     // An invalid destination exercises the real store's error reporting.
     fs::remove_file(path).unwrap();
     fs::create_dir(path).unwrap();
@@ -344,7 +654,7 @@ fn exercise_audit_lock(path: &Path) {
         store::append(&fixture_record(), Durability::Buffered).is_ok()
     });
     assert!(runtime.wait_idle(deadline()));
-    assert_eq!(runtime.audit.snapshot().failed, 1);
+    assert_eq!(runtime.audit.snapshot().failed, 1 + u64::from(cfg!(unix)));
 }
 
 const HOOK_OUTPUT: &str = "ordinary fixture output";
@@ -356,6 +666,32 @@ fn observe_hook(repo: &Path) -> crate::Decision {
     )
 }
 
+fn observe_hook_decisions(repo: &Path) -> (crate::Decision, crate::Decision) {
+    let ordinary_but_over_budget = JsonValue::Object(vec![
+        ("tool_name".into(), JsonValue::Str("Task".into())),
+        (
+            "tool_response".into(),
+            JsonValue::Str("ordinary detail ".repeat(100)),
+        ),
+    ]);
+    (
+        observe_hook(repo),
+        crate::handle_post_tool_hook(&ordinary_but_over_budget.to_json_string(), repo),
+    )
+}
+
+fn assert_hook_decisions((allow, deny): (crate::Decision, crate::Decision)) {
+    assert!(allow.is_allow());
+    assert!(matches!(
+        deny,
+        crate::Decision::Deny {
+            code: "SUBAGENT_RETURN_BUDGET_EXCEEDED",
+            halt_session: false,
+            ..
+        }
+    ));
+}
+
 fn exercise_hook_while_audit_is_full(repo: &Path) {
     start_global();
     let runtime = GLOBAL.get().unwrap();
@@ -365,11 +701,11 @@ fn exercise_hook_while_audit_is_full(repo: &Path) {
     }
     thread::scope(|scope| {
         let (returned, decision) = mpsc::channel();
-        scope.spawn(move || returned.send(observe_hook(repo)).unwrap());
+        scope.spawn(move || returned.send(observe_hook_decisions(repo)).unwrap());
         let actual = decision.recv_timeout(WATCHDOG);
         let counts = runtime.audit.snapshot();
         release.send(()).expect("release the stalled writer");
-        assert!(actual.expect("hook returned with a full queue").is_allow());
+        assert_hook_decisions(actual.expect("hook returned with a full queue"));
         assert!(counts.full > 0);
         assert_eq!(counts.persisted, 0);
     });
@@ -389,15 +725,11 @@ fn exercise_hook_while_audit_is_locked(repo: &Path, path: &Path) {
 
     thread::scope(|scope| {
         let (returned, decision) = mpsc::channel();
-        scope.spawn(move || returned.send(observe_hook(repo)).unwrap());
+        scope.spawn(move || returned.send(observe_hook_decisions(repo)).unwrap());
         let actual = decision.recv_timeout(WATCHDOG);
         let queued = runtime.audit.snapshot();
         drop(hold);
-        assert!(
-            actual
-                .expect("hook returned while audit was locked")
-                .is_allow()
-        );
+        assert_hook_decisions(actual.expect("hook returned while audit was locked"));
         assert!(queued.queued > 1);
         assert_eq!((queued.persisted, queued.failed), (0, 0));
     });
@@ -426,10 +758,10 @@ fn exercise_hook_with_failed_audit(repo: &Path, path: &Path) {
     start_global();
     let runtime = GLOBAL.get().unwrap();
     let release = stall(&runtime.audit);
-    let decision = observe_hook(repo);
+    let decisions = observe_hook_decisions(repo);
     release.send(()).unwrap();
 
-    assert!(decision.is_allow());
+    assert_hook_decisions(decisions);
     assert!(runtime.wait_idle(deadline()));
     assert!(runtime.audit.snapshot().failed > 0);
 }
@@ -457,11 +789,27 @@ const HOOK_BENCH_DATA_PREFIX: &str = "hook_samples_ns=";
 #[test]
 #[ignore = "reports process-isolated post-tool hook latency without portable timing assertions"]
 fn measures_post_tool_hook_overhead() {
-    let configurations = [("bench-disabled", "0"), ("bench-enabled", "1")];
-    let mut elapsed = [Vec::new(), Vec::new()];
-    for round in 0..configurations.len() {
+    let configurations = [
+        ("bench-disabled", "0"),
+        ("bench-enabled", "1"),
+        ("bench-saturated", "1"),
+        ("bench-unavailable", "1"),
+    ];
+    let mut elapsed = [Vec::new(), Vec::new(), Vec::new(), Vec::new()];
+    println!(
+        "{} {}, debug_assertions={}, {} warmup calls per process",
+        std::env::consts::OS,
+        std::env::consts::ARCH,
+        cfg!(debug_assertions),
+        HOOK_BENCH_WARMUP,
+    );
+    for round in 0..2 {
         for step in 0..configurations.len() {
-            let mode = (round + step) % configurations.len();
+            let mode = if round == 0 {
+                step
+            } else {
+                configurations.len() - step - 1
+            };
             let (label, setting) = configurations[mode];
             let fixture = IsolatedState::new(&format!("{label}-{round}"));
             let child = fixture
@@ -491,9 +839,10 @@ fn measures_post_tool_hook_overhead() {
         }
     }
 
-    let [disabled, enabled] = &mut elapsed;
-    summarize("post-tool hook with capture disabled", disabled);
-    summarize("post-tool hook with capture enabled", enabled);
+    for ((label, _), samples) in configurations.into_iter().zip(&mut elapsed) {
+        summarize(label, samples);
+    }
+    let [disabled, enabled, ..] = &elapsed;
     println!(
         "enabled minus disabled quantiles: p50={}ns, p95={}ns, p99={}ns",
         percentile(enabled, 50) - percentile(disabled, 50),
@@ -503,9 +852,23 @@ fn measures_post_tool_hook_overhead() {
 }
 
 fn report_hook_benchmark(repo: &Path, mode: &str) {
-    start_global();
+    if mode != "bench-unavailable" {
+        start_global();
+    }
     let runtime = GLOBAL.get();
-    assert_eq!(runtime.is_some(), mode == "bench-enabled");
+    assert_eq!(
+        runtime.is_some(),
+        matches!(mode, "bench-enabled" | "bench-saturated")
+    );
+    let release = runtime
+        .filter(|_| mode == "bench-saturated")
+        .map(|runtime| {
+            let release = stall(&runtime.audit);
+            for _ in 0..super::QUEUE_CAPACITY {
+                enqueue(&runtime.audit, || true);
+            }
+            release
+        });
     let mut times = Vec::with_capacity(HOOK_BENCH_SAMPLES);
     for iteration in 0..(HOOK_BENCH_WARMUP + HOOK_BENCH_SAMPLES) {
         let start = Instant::now();
@@ -517,17 +880,25 @@ fn report_hook_benchmark(repo: &Path, mode: &str) {
         }
     }
     if let Some(runtime) = runtime {
+        if let Some(release) = release {
+            let counts = runtime.audit.snapshot();
+            release.send(()).unwrap();
+            assert_eq!((counts.persisted, counts.failed), (0, 0));
+            assert!(counts.full >= (HOOK_BENCH_WARMUP + HOOK_BENCH_SAMPLES) as u64);
+        }
         assert!(runtime.wait_idle(deadline()));
         let counts = runtime.audit.snapshot();
         assert!(counts.persisted > 0);
         println!(
-            "hook_writer=enabled queued={} persisted={} failed={} full={} contended={}",
+            "hook_writer={mode} queued={} persisted={} failed={} full={} contended={}",
             counts.queued, counts.persisted, counts.failed, counts.full, counts.contended,
         );
     } else {
         let unavailable = AUDIT_OFFLINE.snapshot().unavailable;
-        assert!(unavailable > 0);
-        println!("hook_writer=disabled unavailable={unavailable}");
+        if mode == "bench-unavailable" {
+            assert!(unavailable > 0);
+        }
+        println!("hook_writer={mode} unavailable={unavailable}");
     }
     println!("{HOOK_BENCH_DATA_PREFIX}{}", times.join(","));
 }

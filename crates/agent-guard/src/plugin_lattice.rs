@@ -309,25 +309,24 @@ pub fn apply_pre_tool_plugin_lattice(
     match final_level {
         VerdictLevel::Allow => ring0_decision,
         VerdictLevel::EmitSignal => {
-            if !crate::telemetry::capture::host_capture_allowed() {
-                return ring0_decision;
-            }
-            let tool_name = snap.tool_name;
-            if tool_name.len() <= MAX_AGENTPI_EXPORT_INPUT_BYTES {
-                let _ = submit_export(move || {
-                    let event = JsonValue::Object(vec![
-                        (
-                            "schema".to_string(),
-                            JsonValue::Str(AGENTPI_EVENT_SCHEMA.to_string()),
-                        ),
-                        (
-                            "event_type".to_string(),
-                            JsonValue::Str("PLUGIN_LATTICE_SIGNAL".to_string()),
-                        ),
-                        ("risk_level".to_string(), JsonValue::Str("low".to_string())),
-                        ("tool_name".to_string(), JsonValue::Str(tool_name)),
-                    ]);
-                    write_agentpi_mirror(&event)
+            if snap.tool_name.len() <= MAX_AGENTPI_EXPORT_INPUT_BYTES {
+                let _ = submit_export(|| {
+                    let tool_name = snap.tool_name;
+                    move || {
+                        let event = JsonValue::Object(vec![
+                            (
+                                "schema".to_string(),
+                                JsonValue::Str(AGENTPI_EVENT_SCHEMA.to_string()),
+                            ),
+                            (
+                                "event_type".to_string(),
+                                JsonValue::Str("PLUGIN_LATTICE_SIGNAL".to_string()),
+                            ),
+                            ("risk_level".to_string(), JsonValue::Str("low".to_string())),
+                            ("tool_name".to_string(), JsonValue::Str(tool_name)),
+                        ]);
+                        write_agentpi_mirror(&event)
+                    }
                 });
             } else {
                 note_invalid_export();

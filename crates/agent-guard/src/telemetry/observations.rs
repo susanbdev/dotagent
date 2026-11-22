@@ -17,8 +17,7 @@ use std::time::Instant;
 use crate::json::JsonValue;
 
 use super::capture::{
-    Completeness, Context, EventType, Payload, Producer, emit, host_capture_allowed, next_local_id,
-    unix_time_ms,
+    Completeness, Context, EventType, Payload, Producer, emit, next_local_id, unix_time_ms,
 };
 
 const BASELINE_ROUTE: &str = "repo_baseline_mediator";
@@ -317,7 +316,7 @@ pub(crate) struct ShellMediatorObservation {
 
 impl ShellMediatorObservation {
     pub(crate) fn new(repo_root: &Path) -> Option<Self> {
-        if !host_capture_allowed() {
+        if !super::runtime::audit_active() {
             return None;
         }
         let mut context = Context::for_repo(repo_root);
