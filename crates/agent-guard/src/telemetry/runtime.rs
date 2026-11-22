@@ -159,7 +159,9 @@ enum Job {
 impl Job {
     fn run(self) -> bool {
         #[cfg(all(unix, feature = "collector-fixture"))]
-        if super::release_probe::before_store().is_err() { return false; }
+        if super::release_probe::before_store().is_err() {
+            return false;
+        }
         match self {
             Self::Record(record) if record.kind.mirror() => {
                 crate::feedback::write_agentpi_mirror(&record.body)
@@ -233,12 +235,14 @@ impl Lane {
         }
     }
 
+    #[cfg(test)]
     fn admit<T>(&self, build: impl FnOnce() -> Option<(Job, T)>) -> Result<T, DropReason> {
         self.try_admit(build).inspect_err(|reason| {
             self.state.counters.note_drop(*reason);
         })
     }
 
+    #[cfg(test)]
     fn try_admit<T>(&self, build: impl FnOnce() -> Option<(Job, T)>) -> Result<T, DropReason> {
         let state = &self.state;
         if !state.accepting.load(Ordering::Acquire) {
@@ -371,7 +375,20 @@ impl Runtime {
         } else {
             &self.audit
         };
-        let _ = lane.admit(|| Some((Job::Record(record), ())));
+        // Both sides of this mutex live in the collector. The worker releases it before I/O.
+        let state = &lane.state;
+        let Ok(mut jobs) = state.jobs.lock() else {
+            state.counters.note_drop(DropReason::Unavailable);
+            return;
+        };
+        if !state.running.load(Ordering::Acquire) {
+            state.counters.note_drop(DropReason::Unavailable);
+        } else if jobs.len() >= state.capacity {
+            state.counters.note_drop(DropReason::Full);
+        } else {
+            jobs.push_back(Job::Record(record));
+            state.counters.queued.fetch_add(1, Ordering::Release);
+        }
     }
 
     pub(super) fn rejected(&self) {
@@ -379,7 +396,10 @@ impl Runtime {
     }
 
     pub(super) fn counts(&self) -> (Counters, Counters) {
-        (self.audit.state.counters.snapshot(), self.export.state.counters.snapshot())
+        (
+            self.audit.state.counters.snapshot(),
+            self.export.state.counters.snapshot(),
+        )
     }
 
     pub(super) fn finish(&self) {
@@ -543,12 +563,10 @@ pub(super) fn try_event(
 ) -> Result<EventIdentity, DropReason> {
     #[cfg(test)]
     if let Some(runtime) = GLOBAL.get() {
-        return runtime
-            .audit
-            .admit(|| {
-                let (identity, event) = EventDescriptor::new(producer, context, payload).ok()?;
-                Some((Job::Audit(event), identity))
-            });
+        return runtime.audit.admit(|| {
+            let (identity, event) = EventDescriptor::new(producer, context, payload).ok()?;
+            Some((Job::Audit(event), identity))
+        });
     }
     handoff(false, || {
         let (id, event) = EventDescriptor::new(producer, context, payload).ok()?;

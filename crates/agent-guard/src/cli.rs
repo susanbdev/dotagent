@@ -66,6 +66,10 @@ pub fn run_cli_entrypoint() -> ExitCode {
         .then(crate::telemetry::runtime::start_host);
     match sub {
         #[cfg(unix)]
+        "supervise-observations" if args.get(1).map(String::as_str) == Some("--owned") && args.len() == 2 => {
+            if crate::telemetry::transport::supervise().is_ok() { ExitCode::SUCCESS } else { ExitCode::FAILURE }
+        }
+        #[cfg(unix)]
         "collect-observations" => {
             let owned = match &args[1..] {
                 [] => false,
@@ -837,8 +841,7 @@ where
             return dec;
         }
     }
-    // The one-shot fallback has no pre-established collector. Starting workers here
-    // would put thread creation and queue allocation ahead of the hook decision.
+    // A local fallback may submit to an existing collector; it never starts one.
     local_fallback()
 }
 

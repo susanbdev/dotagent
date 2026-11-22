@@ -16,9 +16,16 @@ pub(super) fn before_store() -> io::Result<()> {
         2 => Err(io::Error::from(io::ErrorKind::PermissionDenied)),
         3 => {
             #[cfg(target_os = "linux")]
-            { std::fs::OpenOptions::new().write(true).open("/dev/full")?.write_all(b"x") }
+            {
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .open("/dev/full")?
+                    .write_all(b"x")
+            }
             #[cfg(not(target_os = "linux"))]
-            { Err(io::Error::from_raw_os_error(28)) }
+            {
+                Err(io::Error::from_raw_os_error(28))
+            }
         }
         5 if FAULT.swap(0, Ordering::Relaxed) == 5 => {
             writeln!(io::stdout().lock(), "STALLED")?;
@@ -49,18 +56,40 @@ fn producer() -> io::Result<()> {
                 }
             }
             "guard" => {
-                let allow = crate::handle_post_tool_hook(r#"{"tool_name":"Read","tool_response":"ordinary fixture output"}"#, &repo);
-                let payload = format!(r#"{{"tool_name":"Task","tool_response":"{}"}}"#, "ordinary detail ".repeat(100));
+                let allow = crate::handle_post_tool_hook(
+                    r#"{"tool_name":"Read","tool_response":"ordinary fixture output"}"#,
+                    &repo,
+                );
+                let payload = format!(
+                    r#"{{"tool_name":"Task","tool_response":"{}"}}"#,
+                    "ordinary detail ".repeat(100)
+                );
                 let deny = crate::handle_post_tool_hook(&payload, &repo);
                 let mut ledger = SessionLedger::new(&repo, "probe-halt");
                 ledger.trip_circuit_breaker("fixture".to_owned());
                 ledger.save(&repo).map_err(io::Error::other)?;
                 let persisted = SessionLedger::load_or_create(&repo, "probe-halt").halted;
                 std::fs::create_dir_all(session_ledger_path(&repo, "probe-failed-write"))?;
-                let failed = crate::handle_user_prompt_hook(r#"{"session_id":"probe-failed-write"}"#, &repo);
-                let decision = matches!(deny, crate::Decision::Deny { code: "SUBAGENT_RETURN_BUDGET_EXCEEDED", .. });
-                let failure = matches!(failed, crate::Decision::Deny { code: "STATE_WRITE_ERROR", .. });
-                format!("GUARD {} {decision} {persisted} {failure}", allow.is_allow())
+                let failed =
+                    crate::handle_user_prompt_hook(r#"{"session_id":"probe-failed-write"}"#, &repo);
+                let decision = matches!(
+                    deny,
+                    crate::Decision::Deny {
+                        code: "SUBAGENT_RETURN_BUDGET_EXCEEDED",
+                        ..
+                    }
+                );
+                let failure = matches!(
+                    failed,
+                    crate::Decision::Deny {
+                        code: "STATE_WRITE_ERROR",
+                        ..
+                    }
+                );
+                format!(
+                    "GUARD {} {decision} {persisted} {failure}",
+                    allow.is_allow()
+                )
             }
             "quit" => break,
             _ => return Err(io::Error::from(io::ErrorKind::InvalidInput)),
@@ -71,7 +100,9 @@ fn producer() -> io::Result<()> {
 }
 
 pub fn run() -> ExitCode {
-    if !cfg!(panic = "abort") { return ExitCode::FAILURE; }
+    if !cfg!(panic = "abort") {
+        return ExitCode::FAILURE;
+    }
     let mode = std::env::args().nth(1).unwrap_or_default();
     let result = if mode == "producer" {
         producer()
@@ -89,6 +120,9 @@ pub fn run() -> ExitCode {
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
-        Err(e) => { eprintln!("release probe: {e}"); ExitCode::FAILURE }
+        Err(e) => {
+            eprintln!("release probe: {e}");
+            ExitCode::FAILURE
+        }
     }
 }

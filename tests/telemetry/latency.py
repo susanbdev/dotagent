@@ -6,6 +6,7 @@ import math
 import os
 from pathlib import Path
 import platform
+import re
 import socket
 import subprocess
 import sys
@@ -77,6 +78,10 @@ def run(mode, builds):
                                            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                            timeout=WATCHDOG, check=False)
                     elapsed = time.perf_counter_ns() - start
+                    if cycle == 0 and label == "pr":
+                        diagnostic = (child.stderr + child.stdout).decode("ascii", "replace")
+                        codes = sorted(set(re.findall(r"\b[A-Z][A-Z0-9_]{4,}\b", diagnostic)))
+                        print("FIXTURE", mode, operation, child.returncode, codes[:8], flush=True)
                     if cycle >= WARMUP:
                         samples[label].append(elapsed)
                         exits[label].add(child.returncode)

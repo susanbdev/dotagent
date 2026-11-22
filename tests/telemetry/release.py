@@ -2,6 +2,7 @@
 
 import contextlib
 import json
+import hashlib
 import os
 from pathlib import Path
 import resource
@@ -143,7 +144,11 @@ def exercise(mode, bins):
                 spawn([cli, "collect-observations", "--owned"])
                 second = until(lambda: submitted(producer))
                 assert second != previous
-                until(lambda: any(row.get("event_id") == second for row in observed(state)))
+                try:
+                    until(lambda: any(row.get("event_id") == second for row in observed(state)))
+                except AssertionError:
+                    print("restart handoff", second, "collector counters", health(state), flush=True)
+                    raise
                 ids = [r.get("event_id") for r in observed(state)]
                 assert ids.count(previous) == ids.count(second) == 1
         elif mode in {"permission", "enospc"}:
@@ -195,13 +200,22 @@ def shipped_host(bins):
                 client.connect(os.path.relpath(address))
                 client.sendall(json.dumps(request).encode() + b"\n")
                 return json.loads(client.makefile("rb").readline())
-        until((state / "observations/in").is_socket)
+        until((state / "observations/route").is_file)
         allow = {"tool_name": "Read", "tool_response": "unique_private_fixture_output"}
         deny = {"tool_name": "Task", "tool_response": "ordinary detail " * 100}
         assert rpc(allow)["allow"] is True
         assert rpc(deny)["code"] == "SUBAGENT_RETURN_BUDGET_EXCEEDED"
         until(lambda: any(r.get("event_type") == "USAGE_AND_DISPOSITION" for r in observed(state)))
         assert b"unique_private_fixture_output" not in (state / "audit.jsonl").read_bytes()
+        assert host.poll() is None
+        first_pid = until(lambda: health(state).get("collector_pid"))
+        os.kill(first_pid, signal.SIGKILL)
+        def replacement():
+            pid = health(state).get("collector_pid")
+            return pid and pid != first_pid
+        until(replacement)
+        assert rpc(allow)["allow"] is True
+        assert rpc(deny)["code"] == "SUBAGENT_RETURN_BUDGET_EXCEEDED"
         assert host.poll() is None
 
 

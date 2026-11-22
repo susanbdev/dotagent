@@ -82,6 +82,45 @@ fn scalar_tree(value: &JsonValue, depth: usize, budget: &mut usize) -> bool {
     }
 }
 
+fn fields(value: Option<&JsonValue>, keys: &[&str]) -> bool {
+    value.and_then(JsonValue::as_object).is_some_and(|entries| entries.iter().all(|(k, _)| keys.contains(&k.as_str())))
+}
+
+fn event_fields(body: &JsonValue) -> bool {
+    const MEASUREMENTS: &[&str] = &[
+        "argument_summary", "assessment", "attempt", "boundary", "byte_cap_applied",
+        "byte_cap_dropped_bytes", "category", "check_expectation", "cleanup_scope", "compacted_bytes",
+        "compaction_byte_limit", "compaction_line_limit", "continuation_available", "control",
+        "control_sequences_stripped", "deadline_ms", "detector", "detector_signal", "dropped_bytes",
+        "dropped_lines", "duration_ns", "duration_scope", "emitted_bytes", "emitted_lines",
+        "escape_sequences_defanged", "estimated_tokens", "executable", "exit_code", "expectation_met",
+        "expected_exit_code", "finding_byte_offset", "granted_lines", "guard_compaction_epoch",
+        "harness_compaction_result", "invalid_utf8_replaced", "line_cap_dropped_bytes", "mediator_reaped",
+        "nested_process_coverage", "non_ascii_characters_replaced", "observed_status", "operation",
+        "read_bytes", "requested_bytes", "requested_check", "requested_lines", "requested_offset_line",
+        "resolved_commit", "route", "rule", "sanitized_bytes", "scanned_bytes", "scanned_lines",
+        "scope", "selected_bytes", "selected_lines", "selected_max_line_bytes", "selected_offset_line",
+        "signal", "source_bytes_at_stat", "source_freshness", "source_lines", "status_scope", "subject",
+        "termination", "threshold", "threshold_source", "token_estimation_method", "unit",
+        "unscanned_bytes", "worktree_dirty",
+    ];
+    let correlation = body.get("correlation");
+    let links = correlation.and_then(|c| c.get("causal_links"));
+    super::capture::valid_wire_provenance(body)
+        && fields(body.get("producer"), &["component", "instance_id", "sequence"])
+        && fields(body.get("timing"), &["clock", "occurred_at_unix_ms", "observed_at_unix_ms", "duration_ns"])
+        && fields(body.get("work"), &["repo_id", "session_id", "root_session_id", "plan_id", "task_id",
+            "allocating_parent_id", "role", "attempt", "epoch"])
+        && fields(body.get("configuration"), &["policy_id", "bundle_id", "profile_id"])
+        && fields(body.get("result"), &["action", "reason_code", "disposition", "completeness"])
+        && fields(correlation, &["trace_id","parent_event_id","execution_id","intervention_id","source_event_id","causal_links"])
+        && links.is_none_or(|v| v.as_array().is_some_and(|a| a.len() <= 8 && a.iter().all(|link|
+            fields(Some(link), &["event_id", "relation", "method", "algorithm_version"]))))
+        && fields(body.get("payload"), MEASUREMENTS)
+        && body.get("payload").and_then(JsonValue::as_object).is_some_and(|f| f.iter().all(|(_,v)|
+            !matches!(v, JsonValue::Array(_) | JsonValue::Object(_))))
+}
+
 impl Record {
     fn valid(&self) -> bool {
         let body = &self.body;
@@ -137,6 +176,7 @@ impl Record {
                                 | "RECOVERY_OR_ESCALATION"
                         )
                     )
+                    && event_fields(body)
                     && field("event_id").is_some_and(token)
                     && [
                         "producer",
@@ -262,5 +302,57 @@ impl Record {
             return None;
         }
         Some((record, tag.try_into().ok()?))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::telemetry::capture::{self, Context, Producer, hook_decision};
+
+    fn record() -> Record {
+        let (_, body) = capture::encode(
+            Producer::Guard,
+            &Context::default(),
+            hook_decision("post_tool_hook", "allow", "PROBE", "observed", None),
+        ).unwrap();
+        Record { kind: Kind::Event, body }
+    }
+
+    #[test]
+    fn rejects_foreign_generation_malformed_truncated_and_expired_datagrams() {
+        let key = [17; 32];
+        let now = 80_000;
+        let frame = record().frame(&key, 1, now).unwrap();
+        assert!(Record::parse(&frame, &key, now).is_some());
+        assert!(Record::parse(&frame, &[18; 32], now).is_none());
+        assert!(Record::parse(&frame, &key, now + 30_001).is_none());
+        for length in [0, HEADER - 1, HEADER, frame.len() - 1] {
+            assert!(Record::parse(&frame[..length], &key, now).is_none());
+        }
+        for index in [0, 4, 5, 6, HEADER, frame.len() - 1] {
+            let mut corrupt = frame.clone();
+            corrupt[index] ^= 127;
+            assert!(Record::parse(&corrupt, &key, now).is_none());
+        }
+        assert!(Record::parse(&vec![0; MAX_FRAME + 1], &key, now).is_none());
+    }
+
+    #[test]
+    fn rejects_unrecognized_fields_sink_substitution_and_forged_provenance() {
+        let mut event = record();
+        event.kind = Kind::Ballot;
+        assert!(!event.valid());
+        event.kind = Kind::Event;
+        let JsonValue::Object(fields) = &mut event.body else { unreachable!() };
+        let (_, JsonValue::Object(payload)) = fields.iter_mut().find(|(k,_)| k == "payload").unwrap()
+            else { unreachable!() };
+        payload.push(("prompt".into(), JsonValue::Str("fixture".into())));
+        assert!(event.frame(&[1; 32], 1, 1).is_none());
+        let mut event = record();
+        let JsonValue::Object(fields) = &mut event.body else { unreachable!() };
+        let (_, trust) = fields.iter_mut().find(|(k,_)| k == "trust").unwrap();
+        *trust = JsonValue::Null;
+        assert!(!event.valid());
     }
 }

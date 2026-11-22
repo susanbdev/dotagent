@@ -1482,6 +1482,7 @@ impl ExclusiveFileLockGuard {
         let self_pid = std::process::id();
         let self_proc_tok = current_lock_owner_token();
         let mut registered_want = false;
+        let mut next_liveness_check = started;
         loop {
             match OpenOptions::new()
                 .write(true)
@@ -1510,7 +1511,8 @@ impl ExclusiveFileLockGuard {
                             .open(&want_path);
                         registered_want = true;
                     }
-                    let min_reclaim_age = if cfg!(target_os = "linux") {
+                    let observation = std::ptr::eq(registry, &OBSERVATION_FIFOS);
+                    let min_reclaim_age = if cfg!(target_os = "linux") || (cfg!(target_os = "macos") && observation) {
                         Duration::from_millis(250)
                     } else {
                         Duration::from_secs(30)
@@ -1519,7 +1521,11 @@ impl ExclusiveFileLockGuard {
                         && let Ok(modified) = meta.modified()
                         && let Ok(age) = modified.elapsed()
                         && age > min_reclaim_age
-                        && is_lock_holder_dead(&lock_path, age)
+                        && Instant::now() >= next_liveness_check
+                        && {
+                            next_liveness_check = Instant::now() + Duration::from_millis(250);
+                            lock_owner_gone(&lock_path, age, observation)
+                        }
                     {
                         let reclaim_tmp =
                             locks_dir.join(format!(".reclaim.{}.{}", &digest_hex[..16], self_pid));
@@ -1602,6 +1608,23 @@ fn current_lock_owner_token() -> &'static str {
             format!("instance-{stamp:x}")
         })
     })
+}
+
+fn lock_owner_gone(path: &Path, age: Duration, observation: bool) -> bool {
+    #[cfg(target_os = "macos")]
+    if observation {
+        let raw = fs::read_to_string(path).unwrap_or_default();
+        if let Some(pid) = raw.split_whitespace().next().and_then(|p| p.strip_prefix("pid="))
+            .and_then(|p| p.parse::<u32>().ok())
+            && pid != 0 && pid != std::process::id() {
+            // macOS has no procfs. ps returns one for an empty PID selection.
+            // Ambiguous failures leave the marker intact. This is collector-only.
+            return Command::new("/bin/ps").env_clear().args(["-p", &pid.to_string(), "-o", "pid="])
+                .output().is_ok_and(|out| out.status.code() == Some(1) && out.stdout.is_empty() && out.stderr.is_empty());
+        }
+    }
+    let _ = observation;
+    is_lock_holder_dead(path, age)
 }
 
 fn is_lock_holder_dead(lock_path: &Path, age: Duration) -> bool {

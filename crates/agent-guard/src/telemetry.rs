@@ -220,7 +220,7 @@ pub fn analyze_audit_jsonl_reader<R: BufRead>(
         }
         let repo = val.get("repo").and_then(JsonValue::as_str).unwrap_or("");
         if let Some(filter) = repo_filter
-            && !repo.contains(filter)
+            && !repo.contains(filter) && repo != crate::crypto::sha256_hex(filter.as_bytes())
         {
             continue;
         }
@@ -520,6 +520,11 @@ pub fn run_telemetry_cli(args: &[String]) -> ExitCode {
     match sub {
         "baseline" => observations::run_baseline_cli(&args[1..], &repo_root),
         "trace" => run_trace_cli(&audit_path, &args[1..]),
+        #[cfg(unix)]
+        "delivery" => match transport::delivery_status() {
+            Ok(status) => { println!("{}", status.to_json_string()); ExitCode::SUCCESS }
+            Err(e) => { eprintln!("collector delivery status unavailable: {e}"); ExitCode::FAILURE }
+        },
         "rotate" => {
             let mut max_bytes: u64 = 10 * 1024 * 1024; // 10 MiB default
             let mut keep: usize = 5;

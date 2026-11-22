@@ -9,7 +9,6 @@ use std::os::fd::OwnedFd;
 use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::UnixDatagram;
 use std::path::{Path, PathBuf};
-#[cfg(not(test))]
 use std::process::{Child, Command, Stdio};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -162,8 +161,12 @@ fn failure(error: &io::Error) -> DropReason {
     let (no_buffers, oversized) = (105, 90);
     #[cfg(not(target_os = "linux"))]
     let (no_buffers, oversized) = (55, 40);
-    if error.raw_os_error() == Some(no_buffers) { return DropReason::Full; }
-    if error.raw_os_error() == Some(oversized) { return DropReason::Invalid; }
+    if error.raw_os_error() == Some(no_buffers) {
+        return DropReason::Full;
+    }
+    if error.raw_os_error() == Some(oversized) {
+        return DropReason::Invalid;
+    }
     match error.kind() {
         io::ErrorKind::WouldBlock => DropReason::Full,
         io::ErrorKind::NotFound
@@ -237,27 +240,55 @@ pub(super) fn send<T>(build: impl FnOnce() -> Option<(Record, T)>) -> Result<T, 
     }
 }
 
+fn child_command(role: &str) -> io::Result<Command> {
+    let mut command = Command::new(std::env::current_exe()?);
+    command.arg(role).arg("--owned").env_clear();
+    for name in ["HOME", "AGENT_GUARD_STATE_DIR"] {
+        if let Some(value) = std::env::var_os(name) { command.env(name, value); }
+    }
+    command.stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::null());
+    Ok(command)
+}
+
 #[cfg(not(test))]
 pub(super) fn launch() -> Option<Child> {
-    if !enabled() || active() {
-        return None;
+    if !enabled() { return None; }
+    child_command("supervise-observations").ok()?.spawn().ok()
+}
+
+/// Owns the child and its restart budget outside the guard's panic and scheduling domain.
+pub(crate) fn supervise() -> io::Result<()> {
+    if !enabled() { return Err(invalid()); }
+    let (closed, owner) = std::sync::mpsc::sync_channel(1);
+    std::thread::Builder::new().name("observation-owner".into()).spawn(move || {
+        let _ = io::stdin().read(&mut [0]);
+        let _ = closed.send(());
+    })?;
+    let mut child: Option<Child> = None;
+    let mut starts = VecDeque::with_capacity(3);
+    loop {
+        if let Some(process) = &mut child && process.try_wait()?.is_some() { child = None; }
+        let now = Instant::now();
+        while starts.front().is_some_and(|tick| *tick <= now) { starts.pop_front(); }
+        if child.is_none() && starts.len() < 3 && Peer::open().is_err() {
+            starts.push_back(now + Duration::from_secs(60));
+            child = child_command("collect-observations")?.spawn().ok();
+        }
+        if !matches!(owner.recv_timeout(Duration::from_millis(250)), Err(std::sync::mpsc::RecvTimeoutError::Timeout)) { break; }
     }
-    let mut command = Command::new(std::env::current_exe().ok()?);
-    command
-        .arg("collect-observations")
-        .arg("--owned")
-        .env_clear();
-    for name in ["HOME", "AGENT_GUARD_STATE_DIR"] {
-        if let Some(value) = std::env::var_os(name) {
-            command.env(name, value);
+    if let Some(mut child) = child {
+        drop(child.stdin.take());
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while child.try_wait()?.is_none() {
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                break;
+            }
+            std::thread::park_timeout(Duration::from_millis(20));
         }
     }
-    command
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .ok()
+    Ok(())
 }
 
 struct Endpoint {
@@ -297,9 +328,7 @@ impl Endpoint {
             id,
             key,
         };
-        let staging = endpoint
-            .dir
-            .join(format!("route-{}", std::process::id()));
+        let staging = endpoint.dir.join(format!("route-{}", std::process::id()));
         let mut file = OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -321,12 +350,29 @@ impl Endpoint {
 }
 
 impl Endpoint {
-    fn report(&self, counts: (super::runtime::Counters, super::runtime::Counters), closing: bool) -> io::Result<()> {
+    fn report(
+        &self,
+        counts: (super::runtime::Counters, super::runtime::Counters),
+        closing: bool,
+    ) -> io::Result<()> {
         let stage = self.dir.join(format!("health-{}", std::process::id()));
-        let mut file = OpenOptions::new().write(true).create_new(true).mode(0o600).open(&stage)?;
-        let status = super::runtime_health::status(counts.0, counts.1, closing).to_json_string();
-        let result = file.write_all(status.as_bytes()).and_then(|()| fs::rename(&stage, self.dir.join("health")));
-        if result.is_err() { let _ = fs::remove_file(stage); }
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&stage)?;
+        let mut status = super::runtime_health::status(counts.0, counts.1, closing);
+        if let crate::json::JsonValue::Object(fields) = &mut status {
+            fields.push(("collector_pid".into(), crate::json::JsonValue::Uint(u64::from(std::process::id()))));
+            fields.push(("generation".into(), crate::json::JsonValue::Str(crate::crypto::hex_encode(&self.id))));
+        }
+        let status = status.to_json_string();
+        let result = file
+            .write_all(status.as_bytes())
+            .and_then(|()| fs::rename(&stage, self.dir.join("health")));
+        if result.is_err() {
+            let _ = fs::remove_file(stage);
+        }
         result
     }
 }
@@ -338,6 +384,22 @@ impl Drop for Endpoint {
             let _ = fs::remove_file(self.dir.join(SOCKET));
         }
     }
+}
+
+pub(super) fn delivery_status() -> io::Result<crate::json::JsonValue> {
+    use crate::json::JsonValue;
+    let socket = UnixDatagram::unbound()?;
+    let dir = private_dir(uid(&socket)?, false)?;
+    let mut data = String::new();
+    super::store::open_audit_read(&dir.join("health")).map_err(|e| io::Error::other(e.to_string()))?
+        .ok_or(io::ErrorKind::NotFound)?.take(8193).read_to_string(&mut data)?;
+    if data.len() > 8192 { return Err(invalid()); }
+    let snapshot = JsonValue::parse(&data).map_err(io::Error::other)?;
+    let clean = super::runtime_health::read(&snapshot).ok_or_else(invalid)?;
+    Ok(JsonValue::Object(vec![
+        ("collector_available".into(), JsonValue::Bool(Peer::open().is_ok())),
+        ("last_collector_snapshot".into(), clean),
+    ]))
 }
 
 pub(crate) fn collect(owned: bool) -> io::Result<()> {
@@ -373,7 +435,9 @@ pub(crate) fn collect(owned: bool) -> io::Result<()> {
             next_report = Instant::now() + Duration::from_millis(100);
         }
         if CLOSING.load(Ordering::Acquire) {
-            if drain_left == 0 { break; }
+            if drain_left == 0 {
+                break;
+            }
             drain_left -= 1;
             endpoint.socket.set_nonblocking(true)?;
         }
