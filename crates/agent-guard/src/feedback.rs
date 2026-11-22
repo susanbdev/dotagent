@@ -1878,10 +1878,7 @@ pub fn aggregate_verified_clusters(
 pub fn run_feedback_cli(args: &[String], cwd: &Path) -> ExitCode {
     let sub = args.first().map(String::as_str).unwrap_or("--help");
     match sub {
-        "submit" => {
-            let _telemetry = crate::telemetry::runtime::start_host();
-            run_feedback_submit_cli(&args[1..], cwd)
-        }
+        "submit" => run_feedback_submit_cli(&args[1..], cwd),
         "status" => crate::feedback_loop::run_feedback_status_cli(&args[1..], cwd),
         "sync-github" => crate::feedback_loop::run_feedback_sync_github_cli(&args[1..], cwd),
         "triage" => crate::telemetry::run_operator_feedback_triage_cli(&args[1..], cwd),

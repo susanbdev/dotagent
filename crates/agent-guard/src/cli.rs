@@ -62,11 +62,8 @@ pub fn run_cli_entrypoint() -> ExitCode {
     let sub = args.first().map(String::as_str).unwrap_or("--help");
     // Initialize only host processes that produce optional observations.
     // exec-sandbox applies kernel restrictions in-process and must start no such threads.
-    let _telemetry = matches!(
-        sub,
-        "coordinator" | "hook-daemon" | "mcp-gateway" | "pre-compact" | "read-safe"
-    )
-    .then(crate::telemetry::runtime::start_host);
+    let _telemetry = matches!(sub, "coordinator" | "hook-daemon" | "mcp-gateway")
+        .then(crate::telemetry::runtime::start_host);
     match sub {
         "swarm" => exec_sibling_tool("swarm-tool", &args[1..]),
         "compile" | "compiler" => exec_sibling_tool("dotagent-compiler", &args[1..]),
@@ -810,7 +807,7 @@ fn run_scan_file(raw_path: &str, cwd: &Path) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-fn eval_hook_preferring_hot_coord<F>(
+pub(crate) fn eval_hook_preferring_hot_coord<F>(
     phase: &str,
     payload: &str,
     cwd: &Path,
@@ -825,9 +822,8 @@ where
             return dec;
         }
     }
-    // Delegated hooks capture observations in the existing host daemon. Only local evaluation
-    // owns a local telemetry runtime, and fallback adds no delivery handshake.
-    let _telemetry = crate::telemetry::runtime::start_host();
+    // The one-shot fallback has no pre-established collector. Starting workers here
+    // would put thread creation and queue allocation ahead of the hook decision.
     local_fallback()
 }
 
