@@ -182,7 +182,7 @@ The wrapper omits command text and streams from telemetry. The fixed Git baselin
 | Strict workspace Clippy | Passed on Rust 1.100.0, the CI stable channel. The audit counters retain saturating behavior on the Rust 1.88.0 MSRV. |
 | Workspace check and build, offline and locked | Passed on Rust 1.88.0. |
 | Workspace test compilation, offline and locked | All 26 Cargo test executables compiled. Full behavioral execution was outside this run. |
-| Focused telemetry tests | 31 passed. The separately measured writer fixture was ignored in this run. |
+| Focused telemetry tests | 35 passed. The separately measured writer fixture was ignored in this run. |
 | Focused security tests | Checkpoint session identity, isolated scratch preparation and webfont file handling passed. |
 | Compiler verification | All 58 artifacts matched. |
 | Gemini/Antigravity adapter replay | One scenario and all 10 steps passed against the combined binaries. |

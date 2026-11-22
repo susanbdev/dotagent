@@ -3,8 +3,6 @@
 #[cfg(unix)]
 use std::io::{self, Read};
 #[cfg(unix)]
-use std::net::Shutdown;
-#[cfg(unix)]
 use std::os::fd::OwnedFd;
 #[cfg(unix)]
 use std::os::unix::{net::UnixStream, process::CommandExt};
@@ -427,8 +425,6 @@ impl BaselineMediator {
         writer: UnixStream,
     ) -> io::Result<Self> {
         reader.set_nonblocking(true)?;
-        reader.shutdown(Shutdown::Write)?;
-        writer.shutdown(Shutdown::Read)?;
         let child = command
             .stdin(Stdio::null())
             .stdout(Stdio::from(OwnedFd::from(writer)))
