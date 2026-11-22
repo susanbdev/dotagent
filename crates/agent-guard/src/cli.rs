@@ -94,6 +94,10 @@ pub fn run_cli_entrypoint() -> ExitCode {
         "compile" | "compiler" => exec_sibling_tool("dotagent-compiler", &args[1..]),
         "harness" => exec_sibling_tool("dotagent-harness", &args[1..]),
         "doctor" => crate::operator::run_doctor_cli(&args[1..], &cwd),
+        "status" => crate::enforcement_state::run_status_cli(&args[1..], &cwd),
+        "verify-enforcement" => {
+            crate::enforcement_state::run_verify_enforcement_cli(&args[1..], &cwd)
+        }
         "explain" => crate::diagnostics::run_explain_cli(&args[1..]),
         "session-reset" => crate::operator::run_session_reset_cli(&args[1..], &cwd),
         "elevate" => crate::operator::run_elevate_cli(&args[1..], &cwd),
@@ -113,6 +117,9 @@ pub fn run_cli_entrypoint() -> ExitCode {
         "verify-receipt" => crate::stop_receipt::run_verify_receipt_cli(&args[1..], &cwd),
         "receipt-pubkey" => crate::stop_receipt::run_receipt_pubkey_cli(&args[1..], &cwd),
         "mcp-gateway" => crate::mcp_gateway::run_mcp_gateway_cli(&args[1..], &cwd),
+        "antigravity-hook" => {
+            crate::antigravity_adapter::run_antigravity_hook_cli(&args[1..], &cwd)
+        }
         "pre-tool" => {
             let payload = match read_bounded_stdin_or_arg(&args[1..]) {
                 Ok(s) => s,
@@ -121,6 +128,18 @@ pub fn run_cli_entrypoint() -> ExitCode {
             let decision = eval_hook_preferring_hot_coord("pre-tool", &payload, &cwd, || {
                 handle_pre_tool_hook(&payload, &cwd)
             });
+            if let Decision::Deny { code, .. } = &decision
+                && let Some(adapter_id) = infer_single_pre_tool_adapter(&payload)
+            {
+                let ws_root = resolve_repo_root(&cwd);
+                crate::enforcement_state::record_denial_witness(
+                    &ws_root,
+                    adapter_id,
+                    "PreToolUse",
+                    payload.as_bytes(),
+                    code,
+                );
+            }
             emit_hook_decision(decision, HookPhase::PreTool)
         }
         "post-tool" => {
@@ -288,6 +307,7 @@ pub fn run_cli_entrypoint() -> ExitCode {
         "exec-sandbox" => crate::exec_sandbox::run_exec_sandbox_cli(&args[1..], &cwd),
         "sandbox-status" => crate::exec_sandbox::run_sandbox_status_cli(),
         "--probe-landlock-child" => crate::exec_sandbox::run_probe_landlock_child(),
+        "--probe-seccomp-child" => crate::exec_sandbox::run_probe_seccomp_child(),
         "--version" | "-V" | "version" => {
             let bin_label = if is_dotagent_cli {
                 "dotagent"
@@ -502,6 +522,21 @@ fn run_read_safe(raw_path: &str, extra: &[String], cwd: &Path) -> ExitCode {
             let _ = ledger.save(&repo_root);
             emit_cli_decision(dec)
         }
+    }
+}
+
+fn infer_single_pre_tool_adapter(raw_payload: &str) -> Option<&'static str> {
+    let parsed = crate::json::JsonValue::parse(raw_payload).ok()?;
+    if parsed.get("cursor_version").is_some() || parsed.get("workspace_roots").is_some() {
+        return Some("cursor");
+    }
+    match parsed
+        .get("hook_event_name")
+        .and_then(crate::json::JsonValue::as_str)
+    {
+        Some("BeforeTool") => Some("gemini"),
+        Some("PreToolUse") => Some("claude"),
+        _ => None,
     }
 }
 

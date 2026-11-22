@@ -18,6 +18,7 @@
 //! - Cache bleed & cross-repository context contamination (`SHA-256` repo-isolated ledger)
 //! - Confused deputy attacks (git hooks disabled, lifecycle scripts blocked, taint-gated CLIs, MCP lock)
 
+pub mod antigravity_adapter;
 pub mod breadcrumbs;
 pub mod budget_guard;
 pub mod cli;
@@ -25,6 +26,7 @@ pub mod cmd_policy;
 pub mod coordinator;
 pub mod crypto;
 pub mod diagnostics;
+pub mod enforcement_state;
 pub mod exec_sandbox;
 pub mod feedback;
 pub mod feedback_loop;
@@ -134,7 +136,7 @@ impl Decision {
     }
 }
 
-fn discover_git_root_from_canon(canon: &Path) -> PathBuf {
+pub(crate) fn discover_git_root_from_canon(canon: &Path) -> PathBuf {
     let mut cur: &Path = canon;
     loop {
         if cur.join(".git").exists() {
@@ -521,6 +523,7 @@ pub fn handle_pre_tool_hook_with_context(
                     "target_file",
                     "notebook_path",
                     "SearchPath",
+                    "SearchDirectory",
                     "DirectoryPath",
                     "dir",
                     "directory",
@@ -786,11 +789,15 @@ fn evaluate_tool_invocation(
             | "fetch"
             | "browse"
             | "google_browse"
+            | "google:browse"
             | "read_url_content"
             | "websearch"
             | "web_search"
+            | "search_web"
+            | "google_search"
     ) {
-        let url_desc = extract_first_str(input, &["url", "uri", "query"]).unwrap_or("<external>");
+        let url_desc =
+            extract_first_str(input, &["url", "Url", "uri", "query"]).unwrap_or("<external>");
         return Decision::deny(
             "UNTRUSTED_WEB_FETCH_BLOCKED",
             format!(
@@ -1380,7 +1387,14 @@ fn evaluate_tool_invocation(
         }
         if let Err(dec) = ensure_single_alias_key(
             input,
-            &["path", "SearchPath", "DirectoryPath", "dir", "directory"],
+            &[
+                "path",
+                "SearchPath",
+                "SearchDirectory",
+                "DirectoryPath",
+                "dir",
+                "directory",
+            ],
             tool_name,
         ) {
             return dec;
@@ -1398,7 +1412,14 @@ fn evaluate_tool_invocation(
 
         let raw_path = extract_first_str(
             input,
-            &["path", "SearchPath", "DirectoryPath", "dir", "directory"],
+            &[
+                "path",
+                "SearchPath",
+                "SearchDirectory",
+                "DirectoryPath",
+                "dir",
+                "directory",
+            ],
         )
         .unwrap_or(".");
         let is_glob_tool = norm_tool.contains("glob") || norm_tool == "find_by_name";
@@ -1420,12 +1441,24 @@ fn evaluate_tool_invocation(
             }
         }
 
-        for filter_key in ["glob", "Glob", "include", "Include"] {
-            if let Some(filter_pat) = input.get(filter_key).and_then(JsonValue::as_str) {
-                if let Err(pv) =
-                    validate_workspace_glob_pattern(repo_root, cwd, raw_path, filter_pat)
-                {
-                    return Decision::deny(pv.code, pv.detail, pv.is_poisoned_zone);
+        for filter_key in ["glob", "Glob", "include", "Include", "Includes"] {
+            if let Some(filter_val) = input.get(filter_key) {
+                if let Some(filter_pat) = filter_val.as_str() {
+                    if let Err(pv) =
+                        validate_workspace_glob_pattern(repo_root, cwd, raw_path, filter_pat)
+                    {
+                        return Decision::deny(pv.code, pv.detail, pv.is_poisoned_zone);
+                    }
+                } else if let Some(items) = filter_val.as_array() {
+                    for item in items {
+                        if let Some(filter_pat) = item.as_str()
+                            && let Err(pv) = validate_workspace_glob_pattern(
+                                repo_root, cwd, raw_path, filter_pat,
+                            )
+                        {
+                            return Decision::deny(pv.code, pv.detail, pv.is_poisoned_zone);
+                        }
+                    }
                 }
             }
         }
@@ -2954,6 +2987,7 @@ pub(crate) fn collect_nested_path_fields(v: &JsonValue, out: &mut Vec<String>) {
                         | "AbsolutePath"
                         | "TargetFile"
                         | "SearchPath"
+                        | "SearchDirectory"
                         | "DirectoryPath"
                         | "path"
                         | "target_file"

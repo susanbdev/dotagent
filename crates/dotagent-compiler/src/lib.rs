@@ -1409,6 +1409,57 @@ pub fn render_antigravity_harness_json_from_ir(coding: &ProfileIr) -> String {
     format_json_pretty(&doc)
 }
 
+/// Lowers `coding-agent` `ProfileIr` into native Google Antigravity `hooks.json` (`dist/antigravity/hooks.json`).
+/// Uses Antigravity's documented schema (`SessionStart`, `PreInvocation`, `PreToolUse`, `PostToolUse`,
+/// `PostInvocation`, `Stop`) with comprehensive `"*"` tool matchers so shell, file, search, MCP,
+/// subagent, and newly introduced tools are all routed through `agent-guard antigravity-hook`.
+pub fn render_antigravity_hooks_from_ir(_coding: &ProfileIr) -> String {
+    let direct_handler = |event: &str, timeout_secs: u64| -> JsonValue {
+        JsonValue::Array(vec![JsonValue::Object(vec![
+            ("type".to_string(), JsonValue::Str("command".to_string())),
+            (
+                "command".to_string(),
+                JsonValue::Str(format!("agent-guard antigravity-hook {event}")),
+            ),
+            ("timeout".to_string(), JsonValue::Uint(timeout_secs)),
+        ])])
+    };
+    let tool_matcher_handler = |event: &str, timeout_secs: u64| -> JsonValue {
+        JsonValue::Array(vec![JsonValue::Object(vec![
+            ("matcher".to_string(), JsonValue::Str("*".to_string())),
+            ("hooks".to_string(), direct_handler(event, timeout_secs)),
+        ])])
+    };
+    let doc = JsonValue::Object(vec![(
+        "dotagent-guard".to_string(),
+        JsonValue::Object(vec![
+            ("enabled".to_string(), JsonValue::Bool(true)),
+            (
+                "SessionStart".to_string(),
+                direct_handler("SessionStart", 10),
+            ),
+            (
+                "PreInvocation".to_string(),
+                direct_handler("PreInvocation", 10),
+            ),
+            (
+                "PreToolUse".to_string(),
+                tool_matcher_handler("PreToolUse", 15),
+            ),
+            (
+                "PostToolUse".to_string(),
+                tool_matcher_handler("PostToolUse", 10),
+            ),
+            (
+                "PostInvocation".to_string(),
+                direct_handler("PostInvocation", 10),
+            ),
+            ("Stop".to_string(), direct_handler("Stop", 15)),
+        ]),
+    )]);
+    format_json_pretty(&doc)
+}
+
 /// Lowers an agent markdown specification from Claude frontmatter + body into target-native
 /// harness frontmatter (`antigravity`, `claude`, `cursor`, `codex`, `gemini`) driven by the matching `ProfileIr`.
 pub fn lower_agent_markdown_for_harness(

@@ -1072,6 +1072,14 @@ fn check_authority_file_policy(repo_rel: &str, access: PathAccess) -> Result<boo
         || lower.contains("/.cursor/rules/")
         || lower.starts_with(".claude/rules/")
         || lower.contains("/.claude/rules/")
+        || lower.starts_with(".agents/rules/")
+        || lower.contains("/.agents/rules/")
+        || lower.starts_with(".agent/rules/")
+        || lower.contains("/.agent/rules/")
+        || lower.starts_with("_agents/rules/")
+        || lower.contains("/_agents/rules/")
+        || lower.starts_with("_agent/rules/")
+        || lower.contains("/_agent/rules/")
         || lower.starts_with(".github/instructions/")
         || lower.contains("/.github/instructions/");
 
@@ -1095,6 +1103,10 @@ fn check_immutable_control_plane(repo_rel: &str) -> Result<(), PathViolation> {
         ".git/",
         ".guard/",
         ".agent-guard/",
+        ".agents/",
+        ".agent/",
+        "_agents/",
+        "_agent/",
         ".claude/",
         ".codex/",
         ".cursor/",

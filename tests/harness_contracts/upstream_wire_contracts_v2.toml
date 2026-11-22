@@ -60,3 +60,33 @@ profile_env = "research-readonly"
 expected_exit = 2
 required_stdout_json_paths = ["decision", "hookSpecificOutput.permissionDecision"]
 expected_stdout_substring = "PROFILE_WRITE_TOOLS_DISABLED"
+
+[[contract]]
+id = "antigravity_v2_pretool_shell_overwrite"
+harness = "antigravity"
+harness_version = "2.5+"
+subcommand = "antigravity-hook PreToolUse"
+stdin_json = '{"conversationId":"ag_contract_1","workspacePaths":["{{REPO_ROOT}}"],"stepIdx":1,"toolCall":{"name":"run_command","args":{"CommandLine":"git status -sb","Cwd":"{{REPO_ROOT}}","WaitMsBeforeAsync":5000}}}'
+expected_exit = 0
+required_stdout_json_paths = ["decision", "overwrite.CommandLine"]
+expected_stdout_substring = "exec-sandbox --sanitize-stream"
+
+[[contract]]
+id = "antigravity_v2_pretool_view_file_pagination_overwrite"
+harness = "antigravity"
+harness_version = "2.5+"
+subcommand = "antigravity-hook PreToolUse"
+stdin_json = '{"conversationId":"ag_contract_2","workspacePaths":["{{REPO_ROOT}}"],"stepIdx":2,"toolCall":{"name":"view_file","args":{"AbsolutePath":"{{REPO_ROOT}}/README.md"}}}'
+expected_exit = 0
+required_stdout_json_paths = ["decision", "overwrite.StartLine", "overwrite.EndLine"]
+expected_stdout_substring = "\"decision\":\"allow\""
+
+[[contract]]
+id = "antigravity_v2_pretool_hard_deny_exit0"
+harness = "antigravity"
+harness_version = "2.5+"
+subcommand = "antigravity-hook PreToolUse"
+stdin_json = '{"conversationId":"ag_contract_3","workspacePaths":["{{REPO_ROOT}}"],"stepIdx":3,"toolCall":{"name":"view_file","args":{"AbsolutePath":"{{REPO_ROOT}}/.env"}}}'
+expected_exit = 0
+required_stdout_json_paths = ["decision", "reason"]
+expected_stdout_substring = "\"decision\":\"deny\""
