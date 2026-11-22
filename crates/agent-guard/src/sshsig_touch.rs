@@ -90,6 +90,52 @@ fn push_ssh_str(out: &mut Vec<u8>, data: &[u8]) {
     out.extend_from_slice(data);
 }
 
+/// Checks the signed FIDO2 attributes of an OpenSSH Git signature. OpenSSH
+/// independently verifies the signature bytes against the enrolled public key.
+pub(crate) fn release_signature_has_fido2_touch(sig_pem: &str) -> Result<bool, GuardError> {
+    let body = sig_pem
+        .trim()
+        .strip_prefix("-----BEGIN SSH SIGNATURE-----")
+        .and_then(|body| body.strip_suffix("-----END SSH SIGNATURE-----"))
+        .filter(|body| body.len() <= 32_768)
+        .ok_or_else(|| gerr("SSHSIG_MALFORMED", "invalid SSHSIG envelope"))?;
+    let raw = base64_decode_clean(body, 16_384).map_err(|m| gerr("SSHSIG_MALFORMED", m))?;
+    release_signature_bytes_have_fido2_touch(&raw)
+}
+
+fn release_signature_bytes_have_fido2_touch(raw: &[u8]) -> Result<bool, GuardError> {
+    let mut outer = SshCursor(raw, 0);
+    if outer.read_fixed(6)? != SSHSIG_MAGIC || outer.read_u32()? != 1 {
+        return Err(gerr("SSHSIG_MALFORMED", "bad SSHSIG preamble"));
+    }
+    let mut key = SshCursor(outer.read_bytes()?, 0);
+    let algorithm = key.read_str()?;
+    if !matches!(
+        algorithm,
+        SK_ED25519_ALG | "sk-ecdsa-sha2-nistp256@openssh.com"
+    ) {
+        return Ok(false);
+    }
+    if outer.read_str()? != "git" {
+        return Err(gerr("SSHSIG_NAMESPACE_MISMATCH", "expected git namespace"));
+    }
+    outer.read_bytes()?;
+    outer.read_bytes()?;
+    let mut signed = SshCursor(outer.read_bytes()?, 0);
+    outer.ensure_empty()?;
+    if signed.read_str()? != algorithm {
+        return Err(gerr("SSHSIG_WRONG_SIG_TYPE", "FIDO2 algorithms must agree"));
+    }
+    signed.read_bytes()?;
+    let flags = signed.read_u8()?;
+    signed.read_u32()?;
+    signed.ensure_empty()?;
+    if flags & SSH_SK_USER_PRESENCE_REQD == 0 {
+        return Err(gerr("SSHSIG_USER_PRESENCE_REQUIRED", "UP touch bit is 0"));
+    }
+    Ok(true)
+}
+
 /// Verifies an OpenSSH `SSHSIG` PEM signature made by `sk-ssh-ed25519@openssh.com`,
 /// requiring `flags & 0x01 != 0` (`User Presence` touch) and returning `counter`.
 pub fn verify_fido2_sshsig_ed25519(
@@ -246,4 +292,42 @@ pub fn load_operator_sk_keys_from_home(home: &Path) -> Result<Option<Vec<[u8; 32
         return Err(gerr("SSHSIG_KEYRING_EMPTY", "empty operator_sk_keys"));
     }
     Ok(Some(keys))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn git_signature_attributes(algorithm: &str, flags: u8) -> Vec<u8> {
+        let mut public_key = Vec::new();
+        push_ssh_str(&mut public_key, algorithm.as_bytes());
+        let mut signature = Vec::new();
+        push_ssh_str(&mut signature, algorithm.as_bytes());
+        push_ssh_str(&mut signature, &[0; 64]);
+        signature.push(flags);
+        signature.extend_from_slice(&1u32.to_be_bytes());
+        let mut raw = SSHSIG_MAGIC.to_vec();
+        raw.extend_from_slice(&1u32.to_be_bytes());
+        push_ssh_str(&mut raw, &public_key);
+        push_ssh_str(&mut raw, b"git");
+        push_ssh_str(&mut raw, b"");
+        push_ssh_str(&mut raw, b"sha512");
+        push_ssh_str(&mut raw, &signature);
+        raw
+    }
+
+    #[test]
+    fn release_signature_requires_fido2_user_presence() {
+        let raw = git_signature_attributes(SK_ED25519_ALG, SSH_SK_USER_PRESENCE_REQD);
+        assert_eq!(release_signature_bytes_have_fido2_touch(&raw), Ok(true));
+        let raw = git_signature_attributes(SK_ED25519_ALG, 0);
+        assert_eq!(
+            release_signature_bytes_have_fido2_touch(&raw)
+                .expect_err("a release signature requires hardware touch")
+                .code,
+            "SSHSIG_USER_PRESENCE_REQUIRED"
+        );
+        let raw = git_signature_attributes("ssh-ed25519", 0);
+        assert_eq!(release_signature_bytes_have_fido2_touch(&raw), Ok(false));
+    }
 }

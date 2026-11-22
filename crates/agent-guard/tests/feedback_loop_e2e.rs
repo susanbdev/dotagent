@@ -737,6 +737,25 @@ fn inverted_ring0_allowlist_ssh_hardware_signer_and_target_matched_corpus_ratche
             .expect("SSH-signed release tag must verify");
     assert_eq!(tag_rep.tag, "v2.1.0");
     assert_eq!(tag_rep.signer_principal, "test@dotagent.local");
+    let tag_object = Command::new("git")
+        .current_dir(&repo)
+        .args(["rev-parse", "refs/tags/v2.1.0"])
+        .output()
+        .expect("signed tag object");
+    assert!(tag_object.status.success());
+    let tag_object = String::from_utf8(tag_object.stdout).expect("tag object SHA");
+    assert!(
+        Command::new("git")
+            .current_dir(&repo)
+            .args(["update-ref", "refs/tags/v2.1.1", tag_object.trim()])
+            .status()
+            .expect("alias signed tag")
+            .success()
+    );
+    let alias_err =
+        agent_guard::ring0_ratchet::verify_release_tag_signature(&repo, "v2.1.1", "main", false)
+            .expect_err("the signed tag name must match the official ref");
+    assert!(alias_err.contains("RELEASE_TAG_HEADER_MISMATCH"));
     // And requiring hardware `sk-*` key rejects software `ssh-ed25519` test key in production mode!
     let prod_sk_err =
         agent_guard::ring0_ratchet::verify_release_tag_signature(&repo, "v2.1.0", "main", true)

@@ -1699,29 +1699,6 @@ pub fn extract_tag_ssh_signature(raw_tag: &[u8]) -> Option<(Vec<u8>, String)> {
     Some((unsigned_payload, sig_pem))
 }
 
-fn first_ssh_string(encoded: &[u8]) -> Option<&[u8]> {
-    let (length, data) = encoded.split_at_checked(4)?;
-    let length = u32::from_be_bytes(length.try_into().ok()?);
-    data.get(..usize::try_from(length).ok()?)
-}
-
-fn release_signature_uses_fido2_key(sig_pem: &str) -> Option<bool> {
-    let body = sig_pem
-        .trim()
-        .strip_prefix("-----BEGIN SSH SIGNATURE-----")?
-        .strip_suffix("-----END SSH SIGNATURE-----")?;
-    if body.len() > 32_768 {
-        return None;
-    }
-    let decoded = crate::crypto::base64_decode_clean(body, 16_384).ok()?;
-    let public_key = first_ssh_string(decoded.strip_prefix(b"SSHSIG\x00\x00\x00\x01")?)?;
-    let algorithm = first_ssh_string(public_key)?;
-    Some(matches!(
-        algorithm,
-        b"sk-ssh-ed25519@openssh.com" | b"sk-ecdsa-sha2-nistp256@openssh.com"
-    ))
-}
-
 /// Cryptographically verifies an annotated `v*` release tag against `<base_ref>:config/allowed_human_signers`
 /// (`ssh-keygen -Y verify -n git`). Production release verification also requires the public key
 /// embedded in the verified SSH signature to use a FIDO2 algorithm.
@@ -1784,9 +1761,14 @@ pub fn verify_release_tag_signature(
             "UNSIGNED_RELEASE_TAG_FORBIDDEN: annotated tag '{clean_tag}' lacks an embedded OpenSSH signature"
         ));
     };
-    let hardware_fido2_signer = release_signature_uses_fido2_key(&sig_pem).ok_or_else(|| {
-        format!("INVALID_RELEASE_TAG_SIGNATURE: malformed OpenSSH signature on tag '{clean_tag}'")
-    })?;
+    let signed_header = format!("object {target_commit}\ntype commit\ntag {clean_tag}\n");
+    if !unsigned_payload.starts_with(signed_header.as_bytes()) {
+        return Err(format!(
+            "RELEASE_TAG_HEADER_MISMATCH: the signed name and direct commit must match '{clean_tag}' and '{target_commit}'"
+        ));
+    }
+    let hardware_fido2_signer = crate::sshsig_touch::release_signature_has_fido2_touch(&sig_pem)
+        .map_err(|e| format!("INVALID_RELEASE_TAG_SIGNATURE: '{clean_tag}': {e}"))?;
     if require_fido2_sk_key && !hardware_fido2_signer {
         return Err(format!(
             "MISSING_HARDWARE_RELEASE_SIGNERS: tag '{clean_tag}' signature does not use a FIDO2 key"
