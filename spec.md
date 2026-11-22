@@ -111,11 +111,14 @@ dotagent/
    * Enforces pre-buffer 7-bit ASCII sanitization, head/tail stream compaction, `128`-bit spotlighting boundaries, `<= 200` ASCII token subagent caps, and post-edit UTF-8/Unicode/secret/immutability checks.
 3. **`agent-guard on-stop` & Detached Ed25519 `StopReceipt`**:
    * Verifies all 19 global Git hardening settings, repository control-plane hygiene, and Swarm ledger completeness, then mints a detached Ed25519 `StopReceipt` (`crates/agent-guard/src/stop_receipt.rs`) binding `(repo_id, head_commit_oid, work_tree_oid, bundle_manifest_sha256, ledger_clean_summary, epoch_id)` using the vault-isolated `0600` signing key outside worker VFS rulesets. CI admission gates verify receipts with a pinned public key via `dotagent verify-receipt --pubkey <hex|path>`.
+4. **`agent-guard antigravity-hook`** (`crates/agent-guard/src/antigravity.rs`):
+   * Translates native Antigravity requests into the same pre-tool guard decisions and pins the requested conversation to an installed workspace. An authorized shell rewrite routes the command through the existing kernel sandbox with required confinement. Native file hooks check the proposed operation before dispatch.
+   * Workspace activation (`crates/agent-guard/src/operator/antigravity.rs`) installs `.agents/hooks.json` without global Git setup. Lifecycle callbacks use the existing session and repository checks where the host contract permits. Post-tool callbacks observe status with no tool result payload. See [native Antigravity hook coverage](docs/ANTIGRAVITY.md).
 
 ---
 
 ## 4. `dotagent-compiler` Policy-IR, Embedded Rego & Assurance Gates
 
-* **Declarative Policy-IR Lowering (`crates/dotagent-compiler/src/lib.rs`)**: Parses all 9 `profiles/*.toml` and 12 `skills/*` into `PolicyBundleIr`, lowering target-native configurations for Claude Code, Cursor (`hooks.json` + `mcp.json`), OpenAI Codex (`config.toml`), Gemini CLI, Antigravity (`antigravity/harness.json`), and `dist/profiles/policy_ir.json`.
+* **Declarative Policy-IR Lowering (`crates/dotagent-compiler/src/lib.rs`)**: Parses all 9 `profiles/*.toml` and 12 `skills/*` into `PolicyBundleIr`, lowering target-native configurations for Claude Code, Cursor (`hooks.json` + `mcp.json`), OpenAI Codex (`config.toml`), Gemini CLI, Antigravity (`antigravity/hooks.json` and `antigravity/harness.json`), and `dist/profiles/policy_ir.json`.
 * **In-Process `regorus` OPA Gate**: Evaluates `dist/policy/dotagent_harness.rego` directly inside `dotagent-compiler <build|verify>` over both JSON artifacts and normalized TOML ASTs.
 * **Executable Spec Sync & Formal Assurance**: `dotagent-compiler verify` enforces crate and kernel module parity between `Cargo.toml`, `crates/agent-guard/src/*.rs`, and `spec.md`, backed by `315+` adversarial corpus vectors, differential `/bin/bash` vs `cmd_policy` fuzzing, versioned harness contract fixtures, and `#[cfg(kani)]` bounded proofs.
