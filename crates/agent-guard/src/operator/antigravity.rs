@@ -346,6 +346,8 @@ pub(super) fn deactivate(workspace: &Path, dry_run: bool) -> Result<Vec<String>,
             entries.remove(index);
             update = Some(Some((serialize_object(entries), current.mode)));
         }
+    } else if current != backup.previous {
+        return Err("managed Antigravity hooks are missing after a configuration change; the original configuration remains in the backup".into());
     }
     if dry_run {
         return Ok(vec![format!(
@@ -789,6 +791,49 @@ mod tests {
             "{\"later-user-hooks\":{}}\n"
         );
         assert!(!paths.backup.exists());
+    }
+
+    #[test]
+    fn deactivation_keeps_backup_until_namespace_removal_is_accounted_for() {
+        let fixture = Fixture::new("missing-namespace");
+        let paths = Paths::new(&fixture.workspace);
+        fs::create_dir(&paths.agents).unwrap();
+        let original = "{\n  \"user\": {\"enabled\": false}\n}\n";
+        fs::write(&paths.hooks, original).unwrap();
+        fs::set_permissions(&paths.hooks, fs::Permissions::from_mode(0o640)).unwrap();
+        fixture.activate(false).unwrap();
+        let backup = fs::read(&paths.backup).unwrap();
+
+        let replacement = "{\"another-user-hook\":{}}\n";
+        fs::write(&paths.hooks, replacement).unwrap();
+        assert!(
+            deactivate(&fixture.workspace, true)
+                .unwrap_err()
+                .contains("remain")
+        );
+        assert!(
+            deactivate(&fixture.workspace, false)
+                .unwrap_err()
+                .contains("remain")
+        );
+        assert_eq!(fs::read(&paths.backup).unwrap(), backup);
+        assert_eq!(fs::read_to_string(&paths.hooks).unwrap(), replacement);
+
+        fs::remove_file(&paths.hooks).unwrap();
+        assert!(
+            deactivate(&fixture.workspace, false)
+                .unwrap_err()
+                .contains("remain")
+        );
+        assert_eq!(fs::read(&paths.backup).unwrap(), backup);
+        assert!(!paths.hooks.exists());
+
+        fs::write(&paths.hooks, original).unwrap();
+        fs::set_permissions(&paths.hooks, fs::Permissions::from_mode(0o640)).unwrap();
+        deactivate(&fixture.workspace, false).unwrap();
+        assert!(!paths.backup.exists());
+        assert_eq!(fs::read_to_string(&paths.hooks).unwrap(), original);
+        assert_eq!(file_mode(&fs::metadata(&paths.hooks).unwrap()), 0o640);
     }
 
     #[test]

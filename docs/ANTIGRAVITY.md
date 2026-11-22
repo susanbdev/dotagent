@@ -14,6 +14,8 @@ dotagent deactivate --antigravity --workspace "$PWD"
 
 Activation verifies the bundle's hook template, pins the validated guard executable and workspace by absolute path, and merges the `dotagent` group with the existing configuration. It keeps a local activation journal with the original bytes and permissions for recovery. Deactivation uses the existing operator authorization, restores the original file when possible, and preserves unrelated groups added after activation. The workspace route requires no global Git installation.
 
+If an external change removes the managed group from a changed file, deactivation reports the conflict and preserves both the current configuration and the recovery journal. An already-restored file can be recognized by its exact saved bytes and permissions.
+
 An installed `PreToolUse` entry looks like this excerpt. Start a fresh Antigravity session after activation and inspect `/hooks` in the CLI. [CLI reference](https://antigravity.google/docs/cli/reference/)
 
 ```json
