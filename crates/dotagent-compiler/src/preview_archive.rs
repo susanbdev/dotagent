@@ -3,14 +3,18 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
+#[cfg(any(target_os = "macos", test))]
 use agent_guard::crypto::sha256_hex;
-use flate2::{Compression, GzBuilder};
+use flate2::{Compression, GzBuilder, write::GzEncoder};
 use tar::{Builder, EntryType, Header};
 
+#[cfg(any(target_os = "macos", test))]
 const MAX_EXECUTABLE_BYTES: usize = 256 * 1024 * 1024;
+#[cfg(any(target_os = "macos", test))]
 const MAX_BUILD_BYTES: usize = 16 * 1024;
 static STAGING_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
+#[cfg(any(target_os = "macos", test))]
 pub(crate) fn write_preview(
     archive_path: &Path,
     executable: &[u8],
@@ -26,7 +30,7 @@ pub(crate) fn write_preview(
             "preview build information must contain 1 to {MAX_BUILD_BYTES} bytes"
         ));
     }
-    publish_preview(archive_path, executable, build).map_err(|error| {
+    publish_archive(archive_path, |file| write_archive(file, executable, build)).map_err(|error| {
         format!(
             "cannot publish preview '{}': {error}",
             archive_path.display()
@@ -34,7 +38,10 @@ pub(crate) fn write_preview(
     })
 }
 
-fn publish_preview(archive_path: &Path, executable: &[u8], build: &str) -> io::Result<()> {
+pub(crate) fn publish_archive(
+    archive_path: &Path,
+    write: impl FnOnce(File) -> io::Result<File>,
+) -> io::Result<()> {
     let name = archive_path.file_name().ok_or_else(|| {
         io::Error::new(io::ErrorKind::InvalidInput, "expected an archive filename")
     })?;
@@ -57,7 +64,7 @@ fn publish_preview(archive_path: &Path, executable: &[u8], build: &str) -> io::R
 
     let staged = StagedArchive::new(&parent)?;
     let file = staged.open()?;
-    let file = write_archive(file, executable, build)?;
+    let file = write(file)?;
     file.sync_all()?;
     drop(file);
 
@@ -117,28 +124,56 @@ impl Drop for StagedArchive {
     }
 }
 
+#[cfg(any(target_os = "macos", test))]
 fn write_archive<W: Write>(sink: W, executable: &[u8], build: &str) -> io::Result<W> {
     let checksum = format!("{}  dotagent\n", sha256_hex(executable));
+    let mut archive = tar_builder(sink);
+    append_entry(
+        &mut archive,
+        "dotagent",
+        EntryType::Regular,
+        0o755,
+        executable,
+    )?;
+    append_entry(
+        &mut archive,
+        "SHA256SUMS",
+        EntryType::Regular,
+        0o644,
+        checksum.as_bytes(),
+    )?;
+    append_entry(
+        &mut archive,
+        "BUILD.txt",
+        EntryType::Regular,
+        0o644,
+        build.as_bytes(),
+    )?;
+    finish_tar(archive)
+}
+
+pub(crate) fn tar_builder<W: Write>(sink: W) -> Builder<GzEncoder<W>> {
     let encoder = GzBuilder::new()
         .mtime(0)
         .operating_system(255)
         .write(sink, Compression::default());
-    let mut archive = Builder::new(encoder);
-    append(&mut archive, "dotagent", 0o755, executable)?;
-    append(&mut archive, "SHA256SUMS", 0o644, checksum.as_bytes())?;
-    append(&mut archive, "BUILD.txt", 0o644, build.as_bytes())?;
+    Builder::new(encoder)
+}
+
+pub(crate) fn finish_tar<W: Write>(mut archive: Builder<GzEncoder<W>>) -> io::Result<W> {
     archive.finish()?;
     archive.into_inner()?.finish()
 }
 
-fn append<W: Write>(
+pub(crate) fn append_entry<W: Write>(
     archive: &mut Builder<W>,
     name: &str,
+    kind: EntryType,
     mode: u32,
     data: &[u8],
 ) -> io::Result<()> {
     let mut header = Header::new_ustar();
-    header.set_entry_type(EntryType::Regular);
+    header.set_entry_type(kind);
     header.set_mode(mode);
     header.set_uid(0);
     header.set_gid(0);

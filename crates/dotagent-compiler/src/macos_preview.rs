@@ -29,24 +29,27 @@ fn run(args: &[String]) -> Result<(), String> {
     platform::package(args)
 }
 
-#[cfg(any(target_os = "macos", test))]
-mod macho {
+pub(crate) mod macho {
+    #[cfg(any(target_os = "macos", test))]
     use std::ops::Range;
 
     pub(super) const MAX_BYTES: usize = 256 * 1024 * 1024;
 
     const MH_MAGIC_64: u32 = 0xfeed_facf;
     const MH_EXECUTE: u32 = 2;
+    const LC_SEGMENT_64: u32 = 0x19;
     const LC_MAIN: u32 = 0x8000_0028;
     const LC_CODE_SIGNATURE: u32 = 0x1d;
     const EMBEDDED_SIGNATURE: u32 = 0xfade_0cc0;
+    #[cfg(any(target_os = "macos", test))]
     const FAT_MAGIC: u32 = 0xcafe_babe;
+    #[cfg(any(target_os = "macos", test))]
     const FAT_MAGIC_64: u32 = 0xcafe_babf;
     const HEADER_BYTES: usize = 32;
     const MAX_COMMANDS: usize = 4096;
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-    pub(super) enum Arch {
+    pub(crate) enum Arch {
         Arm64,
         X86_64,
     }
@@ -67,6 +70,7 @@ mod macho {
             }
         }
 
+        #[cfg(any(target_os = "macos", test))]
         pub(super) fn other(self) -> Self {
             match self {
                 Self::Arm64 => Self::X86_64,
@@ -107,6 +111,7 @@ mod macho {
         Ok(u32::from_be_bytes(read(bytes, offset)?))
     }
 
+    #[cfg(any(target_os = "macos", test))]
     fn be64(bytes: &[u8], offset: usize) -> Result<u64, String> {
         Ok(u64::from_be_bytes(read(bytes, offset)?))
     }
@@ -130,7 +135,7 @@ mod macho {
         Ok((arch, subtype))
     }
 
-    pub(super) fn thin(bytes: &[u8], wanted: Arch, signed: bool) -> Result<(), String> {
+    pub(crate) fn thin(bytes: &[u8], wanted: Arch, signed: bool) -> Result<(), String> {
         check_bound(bytes)?;
         let (actual, _) = thin_identity(bytes)?;
         if actual != wanted {
@@ -147,7 +152,8 @@ mod macho {
         }
 
         let mut cursor = HEADER_BYTES;
-        let mut entry_found = false;
+        let mut entry_offset = None;
+        let mut executable_sections = Vec::new();
         let mut signature_found = false;
         for _ in 0..count {
             let command = le32(bytes, cursor)?;
@@ -157,15 +163,32 @@ mod macho {
                 .filter(|end| size >= 8 && size.is_multiple_of(8) && *end <= command_end)
                 .ok_or("invalid Mach-O load command size")?;
             match command {
+                LC_SEGMENT_64 => {
+                    if size < 72
+                        || !(size - 72).is_multiple_of(80)
+                        || (size - 72) / 80 != le32(bytes, cursor + 64)? as usize
+                    {
+                        return Err("invalid Mach-O segment command size".into());
+                    }
+                    let file_offset = u64::from_le_bytes(read(bytes, cursor + 40)?);
+                    let file_size = u64::from_le_bytes(read(bytes, cursor + 48)?);
+                    let file_end = file_offset
+                        .checked_add(file_size)
+                        .filter(|end| *end <= bytes.len() as u64)
+                        .ok_or("invalid Mach-O file segment extent")?;
+                    if le32(bytes, cursor + 60)? & 4 != 0 && file_size > 0 {
+                        executable_sections.push(file_offset..file_end);
+                    }
+                }
                 LC_MAIN => {
-                    if entry_found || size != 24 {
+                    if entry_offset.is_some() || size != 24 {
                         return Err("invalid Mach-O entry point command".into());
                     }
                     let offset = u64::from_le_bytes(read(bytes, cursor + 8)?);
                     if offset < command_end as u64 || offset >= bytes.len() as u64 {
                         return Err("Mach-O entry point is outside executable code".into());
                     }
-                    entry_found = true;
+                    entry_offset = Some(offset);
                 }
                 LC_CODE_SIGNATURE => {
                     if signature_found || size != 16 {
@@ -189,12 +212,20 @@ mod macho {
             }
             cursor = end;
         }
-        if cursor != command_end || !entry_found || signed && !signature_found {
+        if cursor != command_end
+            || !entry_offset.is_some_and(|offset| {
+                executable_sections
+                    .iter()
+                    .any(|segment| segment.contains(&offset))
+            })
+            || signed && !signature_found
+        {
             return Err("Mach-O commands do not contain the required executable metadata".into());
         }
         Ok(())
     }
 
+    #[cfg(any(target_os = "macos", test))]
     fn fat_slice(
         bytes: &[u8],
         index: usize,
@@ -234,6 +265,7 @@ mod macho {
         Ok((arch, subtype, offset as usize..end as usize))
     }
 
+    #[cfg(any(target_os = "macos", test))]
     pub(super) fn universal(bytes: &[u8]) -> Result<(), String> {
         check_bound(bytes)?;
         let wide = match be32(bytes, 0)? {
@@ -633,7 +665,7 @@ mod platform {
 mod tests {
     use super::macho::{Arch, thin, universal};
 
-    const EXECUTABLE_BYTES: usize = 96;
+    const EXECUTABLE_BYTES: usize = 176;
 
     fn le32(bytes: &mut [u8], index: usize, value: u32) {
         bytes[index..index + 4].copy_from_slice(&value.to_le_bytes());
@@ -658,20 +690,24 @@ mod tests {
             (4, kind),
             (8, subtype),
             (12, 2),
-            (16, 2),
-            (20, 40),
+            (16, 3),
+            (20, 112),
             (32, 0x8000_0028),
             (36, 24),
-            (40, 72),
+            (40, 144),
             (56, 0x1d),
             (60, 16),
-            (64, 80),
+            (64, 160),
             (68, 12),
+            (72, 0x19),
+            (76, 72),
+            (120, 160),
+            (132, 5),
         ] {
             le32(&mut bytes, index, value);
         }
-        be32(&mut bytes, 80, 0xfade_0cc0);
-        be32(&mut bytes, 84, 12);
+        be32(&mut bytes, 160, 0xfade_0cc0);
+        be32(&mut bytes, 164, 12);
         bytes
     }
 
@@ -680,15 +716,18 @@ mod tests {
         let mut bytes = executable(Arch::Arm64);
         assert!(thin(&bytes, Arch::Arm64, true).is_ok());
         assert!(thin(&bytes, Arch::X86_64, true).is_err());
-        assert!(thin(&bytes[..88], Arch::Arm64, true).is_err());
+        assert!(thin(&bytes[..168], Arch::Arm64, true).is_err());
+        le32(&mut bytes, 40, 160);
+        assert!(thin(&bytes, Arch::Arm64, true).is_err());
+        le32(&mut bytes, 40, 144);
         le32(&mut bytes, 12, 1);
         assert!(thin(&bytes, Arch::Arm64, true).is_err());
     }
 
     #[test]
     fn universal_validation_checks_both_signed_executable_slices() {
-        let offsets = [64, 160];
-        let mut bytes = [0; 256];
+        let offsets = [64, 240];
+        let mut bytes = [0; 416];
         be32(&mut bytes, 0, 0xcafe_babe);
         be32(&mut bytes, 4, 2);
         for (index, arch) in [Arch::Arm64, Arch::X86_64].into_iter().enumerate() {
@@ -703,11 +742,11 @@ mod tests {
             bytes[offset..offset + EXECUTABLE_BYTES].copy_from_slice(&executable(arch));
         }
         assert!(universal(&bytes).is_ok());
-        assert!(universal(&bytes[..255]).is_err());
+        assert!(universal(&bytes[..415]).is_err());
         be32(&mut bytes, 28 + 8, 64);
         assert!(universal(&bytes).is_err());
-        be32(&mut bytes, 28 + 8, 160);
-        be32(&mut bytes, 160 + 80, 0);
+        be32(&mut bytes, 28 + 8, 240);
+        be32(&mut bytes, 240 + 160, 0);
         assert!(universal(&bytes).is_err());
     }
 }

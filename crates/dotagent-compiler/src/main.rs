@@ -4,8 +4,12 @@
 //! snapshot/policy verifier for `susanbdev/dotagent`.
 
 mod macos_preview;
-#[cfg(any(target_os = "macos", test))]
 mod preview_archive;
+mod release_archive;
+mod release_ecosystem;
+mod release_installers;
+mod release_repackage;
+mod release_verify;
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -38,6 +42,17 @@ fn main() -> ExitCode {
 
     match sub {
         "package-macos-preview" => macos_preview::run_cli(&args[1..]),
+        "package-release-archive" => release_archive::package_cli(&args[1..]),
+        "unpack-release-archive" => release_archive::unpack_cli(&args[1..]),
+        "repackage-release" => release_repackage::run_cli(&args[1..]),
+        "release-npm-metadata" => release_repackage::npm_cli(&args[1..]),
+        "release-version"
+        | "hash-release-file"
+        | "verify-file-sha256"
+        | "verify-release-assets"
+        | "release-attestation-statement"
+        | "release-oci-digest"
+        | "release-check-loopback" => release_verify::run_cli(sub, &args[1..]),
         "build" => match build_all(&repo_root) {
             Ok(count) => {
                 println!(
@@ -66,7 +81,8 @@ fn main() -> ExitCode {
         "--help" | "-h" | "help" => {
             println!(
                 "Usage: dotagent-compiler <build|verify> [dotagent_repo_root]\n\
-                 Preview packaging: dotagent-compiler package-macos-preview --help"
+                 Preview packaging: dotagent-compiler package-macos-preview --help\n\
+                 Release packaging: package-release-archive, unpack-release-archive, repackage-release"
             );
             ExitCode::SUCCESS
         }
