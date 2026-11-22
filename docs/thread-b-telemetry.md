@@ -142,7 +142,9 @@ The Thread A closure roadmap keeps S01–S04 and P07 with their assigned owner. 
 | E10–E11, E17 | `telemetry::store` exercises four processes writing 80 complete records, torn-tail recovery, pending quarantine across restart, retention and explicit writer failure. `telemetry::diagnostics` exposes storage and reader coverage. | Platform and filesystem coverage, including a live capacity failure, where available. |
 | E19–E20 | Event rate and retained size can be measured at the writer. Fixtures exercise bounded work. | I02 sustained-load evidence against predeclared limits, then I03 replay if policy changes are proposed. |
 
-The focused local fixture suite is `cargo test --locked -p agent-guard --lib telemetry::`. Repository format, clippy and compiler gates are listed in `.github/workflows/ci.yml`.
+### Historical standalone Thread B verification
+
+These checks used the provisional base `3eb6ce4`. The current verification commands and results are in the integration section below. Repository format, Clippy and compiler gates are listed in `.github/workflows/ci.yml`.
 
 | Verification | Observed status |
 | --- | --- |
@@ -150,7 +152,6 @@ The focused local fixture suite is `cargo test --locked -p agent-guard --lib tel
 | `cargo metadata --offline --locked --format-version=1` | Passed. The 81 resolved packages declare no Rust version above 1.88. |
 | `cargo fmt --all -- --check` and `git diff --check` | Passed. |
 | `cargo check --workspace --all-targets --offline --locked` | Passed with Rust 1.88.0 using isolated build and test-state directories. |
-| `cargo test -p agent-guard --lib --offline --locked telemetry::` | Passed 30 tests, with 36 filtered out. The one ignored latency fixture was run separately. |
 | `cargo clippy --workspace --all-targets --offline --locked -- -D warnings` | Failed with 11 diagnostics in untouched source files. A clean checkout of the pinned base reproduced all 11 at the same lines and with the same lint IDs. |
 | `cargo run -p dotagent-compiler --offline --locked -- verify .` | Passed for all 58 compiled artifacts. |
 | `cargo test -p agent-guard --lib --offline --locked telemetry::store::tests::measures_isolated_append_latency -- --ignored --nocapture` | Passed with the measurements below. |
@@ -174,7 +175,7 @@ The integration applies the telemetry and host-wrapper commits on top of `e30d3a
 
 The wrapper omits command text and streams from telemetry. The fixed Git baseline reports the actual static policy denial when linked worktree metadata is unsupported. Its command-policy fixture uses standalone repository metadata.
 
-### Combined verification
+### Current integration verification
 
 | Check | Result |
 | --- | --- |
@@ -182,7 +183,8 @@ The wrapper omits command text and streams from telemetry. The fixed Git baselin
 | Strict workspace Clippy | Passed on Rust 1.100.0, the CI stable channel. The audit counters retain saturating behavior on the Rust 1.88.0 MSRV. |
 | Workspace check and build, offline and locked | Passed on Rust 1.88.0. |
 | Workspace test compilation, offline and locked | All 26 Cargo test executables compiled. Full behavioral execution was outside this run. |
-| Focused telemetry tests | 35 passed. The separately measured writer fixture was ignored in this run. |
+| `cargo test -p agent-guard --lib --offline --locked telemetry::` | 35 passed. One append-latency fixture is ignored by default. Its separate run is recorded in the historical verification above. |
+| `cargo test -p agent-guard --lib --offline --locked sanitizer::tests::byte_compaction_counts_only_removed_source_bytes` | One regression passed. It checks byte accounting for cuts before, within, and after the line-compaction marker. |
 | Focused security tests | Checkpoint session identity, isolated scratch preparation and webfont file handling passed. |
 | Compiler verification | All 58 artifacts matched. |
 | Gemini/Antigravity adapter replay | One scenario and all 10 steps passed against the combined binaries. |
