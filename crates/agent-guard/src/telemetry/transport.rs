@@ -73,10 +73,6 @@ fn socket_at<T>(dir: &Path, f: impl FnOnce(&Path) -> io::Result<T>) -> io::Resul
     if O_NOFOLLOW_FLAG == 0 {
         return Err(io::Error::from(io::ErrorKind::Unsupported));
     }
-    let path = dir.join(SOCKET);
-    if path.as_os_str().len() <= 95 {
-        return f(&path);
-    }
     #[cfg(target_os = "linux")]
     {
         let fd = OpenOptions::new()
@@ -89,7 +85,18 @@ fn socket_at<T>(dir: &Path, f: impl FnOnce(&Path) -> io::Result<T>) -> io::Resul
         )))
     }
     #[cfg(not(target_os = "linux"))]
-    f(&crate::coordinator::shorten_unix_socket_via_cwd(&path))
+    {
+        let meta = fs::symlink_metadata(dir)?;
+        if meta.file_type().is_symlink() || !meta.is_dir() {
+            return Err(invalid());
+        }
+        let path = dir.join(SOCKET);
+        if path.as_os_str().len() <= 95 {
+            f(&path)
+        } else {
+            f(&crate::coordinator::shorten_unix_socket_via_cwd(&path))
+        }
+    }
 }
 
 fn identity(dir: &Path, owner: u32) -> io::Result<[u8; 16]> {
@@ -259,7 +266,17 @@ pub(super) fn send<T>(build: impl FnOnce() -> Option<(Record, T)>) -> Result<T, 
 }
 
 fn child_command(role: &str) -> io::Result<Command> {
-    let mut command = Command::new(std::env::current_exe()?);
+    use std::os::unix::process::CommandExt;
+    let current = std::env::current_exe()?;
+    #[cfg(target_os = "linux")]
+    let mut command = {
+        let mut c = Command::new("/proc/self/exe");
+        c.arg0(&current);
+        c
+    };
+    #[cfg(not(target_os = "linux"))]
+    let mut command = Command::new(current);
+    command.process_group(0);
     command.arg(role).arg("--owned").env_clear();
     for name in ["HOME", "AGENT_GUARD_STATE_DIR"] {
         if let Some(value) = std::env::var_os(name) {
@@ -310,7 +327,7 @@ pub(crate) fn supervise() -> io::Result<()> {
             child = child_command("collect-observations")?.spawn().ok();
         }
         if !matches!(
-            owner.recv_timeout(Duration::from_millis(250)),
+            owner.recv_timeout(Duration::from_millis(50)),
             Err(std::sync::mpsc::RecvTimeoutError::Timeout)
         ) {
             break;
@@ -318,14 +335,14 @@ pub(crate) fn supervise() -> io::Result<()> {
     }
     if let Some(mut child) = child {
         drop(child.stdin.take());
-        let deadline = Instant::now() + Duration::from_secs(3);
+        let deadline = Instant::now() + Duration::from_millis(350);
         while child.try_wait()?.is_none() {
             if Instant::now() >= deadline {
                 let _ = child.kill();
                 let _ = child.wait();
                 break;
             }
-            std::thread::park_timeout(Duration::from_millis(20));
+            std::thread::park_timeout(Duration::from_millis(5));
         }
     }
     Ok(())
@@ -334,6 +351,7 @@ pub(crate) fn supervise() -> io::Result<()> {
 struct Endpoint {
     socket: UnixDatagram,
     dir: PathBuf,
+    dir_id: (u64, u64),
     owner: u32,
     id: [u8; 16],
     key: [u8; 32],
@@ -345,6 +363,11 @@ impl Endpoint {
         probe.set_nonblocking(true)?;
         let owner = uid(&probe)?;
         let dir = private_dir(owner, true)?;
+        let dir_meta = fs::symlink_metadata(&dir)?;
+        if dir_meta.file_type().is_symlink() || !dir_meta.is_dir() {
+            return Err(invalid());
+        }
+        let dir_id = (dir_meta.dev(), dir_meta.ino());
         let path = dir.join(SOCKET);
         let _lock = ExclusiveFileLockGuard::acquire_observation(&path).map_err(io::Error::other)?;
         match identity(&dir, owner) {
@@ -359,25 +382,41 @@ impl Endpoint {
         let mut key = [0; 32];
         File::open("/dev/urandom")?.read_exact(&mut key)?;
         let socket = socket_at(&dir, |p| UnixDatagram::bind(p))?;
+        let sock_meta = fs::symlink_metadata(&path)?;
+        if sock_meta.file_type().is_symlink()
+            || !sock_meta.file_type().is_socket()
+            || sock_meta.uid() != owner
+        {
+            return Err(invalid());
+        }
         fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
         let id = identity(&dir, owner)?;
         let endpoint = Self {
             socket,
             dir,
+            dir_id,
             owner,
             id,
             key,
         };
+        endpoint.verified_dir()?;
         let staging = endpoint.dir.join(format!("route-{}", std::process::id()));
         let mut file = OpenOptions::new()
             .write(true)
             .create_new(true)
+            .custom_flags(O_NOFOLLOW_FLAG)
             .mode(0o600)
             .open(&staging)?;
+        let route_dst = endpoint.dir.join(ROUTE);
+        if fs::symlink_metadata(&route_dst).is_ok_and(|m| m.file_type().is_symlink()) {
+            let _ = fs::remove_file(&staging);
+            return Err(invalid());
+        }
         let publish = file
             .write_all(&id)
             .and_then(|()| file.write_all(&key))
-            .and_then(|()| fs::rename(&staging, endpoint.dir.join(ROUTE)));
+            .and_then(|()| endpoint.verified_dir().map(|_| ()))
+            .and_then(|()| fs::rename(&staging, &route_dst));
         if let Err(error) = publish {
             let _ = fs::remove_file(staging);
             return Err(error);
@@ -386,6 +425,18 @@ impl Endpoint {
             .socket
             .set_read_timeout(Some(Duration::from_millis(100)))?;
         Ok(Some(endpoint))
+    }
+
+    fn verified_dir(&self) -> io::Result<&Path> {
+        let checked = private_dir(self.owner, false)?;
+        if checked != self.dir {
+            return Err(invalid());
+        }
+        let dm = fs::symlink_metadata(&self.dir)?;
+        if dm.file_type().is_symlink() || !dm.is_dir() || (dm.dev(), dm.ino()) != self.dir_id {
+            return Err(invalid());
+        }
+        Ok(&self.dir)
     }
 }
 
@@ -396,10 +447,12 @@ impl Endpoint {
         closing: bool,
         last_producer: &crate::json::JsonValue,
     ) -> io::Result<()> {
-        let stage = self.dir.join(format!("health-{}", std::process::id()));
+        let dir = self.verified_dir()?;
+        let stage = dir.join(format!("health-{}", std::process::id()));
         let mut file = OpenOptions::new()
             .write(true)
             .create_new(true)
+            .custom_flags(O_NOFOLLOW_FLAG)
             .mode(0o600)
             .open(&stage)?;
         let mut status = super::runtime_health::status(counts.0, counts.1, closing);
@@ -415,9 +468,15 @@ impl Endpoint {
             ));
         }
         let status = status.to_json_string();
+        let health_dst = dir.join("health");
+        if fs::symlink_metadata(&health_dst).is_ok_and(|m| m.file_type().is_symlink()) {
+            let _ = fs::remove_file(&stage);
+            return Err(invalid());
+        }
         let result = file
             .write_all(status.as_bytes())
-            .and_then(|()| fs::rename(&stage, self.dir.join("health")));
+            .and_then(|()| self.verified_dir().map(|_| ()))
+            .and_then(|()| fs::rename(&stage, health_dst));
         if result.is_err() {
             let _ = fs::remove_file(stage);
         }
@@ -427,8 +486,11 @@ impl Endpoint {
 
 impl Drop for Endpoint {
     fn drop(&mut self) {
-        if identity(&self.dir, self.owner).ok() == Some(self.id) {
-            let _ = fs::remove_file(self.dir.join(ROUTE));
+        if self.verified_dir().is_ok() && identity(&self.dir, self.owner).ok() == Some(self.id) {
+            if fs::symlink_metadata(self.dir.join(ROUTE)).is_ok_and(|m| !m.file_type().is_symlink())
+            {
+                let _ = fs::remove_file(self.dir.join(ROUTE));
+            }
             let _ = fs::remove_file(self.dir.join(SOCKET));
         }
     }
@@ -574,7 +636,7 @@ pub(crate) fn collect(owned: bool) -> io::Result<()> {
             Err(e) => return Err(e),
         }
     }
-    runtime.finish();
+    runtime.finish(Duration::from_millis(200));
     let _ = endpoint.report(runtime.counts(), true, &last_producer);
     Ok(())
 }

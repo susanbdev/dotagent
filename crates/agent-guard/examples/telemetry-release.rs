@@ -904,6 +904,316 @@ mod unix_harness {
         Ok(())
     }
 
+    fn supervised_deadlock_and_restart_cap(bins: &Path) -> Result<(), String> {
+        let cli = bins.join("dotagent");
+        let probe = bins.join("examples/observation-probe");
+
+        // 1. Supervised deadlocked (`SIGSTOP`ped) collector MUST be killed & reaped on graceful HostTelemetry::drop!
+        {
+            let ws = TempWorkspace::create()?;
+            let mut host = ManagedProcess::spawn(
+                &[&cli],
+                &["hook-daemon", "--idle-secs", "1"],
+                &ws,
+                false,
+                false,
+            )?;
+            let address = ws.state.join("daemon/hook.sock");
+            until("daemon/hook.sock (deadlock reap)", || {
+                fs::symlink_metadata(&address).ok().map(|_| ())
+            })?;
+            let deadlocked_pid = until("collector_pid (deadlock reap)", || {
+                health(&ws.state)
+                    .get("collector_pid")
+                    .and_then(JsonValue::as_u64)
+                    .filter(|&pid| pid != 0)
+            })?;
+            if !signal_pid(deadlocked_pid, "-STOP")? {
+                return Err(format!("failed to SIGSTOP collector {deadlocked_pid}"));
+            }
+            let exit_status = host.wait_watchdog()?;
+            if !exit_status.success() {
+                return Err(format!(
+                    "hook-daemon idle exit failed while collector SIGSTOPped: {exit_status:?}"
+                ));
+            }
+            until("SIGSTOPped collector killed and reaped", || {
+                (!pid_alive(deadlocked_pid)).then_some(())
+            })?;
+        }
+
+        // 2. Deadlocked store worker (`deadlocked-owned`) exits within bounded finish window and cleans up socket/route!
+        {
+            let ws = TempWorkspace::create()?;
+            let mut producer = ManagedProcess::spawn(&[&probe], &["producer"], &ws, true, false)?;
+            let mut receiver =
+                ManagedProcess::spawn(&[&probe], &["deadlocked-owned"], &ws, true, false)?;
+            if submitted(&mut producer)?.is_none() {
+                return Err("deadlocked-owned: expected ACCEPTED".to_string());
+            }
+            let line = receiver.read_line()?;
+            if line != "DEADLOCKED" {
+                return Err(format!("expected DEADLOCKED, got '{line}'"));
+            }
+            assert_authority(&mut producer)?;
+            let close_start = Instant::now();
+            receiver.close_stdin();
+            let status = receiver.wait_watchdog()?;
+            if !status.success() {
+                return Err(format!("deadlocked-owned exit failed: {status:?}"));
+            }
+            if close_start.elapsed() > Duration::from_secs(3) {
+                return Err(format!(
+                    "deadlocked-owned took {:?} (> 3s budget)",
+                    close_start.elapsed()
+                ));
+            }
+            if ws.state.join("observations/in").exists()
+                || ws.state.join("observations/route").exists()
+            {
+                return Err("deadlocked-owned left socket or route behind".to_string());
+            }
+        }
+
+        // 3. Supervisor enforces 3-starts-per-60s restart cap without losing authoritative allow/deny!
+        {
+            let ws = TempWorkspace::create()?;
+            let mut host = ManagedProcess::spawn(
+                &[&cli],
+                &["hook-daemon", "--idle-secs", "30"],
+                &ws,
+                false,
+                false,
+            )?;
+            let address = ws.state.join("daemon/hook.sock");
+            until("daemon/hook.sock (restart cap)", || {
+                fs::symlink_metadata(&address).ok().map(|_| ())
+            })?;
+            let mut seen_pids = Vec::new();
+            for round in 0..3 {
+                let pid = until("collector_pid (restart round)", || {
+                    health(&ws.state)
+                        .get("collector_pid")
+                        .and_then(JsonValue::as_u64)
+                        .filter(|&p| p != 0 && !seen_pids.contains(&p))
+                })?;
+                seen_pids.push(pid);
+                if !signal_pid(pid, "-KILL")? {
+                    return Err(format!("failed to SIGKILL collector round {round}: {pid}"));
+                }
+                until("killed collector reaped", || {
+                    (!pid_alive(pid)).then_some(())
+                })?;
+            }
+            // After 3 starts within 60s, no 4th collector may be spawned immediately
+            thread::sleep(Duration::from_millis(250));
+            let latest_pid = health(&ws.state)
+                .get("collector_pid")
+                .and_then(JsonValue::as_u64)
+                .unwrap_or(0);
+            if latest_pid != 0 && !seen_pids.contains(&latest_pid) {
+                return Err(format!(
+                    "supervisor exceeded 3-starts-per-60s cap (unexpected 4th pid {latest_pid})"
+                ));
+            }
+            let allow = r#"{"tool_name":"Read","tool_response":"ordinary fixture"}"#;
+            let deny = format!(
+                r#"{{"tool_name":"Task","tool_response":"{}"}}"#,
+                "ordinary detail ".repeat(100)
+            );
+            if daemon_rpc(&address, &ws.repo, allow)?
+                .get("allow")
+                .and_then(JsonValue::as_bool)
+                != Some(true)
+            {
+                return Err("expected allow=true when restart cap exhausted".to_string());
+            }
+            if daemon_rpc(&address, &ws.repo, &deny)?
+                .get("code")
+                .and_then(JsonValue::as_str)
+                != Some("SUBAGENT_RETURN_BUDGET_EXCEEDED")
+            {
+                return Err("expected deny code when restart cap exhausted".to_string());
+            }
+            let _ = host.kill_and_wait()?;
+        }
+
+        // 4. Runtime `observations` directory-to-symlink swap NEVER writes or unlinks through symlink!
+        {
+            let ws = TempWorkspace::create()?;
+            let mut collector = ManagedProcess::spawn(
+                &[&cli],
+                &["collect-observations", "--owned"],
+                &ws,
+                true,
+                false,
+            )?;
+            let obs_dir = ws.state.join("observations");
+            let moved_dir = ws.state.join("observations_moved");
+            let victim_dir = ws.base.join("victim");
+            fs::create_dir_all(&victim_dir).map_err(|e| format!("mkdir victim: {e}"))?;
+            fs::write(victim_dir.join("route"), b"sentinel-route")
+                .map_err(|e| format!("write victim/route: {e}"))?;
+            fs::write(victim_dir.join("in"), b"sentinel-in")
+                .map_err(|e| format!("write victim/in: {e}"))?;
+            fs::rename(&obs_dir, &moved_dir).map_err(|e| format!("rename obs->moved: {e}"))?;
+            symlink(&victim_dir, &obs_dir).map_err(|e| format!("symlink obs->victim: {e}"))?;
+            collector.close_stdin();
+            let status = collector.wait_watchdog()?;
+            if !status.success() {
+                return Err(format!("collector exit after dir swap failed: {status:?}"));
+            }
+            if fs::read(victim_dir.join("route")).ok().as_deref() != Some(b"sentinel-route")
+                || fs::read(victim_dir.join("in")).ok().as_deref() != Some(b"sentinel-in")
+                || victim_dir.join("health").exists()
+            {
+                return Err(
+                    "Endpoint wrote or unlinked files through swapped observations symlink!"
+                        .to_string(),
+                );
+            }
+        }
+
+        Ok(())
+    }
+
+    fn cold_cli_isolation(bins: &Path) -> Result<(), String> {
+        let guard = bins.join("agent-guard");
+        for cond in ["absent", "crashed", "saturated"] {
+            let ws = TempWorkspace::create()?;
+            fs::write(ws.repo.join("AGENTS.md"), "# AGENTS.md\n")
+                .map_err(|e| format!("write AGENTS.md: {e}"))?;
+            let mut col_opt = if cond != "absent" {
+                Some(ManagedProcess::spawn(
+                    &[&guard],
+                    &["collect-observations", "--owned"],
+                    &ws,
+                    true,
+                    false,
+                )?)
+            } else {
+                None
+            };
+            if let Some(ref mut col) = col_opt {
+                if cond == "crashed" {
+                    let _ = col.kill_and_wait()?;
+                } else if cond == "saturated" {
+                    stop_reading(col.pid())?;
+                    let sender =
+                        UnixDatagram::unbound().map_err(|e| format!("unbound dgram: {e}"))?;
+                    sender
+                        .set_nonblocking(true)
+                        .map_err(|e| format!("nonblock dgram: {e}"))?;
+                    sender
+                        .connect(ws.state.join("observations/in"))
+                        .map_err(|e| format!("connect dgram: {e}"))?;
+                    for _ in 0..16384 {
+                        if matches!(sender.send(b"sat"), Err(ref e) if e.kind() == io::ErrorKind::WouldBlock)
+                        {
+                            break;
+                        }
+                    }
+                }
+            }
+
+            let ws_json = JsonValue::Str(ws.repo.to_string_lossy().into_owned()).to_json_string();
+            for i in 0..12 {
+                // Cold `antigravity-hook PreToolUse` allow + deny
+                let ag_allow = format!(
+                    r#"{{"conversationId":"cold_ag_{cond}_{i}","workspacePaths":[{ws_json}],"toolCall":{{"name":"view_file","args":{{"AbsolutePath":"{}/plain.txt","StartLine":1,"EndLine":5}}}},"stepIdx":0}}"#,
+                    ws.repo.display()
+                );
+                let start = Instant::now();
+                let mut child = Command::new(&guard)
+                    .args(["antigravity-hook", "PreToolUse"])
+                    .current_dir(&ws.repo)
+                    .env_clear()
+                    .envs(ws.clean_env())
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .spawn()
+                    .map_err(|e| format!("spawn cold antigravity allow: {e}"))?;
+                if let Some(mut sin) = child.stdin.take() {
+                    sin.write_all(ag_allow.as_bytes())
+                        .map_err(|e| format!("write ag allow: {e}"))?;
+                }
+                let out = child
+                    .wait_with_output()
+                    .map_err(|e| format!("wait ag allow: {e}"))?;
+                if !out.status.success() {
+                    return Err(format!("cold antigravity allow exit {:?}", out.status));
+                }
+                if start.elapsed() > Duration::from_millis(500) {
+                    return Err(format!(
+                        "cold antigravity-hook PreToolUse ({cond}) exceeded 500ms: {:?}",
+                        start.elapsed()
+                    ));
+                }
+                let stdout_s = String::from_utf8(out.stdout)
+                    .map_err(|_| "non-utf8 stdout on antigravity allow".to_string())?;
+                let parsed = JsonValue::parse(stdout_s.trim()).map_err(|e| {
+                    format!("contaminated stdout on antigravity allow ('{stdout_s}'): {e}")
+                })?;
+                if parsed.get("decision").and_then(JsonValue::as_str) != Some("allow")
+                    || stdout_s.lines().count() != 1
+                {
+                    return Err(format!("unexpected antigravity allow stdout: '{stdout_s}'"));
+                }
+
+                let ag_deny = format!(
+                    r#"{{"conversationId":"cold_ag_d_{cond}_{i}","workspacePaths":[{ws_json}],"toolCall":{{"name":"view_file","args":{{"AbsolutePath":"{}/.env"}}}},"stepIdx":0}}"#,
+                    ws.repo.display()
+                );
+                let mut d_child = Command::new(&guard)
+                    .args(["antigravity-hook", "PreToolUse"])
+                    .current_dir(&ws.repo)
+                    .env_clear()
+                    .envs(ws.clean_env())
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .spawn()
+                    .map_err(|e| format!("spawn cold antigravity deny: {e}"))?;
+                if let Some(mut sin) = d_child.stdin.take() {
+                    sin.write_all(ag_deny.as_bytes())
+                        .map_err(|e| format!("write ag deny: {e}"))?;
+                }
+                let d_out = d_child
+                    .wait_with_output()
+                    .map_err(|e| format!("wait ag deny: {e}"))?;
+                if !d_out.status.success() {
+                    return Err(format!("cold antigravity deny exit {:?}", d_out.status));
+                }
+                let d_stdout = String::from_utf8(d_out.stdout)
+                    .map_err(|_| "non-utf8 stdout on antigravity deny".to_string())?;
+                let d_parsed = JsonValue::parse(d_stdout.trim()).map_err(|e| {
+                    format!("contaminated stdout on antigravity deny ('{d_stdout}'): {e}")
+                })?;
+                if d_parsed.get("decision").and_then(JsonValue::as_str) != Some("deny")
+                    || d_stdout.lines().count() != 1
+                {
+                    return Err(format!("unexpected antigravity deny stdout: '{d_stdout}'"));
+                }
+
+                if cond == "absent" && ws.state.join("observations").exists() {
+                    return Err(
+                        "cold antigravity-hook PreToolUse unexpectedly spawned observations collector!"
+                            .to_string(),
+                    );
+                }
+            }
+
+            if let Some(mut col) = col_opt
+                && cond == "saturated"
+            {
+                let _ = signal_pid(u64::from(col.pid()), "-CONT");
+                let _ = col.kill_and_wait();
+            }
+        }
+        Ok(())
+    }
+
     pub fn run_all() -> Result<(), String> {
         let arg1 = env::args()
             .nth(1)
@@ -929,6 +1239,12 @@ mod unix_harness {
         }
         shipped_host(&binaries)?;
         println!("PASS production hook daemon and automatic collector");
+        supervised_deadlock_and_restart_cap(&binaries)?;
+        println!(
+            "PASS supervised deadlock reap, restart cap, bounded worker finish, and symlink-swap defense"
+        );
+        cold_cli_isolation(&binaries)?;
+        println!("PASS repeated cold CLI startup isolation and stdout purity");
         boundaries(&binaries)?;
         println!("PASS local endpoint authentication, protocol rejection and session correlation");
         Ok(())
