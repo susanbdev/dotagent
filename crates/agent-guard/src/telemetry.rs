@@ -28,6 +28,8 @@ pub(crate) mod capture;
 pub(crate) mod controls;
 mod diagnostics;
 pub(crate) mod observations;
+pub(crate) mod runtime;
+mod runtime_health;
 pub(crate) mod store;
 
 pub(crate) const AGENT_SANDBOX_AND_HARNESS_MARKERS: &[&str] = &[

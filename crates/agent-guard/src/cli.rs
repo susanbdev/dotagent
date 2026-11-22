@@ -60,6 +60,19 @@ pub fn run_cli_entrypoint() -> ExitCode {
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
 
     let sub = args.first().map(String::as_str).unwrap_or("--help");
+    // Initialize only host processes that produce optional observations.
+    // exec-sandbox applies kernel restrictions in-process and must start no such threads.
+    let _telemetry = matches!(
+        sub,
+        "coordinator"
+            | "hook-daemon"
+            | "mcp-gateway"
+            | "post-tool"
+            | "pre-compact"
+            | "pre-tool"
+            | "read-safe"
+    )
+    .then(crate::telemetry::runtime::start_host);
     match sub {
         "swarm" => exec_sibling_tool("swarm-tool", &args[1..]),
         "compile" | "compiler" => exec_sibling_tool("dotagent-compiler", &args[1..]),

@@ -1,15 +1,15 @@
-//! Versioned observations written by host call sites. The wire format carries
+//! Versioned observations submitted by host call sites. The wire format carries
 //! provenance for interpretation and cannot authorize a state transition.
 
 use std::path::Path;
-use std::sync::OnceLock;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::crypto::sha256_hex;
 use crate::json::JsonValue;
 
-use super::store::{self, Durability};
+use super::runtime::{Submission, note_invalid_audit, submit_audit};
+use super::store::Durability;
 
 pub(crate) const SCHEMA_VERSION: u64 = 1;
 pub(crate) const MAX_RECORD_BYTES: usize = 16 * 1024;
@@ -19,8 +19,7 @@ const MAX_PAYLOAD_FIELDS: usize = 48;
 const MAX_PAYLOAD_DEPTH: usize = 4;
 const MAX_PAYLOAD_NODES: usize = 192;
 static SEQUENCE: AtomicU64 = AtomicU64::new(0);
-static INSTANCE: OnceLock<String> = OnceLock::new();
-static DIAGNOSTIC_REPORTED: AtomicBool = AtomicBool::new(false);
+static INSTANCE_NANOS: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
@@ -220,19 +219,6 @@ impl Payload {
     }
 }
 
-#[derive(Debug)]
-pub(crate) struct Receipt {
-    pub event_id: String,
-    pub storage: store::Receipt,
-}
-
-#[derive(Debug)]
-pub(crate) enum EmitResult {
-    Persisted(Receipt),
-    DroppedNoncritical(&'static str),
-    FailedRequiredEvidence(&'static str),
-}
-
 pub(crate) fn guard_context(
     repo: &Path,
     ledger: &crate::traversal_ledger::SessionLedger,
@@ -250,26 +236,13 @@ pub(crate) fn guard_context(
 }
 
 pub(crate) fn record_guard(context: &Context, payload: Payload) {
-    let _ = record_guard_event(context, payload);
+    let _ = emit(Producer::Guard, context, payload);
 }
 
 pub(crate) fn host_capture_allowed() -> bool {
     // A sandboxed process cannot opt in to host recording with hook input.
     std::env::var("AGENT_GUARD_IN_SANDBOX").as_deref() != Ok("1")
         && std::env::var("AGENT_GUARD_WORKER_LOCK").as_deref() != Ok("1")
-}
-
-fn record_guard_event(context: &Context, payload: Payload) -> Option<String> {
-    if !host_capture_allowed() {
-        return None;
-    }
-    match emit(Producer::Guard, context, payload) {
-        EmitResult::Persisted(receipt) => Some(receipt.event_id),
-        EmitResult::DroppedNoncritical(reason) | EmitResult::FailedRequiredEvidence(reason) => {
-            report_failure(reason);
-            None
-        }
-    }
 }
 
 pub(crate) fn intervention(context: &Context) -> Context {
@@ -280,7 +253,7 @@ pub(crate) fn intervention(context: &Context) -> Context {
 
 pub(crate) fn record_alert(context: &Context, alert: Payload, action: Payload) {
     let mut action_context = intervention(context);
-    action_context.parent_event_id = record_guard_event(context, alert);
+    action_context.parent_event_id = emit(Producer::Guard, context, alert);
     record_guard(&action_context, action);
 }
 
@@ -325,38 +298,22 @@ pub(crate) fn hook_decision(
     .with_result(action, reason_code, disposition)
 }
 
-pub(crate) fn emit(producer: Producer, context: &Context, payload: Payload) -> EmitResult {
-    emit_with_durability(producer, context, payload, Durability::Buffered)
-}
-
-pub(crate) fn emit_required(producer: Producer, context: &Context, payload: Payload) -> EmitResult {
-    emit_with_durability(producer, context, payload, Durability::Required)
-}
-
-fn emit_with_durability(
-    producer: Producer,
-    context: &Context,
-    payload: Payload,
-    durability: Durability,
-) -> EmitResult {
-    let outcome = encode(producer, context, payload).and_then(|(event_id, record)| {
-        store::append(&record, durability)
-            .map(|storage| Receipt { event_id, storage })
-            .map_err(|_| "AUDIT_APPEND_FAILED")
-    });
-    match outcome {
-        Ok(receipt) => EmitResult::Persisted(receipt),
-        Err(reason) => match durability {
-            Durability::Buffered => EmitResult::DroppedNoncritical(reason),
-            Durability::Required => EmitResult::FailedRequiredEvidence(reason),
-        },
+/// Returns an event ID only after queue admission. The ID supports correlation while storage is
+/// pending, and a later record can refer to an event that never reaches the audit log.
+pub(crate) fn emit(producer: Producer, context: &Context, payload: Payload) -> Option<String> {
+    if !host_capture_allowed() {
+        return None;
     }
-}
-
-pub(super) fn report_failure(reason: &'static str) {
-    if !DIAGNOSTIC_REPORTED.swap(true, Ordering::Relaxed) {
-        use std::io::Write;
-        let _ = writeln!(std::io::stderr().lock(), "[DOTAGENT CAPTURE] {reason}");
+    if !super::runtime::prepare_audit() {
+        return None;
+    }
+    let Ok((event_id, record)) = encode(producer, context, payload) else {
+        note_invalid_audit();
+        return None;
+    };
+    match submit_audit(record, Durability::Buffered) {
+        Submission::Queued => Some(event_id),
+        Submission::Dropped(_) => None,
     }
 }
 
@@ -366,21 +323,25 @@ pub(crate) fn unix_time_ms() -> Option<u64> {
 }
 
 fn next_identity() -> (String, u64, String) {
-    let instance = INSTANCE.get_or_init(|| {
-        let created = SystemTime::now().duration_since(UNIX_EPOCH).ok();
-        // IDs are local labels. They are neither credentials nor authentication.
-        format!(
-            "{:x}-{:x}",
-            std::process::id(),
-            created.map_or(0, |duration| duration.as_nanos())
-        )
-    });
-    let sequence = SEQUENCE.fetch_add(1, Ordering::Relaxed) + 1;
-    (
-        instance.clone(),
-        sequence,
-        format!("{instance}-{sequence:x}"),
-    )
+    let mut created = INSTANCE_NANOS.load(Ordering::Relaxed);
+    if created == 0 {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .ok()
+            .and_then(|duration| u64::try_from(duration.as_nanos()).ok())
+            .unwrap_or(1)
+            .max(1);
+        created =
+            match INSTANCE_NANOS.compare_exchange(0, now, Ordering::Relaxed, Ordering::Relaxed) {
+                Ok(_) => now,
+                Err(existing) => existing,
+            };
+    }
+    // IDs are local labels. They are neither credentials nor authentication.
+    let instance = format!("{:x}-{created:x}", std::process::id());
+    let sequence = SEQUENCE.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
+    let event_id = format!("{instance}-{sequence:x}");
+    (instance, sequence, event_id)
 }
 
 pub(crate) fn next_local_id() -> String {

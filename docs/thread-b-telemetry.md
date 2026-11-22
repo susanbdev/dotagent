@@ -66,7 +66,15 @@ The writer uses the existing cross-process audit lock. The Unix state directory 
 
 The append path limits active files to a 10 MiB target with up to five numbered archives by default. Rotation reserves room for a bounded health record. Manual rotation shares the writer lock and allows up to 20 archives. Retention is size-based, so the earliest retained wall-clock time depends on event volume and rotation. Use the oldest retained observation and any gap indications when evaluating coverage. The newest recoverable incomplete suffix, at most one frame, is quarantined separately. A missing frame boundary beyond that limit produces a writer error. A pending quarantine allows restart to report the gap before finalizing recovery. Quarantine bytes are outside the diagnostic stream and carry unknown origin.
 
-The append API distinguishes `Persisted`, `DroppedNoncritical` and `FailedRequiredEvidence`. Buffered success acknowledges a complete write to the operating system. Required success includes a data sync and a directory sync on Unix. Failure is returned to the caller with a bounded operator diagnostic. A later successful write can persist a health record for available counters. Failed-write counters are process-local and can be lost when a writer terminates. Logging is synchronous and uses the bounded existing lock wait.
+Trusted host executables initialize two independent worker lanes before dispatch. Each lane has room for 128 queued jobs and one job in flight. A producer attempts admission once and receives `Queued` or a drop for full capacity, contention, unavailable worker, or closed admission. Invalid inputs are counted separately. Queue admission performs a try-lock on preallocated queue storage. Workers release the queue lock before opening, locking, writing, syncing, or rotating any sink. Producers have bounded record preparation and proceed independently of sink progress. Worker startup happens at host process initialization. Set `DOTAGENT_TELEMETRY=0` before startup to disable both lanes.
+
+The audit worker writes typed and legacy observations through the protected local store. The independent export worker writes optional AgentPI projections, including guard, plugin and feedback-loop signals, to the existing protected mirror. Explicit feedback command results and MCP replies retain their result channels. `DOTAGENT_AGENTPI_STDERR` no longer enables optional stderr output. The human-authorized `telemetry export-otlp` command continues to read and render a local snapshot in a separate invocation.
+
+The session ledger, authenticated breadcrumbs, signed feedback ballots, coordinator transactions, work-ledger checkpoints and StopReceipts retain their own durability and decision rules. Use session-ledger evidence to ground feedback, checkpoint and permission decisions. The legacy audit lookup provides a best-effort view of the active observation file.
+
+Close stops admission and asks workers to drain as their sinks permit. The host exits independently of pending writes. A one-shot process may exit before workers finish accepted jobs or publish their final counters. In-flight I/O may keep a worker occupied through a shutdown deadline. Retained `CAPTURE_HEALTH` snapshots expose process-local counters for queued jobs, successful sink completions, sink failures and admission drops. Partial snapshots and abrupt process exit limit cross-process accounting.
+
+Telemetry-specific lock stalls and sink failures are confined to the relevant worker. Authoritative storage retains its existing failure behavior for a shared-volume outage. The queue bound is a bound on work and storage occupancy. Wall-clock latency also depends on host scheduling and allocation.
 
 Payload construction uses allowlisted command shapes, names and metrics before serialization. Treat raw prompts, source, shell strings, arbitrary arguments, environment and output as sensitive input. Secret-derived hashes can be reversible for low-entropy values. Use a bounded reference to a retained authorized artifact when available. Character sanitization serves output hygiene. It cannot establish that emitted data is free of secrets.
 
@@ -78,9 +86,9 @@ To extract the contract into a shared Rust component, move the envelope types, p
 
 ### Operator diagnostics
 
-From the repository directory, an authorized operator can run `dotagent telemetry baseline` to record individual observations for `HEAD`, local `main`, cached `origin/main` and working-tree status. Add `--include-review-fixes` to check cached `origin/v2-1-review-fixes` before status. The fixed checks run through the existing sandbox mediator with kernel enforcement required, network denied and read-only access. Status includes changes to recorded submodule commits while ignoring nested submodule dirtiness. The baseline exits unsuccessfully if a prerequisite cannot be established or its record cannot be persisted. Each check has one 10-second monotonic deadline for output collection and the mediator wait. On a timeout, the host attempts to stop the outer mediator process group and records whether it reaped the direct child. Nested execution remains unavailable on this route. Remote freshness is outside this route. Operator signature requirements apply when configured.
+From the repository directory, an authorized operator can run `dotagent telemetry baseline` to record individual observations for `HEAD`, local `main`, cached `origin/main` and working-tree status. Add `--include-review-fixes` to check cached `origin/v2-1-review-fixes` before status. The fixed checks run through the existing sandbox mediator with kernel enforcement required, network denied and read-only access. Status includes changes to recorded submodule commits while ignoring nested submodule dirtiness. The baseline exit status reflects the prerequisite checks. Each check also reports `capture_queued` or `capture_dropped`. Queue admission supplies correlation IDs while persistence is pending. Each check has one 10-second monotonic deadline for output collection and the mediator wait. On a timeout, the host attempts to stop the outer mediator process group and records whether it reaped the direct child. Nested execution remains unavailable on this route. Remote freshness is outside this route. Operator signature requirements apply when configured.
 
-Use `dotagent telemetry trace` for aggregated observations from the beginning of the active file, up to 8 MiB or 4,096 records. Archives are outside this query window. `dotagent telemetry trace --trace-id ID` adds up to 256 rows from a trace and its connected observations. The report includes control settings, interventions, outcomes where linked, truncation and continuation, detector dispositions, storage health and explicit coverage counters. It limits each grouping to 128 keys with overflow counts. A missing or unreadable active file produces an unavailable result. A launch without its observed finish is incomplete in the queried window. Missing predecessor events can reflect earlier rotation. The writer-wait aggregate reports the observed sample count and total microseconds, with a null total when no sample is present. Event durations are reported separately and can overlap.
+Use `dotagent telemetry trace` for aggregated observations from the beginning of the active file, up to 8 MiB or 4,096 records. Archives are outside this query window. `dotagent telemetry trace --trace-id ID` adds up to 256 rows from a trace and its connected observations. The report includes control settings, interventions, outcomes where linked, truncation and continuation, detector dispositions, storage health and explicit coverage counters. It includes up to 128 latest process-scoped runtime snapshots from the retained window, with explicit omitted or invalid snapshot counts. It limits each grouping to 128 keys with overflow counts. A missing or unreadable active file produces an unavailable result. A launch without its observed finish is incomplete in the queried window. Missing predecessor events can reflect earlier rotation. The writer-wait aggregate reports the observed sample count and total microseconds, with a null total when no sample is present. Event durations are reported separately and can overlap.
 
 ## Execution ledger
 
@@ -175,7 +183,7 @@ The integration applies the telemetry and host-wrapper commits on top of `e30d3a
 
 The wrapper omits command text and streams from telemetry. The fixed Git baseline reports the actual static policy denial when linked worktree metadata is unsupported. Its command-policy fixture uses standalone repository metadata.
 
-### Current integration verification
+### Phase 0 integration verification
 
 | Check | Result |
 | --- | --- |
@@ -191,3 +199,31 @@ The wrapper omits command text and streams from telemetry. The fixed Git baselin
 | Native Antigravity | Unverified. The workspace has no connected authenticated runtime. |
 
 Release promotion and hardware signer rotation remain blocked pending independent verification of the existing [release signing requirements](RELEASE_SIGNING.md).
+
+## Nonblocking verification
+
+The runtime tests hold a telemetry writer behind a barrier while queue admission, a production PostToolUse decision and shutdown return. Other fixtures hold the real audit-file lock, hold the queue admission mutex, fill the queue, provide an invalid audit destination, and start the hook without a collector. The independent export lane can stall while audit jobs complete. The audit worker counts both injected `EIO` and a Linux `ENOSPC` write to `/dev/full`, then completes another job. A live MCP fixture verifies a successful JSON-RPC ballot result and delivery to the AgentPI mirror. The disk fixture isolates the telemetry write. A failure on a volume that also hosts authoritative state remains subject to the security journals' existing rules.
+
+The telemetry suite passed 45 tests, with three opt-in benchmarks. The FIFO isolation test, MCP fixtures, checkpoint identity and scratch fixtures, webfont fixture, workspace compilation, strict workspace Clippy, and all 58 compiler artifact checks passed. Workspace test compilation covered all 26 test executables. The behavioral run covered the focused suites listed here.
+
+Run the release benchmark on Linux.
+
+```sh
+cargo test -p agent-guard --release --lib --offline --locked \
+  telemetry::runtime::tests::measures_ -- --test-threads=1 --ignored --nocapture
+```
+
+The policy benchmark runs with a no-op sink and drains the enabled lane between batches outside the timed region. The PostToolUse benchmark runs the production hook in separate processes, alternates the order of enabled and disabled modes, discards warmup observations and excludes process startup. The full-queue measurements hold the worker until sampling ends. Admission includes the job wrapper and single try-lock attempt. Wall-clock measurements depend on the host and scheduler.
+
+Linux x86-64 release measurements used Rust 1.100.0 and 2,048 samples per row. Both enabled hook runs persisted every queued observation, including warmup.
+
+| Measurement | p50 | p95 | p99 | Maximum observed |
+| --- | ---: | ---: | ---: | ---: |
+| Guard policy, telemetry disabled | 451 ns | 541 ns | 1,422 ns | 84,868 ns |
+| Guard policy, telemetry enabled | 581 ns | 671 ns | 1,882 ns | 50,255 ns |
+| Guard policy, queue full | 471 ns | 641 ns | 1,883 ns | 43,826 ns |
+| Successful admission alone | 30 ns | 40 ns | 80 ns | 311 ns |
+| Full-queue drop alone | 30 ns | 31 ns | 60 ns | 311 ns |
+| PostToolUse, telemetry disabled | 166.940 µs | 265.799 µs | 318.568 µs | 1,065.199 µs |
+| PostToolUse, telemetry enabled | 183.035 µs | 278.298 µs | 362.354 µs | 1,350.057 µs |
+| Difference between PostToolUse quantiles | +16.095 µs | +12.499 µs | +43.786 µs | — |

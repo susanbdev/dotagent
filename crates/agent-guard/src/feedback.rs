@@ -24,9 +24,8 @@
 //!    `session_total_submissions > 8` (`GuardCode::FeedbackRateLimitExceeded`), and writes
 //!    `<= 2048`-byte single-line JSONL records under `flock(LOCK_EX)` + `O_APPEND` with 10 MiB
 //!    two-generation rotation (`ballots.jsonl` / `ballots.jsonl.1`).
-//! 5. **Transport-Safe AgentPI Stream**: Emits `[AGENTPI_EVENT] {...}` to `stdout` ONLY on direct
-//!    CLI `dotagent feedback submit`, and strictly to `stderr` on hooks and MCP (`mcp-gateway`) so
-//!    stdio JSON-RPC frames are never corrupted.
+//! 5. **Transport-Safe AgentPI Stream**: The direct feedback CLI owns its stdout result.
+//!    Optional AgentPI projections use the protected local mirror.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, OpenOptions};
@@ -45,6 +44,7 @@ use crate::injection_scan::scan_untrusted_content;
 use crate::json::JsonValue;
 use crate::resolve_repo_root;
 use crate::sanitizer::neuter_to_clean_ascii;
+use crate::telemetry::runtime::{note_invalid_export, submit_export};
 use crate::traversal_ledger::{
     O_NOFOLLOW_FLAG, SessionLedger, compute_session_key_hash, ensure_nonsymlink_state_dir,
 };
@@ -58,6 +58,7 @@ pub const AGENTPI_STDOUT_PREFIX: &str = "[AGENTPI_EVENT] ";
 pub const MAX_BALLOTS_PER_SESSION: u32 = 8;
 pub const MAX_SPOOL_FILE_BYTES: u64 = 10 * 1024 * 1024;
 pub const MAX_JSONL_RECORD_BYTES: usize = 2048;
+pub(crate) const MAX_AGENTPI_EXPORT_INPUT_BYTES: usize = 4096;
 
 pub const RING0_CONSTITUTIONAL_CODES: &[&str] = &[
     "FORBIDDEN_DIRECTORY_ACCESS",
@@ -102,6 +103,7 @@ pub fn is_ring0_constitutional_code(code: &str) -> bool {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EmitSink {
     CliStdout,
+    /// Keeps existing caller behavior for the result while optional events use the mirror.
     HookOrMcpStderr,
     Silent,
 }
@@ -917,8 +919,11 @@ pub fn utc_day_yyyymmdd(ts_unix: u64) -> String {
 }
 
 pub fn feedback_state_dir() -> Result<PathBuf, String> {
-    let root = crate::traversal_ledger::state_root_dir();
-    ensure_nonsymlink_state_dir(&root)?;
+    feedback_dir_under(&crate::traversal_ledger::state_root_dir())
+}
+
+fn feedback_dir_under(root: &Path) -> Result<PathBuf, String> {
+    ensure_nonsymlink_state_dir(root)?;
     let fb = root.join("feedback");
     ensure_nonsymlink_state_dir(&fb)?;
     Ok(fb)
@@ -1085,7 +1090,11 @@ pub fn verify_ipc_worker_token(
     Ok((sid, root_sid, role))
 }
 
-fn append_bounded_rotated_jsonl(path: &Path, line_json: &str) -> Result<(), String> {
+fn append_bounded_rotated_jsonl(
+    path: &Path,
+    line_json: &str,
+    acquire_lock: fn(&Path) -> Result<ExclusiveFileLockGuard, String>,
+) -> Result<(), String> {
     if line_json.len() + 1 > MAX_JSONL_RECORD_BYTES {
         return Err(format!(
             "ballot/telemetry record {} bytes exceeds {MAX_JSONL_RECORD_BYTES}-byte atomic ceiling",
@@ -1097,7 +1106,7 @@ fn append_bounded_rotated_jsonl(path: &Path, line_json: &str) -> Result<(), Stri
         .ok_or_else(|| "spool file missing parent dir".to_string())?;
     ensure_nonsymlink_state_dir(parent)?;
     let lock_path = path.with_extension("lock");
-    let _guard = ExclusiveFileLockGuard::acquire(&lock_path)?;
+    let _guard = acquire_lock(&lock_path)?;
 
     if let Ok(meta) = fs::symlink_metadata(path) {
         if meta.file_type().is_symlink() {
@@ -1153,27 +1162,29 @@ fn append_bounded_rotated_jsonl(path: &Path, line_json: &str) -> Result<(), Stri
         .map_err(|e| format!("failed appending spool '{}': {e}", path.display()))
 }
 
-fn emit_agentpi_frame(event_json: &JsonValue, sink: EmitSink) {
+pub(crate) fn write_agentpi_mirror(event_json: &JsonValue) -> bool {
     let encoded = event_json.to_json_string();
-    match sink {
-        EmitSink::CliStdout => {
-            println!("{AGENTPI_STDOUT_PREFIX}{encoded}");
-        }
-        EmitSink::HookOrMcpStderr => {
-            eprintln!("{AGENTPI_STDOUT_PREFIX}{encoded}");
-        }
-        EmitSink::Silent => {}
-    }
-    if let Ok(dir) = feedback_state_dir() {
-        let _ = append_bounded_rotated_jsonl(&dir.join("agentpi_events.jsonl"), &encoded);
+    feedback_dir_under(&crate::traversal_ledger::observation_state_root_dir())
+        .and_then(|dir| {
+            append_bounded_rotated_jsonl(
+                &dir.join("agentpi_events.jsonl"),
+                &encoded,
+                ExclusiveFileLockGuard::acquire_observation,
+            )
+        })
+        .is_ok()
+}
+
+fn publish_agentpi_result(event_json: &JsonValue, sink: EmitSink) {
+    if sink == EmitSink::CliStdout {
+        println!("{AGENTPI_STDOUT_PREFIX}{}", event_json.to_json_string());
     }
 }
 
-/// Emits an AgentPI guard-denial risk event strictly to `agentpi_events.jsonl` (and `stderr` when
-/// `DOTAGENT_AGENTPI_STDERR=1` is enabled, never touching `stdout` so hook/MCP JSON stays pure).
+/// Queues the observational AgentPI guard-denial event for the protected mirror.
 pub fn record_guard_denial_agentpi_signal(
     repo_root: &Path,
-    session_hash_prefix: &str,
+    session_id: &str,
     tool: &str,
     code: &str,
     detail: &str,
@@ -1183,14 +1194,50 @@ pub fn record_guard_denial_agentpi_signal(
     if std::env::var("AGENT_GUARD_IN_SANDBOX").as_deref() == Ok("1") {
         return;
     }
+    if repo_root.as_os_str().len() > MAX_AGENTPI_EXPORT_INPUT_BYTES
+        || [session_id, tool, code, detail]
+            .into_iter()
+            .any(|value| value.len() > MAX_AGENTPI_EXPORT_INPUT_BYTES)
+    {
+        note_invalid_export();
+        return;
+    }
+    let repo_root = repo_root.to_path_buf();
+    let [session_id, tool, code, detail] = [session_id, tool, code, detail].map(str::to_owned);
+    let _ = submit_export(move || {
+        let event = guard_denial_agentpi_event(
+            &repo_root,
+            &session_id,
+            &tool,
+            &code,
+            &detail,
+            halted,
+            ts_unix,
+        );
+        write_agentpi_mirror(&event)
+    });
+}
+
+fn guard_denial_agentpi_event(
+    repo_root: &Path,
+    session_id: &str,
+    tool: &str,
+    code: &str,
+    detail: &str,
+    halted: bool,
+    ts_unix: u64,
+) -> JsonValue {
     let repo_id = sha256_hex(repo_root.to_string_lossy().as_bytes());
-    let (clean_detail, _) = scrub_high_entropy_and_secrets(detail, 160);
-    let severity = if halted || is_ring0_constitutional_code(code) {
+    let session_hash = compute_session_key_hash(repo_root, session_id);
+    let code = crate::traversal_ledger::audit_ascii(code, 128);
+    let detail = crate::traversal_ledger::audit_ascii(detail, 240);
+    let (clean_detail, _) = scrub_high_entropy_and_secrets(&detail, 160);
+    let severity = if halted || is_ring0_constitutional_code(&code) {
         "HIGH"
     } else {
         "INFO"
     };
-    let ev = JsonValue::Object(vec![
+    JsonValue::Object(vec![
         (
             "schema".to_string(),
             JsonValue::Str(AGENTPI_EVENT_SCHEMA.to_string()),
@@ -1206,23 +1253,17 @@ pub fn record_guard_denial_agentpi_signal(
         ),
         (
             "session_hash".to_string(),
-            JsonValue::Str(session_hash_prefix.to_string()),
+            JsonValue::Str(session_hash[..16].to_string()),
         ),
         (
             "tool".to_string(),
             JsonValue::Str(clean_single_line_ascii(tool, 48)),
         ),
-        ("code".to_string(), JsonValue::Str(code.to_string())),
+        ("code".to_string(), JsonValue::Str(code)),
         ("halted".to_string(), JsonValue::Bool(halted)),
         ("detail".to_string(), JsonValue::Str(clean_detail)),
         ("ts_unix".to_string(), JsonValue::Uint(ts_unix)),
-    ]);
-    let sink = if std::env::var("DOTAGENT_AGENTPI_STDERR").as_deref() == Ok("1") {
-        EmitSink::HookOrMcpStderr
-    } else {
-        EmitSink::Silent
-    };
-    emit_agentpi_frame(&ev, sink);
+    ])
 }
 
 /// Opens a spool file read-only with `O_NOFOLLOW` (where supported) after an lstat regular-file
@@ -1568,11 +1609,18 @@ pub fn commit_ballot_on_host_redacted(
     } else {
         dir.join("ballots.jsonl")
     };
-    append_bounded_rotated_jsonl(&target_spool, &rec.to_json_value().to_json_string())
-        .map_err(FeedbackSubmitError::InvalidBallot)?;
+    append_bounded_rotated_jsonl(
+        &target_spool,
+        &rec.to_json_value().to_json_string(),
+        ExclusiveFileLockGuard::acquire,
+    )
+    .map_err(FeedbackSubmitError::InvalidBallot)?;
 
     let agentpi_ev = rec.to_agentpi_event_json();
-    emit_agentpi_frame(&agentpi_ev, sink);
+    publish_agentpi_result(&agentpi_ev, sink);
+    // The signed ballot journal already bounds the source fields of this projection.
+    let event = agentpi_ev.clone();
+    let _ = submit_export(move || write_agentpi_mirror(&event));
     Ok(agentpi_ev)
 }
 
@@ -1593,13 +1641,8 @@ pub fn submit_friction_ballot_with_sink(
         let ev = resp.get("agentpi_event").cloned().ok_or_else(|| {
             FeedbackSubmitError::InvalidBallot("missing agentpi_event".to_string())
         })?;
-        match sink {
-            EmitSink::CliStdout => println!("{AGENTPI_STDOUT_PREFIX}{}", ev.to_json_string()),
-            EmitSink::HookOrMcpStderr => {
-                eprintln!("{AGENTPI_STDOUT_PREFIX}{}", ev.to_json_string())
-            }
-            EmitSink::Silent => {}
-        }
+        // The coordinator owns the local mirror of sandboxed ballot results.
+        publish_agentpi_result(&ev, sink);
         return Ok(ev);
     }
     commit_ballot_on_host_redacted(repo_root, req, false, sink)
@@ -1834,7 +1877,10 @@ pub fn aggregate_verified_clusters(
 pub fn run_feedback_cli(args: &[String], cwd: &Path) -> ExitCode {
     let sub = args.first().map(String::as_str).unwrap_or("--help");
     match sub {
-        "submit" => run_feedback_submit_cli(&args[1..], cwd),
+        "submit" => {
+            let _telemetry = crate::telemetry::runtime::start_host();
+            run_feedback_submit_cli(&args[1..], cwd)
+        }
         "status" => crate::feedback_loop::run_feedback_status_cli(&args[1..], cwd),
         "sync-github" => crate::feedback_loop::run_feedback_sync_github_cli(&args[1..], cwd),
         "triage" => crate::telemetry::run_operator_feedback_triage_cli(&args[1..], cwd),

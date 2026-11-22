@@ -17,8 +17,8 @@ use std::time::Instant;
 use crate::json::JsonValue;
 
 use super::capture::{
-    Completeness, Context, EmitResult, EventType, Payload, Producer, emit, emit_required,
-    host_capture_allowed, next_local_id, report_failure, unix_time_ms,
+    Completeness, Context, EventType, Payload, Producer, emit, host_capture_allowed, next_local_id,
+    unix_time_ms,
 };
 
 const BASELINE_ROUTE: &str = "repo_baseline_mediator";
@@ -332,9 +332,11 @@ impl ShellMediatorObservation {
     pub(crate) fn started(&mut self) {
         self.started_at = Some(Instant::now());
         self.context.occurred_at_unix_ms = unix_time_ms();
-        self.context.parent_event_id = self.emit(execution_started(mediator_execution_fields(
-            SHELL_WRAPPER_ROUTE,
-        )));
+        self.context.parent_event_id = emit(
+            Producer::ExecutionMediator,
+            &self.context,
+            execution_started(mediator_execution_fields(SHELL_WRAPPER_ROUTE)),
+        );
     }
 
     pub(crate) fn finished(mut self, status: Option<ExitStatus>) {
@@ -347,33 +349,18 @@ impl ShellMediatorObservation {
             None if self.started_at.is_some() => MediatorResult::WaitFailed,
             None => MediatorResult::LaunchFailed,
         };
-        let _ = self.emit(execution_finished(
-            mediator_execution_fields(SHELL_WRAPPER_ROUTE),
-            result,
-        ));
-    }
-
-    fn emit(&self, payload: Payload) -> Option<String> {
-        match emit(Producer::ExecutionMediator, &self.context, payload) {
-            EmitResult::Persisted(receipt) => Some(receipt.event_id),
-            EmitResult::DroppedNoncritical(reason) | EmitResult::FailedRequiredEvidence(reason) => {
-                report_failure(reason);
-                None
-            }
-        }
+        let _ = emit(
+            Producer::ExecutionMediator,
+            &self.context,
+            execution_finished(mediator_execution_fields(SHELL_WRAPPER_ROUTE), result),
+        );
     }
 }
 
-fn record(context: &Context, payload: Payload, persisted: &mut bool) -> Option<String> {
-    match emit_required(Producer::Baseline, context, payload) {
-        EmitResult::Persisted(receipt) if receipt.storage.durable => return Some(receipt.event_id),
-        EmitResult::Persisted(_) => report_failure("AUDIT_DURABILITY_UNCONFIRMED"),
-        EmitResult::FailedRequiredEvidence(reason) | EmitResult::DroppedNoncritical(reason) => {
-            report_failure(reason);
-        }
-    }
-    *persisted = false;
-    None
+fn queue_baseline(context: &Context, payload: Payload, all_queued: &mut bool) -> Option<String> {
+    let event_id = emit(Producer::Baseline, context, payload);
+    *all_queued &= event_id.is_some();
+    event_id
 }
 
 #[cfg(unix)]
@@ -535,7 +522,7 @@ fn terminate_mediator(mut child: Child) -> Option<ExitStatus> {
 
 fn capture_check(repo_root: &Path, check: Check, mut context: Context) -> bool {
     context.execution_id = Some(next_local_id());
-    let mut persisted = true;
+    let mut all_queued = true;
 
     // Keep the existing command policy in the path. A refusal supplies neither a launch
     // observation nor evidence that the requested ref was absent.
@@ -552,8 +539,8 @@ fn capture_check(repo_root: &Path, check: Check, mut context: Context) -> bool {
     if let Some(reason) = refusal {
         let observation = CheckObservation::Unavailable(reason);
         context.occurred_at_unix_ms = unix_time_ms();
-        record(&context, observation.payload(check), &mut persisted);
-        print_observation(check, &observation, persisted);
+        let _ = queue_baseline(&context, observation.payload(check), &mut all_queued);
+        print_observation(check, &observation, all_queued);
         return false;
     }
 
@@ -562,10 +549,10 @@ fn capture_check(repo_root: &Path, check: Check, mut context: Context) -> bool {
     let (termination, output) = match launch_baseline_check(repo_root, check) {
         Ok(mediator) => {
             context.occurred_at_unix_ms = unix_time_ms();
-            context.parent_event_id = record(
+            context.parent_event_id = queue_baseline(
                 &context,
                 execution_started(baseline_execution_fields(check)),
-                &mut persisted,
+                &mut all_queued,
             );
             mediator.collect(started_at + Duration::from_millis(BASELINE_DEADLINE_MS))
         }
@@ -580,27 +567,31 @@ fn capture_check(repo_root: &Path, check: Check, mut context: Context) -> bool {
     };
     context.occurred_at_unix_ms = unix_time_ms();
     context.duration_ns = u64::try_from(started_at.elapsed().as_nanos()).ok();
-    context.parent_event_id = record(
+    context.parent_event_id = queue_baseline(
         &context,
         execution_finished(baseline_execution_fields(check), termination),
-        &mut persisted,
+        &mut all_queued,
     );
     context.duration_ns = None;
     context.occurred_at_unix_ms = unix_time_ms();
-    record(&context, observation.payload(check), &mut persisted);
-    print_observation(check, &observation, persisted);
-    persisted && observation.satisfied()
+    let _ = queue_baseline(&context, observation.payload(check), &mut all_queued);
+    print_observation(check, &observation, all_queued);
+    observation.satisfied()
 }
 
-fn print_observation(check: Check, observation: &CheckObservation, persisted: bool) {
-    let persistence = if persisted { "recorded" } else { "capture_gap" };
+fn print_observation(check: Check, observation: &CheckObservation, all_queued: bool) {
+    let capture = if all_queued {
+        "capture_queued"
+    } else {
+        "capture_dropped"
+    };
     let value = match observation {
         CheckObservation::Commit(commit) => commit.as_str(),
         CheckObservation::Worktree { dirty: true } => "dirty",
         CheckObservation::Worktree { dirty: false } => "clean",
         _ => observation.status(),
     };
-    println!("{} {} {}", check.identity(), value, persistence);
+    println!("{} {} {}", check.identity(), value, capture);
 }
 
 /// Entry point called after the existing human TTY and operator signature gates.
@@ -615,6 +606,7 @@ pub(super) fn run_baseline_cli(args: &[String], repo_root: &Path) -> ExitCode {
             return ExitCode::from(2);
         }
     };
+    let _telemetry = super::runtime::start_host();
     let mut context = Context::for_repo(repo_root);
     context.trace_id = Some(next_local_id());
     let mut complete = true;

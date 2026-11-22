@@ -1,7 +1,7 @@
 #![forbid(unsafe_code)]
 
 //! End-to-End Verification Suite for `dotagent v2.1 -- Hardened`:
-//! 1. MCP `stdout` JSON-RPC purity (`[AGENTPI_EVENT]` strictly on `stderr`), `coord.sock` worker
+//! 1. MCP `stdout` JSON-RPC purity and independent local AgentPI export, `coord.sock` worker
 //!    token anti-spoofing, and `> 8` submission `FEEDBACK_RATE_LIMIT_EXCEEDED` disk cutoff.
 //! 2. All-category `denial_id` kernel grounding, `root_session_id` swarm Sybil collapse (`1 + 4`
 //!    sessions -> `1` vote), cross-bucket quorum (`>= 3` votes across `>= 2` `(repo, day)` buckets),
@@ -18,6 +18,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 use agent_guard::coordinator::{coordinator_socket_path, ensure_coordinator_daemon};
 use agent_guard::feedback::{
@@ -370,9 +371,7 @@ fn mcp_gateway_requires_nonempty_denial_reference() {
     fs::remove_dir_all(root).expect("remove test fixture");
 }
 
-#[test]
-fn mcp_gateway_stdout_is_pure_jsonrpc_and_coord_sock_blocks_session_spoofing() {
-    let root = unique_test_dir("fbk_mcp_ipc");
+fn seed_default_session_denial(root: &Path) -> String {
     let state_dir = root.join("guard_state");
     let repo = root.join("repo");
     fs::create_dir_all(&repo).expect("repo");
@@ -384,6 +383,7 @@ fn mcp_gateway_stdout_is_pure_jsonrpc_and_coord_sock_blocks_session_spoofing() {
     let deny = Command::new(agent_guard_bin())
         .current_dir(&repo)
         .env("AGENT_GUARD_STATE_DIR", &state_dir)
+        .env_remove("AGENT_GUARD_SESSION_ID")
         .args([
             "pre-tool",
             "--json",
@@ -393,10 +393,17 @@ fn mcp_gateway_stdout_is_pure_jsonrpc_and_coord_sock_blocks_session_spoofing() {
         .expect("seed denial");
     let deny_err = String::from_utf8_lossy(&deny.stderr);
     let pos = deny_err.find("[denial_id: dnl_").expect("denial_id") + "[denial_id: ".len();
-    let did = deny_err[pos..pos + 20].to_string();
+    deny_err[pos..pos + 20].to_string()
+}
 
-    // 1. Invoke `dotagent_submit_friction` over stdio `mcp-gateway`:
-    //    `stdout` MUST contain ONLY valid JSON-RPC 2.0 lines, while `[AGENTPI_EVENT]` goes to `stderr`!
+#[test]
+fn mcp_gateway_stdout_is_pure_jsonrpc_and_exports_agentpi_independently() {
+    let root = unique_test_dir("fbk_mcp_export");
+    let did = seed_default_session_denial(&root);
+    let state_dir = root.join("guard_state");
+    let repo = root.join("repo");
+
+    // The JSON-RPC result and the protected mirror have independent delivery paths.
     let rpc_input = format!(
         concat!(
             r#"{{"jsonrpc":"2.0","id":1,"method":"initialize","params":{{"protocolVersion":"2024-11-05"}}}}"#,
@@ -409,17 +416,36 @@ fn mcp_gateway_stdout_is_pure_jsonrpc_and_coord_sock_blocks_session_spoofing() {
     let mut gw = Command::new(agent_guard_bin())
         .current_dir(&repo)
         .env("AGENT_GUARD_STATE_DIR", &state_dir)
+        .env("DOTAGENT_TELEMETRY", "1")
+        .env_remove("AGENT_GUARD_SESSION_ID")
         .args(["mcp-gateway"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn mcp-gateway");
-    gw.stdin
-        .take()
-        .expect("stdin")
-        .write_all(rpc_input.as_bytes())
-        .expect("write rpc");
+    let mut gw_stdin = gw.stdin.take().expect("stdin");
+    gw_stdin.write_all(rpc_input.as_bytes()).expect("write rpc");
+    // The gateway remains live during ordinary MCP sessions. Keep it live while waiting for
+    // the independent export so closing the test pipe does not race best-effort delivery.
+    let event_spool = state_dir.join("feedback").join("agentpi_events.jsonl");
+    let delivery_deadline = Instant::now() + Duration::from_secs(5);
+    let mirrored = loop {
+        if fs::read_to_string(&event_spool).is_ok_and(|text| {
+            text.lines().any(|line| {
+                JsonValue::parse(line).is_ok_and(|event| {
+                    event.get("event_type").and_then(JsonValue::as_str) == Some("friction_ballot")
+                })
+            })
+        }) {
+            break true;
+        }
+        if Instant::now() >= delivery_deadline {
+            break false;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    drop(gw_stdin);
     let gw_out = gw.wait_with_output().expect("wait mcp-gateway");
     assert!(gw_out.status.success());
 
@@ -438,19 +464,37 @@ fn mcp_gateway_stdout_is_pure_jsonrpc_and_coord_sock_blocks_session_spoofing() {
         2,
         "expected 2 pure JSON-RPC frames on stdout"
     );
-    for line in rpc_lines {
+    for line in &rpc_lines {
         let parsed = JsonValue::parse(line).expect("every MCP stdout line must be valid JSON-RPC");
         assert_eq!(
             parsed.get("jsonrpc").and_then(JsonValue::as_str),
             Some("2.0")
         );
     }
-    assert!(
-        stderr_str.contains("[AGENTPI_EVENT]"),
-        "MCP stderr must receive [AGENTPI_EVENT] frame: stderr={stderr_str} stdout={stdout_str}"
+    let ballot_reply = JsonValue::parse(rpc_lines[1]).expect("ballot reply");
+    assert_eq!(
+        ballot_reply
+            .get("result")
+            .and_then(|result| result.get("isError"))
+            .and_then(JsonValue::as_bool),
+        Some(false)
     );
+    assert!(
+        mirrored,
+        "live MCP gateway must export AgentPI to its local mirror"
+    );
+    assert!(!stderr_str.contains("[AGENTPI_EVENT]"));
+    fs::remove_dir_all(root).expect("remove MCP fixture");
+}
 
-    // 2. Sandboxed worker via `exec-sandbox` submits ballot over `coord.sock` using kernel-minted
+#[test]
+fn coord_sock_blocks_session_spoofing() {
+    let root = unique_test_dir("fbk_mcp_ipc");
+    let did = seed_default_session_denial(&root);
+    let state_dir = root.join("guard_state");
+    let repo = root.join("repo");
+
+    // A sandboxed worker via `exec-sandbox` submits a ballot over `coord.sock` using kernel-minted
     //    `AGENT_GUARD_IPC_WORKER_TOKEN`, while direct read of `ballots.jsonl` is blocked (`EACCES`),
     //    and unauthenticated/forged `coord.sock` session spoofing is rejected!
     let sbx_submit = Command::new(agent_guard_bin())
@@ -1477,12 +1521,8 @@ with open("tests/bypass_corpus.toml", "w", encoding="utf-8") as fh:
         String::from_utf8_lossy(&loop_out.stderr)
     );
     let loop_stdout = String::from_utf8_lossy(&loop_out.stdout);
-    assert!(
-        loop_stdout.contains("\"event_type\":\"loop_merge\""),
-        "expected loop_merge: stdout={loop_stdout} stderr={}",
-        String::from_utf8_lossy(&loop_out.stderr)
-    );
     assert!(loop_stdout.contains("merged_prs=1"));
+    assert!(!loop_stdout.contains("\"event_type\":\"loop_merge\""));
 
     // Verify bare `origin/main` received the squash-merged commit!
     let main_policy = Command::new("git")
