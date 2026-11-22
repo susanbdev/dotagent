@@ -273,9 +273,14 @@ else
             || cargo build --release --manifest-path "${DOTAGENT_ROOT}/Cargo.toml"
     )
 fi
-for bin_name in agent-guard agent-guard-sh dotagent-compiler swarm-tool; do
+for bin_name in agent-guard dotagent-compiler swarm-tool; do
     install_sealed_bin "${BIN_SRC}/${bin_name}" "${BIN_DIR}/${bin_name}"
 done
+if [[ -f "${BIN_SRC}/agent-guard-sh" ]]; then
+    install_sealed_bin "${BIN_SRC}/agent-guard-sh" "${BIN_DIR}/agent-guard-sh"
+else
+    install_sealed_bin "${BIN_SRC}/agent-guard" "${BIN_DIR}/agent-guard-sh"
+fi
 
 # Install unified `dotagent` CLI (falling back to `agent-guard` multicall binary under minimal test shims)
 if [[ -f "${BIN_SRC}/dotagent" ]]; then

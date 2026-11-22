@@ -1993,12 +1993,24 @@ fn write_bundle_provenance_file(
     let is_cursor_hooks = rel_path == ".cursor/hooks.json";
 
     if let Some(prior) = prior_entry {
-        if prior.pre_existing && existing_bak.is_none() {
-            return Err(format!(
-                "missing required backup '{}' for pre-existing '{}' during re-activation",
-                bak.display(),
-                target.display()
-            ));
+        if prior.pre_existing {
+            if existing_bak.is_none() {
+                return Err(format!(
+                    "missing required backup '{}' for pre-existing '{}' during re-activation",
+                    bak.display(),
+                    target.display()
+                ));
+            }
+            if let Some(ref exp_orig) = prior.orig_sha256 {
+                let bak_bytes = fs::read(&bak)
+                    .map_err(|e| format!("failed reading '{}': {e}", bak.display()))?;
+                if crate::crypto::sha256_hex(&bak_bytes) != *exp_orig {
+                    return Err(format!(
+                        "backup integrity mismatch on '{}' during re-activation; refusing destructive overwrite",
+                        bak.display()
+                    ));
+                }
+            }
         }
         if existing_meta.is_some() {
             let existing_bytes = fs::read(target)
@@ -2830,6 +2842,7 @@ pub(crate) fn execute_activate(
     let verified_guard_buf: Option<PathBuf> = if is_external_target {
         Some(resolve_verified_guard_binary(bin_dir)?)
     } else {
+        validate_dir_ancestors_lstat(bin_dir, "guard binary directory")?;
         let _ = validate_optional_dir_lstat(bin_dir, "guard binary directory")?;
         if fs::symlink_metadata(bin_dir.join("agent-guard")).is_ok()
             || fs::symlink_metadata(bin_dir.join("dotagent")).is_ok()
@@ -2864,12 +2877,14 @@ pub(crate) fn execute_activate(
     let local_state = local_dir.join("state");
     let state_root = local_state.join("agent-guard");
     let state_sessions = state_root.join("sessions");
+    validate_dir_ancestors_lstat(&state_sessions, "agent-guard state directory")?;
     for sd in [&local_dir, &local_state, &state_root, &state_sessions] {
         let _ = validate_optional_dir_lstat(sd, "agent-guard state directory")?;
     }
     if !dry_run {
         fs::create_dir_all(&state_sessions)
             .map_err(|e| format!("failed creating '{}': {e}", state_sessions.display()))?;
+        validate_dir_ancestors_lstat(&state_sessions, "agent-guard state directory")?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -3399,11 +3414,56 @@ fn read_prior_target_snapshot(target: &Path) -> Result<(Vec<u8>, u32), String> {
     Ok((bytes, mode))
 }
 
+struct CommittedPlaneUndo {
+    root: PathBuf,
+    created_dirs: Vec<String>,
+    manifest_path: PathBuf,
+    manifest_bytes: Vec<u8>,
+    manifest_mode: u32,
+    use_cp_semantics: bool,
+    target_rollback: Vec<(PathBuf, Vec<u8>, u32)>,
+    backup_rollback: Vec<(PathBuf, Vec<u8>, u32)>,
+}
+
+impl CommittedPlaneUndo {
+    fn undo(self) {
+        for (bak_path, bak_bytes, bak_mode) in self.backup_rollback.into_iter().rev() {
+            let _ = write_target_bytes_with_mode(
+                &bak_path,
+                &bak_bytes,
+                bak_mode,
+                self.use_cp_semantics,
+            );
+        }
+        for (path, prev_bytes, prev_mode) in self.target_rollback.into_iter().rev() {
+            let _ =
+                write_target_bytes_with_mode(&path, &prev_bytes, prev_mode, self.use_cp_semantics);
+        }
+        let _ = write_target_bytes_with_mode(
+            &self.manifest_path,
+            &self.manifest_bytes,
+            self.manifest_mode,
+            self.use_cp_semantics,
+        );
+    }
+
+    fn cleanup_empty_dirs(&self) {
+        for rel_d in self.created_dirs.iter().rev() {
+            let dp = if rel_d.is_empty() {
+                self.root.clone()
+            } else {
+                self.root.join(rel_d)
+            };
+            let _ = fs::remove_dir(&dp);
+        }
+    }
+}
+
 fn execute_bundle_deactivation(
     plan: ValidatedBundleDeactivation,
     use_cp_semantics: bool,
     dry_run: bool,
-) -> Result<Vec<String>, String> {
+) -> Result<(Vec<String>, Option<CommittedPlaneUndo>), String> {
     let mut log = Vec::new();
     if dry_run {
         for action in &plan.actions {
@@ -3438,14 +3498,12 @@ fn execute_bundle_deactivation(
             "[dry-run] would remove provenance manifest '{}'",
             plan.manifest_path.display()
         ));
-        return Ok(log);
+        return Ok((log, None));
     }
 
-    // Two-phase transactional execution:
-    // 1. Apply all target file restorations/deletions and remove the provenance manifest BEFORE
-    //    deleting any `.dotagent.bak` backup. Record prior target snapshots so any failure rolls
-    //    back earlier target writes while all backups remain intact on disk.
+    let (manifest_bytes, manifest_mode) = read_prior_target_snapshot(&plan.manifest_path)?;
     let mut target_rollback: Vec<(PathBuf, Vec<u8>, u32)> = Vec::with_capacity(plan.actions.len());
+    let mut backup_rollback: Vec<(PathBuf, Vec<u8>, u32)> = Vec::new();
     let mut backups_to_delete: Vec<PathBuf> = Vec::new();
 
     let commit_res = (|| -> Result<(), String> {
@@ -3510,6 +3568,20 @@ fn execute_bundle_deactivation(
             }
         }
 
+        // Remove consumed `.dotagent.bak` files BEFORE removing the provenance manifest, checking
+        // every error so no orphaned `.dotagent.bak` can outlive the manifest on failure.
+        for bak in backups_to_delete {
+            let (bak_bytes, bak_mode) = read_prior_target_snapshot(&bak)?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = fs::set_permissions(&bak, fs::Permissions::from_mode(0o600));
+            }
+            fs::remove_file(&bak)
+                .map_err(|e| format!("failed removing backup '{}': {e}", bak.display()))?;
+            backup_rollback.push((bak, bak_bytes, bak_mode));
+        }
+
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -3525,30 +3597,28 @@ fn execute_bundle_deactivation(
     })();
 
     if let Err(err) = commit_res {
+        for (bak_path, bak_bytes, bak_mode) in backup_rollback.into_iter().rev() {
+            let _ = write_target_bytes_with_mode(&bak_path, &bak_bytes, bak_mode, use_cp_semantics);
+        }
         for (path, prev_bytes, prev_mode) in target_rollback.into_iter().rev() {
             let _ = write_target_bytes_with_mode(&path, &prev_bytes, prev_mode, use_cp_semantics);
         }
         return Err(err);
     }
 
-    // 2. Provenance manifest and all target files are committed; now purge consumed backups & empty dirs.
-    for bak in backups_to_delete {
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = fs::set_permissions(&bak, fs::Permissions::from_mode(0o600));
-        }
-        let _ = fs::remove_file(&bak);
-    }
-    for rel_d in plan.created_dirs.iter().rev() {
-        let dp = if rel_d.is_empty() {
-            plan.root.clone()
-        } else {
-            plan.root.join(rel_d)
-        };
-        let _ = fs::remove_dir(&dp);
-    }
-    Ok(log)
+    Ok((
+        log,
+        Some(CommittedPlaneUndo {
+            root: plan.root,
+            created_dirs: plan.created_dirs,
+            manifest_path: plan.manifest_path,
+            manifest_bytes,
+            manifest_mode,
+            use_cp_semantics,
+            target_rollback,
+            backup_rollback,
+        }),
+    ))
 }
 
 pub fn execute_deactivate(
@@ -3566,21 +3636,57 @@ pub fn execute_deactivate(
         "Gemini home",
         false,
     )?;
-    // Pre-validate Antigravity plane before mutating any plane so cross-plane deactivation is atomic.
+    // Pre-validate Antigravity plane before mutating any plane.
     let _ = execute_antigravity_deactivate(target_ws, true)?;
 
     let mut log = Vec::new();
-    match ws_plan {
-        Some(p) => log.extend(execute_bundle_deactivation(p, false, dry_run)?),
-        None => log.push(format!(
-            "[deactivate] No managed workspace bundle provenance in '{}'.",
-            target_ws.display()
-        )),
+    let ws_undo = match ws_plan {
+        Some(p) => {
+            let (lines, undo) = execute_bundle_deactivation(p, false, dry_run)?;
+            log.extend(lines);
+            undo
+        }
+        None => {
+            log.push(format!(
+                "[deactivate] No managed workspace bundle provenance in '{}'.",
+                target_ws.display()
+            ));
+            None
+        }
+    };
+    let gemini_undo = match gemini_plan {
+        Some(gp) => match execute_bundle_deactivation(gp, true, dry_run) {
+            Ok((lines, undo)) => {
+                log.extend(lines);
+                undo
+            }
+            Err(e) => {
+                if let Some(wu) = ws_undo {
+                    wu.undo();
+                }
+                return Err(e);
+            }
+        },
+        None => None,
+    };
+    let ag_lines = match execute_antigravity_deactivate(target_ws, dry_run) {
+        Ok(lines) => lines,
+        Err(e) => {
+            if let Some(gu) = gemini_undo {
+                gu.undo();
+            }
+            if let Some(wu) = ws_undo {
+                wu.undo();
+            }
+            return Err(e);
+        }
+    };
+    if let Some(ref gu) = gemini_undo {
+        gu.cleanup_empty_dirs();
     }
-    if let Some(gp) = gemini_plan {
-        log.extend(execute_bundle_deactivation(gp, true, dry_run)?);
+    if let Some(ref wu) = ws_undo {
+        wu.cleanup_empty_dirs();
     }
-    let ag_lines = execute_antigravity_deactivate(target_ws, dry_run)?;
     log.extend(ag_lines);
     log.push(format!(
         "[deactivate] Completed non-destructive deactivation for '{}'.",
@@ -3598,14 +3704,32 @@ pub fn execute_workspace_only_deactivate(
     let _ = execute_antigravity_deactivate(target_ws, true)?;
 
     let mut log = Vec::new();
-    match ws_plan {
-        Some(p) => log.extend(execute_bundle_deactivation(p, false, dry_run)?),
-        None => log.push(format!(
-            "[deactivate] No managed workspace bundle provenance in '{}'.",
-            target_ws.display()
-        )),
+    let ws_undo = match ws_plan {
+        Some(p) => {
+            let (lines, undo) = execute_bundle_deactivation(p, false, dry_run)?;
+            log.extend(lines);
+            undo
+        }
+        None => {
+            log.push(format!(
+                "[deactivate] No managed workspace bundle provenance in '{}'.",
+                target_ws.display()
+            ));
+            None
+        }
+    };
+    let ag_lines = match execute_antigravity_deactivate(target_ws, dry_run) {
+        Ok(lines) => lines,
+        Err(e) => {
+            if let Some(wu) = ws_undo {
+                wu.undo();
+            }
+            return Err(e);
+        }
+    };
+    if let Some(ref wu) = ws_undo {
+        wu.cleanup_empty_dirs();
     }
-    let ag_lines = execute_antigravity_deactivate(target_ws, dry_run)?;
     log.extend(ag_lines);
     log.push(format!(
         "[deactivate] Completed workspace-only deactivation for '{}'.",
@@ -3725,6 +3849,72 @@ pub fn detect_antigravity_workspace_dir(target_ws: &Path) -> Result<PathBuf, Str
     ))
 }
 
+fn validate_dir_ancestors_lstat(path: &Path, label: &str) -> Result<PathBuf, String> {
+    use std::path::Component;
+    let abs = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map_err(|e| format!("cannot resolve current_dir for {label}: {e}"))?
+            .join(path)
+    };
+    let mut cur = PathBuf::new();
+    let mut depth = 0usize;
+    for comp in abs.components() {
+        match comp {
+            Component::Prefix(p) => cur.push(p.as_os_str()),
+            Component::RootDir => cur.push(comp.as_os_str()),
+            Component::CurDir | Component::ParentDir => {
+                return Err(format!(
+                    "refusing '.' or '..' traversal segment in {label} '{}'",
+                    abs.display()
+                ));
+            }
+            Component::Normal(seg) => {
+                depth += 1;
+                cur.push(seg);
+                match fs::symlink_metadata(&cur) {
+                    Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                    Err(e) => {
+                        return Err(format!(
+                            "cannot stat {label} ancestor '{}': {e}",
+                            cur.display()
+                        ));
+                    }
+                    Ok(meta) => {
+                        if meta.file_type().is_symlink() {
+                            #[cfg(target_os = "macos")]
+                            if depth == 1
+                                && seg
+                                    .to_str()
+                                    .is_some_and(|s| matches!(s, "var" | "tmp" | "etc"))
+                                && fs::read_link(&cur)
+                                    .ok()
+                                    .and_then(|t| t.to_str().map(|s| s.starts_with("private/")))
+                                    == Some(true)
+                            {
+                                continue;
+                            }
+                            return Err(format!(
+                                "refusing symlinked {label} ancestor '{}'",
+                                cur.display()
+                            ));
+                        }
+                        if !meta.file_type().is_dir() {
+                            return Err(format!(
+                                "refusing unexpected non-directory object at {label} ancestor '{}'",
+                                cur.display()
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let _ = depth;
+    Ok(abs)
+}
+
 fn verify_guard_binary_path(candidate: &Path) -> Result<PathBuf, String> {
     let abs = if candidate.is_absolute() {
         candidate.to_path_buf()
@@ -3734,6 +3924,7 @@ fn verify_guard_binary_path(candidate: &Path) -> Result<PathBuf, String> {
             .join(candidate)
     };
     if let Some(parent) = abs.parent() {
+        let _ = validate_dir_ancestors_lstat(parent, "guard binary directory")?;
         validate_existing_regular_dir_lstat(parent, "guard binary directory")?;
     }
     let Some(meta) = validate_optional_regular_file_lstat(&abs, "agent-guard binary")? else {
@@ -3784,12 +3975,13 @@ fn verify_guard_binary_path(candidate: &Path) -> Result<PathBuf, String> {
 }
 
 fn resolve_verified_guard_binary(bin_dir: &Path) -> Result<PathBuf, String> {
-    validate_existing_regular_dir_lstat(bin_dir, "guard binary directory")?;
-    let primary = bin_dir.join("agent-guard");
+    let abs_bin_dir = validate_dir_ancestors_lstat(bin_dir, "guard binary directory")?;
+    validate_existing_regular_dir_lstat(&abs_bin_dir, "guard binary directory")?;
+    let primary = abs_bin_dir.join("agent-guard");
     if fs::symlink_metadata(&primary).is_ok() {
         return verify_guard_binary_path(&primary);
     }
-    let secondary = bin_dir.join("dotagent");
+    let secondary = abs_bin_dir.join("dotagent");
     if fs::symlink_metadata(&secondary).is_ok() {
         return verify_guard_binary_path(&secondary);
     }

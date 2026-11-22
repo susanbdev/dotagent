@@ -418,7 +418,11 @@ dotagent_install_main() {
     done
 
     chmod 0755 "${fresh}"
-    if [[ -e "${share_root}" || -L "${share_root}" ]]; then
+    [[ ! -L "${share_root}" ]] || dotagent_die "existing install root ${share_root} must not be a symlink"
+    if [[ -e "${share_root}" && ! -d "${share_root}" ]]; then
+        dotagent_die "existing install root ${share_root} is not a directory"
+    fi
+    if [[ -d "${share_root}" ]]; then
         had_prior_share=1
         chmod -R u+rwX "${share_root}" 2>/dev/null || true
         mv "${share_root}" "${old_share}"
