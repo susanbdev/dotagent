@@ -233,6 +233,8 @@ pub(crate) fn sanitize_and_compact_bytes_observed(
     (sanitized, observation)
 }
 
+const TRUNC_MARKER: &str = "\n... [TRUNCATED AT TIGHT STEP BYTE CAP BY AGENT-GUARD] ...";
+
 fn sanitize_and_compact_bytes_inner(
     raw: &[u8],
     max_lines: usize,
@@ -313,9 +315,9 @@ fn sanitize_and_compact_bytes_inner(
         }
     }
 
-    const TRUNC_MARKER: &str = "\n... [TRUNCATED AT TIGHT STEP BYTE CAP BY AGENT-GUARD] ...";
     if san.clean_ascii.len() > max_bytes {
         let keep = max_bytes.saturating_sub(TRUNC_MARKER.len());
+        // Count only source bytes in the dropped suffix. The marker overlap is inside it.
         let dropped_marker_bytes = line_marker.end.saturating_sub(line_marker.start.max(keep));
         observation.byte_cap_dropped_bytes = san.clean_ascii.len() - keep - dropped_marker_bytes;
         observation.byte_cap_applied = true;
@@ -505,7 +507,10 @@ fn hex_val(b: u8) -> Option<u8> {
 
 #[cfg(test)]
 mod tests {
-    use super::{neuter_to_clean_ascii, sanitize_and_compact_bytes};
+    use super::{
+        TRUNC_MARKER, neuter_to_clean_ascii, sanitize_and_compact_bytes,
+        sanitize_and_compact_bytes_observed,
+    };
 
     #[test]
     fn neuters_every_non_ascii_and_defangs_all_escapes_to_pure_7bit_ascii() {
@@ -537,6 +542,47 @@ mod tests {
         assert!(!res.clean_ascii.contains(concat!("&#", "xE0041;")));
         assert!(!res.clean_ascii.contains(concat!("%E2", "%80%AE")));
         assert!(res.clean_ascii.contains("[ANSI_STRIPPED]"));
+    }
+
+    #[test]
+    fn byte_compaction_counts_only_removed_source_bytes() {
+        let line = format!("{}\n", "ordinary observation data ".repeat(5));
+        let input = line.repeat(12);
+        let (line_only, line_observation) =
+            sanitize_and_compact_bytes_observed(input.as_bytes(), 10, input.len());
+        assert_eq!(line_only.truncated_lines, 2);
+        assert!(!line_observation.byte_cap_applied);
+
+        let compacted = line_only.clean_ascii;
+        let marker_start = compacted.find("... [COMPACTED").expect("line marker");
+        let marker_end =
+            marker_start + compacted[marker_start..].find('\n').expect("marker end") + 1;
+        let tail_bytes = compacted.len() - marker_end;
+
+        for (keep, expected_dropped_source_bytes) in [
+            (marker_start - 1, tail_bytes + 1),
+            (marker_start + 1, tail_bytes),
+            (marker_end + 1, tail_bytes - 1),
+        ] {
+            let byte_cap = keep + TRUNC_MARKER.len();
+            let (output, observation) =
+                sanitize_and_compact_bytes_observed(input.as_bytes(), 10, byte_cap);
+
+            assert!(observation.byte_cap_applied);
+            assert_eq!(output.clean_ascii.len(), byte_cap);
+            assert_eq!(
+                output.clean_ascii.strip_suffix(TRUNC_MARKER),
+                Some(&compacted[..keep])
+            );
+            assert_eq!(
+                observation.byte_cap_dropped_bytes,
+                expected_dropped_source_bytes
+            );
+            assert_eq!(
+                observation.line_cap_dropped_bytes,
+                line_observation.line_cap_dropped_bytes
+            );
+        }
     }
 
     #[test]
