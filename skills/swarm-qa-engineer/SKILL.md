@@ -15,12 +15,12 @@ Author executable spec tests and boundary contracts *before* `Grunt` writes prod
 4. **Evidence-Based Blame Only**: Never guess which `Grunt` broke a build; run `swarm-tool qa triangulate` to emit a deterministic `SuspectVerdict`.
 
 ## Dedicated Rust Tooling (`swarm-tool qa`)
-1. **Compute Required Coverage Floors**:
-   `swarm-tool qa coverage-targets`
+1. **Attach Session & Compute Coverage Floors**:
+   `swarm-tool qa attach --session <SESSION_ID>` / `swarm-tool qa coverage-targets`
    Outputs `max(domain_floor_pct, fanout_pct)` (`50%..95%`) for every task in `PLAN.lock.json`.
-2. **Verify `test_attribution.toml` Against Locked DAG**:
-   `swarm-tool qa verify-attribution tests/swarm_v2_attribution.toml`
-   Validates `1 / 0..2 / 0..N` suspect cardinality and confirms every suspect task ID exists in `PLAN.lock.json`.
+2. **Verify `test_attribution.toml` & Live Integration Contracts**:
+   `swarm-tool qa verify-attribution tests/swarm_v2_attribution.toml --require-live-contracts`
+   Validates `1 / 0..2 / 0..N` suspect cardinality, rejects skipped/ignored attributed tests, and enforces on-disk `tests/` contracts on high-risk tasks.
 3. **Triangulate Failing Tests After a Wave**:
    `swarm-tool qa triangulate --attribution tests/swarm_v2_attribution.toml --failing "<t1,t2>" --passing "<t3,t4>"`
    Emits `SuspectIsolated`, `BlockedByNeighbor`, `SeamOrSpecConflict`, or `InconclusiveAskMaster`.

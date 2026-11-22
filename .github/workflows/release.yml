@@ -2,10 +2,14 @@ name: Verifiable Release & SLSA Provenance
 
 on:
   push:
-    branches:
-      - "main"
     tags:
       - "v*"
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Version with a signed tag staged under release-request/"
+        required: true
+        type: string
 
 permissions:
   contents: read
@@ -15,53 +19,111 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  auto-tag-release:
-    name: auto-tag-release
-    if: github.ref == 'refs/heads/main'
+  validate-release-request:
+    name: Verify the staged release signature
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-24.04
-    timeout-minutes: 5
+    timeout-minutes: 15
+    permissions:
+      actions: read
+      contents: read
+    outputs:
+      release_tag: ${{ steps.request.outputs.release_tag }}
+      tag_object: ${{ steps.request.outputs.tag_object }}
+      base_commit: ${{ steps.request.outputs.base_commit }}
     steps:
-      - name: Checkout main (zero persisted credentials)
+      - name: Require configured release reviewers
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          reviewers="$(gh api "repos/${GITHUB_REPOSITORY}/environments/release" \
+            --jq '[.protection_rules[] | select(.type == "required_reviewers") | .reviewers[]] | length')"
+          if [[ ! "${reviewers}" =~ ^[1-9][0-9]*$ ]]; then
+            echo "::error::Configure required reviewers for the release environment before promoting a tag."
+            exit 1
+          fi
+
+      - name: Check out the trusted release verifier
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ github.sha }}
           fetch-depth: 0
           persist-credentials: false
           submodules: false
 
-      - name: Validate SemVer Cargo.toml version & check remote release tags
-        id: check_ver
+      - name: Resolve a GitHub-verified annotated release request
+        id: request
         shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
         run: |
           set -euo pipefail
-          VER="$(python3 - <<'PY'
-          import re, sys, tomllib
-          ver = tomllib.load(open("Cargo.toml", "rb"))["workspace"]["package"]["version"]
-          if not isinstance(ver, str) or not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?", ver):
-              sys.stderr.write(f"INVALID_SEMVER: '{ver}'\n")
-              sys.exit(1)
-          print(ver)
-          PY
-          )"
-          TAG="v${VER}"
-          echo "tag=${TAG}" >> "${GITHUB_OUTPUT}"
-          if git ls-remote --exit-code --tags origin "refs/tags/${TAG}" >/dev/null 2>&1; then
-            echo "needs_tag=false" >> "${GITHUB_OUTPUT}"
-            echo "[auto-tag-release] Remote tag ${TAG} already exists; nothing to tag."
+          if [[ ${#RELEASE_TAG} -gt 64 || ! "${RELEASE_TAG}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::Enter a release version such as v2.1.0"
+            exit 1
+          fi
+          official_ref="refs/tags/${RELEASE_TAG}"
+          request_ref="refs/tags/release-request/${RELEASE_TAG}"
+          [[ "$(git rev-parse HEAD)" == "${GITHUB_SHA}" ]]
+          read -r object_type tag_object < <(
+            gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/release-request/${RELEASE_TAG}" \
+              --jq '[.object.type, .object.sha] | @tsv'
+          )
+          [[ "${object_type}" == tag && "${tag_object}" =~ ^[0-9a-f]{40}$ ]]
+          read -r signed_name target_type target_commit verified < <(
+            gh api "repos/${GITHUB_REPOSITORY}/git/tags/${tag_object}" \
+              --jq '[.tag, .object.type, .object.sha, .verification.verified] | @tsv'
+          )
+          [[ "${signed_name}" == "${RELEASE_TAG}" && "${target_type}" == commit &&
+             "${target_commit}" =~ ^[0-9a-f]{40}$ && "${verified}" == true ]]
+          git fetch --no-tags origin "${request_ref}"
+          [[ "$(git rev-parse FETCH_HEAD)" == "${tag_object}" ]]
+          git merge-base --is-ancestor "${target_commit}" "${GITHUB_SHA}"
+          version="$(git show "${target_commit}:Cargo.toml" | python3 -c \
+            'import sys,tomllib; print(tomllib.load(sys.stdin.buffer)["workspace"]["package"]["version"])')"
+          [[ "${RELEASE_TAG}" == "v${version}" ]]
+          if git show-ref --verify --quiet "${official_ref}"; then
+            [[ "$(git rev-parse --verify "${official_ref}")" == "${tag_object}" ]]
           else
-            echo "needs_tag=true" >> "${GITHUB_OUTPUT}"
-            echo "[auto-tag-release] Detected untagged workspace version ${TAG} on main."
+            git update-ref "${official_ref}" "${tag_object}" 0000000000000000000000000000000000000000
+          fi
+          {
+            echo "release_tag=${RELEASE_TAG}"
+            echo "tag_object=${tag_object}"
+            echo "base_commit=${GITHUB_SHA}"
+          } >> "${GITHUB_OUTPUT}"
+
+      - name: Require an enrolled FIDO2 signature on the exact object
+        env:
+          RELEASE_TAG: ${{ steps.request.outputs.release_tag }}
+          BASE_COMMIT: ${{ steps.request.outputs.base_commit }}
+        run: |
+          cargo run --release --locked -p agent-guard --bin dotagent -- verify-ring0-ratchet \
+            --verify-release-tag "${RELEASE_TAG}" --base "${BASE_COMMIT}"
+
+  promote-release-request:
+    name: Promote the verified tag after release approval
+    needs: validate-release-request
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    environment: release
+    steps:
+      - name: Check that the verified trust base is still current
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BASE_COMMIT: ${{ needs.validate-release-request.outputs.base_commit }}
+        run: |
+          set -euo pipefail
+          current_base="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/heads/main" --jq '.object.sha')"
+          if [[ "${current_base}" != "${BASE_COMMIT}" ]]; then
+            echo "::error::Main advanced during release approval. Dispatch again to reverify the signature."
+            exit 1
           fi
 
-      - name: Notice when Promoter App is not configured for untagged version bump
-        if: steps.check_ver.outputs.needs_tag == 'true' && vars.PROMOTER_APP_ID == ''
-        env:
-          RELEASE_TAG: ${{ steps.check_ver.outputs.tag }}
-        run: |
-          echo "::notice::Detected new version ${RELEASE_TAG}; configure vars.PROMOTER_APP_ID or push tag ${RELEASE_TAG} to publish release."
-
-      - name: Mint least-privilege repo-scoped dotagent-promoter[bot] token
-        id: app_token
-        if: steps.check_ver.outputs.needs_tag == 'true' && vars.PROMOTER_APP_ID != ''
+      - name: Mint a repository-scoped release promoter token
+        id: promoter
         uses: actions/create-github-app-token@f418cff399f7aef4c2f0ad47e25ca7a6abbdd6fc # v3.4.0
         with:
           app-id: ${{ vars.PROMOTER_APP_ID }}
@@ -69,34 +131,22 @@ jobs:
           repositories: ${{ github.event.repository.name }}
           permission-contents: write
 
-      - name: Atomically create annotated release tag via GitHub API (zero token in argv)
-        if: steps.check_ver.outputs.needs_tag == 'true' && vars.PROMOTER_APP_ID != ''
-        shell: bash
+      - name: Create the official ref for the original signed object
         env:
-          GH_TOKEN: ${{ steps.app_token.outputs.token }}
-          TAG: ${{ steps.check_ver.outputs.tag }}
-          REPO_FULL: ${{ github.repository }}
-          TARGET_SHA: ${{ github.sha }}
+          GH_TOKEN: ${{ steps.promoter.outputs.token }}
+          RELEASE_TAG: ${{ needs.validate-release-request.outputs.release_tag }}
+          TAG_OBJECT: ${{ needs.validate-release-request.outputs.tag_object }}
         run: |
           set -euo pipefail
-          if gh api "repos/${REPO_FULL}/git/ref/tags/${TAG}" >/dev/null 2>&1; then
-            echo "[auto-tag-release] Tag ${TAG} already created concurrently; skipping."
-            exit 0
+          if ! gh api --method POST "repos/${GITHUB_REPOSITORY}/git/refs" \
+            --raw-field "ref=refs/tags/${RELEASE_TAG}" --raw-field "sha=${TAG_OBJECT}" >/dev/null; then
+            existing="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${RELEASE_TAG}" --jq '.object.sha')"
+            [[ "${existing}" == "${TAG_OBJECT}" ]]
           fi
-          TAG_OBJ_SHA="$(gh api --method POST "repos/${REPO_FULL}/git/tags" \
-            -f tag="${TAG}" \
-            -f message="dotagent ${TAG}" \
-            -f object="${TARGET_SHA}" \
-            -f type="commit" \
-            --jq '.sha')"
-          gh api --method POST "repos/${REPO_FULL}/git/refs" \
-            -f ref="refs/tags/${TAG}" \
-            -f sha="${TAG_OBJ_SHA}" >/dev/null
-          echo "[auto-tag-release] Pushed annotated tag ${TAG} -> ${TARGET_SHA}"
 
   verify-release-gate:
     name: Pre-Release Security & Manifest Gate
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     env:
@@ -113,7 +163,6 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
           submodules: false
-          fetch-depth: 0
 
       - name: Require a GitHub-verified annotated tag whose commit is on main
         env:
@@ -171,6 +220,11 @@ jobs:
           PY
           tar -xzf "${ARCHIVE}" -C "${RUNNER_TEMP}"
           "${RUNNER_TEMP}/cargo-deny-0.22.0-x86_64-unknown-linux-musl/cargo-deny" check advisories licenses bans sources
+
+      - name: Require an enrolled FIDO2 signature on the release tag
+        run: |
+          cargo run --release --locked -p agent-guard --bin dotagent -- verify-ring0-ratchet \
+            --verify-release-tag "${GITHUB_REF_NAME}" --base refs/remotes/origin/main
 
       - name: Run fmt, strict clippy, MSRV 1.88 check, full test & fuzz suite, compiler verify, and repo audit
         run: |

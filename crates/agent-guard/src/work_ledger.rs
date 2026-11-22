@@ -4,9 +4,11 @@
 //! `CONFUSED`, `RISKY`), `2+2` pure-ASCII sentence `WORK_LEDGER.jsonl` receipt
 //! engine, and fail-closed `Grunt` `on-stop` tree-OID verifier (`F18`, `F32`, `F33`).
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::Write;
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -18,6 +20,7 @@ use crate::breadcrumbs::{
 };
 use crate::json::JsonValue;
 use crate::path_policy::{PathAccess, validate_path_with_max_depth};
+use crate::qa_suspects::{SourceToken, rust_source_tokens};
 use crate::role_sandbox::{
     close_open_session, load_session_capability, path_matches_any_scope, resolve_active_role,
     save_session_capability,
@@ -446,7 +449,368 @@ pub fn classify_session_smells(
         });
     }
 
+    if !cap.allowed_write_paths.is_empty() {
+        badges.extend(scan_production_stub_smells(
+            repo_root,
+            &cap.allowed_write_paths,
+        ));
+    }
+
     Ok(badges)
+}
+
+/// Scans in-scope non-test production files for reward-hacking stubs:
+/// - `todo!(...)` / `unimplemented!(...)` macros outside `#[cfg(test)]`
+/// - Empty string-literal dispatch arms (`"fault-inject" => {}`)
+/// - HTTP `501` unimplemented shims (`501` + `"not implemented"` / `"attach compiled"` / `"before live dispatch"`)
+/// - Unbound secret-stream reads (`if let Err(...) = ...read_secret_stdin()` / `let _ = ...read_secret_from_fd()`)
+/// - No-op stack-copy `.to_bytes()` + `.zeroize()` inside `Drop::drop`
+pub fn scan_production_stub_smells(repo_root: &Path, write_patterns: &[String]) -> Vec<SmellBadge> {
+    let canon_repo = fs::canonicalize(repo_root).unwrap_or_else(|_| repo_root.to_path_buf());
+    let mut prod_files = BTreeMap::new();
+    collect_scoped_source_files(&canon_repo, &canon_repo, write_patterns, &mut prod_files);
+
+    let mut out = Vec::new();
+    for (rel, body) in prod_files {
+        if crate::role_sandbox::is_qa_writable_path(&rel) {
+            continue;
+        }
+        let rust_tokens = if rel.ends_with(".rs") {
+            rust_source_tokens(&body)
+        } else {
+            Vec::new()
+        };
+        let test_ranges = rust_cfg_test_item_ranges(&rust_tokens);
+        let effective = mask_rust_test_items(&body, &test_ranges);
+        let macro_lines = rust_stub_macro_lines(&rust_tokens, &test_ranges);
+
+        let mut in_drop_fn = false;
+        let mut drop_brace_depth: i32 = 0;
+        let mut drop_copied_bytes_var: Option<String> = None;
+
+        for (idx, raw_line) in effective.lines().enumerate() {
+            let line_no = idx + 1;
+            if macro_lines.contains(&line_no) {
+                out.push(SmellBadge {
+                    bucket: SmellBucket::Risky,
+                    signal: format!("hollow_stub:todo_macro:{rel}:{line_no}"),
+                });
+            }
+            let trimmed = raw_line.trim();
+            if trimmed.is_empty()
+                || trimmed.starts_with("//")
+                || trimmed.starts_with('#')
+                || trimmed.starts_with("/*")
+                || trimmed.starts_with('*')
+            {
+                continue;
+            }
+            let code_only = trimmed.split("//").next().unwrap_or(trimmed).trim();
+            let lower = code_only.to_ascii_lowercase();
+
+            if is_empty_string_literal_match_arm(code_only) {
+                out.push(SmellBadge {
+                    bucket: SmellBucket::Risky,
+                    signal: format!("hollow_stub:empty_literal_arm:{rel}:{line_no}"),
+                });
+            }
+
+            if code_only.contains("501")
+                && (lower.contains("not implemented")
+                    || lower.contains("attach compiled")
+                    || lower.contains("before live dispatch"))
+            {
+                out.push(SmellBadge {
+                    bucket: SmellBucket::Risky,
+                    signal: format!("hollow_stub:http_501_placeholder:{rel}:{line_no}"),
+                });
+            }
+
+            if (code_only.starts_with("let _ =")
+                || code_only.starts_with("if let Err(")
+                || code_only.starts_with("let Err("))
+                && (code_only.contains("read_secret_stdin(")
+                    || code_only.contains("read_secret_from_fd("))
+            {
+                out.push(SmellBadge {
+                    bucket: SmellBucket::Malicious,
+                    signal: format!("hollow_stub:discarded_secret_read:{rel}:{line_no}"),
+                });
+            }
+
+            if rel.ends_with(".rs") {
+                if !in_drop_fn && code_only.starts_with("fn drop(&mut self)") {
+                    in_drop_fn = true;
+                    drop_brace_depth = 0;
+                    drop_copied_bytes_var = None;
+                }
+                if in_drop_fn {
+                    for ch in code_only.chars() {
+                        if ch == '{' {
+                            drop_brace_depth += 1;
+                        } else if ch == '}' {
+                            drop_brace_depth -= 1;
+                        }
+                    }
+                    if let Some(rest) = code_only.strip_prefix("let mut ")
+                        && let Some((var_name, rhs)) = rest.split_once('=')
+                        && rhs.contains(".to_bytes()")
+                    {
+                        drop_copied_bytes_var = Some(var_name.trim().to_string());
+                    } else if let Some(ref vname) = drop_copied_bytes_var
+                        && code_only.starts_with(&format!("{vname}.zeroize()"))
+                    {
+                        out.push(SmellBadge {
+                            bucket: SmellBucket::Risky,
+                            signal: format!("hollow_stub:noop_stack_copy_zeroize:{rel}:{line_no}"),
+                        });
+                        drop_copied_bytes_var = None;
+                    }
+                    if drop_brace_depth <= 0 {
+                        in_drop_fn = false;
+                        drop_copied_bytes_var = None;
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+fn collect_scoped_source_files(
+    canon_repo: &Path,
+    dir: &Path,
+    scope_patterns: &[String],
+    out: &mut BTreeMap<String, String>,
+) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+        if matches!(
+            name_str.as_ref(),
+            ".git" | "target" | ".state" | ".breadcrumbs.jsonl"
+        ) || name_str.ends_with(".breadcrumbs.jsonl.lock")
+        {
+            continue;
+        }
+        let full = entry.path();
+        let Ok(ft) = entry.file_type() else {
+            continue;
+        };
+        if ft.is_symlink() {
+            continue;
+        }
+        let rel = full
+            .strip_prefix(canon_repo)
+            .unwrap_or(&full)
+            .to_string_lossy()
+            .replace('\\', "/");
+        if ft.is_dir() {
+            if !scope_patterns.is_empty() && !dir_can_match_any_scope(&rel, scope_patterns) {
+                continue;
+            }
+            if validate_path_with_max_depth(
+                canon_repo,
+                canon_repo,
+                &rel,
+                PathAccess::ListSearch {
+                    requested_depth: Some(1),
+                },
+                usize::MAX,
+            )
+            .is_err()
+            {
+                continue;
+            }
+            collect_scoped_source_files(canon_repo, &full, scope_patterns, out);
+        } else if ft.is_file()
+            && (scope_patterns.is_empty() || path_matches_any_scope(&rel, scope_patterns))
+            && validate_path_with_max_depth(
+                canon_repo,
+                canon_repo,
+                &rel,
+                PathAccess::Read,
+                usize::MAX,
+            )
+            .is_ok()
+            && let Ok(text) = fs::read_to_string(&full)
+        {
+            out.insert(rel, text);
+        }
+    }
+}
+
+fn rust_cfg_test_item_ranges(tokens: &[SourceToken<'_>]) -> Vec<Range<usize>> {
+    const CFG_TEST: [&str; 7] = ["#", "[", "cfg", "(", "test", ")", "]"];
+    let mut ranges = Vec::new();
+    let mut index = 0;
+    while let Some(attribute) = tokens.get(index..index + CFG_TEST.len()) {
+        if attribute
+            .iter()
+            .zip(CFG_TEST)
+            .all(|(token, expected)| token.is(expected))
+            && let Some(end) = rust_attributed_item_end(tokens, index + CFG_TEST.len())
+        {
+            ranges.push(attribute[0].offset..tokens[end].offset + tokens[end].text.len());
+            index = end + 1;
+        } else {
+            index += 1;
+        }
+    }
+    ranges
+}
+
+fn rust_attributed_item_end(tokens: &[SourceToken<'_>], start: usize) -> Option<usize> {
+    let mut groups = Vec::new();
+    let mut item_kind_found = false;
+    let mut braced_item = false;
+    let mut type_parameters = 0usize;
+    for (index, token) in tokens.iter().enumerate().skip(start) {
+        if groups.is_empty() {
+            if token.is("}") {
+                return None;
+            }
+            if token.is(";") {
+                return item_kind_found.then_some(index);
+            }
+            if !item_kind_found {
+                braced_item = [
+                    "fn",
+                    "mod",
+                    "struct",
+                    "enum",
+                    "union",
+                    "trait",
+                    "impl",
+                    "extern",
+                    "macro_rules",
+                    "{",
+                ]
+                .iter()
+                .any(|name| token.is(name))
+                    || rust_macro_item_starts_at(tokens, index);
+                let const_fn = token.is("const")
+                    && tokens.get(index + 1).is_some_and(|next| {
+                        ["fn", "async", "unsafe", "extern"]
+                            .iter()
+                            .any(|qualifier| next.is(qualifier))
+                    });
+                item_kind_found = braced_item
+                    || !const_fn
+                        && ["type", "const", "static", "use", "let"]
+                            .iter()
+                            .any(|name| token.is(name));
+                if !item_kind_found
+                    && !const_fn
+                    && !["#", "[", "pub", "(", "async", "unsafe", "default", "auto"]
+                        .iter()
+                        .any(|qualifier| token.is(qualifier))
+                {
+                    return None;
+                }
+            }
+            if braced_item {
+                if token.is("<") {
+                    type_parameters += 1;
+                } else if token.is(">")
+                    && !tokens
+                        .get(index.wrapping_sub(1))
+                        .is_some_and(|previous| previous.is("-"))
+                {
+                    type_parameters = type_parameters.saturating_sub(1);
+                }
+            }
+        }
+        if let Some(close) = [("(", ")"), ("[", "]"), ("{", "}")]
+            .into_iter()
+            .find_map(|(open, close)| token.is(open).then_some(close))
+        {
+            groups.push(close);
+        } else if groups.last().is_some_and(|close| token.is(close)) {
+            groups.pop();
+            if groups.is_empty() && token.is("}") && braced_item && type_parameters == 0 {
+                return Some(index);
+            }
+        }
+    }
+    None
+}
+
+fn rust_macro_item_starts_at(tokens: &[SourceToken<'_>], mut index: usize) -> bool {
+    while let Some(token) = tokens.get(index).filter(|token| {
+        token.is(token.text)
+            && token
+                .text
+                .starts_with(|first: char| first.is_alphabetic() || first == '_')
+    }) {
+        if token.is("_") {
+            return false;
+        }
+        if tokens.get(index + 1).is_some_and(|next| next.is("!")) {
+            return tokens
+                .get(index + 2)
+                .is_some_and(|opener| ["(", "[", "{"].iter().any(|text| opener.is(text)));
+        }
+        if !tokens
+            .get(index + 1..index + 3)
+            .is_some_and(|pair| pair.iter().all(|colon| colon.is(":")))
+        {
+            return false;
+        }
+        index += 3;
+    }
+    false
+}
+
+fn mask_rust_test_items<'a>(source: &'a str, test_ranges: &[Range<usize>]) -> Cow<'a, str> {
+    if test_ranges.is_empty() {
+        return Cow::Borrowed(source);
+    }
+    let mut code = String::with_capacity(source.len());
+    let mut copied = 0;
+    for range in test_ranges {
+        code.push_str(&source[copied..range.start]);
+        code.push(' ');
+        code.extend(source[range.clone()].chars().filter(|&c| c == '\n'));
+        copied = range.end;
+    }
+    code.push_str(&source[copied..]);
+    Cow::Owned(code)
+}
+
+fn rust_stub_macro_lines(
+    tokens: &[SourceToken<'_>],
+    test_ranges: &[Range<usize>],
+) -> BTreeSet<usize> {
+    tokens
+        .windows(3)
+        .filter(|t| {
+            (t[0].is("todo")
+                || t[0].is("unimplemented")
+                || t[0].is("r#todo")
+                || t[0].is("r#unimplemented"))
+                && t[1].is("!")
+                && (t[2].is("(") || t[2].is("[") || t[2].is("{"))
+                && !test_ranges
+                    .get(test_ranges.partition_point(|range| range.end <= t[0].offset))
+                    .is_some_and(|range| range.start <= t[2].offset)
+        })
+        .map(|t| t[0].line)
+        .collect()
+}
+
+fn is_empty_string_literal_match_arm(code_only: &str) -> bool {
+    if !code_only.starts_with('"') {
+        return false;
+    }
+    let Some((_, rhs)) = code_only.split_once("=>") else {
+        return false;
+    };
+    let rhs_clean = rhs.trim().trim_end_matches(',').trim();
+    rhs_clean == "{}" || rhs_clean == "()"
 }
 
 type TrailRecordsMap = BTreeMap<PathBuf, Vec<crate::breadcrumbs::SignedBreadcrumbRecord>>;
@@ -535,6 +899,16 @@ pub fn submit_work_ledger_entry(
     what_changed: &str,
     why_changed: &str,
 ) -> Result<WorkLedgerEntry, String> {
+    submit_work_ledger_entry_with_opts(repo_root, session_id, what_changed, why_changed, false)
+}
+
+pub fn submit_work_ledger_entry_with_opts(
+    repo_root: &Path,
+    session_id: &str,
+    what_changed: &str,
+    why_changed: &str,
+    reject_hollow_stubs: bool,
+) -> Result<WorkLedgerEntry, String> {
     validate_two_plus_two_sentences(what_changed, why_changed)?;
     let cap = load_session_capability(repo_root, session_id)?;
     if cap.role != SwarmRole::Grunt {
@@ -607,6 +981,16 @@ pub fn submit_work_ledger_entry(
     }
 
     let smell_badges = classify_session_smells(repo_root, &cap)?;
+    if reject_hollow_stubs
+        && let Some(stub_badge) = smell_badges
+            .iter()
+            .find(|b| b.signal.starts_with("hollow_stub:"))
+    {
+        return Err(format!(
+            "HOLLOW_STUB_IMPLEMENTATION_REJECTED: production stub detected ({}) in session '{}'; replace placeholders with real implementation before submitting WORK_LEDGER.jsonl",
+            stub_badge.signal, cap.session_id
+        ));
+    }
     let what_trimmed = what_changed.trim().to_string();
     let why_trimmed = why_changed.trim().to_string();
     let event_ids = verified.ids;
@@ -952,3 +1336,7 @@ pub fn verify_on_stop_swarm_gates(repo_root: &Path) -> Result<(), String> {
 
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "../tests/fixtures/stub_macro_checks.rs"]
+mod stub_macro_tests;

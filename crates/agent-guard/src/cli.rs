@@ -19,8 +19,9 @@ use crate::traversal_ledger::SessionLedger;
 use crate::unicode_guard::{ScanMode, scan_unicode};
 use crate::{
     CANONICAL_DIST_GEMINI_SHA256, Decision, audit_repository, handle_post_edit,
-    handle_post_tool_hook, handle_pre_compact_hook, handle_pre_tool_hook, handle_user_prompt_hook,
-    pre_inspect_file_for_ingestion, resolve_repo_root, verify_global_git_hardening,
+    handle_post_edit_with_session, handle_post_tool_hook, handle_pre_compact_hook,
+    handle_pre_tool_hook, handle_user_prompt_hook, pre_inspect_file_for_ingestion,
+    resolve_repo_root, verify_global_git_hardening,
 };
 
 const MAX_HOOK_STDIN_BYTES: u64 = 262_144; // 256 KiB cap on hook JSON stdin
@@ -173,7 +174,12 @@ pub fn run_cli_entrypoint() -> ExitCode {
                         false,
                     );
                 };
-                emit_cli_decision(handle_post_edit(file, &cwd))
+                let hook_sid = parsed
+                    .get("session_id")
+                    .or_else(|| parsed.get("conversation_id"))
+                    .and_then(JsonValue::as_str)
+                    .unwrap_or("");
+                emit_cli_decision(handle_post_edit_with_session(file, &cwd, hook_sid))
             } else {
                 eprintln!("[AGENT-GUARD] usage: agent-guard post-edit <file>");
                 ExitCode::from(2)

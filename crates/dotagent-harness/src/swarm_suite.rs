@@ -32,6 +32,10 @@ const CASE_DA05_SPOOL_INTEGRITY: &str =
     "swarm::da05_rejects_corrupt_midstream_spool_frame_while_quarantining_eof_tail";
 const CASE_DA06_DAG_AND_TRIANGULATION: &str =
     "swarm::da06_blocks_overlapping_parallel_wave_globs_and_triangulates_all_secondary_suspects";
+const CASE_V2_BOOTSTRAP_CONCURRENT_SCOPE: &str =
+    "swarm::v2_phase1_discovery_bootstrap_concurrent_hook_attach_and_scoped_hops";
+const CASE_V2_ANTI_STUB_AND_LIVE_CONTRACTS: &str =
+    "swarm::v2_anti_stub_gate_reviewer_block_and_live_integration_contracts";
 
 pub fn swarm_case_ids() -> &'static [&'static str] {
     &[
@@ -42,6 +46,8 @@ pub fn swarm_case_ids() -> &'static [&'static str] {
         CASE_DA04B_HASH_CHAINED_LEDGER,
         CASE_DA05_SPOOL_INTEGRITY,
         CASE_DA06_DAG_AND_TRIANGULATION,
+        CASE_V2_BOOTSTRAP_CONCURRENT_SCOPE,
+        CASE_V2_ANTI_STUB_AND_LIVE_CONTRACTS,
     ]
 }
 
@@ -53,7 +59,7 @@ pub fn run_swarm_suite(
     filter: Option<&str>,
 ) -> Vec<CaseResult> {
     let mut out = Vec::new();
-    let runners: [(&str, SwarmCaseRunner); 7] = [
+    let runners: [(&str, SwarmCaseRunner); 9] = [
         (CASE_SIX_ROLE_E2E, case_six_role_e2e),
         (CASE_DA01_MASTER_ESCALATION, case_da01_master_escalation),
         (
@@ -72,6 +78,14 @@ pub fn run_swarm_suite(
         (
             CASE_DA06_DAG_AND_TRIANGULATION,
             case_da06_dag_and_triangulation,
+        ),
+        (
+            CASE_V2_BOOTSTRAP_CONCURRENT_SCOPE,
+            case_v2_bootstrap_concurrent_scope,
+        ),
+        (
+            CASE_V2_ANTI_STUB_AND_LIVE_CONTRACTS,
+            case_v2_anti_stub_and_live_contracts,
         ),
     ];
 
@@ -1246,6 +1260,864 @@ secondary_suspects = []\n";
 
     Ok(
         "DA-06 verified: parallel prefix/glob write overlaps blocked and multi-secondary triangulation accurate"
+            .to_string(),
+    )
+}
+
+fn run_guard_json(
+    bins: &WorkspaceBinaries,
+    sb: &TestSandbox,
+    subcmd: &str,
+    payload: &str,
+) -> Result<Output, String> {
+    let mut c = Command::new(&bins.agent_guard);
+    c.args([subcmd, "--json", payload]);
+    sb.configure_isolated_command(&mut c);
+    c.output()
+        .map_err(|e| format!("failed spawning agent-guard {subcmd}: {e}"))
+}
+
+fn case_v2_bootstrap_concurrent_scope(
+    workspace_root: &Path,
+    bins: &WorkspaceBinaries,
+) -> Result<String, String> {
+    let sb = TestSandbox::create(workspace_root, "swarm_v2_bootstrap_concurrent_scope")?;
+    fs::create_dir_all(sb.repo_dir.join("src")).map_err(|e| e.to_string())?;
+    fs::create_dir_all(sb.repo_dir.join("assets")).map_err(|e| e.to_string())?;
+    fs::create_dir_all(sb.repo_dir.join("tests")).map_err(|e| e.to_string())?;
+    fs::create_dir_all(sb.repo_dir.join("docs")).map_err(|e| e.to_string())?;
+
+    // Seed A -> B -> C -> unassigned chain via backticked repo pointers.
+    fs::write(
+        sb.repo_dir.join("src/a.rs"),
+        "// Entry module referencing `src/b.rs`\npub fn step_a() -> u32 { 1 }\n",
+    )
+    .map_err(|e| e.to_string())?;
+    fs::write(
+        sb.repo_dir.join("src/b.rs"),
+        "// Middle module referencing `src/c.rs`\npub fn step_b() -> u32 { 2 }\n",
+    )
+    .map_err(|e| e.to_string())?;
+    fs::write(
+        sb.repo_dir.join("src/c.rs"),
+        "// Leaf module referencing `src/unassigned.rs`\npub fn step_c() -> u32 { 3 }\n",
+    )
+    .map_err(|e| e.to_string())?;
+    fs::write(
+        sb.repo_dir.join("src/unassigned.rs"),
+        "pub fn secret_unassigned() -> u32 { 99 }\n",
+    )
+    .map_err(|e| e.to_string())?;
+    fs::write(
+        sb.repo_dir.join("src/other.rs"),
+        "pub fn other_worker_fn() -> u32 { 42 }\n",
+    )
+    .map_err(|e| e.to_string())?;
+    fs::write(
+        sb.repo_dir.join("tests/test_wave.py"),
+        "import unittest\nclass WaveTest(unittest.TestCase):\n    def test_ok(self):\n        self.assertEqual(1 + 1, 2)\nif __name__ == '__main__':\n    unittest.main()\n",
+    )
+    .map_err(|e| e.to_string())?;
+
+    // 1. Phase-1 Discovery Bootstrap BEFORE PLAN.lock.json exists:
+    //    - Non-investigator roles MUST be rejected (`DISCOVERY_ROLE_FORBIDDEN`).
+    let bad_disc = run_swarm_cmd(
+        bins,
+        &sb,
+        &[
+            "master",
+            "mint-session",
+            "--role",
+            "grunt",
+            "--task",
+            "DISC-1",
+            "--phase",
+            "discovery",
+        ],
+        Some("master"),
+        None,
+    )?;
+    if bad_disc.status.success()
+        || !String::from_utf8_lossy(&bad_disc.stderr).contains("DISCOVERY_ROLE_FORBIDDEN")
+    {
+        return Err(format!(
+            "expected DISCOVERY_ROLE_FORBIDDEN on grunt --phase discovery, got stderr={}",
+            String::from_utf8_lossy(&bad_disc.stderr)
+        ));
+    }
+
+    let disc_out = run_swarm_cmd(
+        bins,
+        &sb,
+        &[
+            "master",
+            "mint-session",
+            "--role",
+            "investigator",
+            "--task",
+            "DISC-1",
+            "--phase",
+            "discovery",
+            "--scope",
+            "src/a.rs,src/b.rs,src/c.rs",
+        ],
+        Some("master"),
+        None,
+    )?;
+    if !disc_out.status.success() {
+        return Err(format!(
+            "Phase-1 discovery mint-session failed: {}",
+            String::from_utf8_lossy(&disc_out.stderr)
+        ));
+    }
+    let disc_json = JsonValue::parse(&String::from_utf8_lossy(&disc_out.stdout))
+        .map_err(|e| format!("invalid discovery mint JSON: {e}"))?;
+    if disc_json.get("phase").and_then(JsonValue::as_str) != Some("discovery") {
+        return Err("expected phase == 'discovery' on Phase-1 investigator mint".to_string());
+    }
+    let disc_sid = disc_json
+        .get("session_id")
+        .and_then(JsonValue::as_str)
+        .ok_or_else(|| "missing session_id on discovery mint".to_string())?
+        .to_string();
+
+    let scout_out = run_swarm_cmd(
+        bins,
+        &sb,
+        &["investigator", "scout", "src", "--session", &disc_sid],
+        None,
+        None,
+    )?;
+    if !scout_out.status.success() {
+        return Err(format!(
+            "Phase-1 discovery scout failed: {}",
+            String::from_utf8_lossy(&scout_out.stderr)
+        ));
+    }
+    let fact_out = run_swarm_cmd(
+        bins,
+        &sb,
+        &[
+            "investigator",
+            "emit-fact",
+            "--session",
+            &disc_sid,
+            "--task",
+            "DISC-1",
+            "--claim",
+            "Mapped step_a -> step_b -> step_c chain across src/a.rs..src/c.rs.",
+            "--slice",
+            "src/a.rs:1-2",
+        ],
+        None,
+        None,
+    )?;
+    if !fact_out.status.success() {
+        return Err(format!(
+            "Phase-1 discovery emit-fact failed: {}",
+            String::from_utf8_lossy(&fact_out.stderr)
+        ));
+    }
+    let fact_pkt = String::from_utf8_lossy(&fact_out.stdout).trim().to_string();
+    close_role_session(bins, &sb, &disc_sid)?;
+
+    // Lock the wave DAG and confirm Phase-1 discovery packet provenance STILL verifies (no epoch wipe!).
+    let parallel_dag = r#"{
+  "plan_id": "V2-PARALLEL-BOOTSTRAP",
+  "tasks": [
+    {
+      "id": "TASK-A",
+      "wave": "W1",
+      "depends_on": [],
+      "domain_risk": "core_logic",
+      "assigned_read_paths": ["src/a.rs", "src/b.rs", "src/c.rs", "tests/test_wave.py"],
+      "allowed_write_paths": ["src/a.rs", "newdir/created.rs", "assets/font.woff2"],
+      "assigned_tests": ["test_wave"]
+    },
+    {
+      "id": "TASK-B",
+      "wave": "W1",
+      "depends_on": [],
+      "domain_risk": "core_logic",
+      "assigned_read_paths": ["src/other.rs", "tests/test_wave.py"],
+      "allowed_write_paths": ["src/other.rs"],
+      "assigned_tests": ["test_wave"]
+    }
+  ]
+}"#;
+    fs::write(sb.repo_dir.join("docs/dag.json"), parallel_dag).map_err(|e| e.to_string())?;
+    let lock_out = run_swarm_cmd(
+        bins,
+        &sb,
+        &["master", "lock-plan", "docs/dag.json"],
+        Some("master"),
+        None,
+    )?;
+    if !lock_out.status.success() {
+        return Err(format!(
+            "lock-plan after Phase-1 discovery failed: {}",
+            String::from_utf8_lossy(&lock_out.stderr)
+        ));
+    }
+    let ingest_after_lock = run_swarm_cmd(
+        bins,
+        &sb,
+        &["master", "ingest-packet", &fact_pkt],
+        Some("master"),
+        None,
+    )?;
+    if !ingest_after_lock.status.success() {
+        return Err(format!(
+            "Phase-1 ObservedFact failed provenance check after initial lock-plan: {}",
+            String::from_utf8_lossy(&ingest_after_lock.stderr)
+        ));
+    }
+
+    // 2. Concurrent Worker Session Binding (`PreToolUse` auto-bind + explicit `attach`):
+    let sid_a = mint_role_session(bins, &sb, "grunt", "TASK-A", 1)?;
+    let sid_b = mint_role_session(bins, &sb, "grunt", "TASK-B", 1)?;
+
+    // Unbound hook UUID MUST fail closed (`AMBIGUOUS_CONCURRENT_SWARM_SESSIONS`) when 2 sessions are open.
+    let unbound_pre = run_guard_json(
+        bins,
+        &sb,
+        "pre-tool",
+        r#"{"session_id":"uuid-unbound","tool_name":"Read","tool_input":{"file_path":"src/a.rs"}}"#,
+    )?;
+    let unbound_msg = format!(
+        "{}{}",
+        String::from_utf8_lossy(&unbound_pre.stdout),
+        String::from_utf8_lossy(&unbound_pre.stderr)
+    );
+    if !unbound_msg.contains("AMBIGUOUS_CONCURRENT_SWARM_SESSIONS") {
+        return Err(format!(
+            "expected AMBIGUOUS_CONCURRENT_SWARM_SESSIONS for unbound hook UUID, got: {unbound_msg}"
+        ));
+    }
+
+    // Auto-bind `uuid-worker-a` via PreToolUse on `swarm-tool grunt context --session <sid_a>`.
+    let auto_bind_payload = format!(
+        r#"{{"session_id":"uuid-worker-a","tool_name":"Bash","tool_input":{{"command":"swarm-tool grunt context --session {sid_a}"}}}}"#
+    );
+    let auto_bind_out = run_guard_json(bins, &sb, "pre-tool", &auto_bind_payload)?;
+    if !auto_bind_out.status.success() {
+        return Err(format!(
+            "PreToolUse auto-bind failed: {}{}",
+            String::from_utf8_lossy(&auto_bind_out.stdout),
+            String::from_utf8_lossy(&auto_bind_out.stderr)
+        ));
+    }
+
+    // Bind `uuid-worker-b` via explicit `swarm-tool grunt attach --session <sid_b> --hook-session uuid-worker-b`.
+    let attach_b = run_swarm_cmd(
+        bins,
+        &sb,
+        &[
+            "grunt",
+            "attach",
+            "--session",
+            &sid_b,
+            "--hook-session",
+            "uuid-worker-b",
+        ],
+        None,
+        None,
+    )?;
+    if !attach_b.status.success() {
+        return Err(format!(
+            "swarm-tool grunt attach failed: {}",
+            String::from_utf8_lossy(&attach_b.stderr)
+        ));
+    }
+
+    // Verify `uuid-worker-b` can read `src/other.rs` concurrently, while `uuid-worker-a` is blocked from `src/other.rs`.
+    let b_read = run_guard_json(
+        bins,
+        &sb,
+        "pre-tool",
+        r#"{"session_id":"uuid-worker-b","tool_name":"Read","tool_input":{"file_path":"src/other.rs"}}"#,
+    )?;
+    if !b_read.status.success()
+        || String::from_utf8_lossy(&b_read.stdout).contains("\"permissionDecision\":\"deny\"")
+    {
+        return Err(format!(
+            "bound uuid-worker-b failed reading in-scope src/other.rs: {}",
+            String::from_utf8_lossy(&b_read.stdout)
+        ));
+    }
+    let a_cross_read = run_guard_json(
+        bins,
+        &sb,
+        "pre-tool",
+        r#"{"session_id":"uuid-worker-a","tool_name":"Read","tool_input":{"file_path":"src/other.rs"}}"#,
+    )?;
+    let a_cross_msg = format!(
+        "{}{}",
+        String::from_utf8_lossy(&a_cross_read.stdout),
+        String::from_utf8_lossy(&a_cross_read.stderr)
+    );
+    if !a_cross_msg.contains("GRUNT_READ_OUT_OF_SCOPE") {
+        return Err(format!(
+            "expected GRUNT_READ_OUT_OF_SCOPE when uuid-worker-a reads TASK-B file, got: {a_cross_msg}"
+        ));
+    }
+
+    // 3. Capability-preapproved `A -> B -> C` hop exemption on `uuid-worker-a`:
+    for rel in ["src/a.rs", "src/b.rs", "src/c.rs"] {
+        let pre_p = format!(
+            r#"{{"session_id":"uuid-worker-a","tool_name":"Read","tool_input":{{"file_path":"{rel}"}}}}"#
+        );
+        let pre_r = run_guard_json(bins, &sb, "pre-tool", &pre_p)?;
+        let pre_txt = String::from_utf8_lossy(&pre_r.stdout);
+        if !pre_r.status.success()
+            || pre_txt.contains("TRANSITIVE_DEPTH_EXCEEDED")
+            || pre_txt.contains("\"deny\"")
+        {
+            return Err(format!(
+                "capability-preapproved file '{rel}' unexpectedly denied on hop chain: stdout={pre_txt} stderr={}",
+                String::from_utf8_lossy(&pre_r.stderr)
+            ));
+        }
+        let body = fs::read_to_string(sb.repo_dir.join(rel)).map_err(|e| e.to_string())?;
+        let post_obj = JsonValue::Object(vec![
+            (
+                "session_id".to_string(),
+                JsonValue::Str("uuid-worker-a".to_string()),
+            ),
+            ("tool_name".to_string(), JsonValue::Str("Read".to_string())),
+            (
+                "tool_input".to_string(),
+                JsonValue::Object(vec![(
+                    "file_path".to_string(),
+                    JsonValue::Str(rel.to_string()),
+                )]),
+            ),
+            ("tool_response".to_string(), JsonValue::Str(body)),
+        ]);
+        let post_r = run_guard_json(bins, &sb, "post-tool", &post_obj.to_json_string())?;
+        if !post_r.status.success() {
+            return Err(format!(
+                "post-tool failed on '{rel}': {}",
+                String::from_utf8_lossy(&post_r.stderr)
+            ));
+        }
+    }
+
+    // 3b. Landlock precreate of new root-nested directory `newdir/created.rs` in `allowed_write_paths`:
+    let mut sbx_cmd = Command::new(&bins.agent_guard);
+    sbx_cmd.args([
+        "exec-sandbox",
+        "--session-id",
+        "uuid-worker-a",
+        "--",
+        "printf 'pub fn created() -> u32 { 7 }\\n' > newdir/created.rs",
+    ]);
+    sb.configure_isolated_command(&mut sbx_cmd);
+    let sbx_out = sbx_cmd
+        .output()
+        .map_err(|e| format!("exec-sandbox precreate test failed: {e}"))?;
+    if !sbx_out.status.success() || !sb.repo_dir.join("newdir/created.rs").is_file() {
+        return Err(format!(
+            "exec-sandbox failed writing capability-authorized newdir/created.rs: status={:?} stderr={}",
+            sbx_out.status.code(),
+            String::from_utf8_lossy(&sbx_out.stderr)
+        ));
+    }
+
+    // 3c. Vetted `.woff2` magic-byte check + raw SHA-256 breadcrumb in `post-edit`:
+    fs::write(
+        sb.repo_dir.join("assets/font.woff2"),
+        b"FAKEFONT_NOT_WOFF2_HEADER",
+    )
+    .map_err(|e| e.to_string())?;
+    let bad_font = run_guard_json(
+        bins,
+        &sb,
+        "post-edit",
+        r#"{"session_id":"uuid-worker-a","file_path":"assets/font.woff2"}"#,
+    )?;
+    if bad_font.status.success()
+        || !String::from_utf8_lossy(&bad_font.stderr).contains("INVALID_WEBFONT_MAGIC")
+    {
+        return Err(format!(
+            "expected INVALID_WEBFONT_MAGIC on spoofed .woff2, got stderr={}",
+            String::from_utf8_lossy(&bad_font.stderr)
+        ));
+    }
+
+    let mut valid_woff2 = b"wOF2\x00\x01\x00\x00".to_vec();
+    valid_woff2.resize(64, 0u8);
+    fs::write(sb.repo_dir.join("assets/font.woff2"), &valid_woff2).map_err(|e| e.to_string())?;
+    let ok_font = run_guard_json(
+        bins,
+        &sb,
+        "post-edit",
+        r#"{"session_id":"uuid-worker-a","file_path":"assets/font.woff2"}"#,
+    )?;
+    if !ok_font.status.success() {
+        return Err(format!(
+            "valid wOF2 subset asset rejected by post-edit: {}",
+            String::from_utf8_lossy(&ok_font.stderr)
+        ));
+    }
+    if !sb.repo_dir.join("assets/.breadcrumbs.jsonl").is_file() {
+        return Err(
+            "expected assets/.breadcrumbs.jsonl after post-edit on valid .woff2".to_string(),
+        );
+    }
+
+    close_role_session(bins, &sb, &sid_a)?;
+    close_role_session(bins, &sb, &sid_b)?;
+
+    Ok(
+        "Swarm v2 bootstrap, concurrent hook auto-bind/attach, scoped A->B->C hops, Landlock precreate, and wOFF2 gate verified"
+            .to_string(),
+    )
+}
+
+fn case_v2_anti_stub_and_live_contracts(
+    workspace_root: &Path,
+    bins: &WorkspaceBinaries,
+) -> Result<String, String> {
+    let sb = TestSandbox::create(workspace_root, "swarm_v2_anti_stub_and_live_contracts")?;
+    fs::create_dir_all(sb.repo_dir.join("src")).map_err(|e| e.to_string())?;
+    fs::create_dir_all(sb.repo_dir.join("tests")).map_err(|e| e.to_string())?;
+    fs::create_dir_all(sb.repo_dir.join("docs")).map_err(|e| e.to_string())?;
+
+    let sec_dag = r#"{
+  "plan_id": "V2-ANTI-STUB-GATE",
+  "tasks": [
+    {
+      "id": "TASK-SEC",
+      "wave": "W1",
+      "depends_on": [],
+      "domain_risk": "security_critical",
+      "assigned_read_paths": ["src/vault.rs", "tests/test_vault_e2e.py"],
+      "allowed_write_paths": ["src/vault.rs"],
+      "assigned_tests": ["test_vault_e2e"]
+    }
+  ]
+}"#;
+    fs::write(sb.repo_dir.join("docs/dag.json"), sec_dag).map_err(|e| e.to_string())?;
+    fs::write(
+        sb.repo_dir.join("src/vault.rs"),
+        "pub fn seal_secret(input: &str) -> usize {\n    input.len()\n}\n",
+    )
+    .map_err(|e| e.to_string())?;
+
+    let lock_out = run_swarm_cmd(
+        bins,
+        &sb,
+        &["master", "lock-plan", "docs/dag.json"],
+        Some("master"),
+        None,
+    )?;
+    if !lock_out.status.success() {
+        return Err(format!(
+            "lock-plan failed: {}",
+            String::from_utf8_lossy(&lock_out.stderr)
+        ));
+    }
+
+    // 1. Live Integration Contract Gate (`qa verify-attribution --require-live-contracts`):
+    fs::write(
+        sb.repo_dir.join("test_attribution.toml"),
+        "[[tests]]\nname = \"test_vault_e2e\"\nprimary_suspect = \"TASK-SEC\"\nsecondary_suspects = []\n",
+    )
+    .map_err(|e| e.to_string())?;
+
+    let qa_sid = mint_role_session(bins, &sb, "qa", "TASK-SEC", 1)?;
+
+    // 1a. Missing integration test file under `tests/` -> `MISSING_LIVE_INTEGRATION_CONTRACT`.
+    let missing_live = run_swarm_cmd(
+        bins,
+        &sb,
+        &[
+            "qa",
+            "verify-attribution",
+            "test_attribution.toml",
+            "--require-live-contracts",
+            "--session",
+            &qa_sid,
+        ],
+        None,
+        None,
+    )?;
+    if missing_live.status.success()
+        || !String::from_utf8_lossy(&missing_live.stderr)
+            .contains("MISSING_LIVE_INTEGRATION_CONTRACT")
+    {
+        return Err(format!(
+            "expected MISSING_LIVE_INTEGRATION_CONTRACT when tests/ has no integration test, got: {}",
+            String::from_utf8_lossy(&missing_live.stderr)
+        ));
+    }
+
+    // 1b. Skipped integration test (`@unittest.skip`) -> `SKIPPED_ATTRIBUTED_TEST_FORBIDDEN`.
+    fs::write(
+        sb.repo_dir.join("tests/test_vault_e2e.py"),
+        "import unittest\nclass VaultE2ETest(unittest.TestCase):\n    @unittest.skip('later')\n    def test_vault_e2e(self):\n        self.assertEqual(1, 1)\n",
+    )
+    .map_err(|e| e.to_string())?;
+    let skipped_live = run_swarm_cmd(
+        bins,
+        &sb,
+        &[
+            "qa",
+            "verify-attribution",
+            "test_attribution.toml",
+            "--require-live-contracts",
+            "--session",
+            &qa_sid,
+        ],
+        None,
+        None,
+    )?;
+    if skipped_live.status.success()
+        || !String::from_utf8_lossy(&skipped_live.stderr)
+            .contains("SKIPPED_ATTRIBUTED_TEST_FORBIDDEN")
+    {
+        return Err(format!(
+            "expected SKIPPED_ATTRIBUTED_TEST_FORBIDDEN on skipped test_vault_e2e, got: {}",
+            String::from_utf8_lossy(&skipped_live.stderr)
+        ));
+    }
+
+    // 1c. Live integration test without skip annotations passes `--require-live-contracts`.
+    fs::write(
+        sb.repo_dir.join("tests/test_vault_e2e.py"),
+        "import unittest\nclass VaultE2ETest(unittest.TestCase):\n    def test_vault_e2e(self):\n        self.assertEqual(2 + 2, 4)\nif __name__ == '__main__':\n    unittest.main()\n",
+    )
+    .map_err(|e| e.to_string())?;
+    let ok_live = run_swarm_cmd(
+        bins,
+        &sb,
+        &[
+            "qa",
+            "verify-attribution",
+            "test_attribution.toml",
+            "--require-live-contracts",
+            "--session",
+            &qa_sid,
+        ],
+        None,
+        None,
+    )?;
+    if !ok_live.status.success() {
+        return Err(format!(
+            "expected live integration contract verification to pass, got: {}",
+            String::from_utf8_lossy(&ok_live.stderr)
+        ));
+    }
+    close_role_session(bins, &sb, &qa_sid)?;
+
+    // 2. Anti-Stub Gate (`submit-ledger --reject-stubs` + Reviewer hard block):
+    let grunt_a1 = mint_role_session(bins, &sb, "grunt", "TASK-SEC", 1)?;
+    fs::write(
+        sb.repo_dir.join("src/vault.rs"),
+        concat!(
+            "pub fn dispatch(cmd: &str) {\n",
+            "    let _ = read_secret_stdin();\n",
+            "    match cmd {\n",
+            "        \"rotate\" => {}\n",
+            "        _ => todo!(\"finish vault handler\"),\n",
+            "    }\n",
+            "}\n",
+        ),
+    )
+    .map_err(|e| e.to_string())?;
+
+    let rec_a1 = run_swarm_cmd(
+        bins,
+        &sb,
+        &[
+            "grunt",
+            "record-edit",
+            "--session",
+            &grunt_a1,
+            "--file",
+            "src/vault.rs",
+        ],
+        None,
+        None,
+    )?;
+    if !rec_a1.status.success() {
+        return Err(format!(
+            "grunt record-edit a1 failed: {}",
+            String::from_utf8_lossy(&rec_a1.stderr)
+        ));
+    }
+    let cp_a1 = run_swarm_cmd(
+        bins,
+        &sb,
+        &[
+            "grunt",
+            "checkpoint-green",
+            "--session",
+            &grunt_a1,
+            "--",
+            "python3",
+            "-m",
+            "unittest",
+            "discover",
+            "-s",
+            "tests",
+            "-k",
+            "test_vault_e2e",
+        ],
+        None,
+        None,
+    )?;
+    if !cp_a1.status.success() {
+        return Err(format!(
+            "grunt checkpoint-green a1 failed: {}",
+            String::from_utf8_lossy(&cp_a1.stderr)
+        ));
+    }
+
+    // 2a. `submit-ledger --reject-stubs` MUST reject hollow production stubs (`HOLLOW_STUB_IMPLEMENTATION_REJECTED`).
+    let reject_sub = run_swarm_cmd(
+        bins,
+        &sb,
+        &[
+            "grunt",
+            "submit-ledger",
+            "--session",
+            &grunt_a1,
+            "--reject-stubs",
+            "--what",
+            "Added dispatch stub in src/vault.rs. Wired initial rotate match arm.",
+            "--why",
+            "Prepared command dispatch entry point. Verified unit harness executes.",
+        ],
+        None,
+        None,
+    )?;
+    if reject_sub.status.success()
+        || !String::from_utf8_lossy(&reject_sub.stderr)
+            .contains("HOLLOW_STUB_IMPLEMENTATION_REJECTED")
+    {
+        return Err(format!(
+            "expected HOLLOW_STUB_IMPLEMENTATION_REJECTED on --reject-stubs, got stderr={}",
+            String::from_utf8_lossy(&reject_sub.stderr)
+        ));
+    }
+
+    // 2b. Even if submitted without `--reject-stubs`, `hollow_stub:*` badges are recorded and
+    //     `AdversarialReviewer` `--decision approve` MUST hard-block (`REVIEWER_APPROVAL_BLOCKED_BY_HOLLOW_STUB`)!
+    let plain_sub = run_swarm_cmd(
+        bins,
+        &sb,
+        &[
+            "grunt",
+            "submit-ledger",
+            "--session",
+            &grunt_a1,
+            "--what",
+            "Added dispatch stub in src/vault.rs. Wired initial rotate match arm.",
+            "--why",
+            "Prepared command dispatch entry point. Verified unit harness executes.",
+        ],
+        None,
+        None,
+    )?;
+    if !plain_sub.status.success() {
+        return Err(format!(
+            "plain submit-ledger a1 failed: {}",
+            String::from_utf8_lossy(&plain_sub.stderr)
+        ));
+    }
+    if !String::from_utf8_lossy(&plain_sub.stdout).contains("hollow_stub:") {
+        return Err(format!(
+            "expected hollow_stub:* smell badge on receipt, got: {}",
+            String::from_utf8_lossy(&plain_sub.stdout)
+        ));
+    }
+
+    let rev_a1 = mint_role_session(bins, &sb, "reviewer", "TASK-SEC", 1)?;
+    let blocked_approve = run_swarm_cmd(
+        bins,
+        &sb,
+        &[
+            "reviewer",
+            "verdict",
+            "--session",
+            &rev_a1,
+            "--task",
+            "TASK-SEC",
+            "--round",
+            "1",
+            "--attempt",
+            "1",
+            "--decision",
+            "approve",
+            "--notes",
+            "Attempted rubber-stamp approval.",
+        ],
+        None,
+        None,
+    )?;
+    if blocked_approve.status.success()
+        || !String::from_utf8_lossy(&blocked_approve.stderr)
+            .contains("REVIEWER_APPROVAL_BLOCKED_BY_HOLLOW_STUB")
+    {
+        return Err(format!(
+            "expected REVIEWER_APPROVAL_BLOCKED_BY_HOLLOW_STUB, got stderr={}",
+            String::from_utf8_lossy(&blocked_approve.stderr)
+        ));
+    }
+
+    let reject_verdict = run_swarm_cmd(
+        bins,
+        &sb,
+        &[
+            "reviewer",
+            "verdict",
+            "--session",
+            &rev_a1,
+            "--task",
+            "TASK-SEC",
+            "--round",
+            "1",
+            "--attempt",
+            "1",
+            "--decision",
+            "reject",
+            "--notes",
+            "Hollow stub in src/vault.rs: remove todo! and empty rotate arm.",
+        ],
+        None,
+        None,
+    )?;
+    if !reject_verdict.status.success() {
+        return Err(format!(
+            "reviewer reject verdict failed: {}",
+            String::from_utf8_lossy(&reject_verdict.stderr)
+        ));
+    }
+    close_role_session(bins, &sb, &rev_a1)?;
+
+    // 2c. Clean-slate `attempt 2` implements real logic, passes `submit-ledger --reject-stubs` AND Reviewer approval!
+    let grunt_a2 = mint_role_session(bins, &sb, "grunt", "TASK-SEC", 2)?;
+    fs::write(
+        sb.repo_dir.join("src/vault.rs"),
+        concat!(
+            "pub fn dispatch(cmd: &str, secret: &[u8]) -> Result<usize, &'static str> {\n",
+            "    if secret.is_empty() {\n",
+            "        return Err(\"EMPTY_SECRET\");\n",
+            "    }\n",
+            "    match cmd {\n",
+            "        \"rotate\" => Ok(secret.len()),\n",
+            "        _ => Err(\"UNSUPPORTED_COMMAND\"),\n",
+            "    }\n",
+            "}\n",
+        ),
+    )
+    .map_err(|e| e.to_string())?;
+    let rec_a2 = run_swarm_cmd(
+        bins,
+        &sb,
+        &[
+            "grunt",
+            "record-edit",
+            "--session",
+            &grunt_a2,
+            "--file",
+            "src/vault.rs",
+        ],
+        None,
+        None,
+    )?;
+    if !rec_a2.status.success() {
+        return Err(format!(
+            "grunt record-edit a2 failed: {}",
+            String::from_utf8_lossy(&rec_a2.stderr)
+        ));
+    }
+    let cp_a2 = run_swarm_cmd(
+        bins,
+        &sb,
+        &[
+            "grunt",
+            "checkpoint-green",
+            "--session",
+            &grunt_a2,
+            "--",
+            "python3",
+            "-m",
+            "unittest",
+            "discover",
+            "-s",
+            "tests",
+            "-k",
+            "test_vault_e2e",
+        ],
+        None,
+        None,
+    )?;
+    if !cp_a2.status.success() {
+        return Err(format!(
+            "grunt checkpoint-green a2 failed: {}",
+            String::from_utf8_lossy(&cp_a2.stderr)
+        ));
+    }
+    let clean_sub = run_swarm_cmd(
+        bins,
+        &sb,
+        &[
+            "grunt",
+            "submit-ledger",
+            "--session",
+            &grunt_a2,
+            "--reject-stubs",
+            "--what",
+            "Implemented real secret validation and rotate handler in src/vault.rs. Removed all hollow placeholders.",
+            "--why",
+            "Enforced non-empty secret custody invariant on rotate commands. Verified live e2e contract suite.",
+        ],
+        None,
+        None,
+    )?;
+    if !clean_sub.status.success() {
+        return Err(format!(
+            "clean submit-ledger --reject-stubs failed: {}",
+            String::from_utf8_lossy(&clean_sub.stderr)
+        ));
+    }
+
+    let rev_a2 = mint_role_session(bins, &sb, "reviewer", "TASK-SEC", 2)?;
+    let ok_approve = run_swarm_cmd(
+        bins,
+        &sb,
+        &[
+            "reviewer",
+            "verdict",
+            "--session",
+            &rev_a2,
+            "--task",
+            "TASK-SEC",
+            "--round",
+            "2",
+            "--attempt",
+            "2",
+            "--decision",
+            "approve",
+            "--notes",
+            "Verified clean non-stub implementation and passing live contract.",
+        ],
+        None,
+        None,
+    )?;
+    if !ok_approve.status.success() {
+        return Err(format!(
+            "reviewer approve on clean attempt 2 failed: {}",
+            String::from_utf8_lossy(&ok_approve.stderr)
+        ));
+    }
+    close_role_session(bins, &sb, &rev_a2)?;
+
+    Ok(
+        "Anti-stub scanner, submit-ledger --reject-stubs, Reviewer hollow-stub block, and QA live integration contract gate verified"
             .to_string(),
     )
 }

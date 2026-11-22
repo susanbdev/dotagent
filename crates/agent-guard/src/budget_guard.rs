@@ -134,6 +134,141 @@ pub fn inspect_file_on_disk_hygiene(path: &Path) -> Result<String, BudgetViolati
     Ok(text)
 }
 
+pub const MAX_VETTED_WEBFONT_BYTES: u64 = 65_536; // 64 KiB cap for subset `.woff2`/`.woff` glyph atlases
+
+/// Validates bounded, magic-verified `.woff2` (`wOF2`) and `.woff` (`wOFF`) static webfont
+/// assets during `post-edit` so UI libraries (such as `vespoli-ui`'s `< 2 KB` glyph font)
+/// can persist valid font assets on disk while keeping binary context-ingestion hard-blocked.
+/// Returns `None` when `path` does not carry a `.woff2`/`.woff` extension.
+pub fn inspect_vetted_webfont_asset_on_disk(
+    path: &Path,
+) -> Option<Result<Vec<u8>, BudgetViolation>> {
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|s| s.to_ascii_lowercase())?;
+    let expected_magic: &[u8; 4] = match ext.as_str() {
+        "woff2" => b"wOF2",
+        "woff" => b"wOFF",
+        _ => return None,
+    };
+
+    let check = || -> Result<Vec<u8>, BudgetViolation> {
+        let meta = std::fs::symlink_metadata(path).map_err(|e| BudgetViolation {
+            code: "FILE_STAT_ERROR",
+            detail: format!("Cannot stat '{}': {e}", path.display()),
+        })?;
+        if meta.file_type().is_symlink() || !meta.file_type().is_file() {
+            return Err(BudgetViolation {
+                code: "NON_REGULAR_FILE",
+                detail: format!(
+                    "Refusing non-regular webfont file '{}' (FIFO/socket/device/symlink blocked)",
+                    path.display()
+                ),
+            });
+        }
+        if meta.len() > MAX_VETTED_WEBFONT_BYTES {
+            return Err(BudgetViolation {
+                code: "WEBFONT_SIZE_EXCEEDED",
+                detail: format!(
+                    "Webfont asset '{}' is {} bytes (> {MAX_VETTED_WEBFONT_BYTES} byte subset glyph ceiling).",
+                    path.display(),
+                    meta.len()
+                ),
+            });
+        }
+
+        let mut file = open_vetted_webfont_nofollow(path).map_err(|e| BudgetViolation {
+            code: "FILE_OPEN_ERROR",
+            detail: format!("Cannot open '{}': {e}", path.display()),
+        })?;
+        let fd_meta = file.metadata().map_err(|e| BudgetViolation {
+            code: "FILE_STAT_ERROR",
+            detail: format!("Cannot fstat '{}': {e}", path.display()),
+        })?;
+        if !fd_meta.is_file() || !same_vetted_webfont(&meta, &fd_meta) {
+            return Err(BudgetViolation {
+                code: "FILE_TOCTOU_REJECTED",
+                detail: format!("Webfont asset '{}' changed while opening.", path.display()),
+            });
+        }
+
+        let mut raw = Vec::new();
+        (&mut file)
+            .take(fd_meta.len() + 1)
+            .read_to_end(&mut raw)
+            .map_err(|e| BudgetViolation {
+                code: "FILE_READ_ERROR",
+                detail: format!("Cannot read '{}': {e}", path.display()),
+            })?;
+        let after = file.metadata().map_err(|e| BudgetViolation {
+            code: "FILE_STAT_ERROR",
+            detail: format!("Cannot fstat '{}': {e}", path.display()),
+        })?;
+        if raw.len() as u64 != fd_meta.len() || !same_vetted_webfont(&fd_meta, &after) {
+            return Err(BudgetViolation {
+                code: "FILE_TOCTOU_REJECTED",
+                detail: format!("Webfont asset '{}' changed while reading.", path.display()),
+            });
+        }
+        if raw.len() < 44 || &raw[..4] != expected_magic {
+            return Err(BudgetViolation {
+                code: "INVALID_WEBFONT_MAGIC",
+                detail: format!(
+                    "File '{}' carries '.{ext}' extension without valid WOFF/WOFF2 header signature.",
+                    path.display()
+                ),
+            });
+        }
+        Ok(raw)
+    };
+
+    Some(check())
+}
+
+#[cfg(unix)]
+fn open_vetted_webfont_nofollow(path: &Path) -> std::io::Result<File> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let nofollow = crate::traversal_ledger::O_NOFOLLOW_FLAG;
+    if nofollow == 0 {
+        return Err(std::io::ErrorKind::Unsupported.into());
+    }
+    // A replacement FIFO must not block the open before the descriptor can be checked.
+    let nonblock = if cfg!(target_os = "macos") {
+        0x4
+    } else {
+        0o4000
+    };
+    std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(nofollow | nonblock)
+        .open(path)
+}
+
+#[cfg(not(unix))]
+fn open_vetted_webfont_nofollow(_path: &Path) -> std::io::Result<File> {
+    Err(std::io::ErrorKind::Unsupported.into())
+}
+
+#[cfg(unix)]
+fn same_vetted_webfont(before: &std::fs::Metadata, after: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+
+    before.dev() == after.dev()
+        && before.ino() == after.ino()
+        && before.size() == after.size()
+        && before.mtime() == after.mtime()
+        && before.mtime_nsec() == after.mtime_nsec()
+        && before.ctime() == after.ctime()
+        && before.ctime_nsec() == after.ctime_nsec()
+}
+
+#[cfg(not(unix))]
+fn same_vetted_webfont(_before: &std::fs::Metadata, _after: &std::fs::Metadata) -> bool {
+    false
+}
+
 /// Safely reads up to `MAX_RAW_FILE_BYTES + 1` (or bounded slice) using `Read::take`
 /// so a multi-gigabyte file or special device can never OOM the guard itself.
 pub fn inspect_file_budget(
@@ -1225,6 +1360,43 @@ mod tests {
         RuntimeProfile, analyze_text_budget, apply_profile_toml_tightening, load_profile_by_id,
     };
     use std::path::Path;
+
+    #[cfg(any(
+        target_os = "macos",
+        all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        )
+    ))]
+    #[test]
+    fn vetted_webfont_reads_regular_file_and_refuses_symlink() -> std::io::Result<()> {
+        use std::os::unix::fs::symlink;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let nonce = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
+        let fixture = std::env::temp_dir().join(format!(
+            "dotagent-webfont-{}-{}",
+            std::process::id(),
+            nonce.as_nanos()
+        ));
+        std::fs::create_dir(&fixture)?;
+        let font = fixture.join("regular.woff2");
+        let link = fixture.join("linked.woff2");
+        let mut bytes = [0; 48];
+        bytes[..4].copy_from_slice(b"wOF2");
+        std::fs::write(&font, bytes)?;
+        symlink(&font, &link)?;
+
+        let regular = super::inspect_vetted_webfont_asset_on_disk(&font);
+        let linked = super::inspect_vetted_webfont_asset_on_disk(&link);
+        let open_link = super::open_vetted_webfont_nofollow(&link);
+        std::fs::remove_dir_all(&fixture)?;
+
+        assert_eq!(regular.unwrap().unwrap(), bytes);
+        assert_eq!(linked.unwrap().unwrap_err().code, "NON_REGULAR_FILE");
+        assert!(open_link.is_err(), "no-follow open must refuse a symlink");
+        Ok(())
+    }
 
     #[test]
     fn blocks_minified_single_line_and_splitter_bombs() {

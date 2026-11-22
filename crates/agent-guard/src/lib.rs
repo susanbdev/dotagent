@@ -402,6 +402,22 @@ pub fn handle_pre_tool_hook_with_context(
         extract_first_str(&parsed, &["agent_type", "subagent_type", "agent_name"])
             .is_some_and(is_allowed_airlock_subagent_name);
 
+    if caller_ctx
+        .session_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .is_none()
+        && let Err(err) = role_sandbox::try_auto_bind_hook_from_swarm_tool_call(
+            &repo_root,
+            &session_id,
+            &tool_name,
+            tool_input,
+        )
+    {
+        return Decision::deny("INVALID_SWARM_ROLE", err, true);
+    }
+
     let (role, cap_opt) = match role_sandbox::resolve_active_role_with_overrides(
         &repo_root,
         &session_id,
@@ -840,6 +856,8 @@ fn evaluate_tool_invocation(
         // Pre-inspect every file read by the shell command (enforces A->B->C, Unicode, injection, & token budget!)
         for (rel, abs_path, is_root_auth) in &plan.read_files {
             if abs_path.exists() {
+                let cap_preapproved =
+                    role_sandbox::is_capability_preapproved_read_path(role, cap, rel);
                 if let Err(dec) = pre_inspect_file_for_ingestion_with_profile(
                     abs_path,
                     rel,
@@ -850,6 +868,7 @@ fn evaluate_tool_invocation(
                     profile,
                     ledger,
                     false,
+                    cap_preapproved,
                 ) {
                     return dec;
                 }
@@ -857,7 +876,9 @@ fn evaluate_tool_invocation(
         }
 
         for (rel, _abs_path) in &plan.search_files {
-            if let Err((code, msg)) = ledger.check_search_target(rel) {
+            if !role_sandbox::is_capability_preapproved_read_path(role, cap, rel)
+                && let Err((code, msg)) = ledger.check_search_target(rel)
+            {
                 return Decision::deny(code, msg, false);
             }
         }
@@ -1014,6 +1035,9 @@ fn evaluate_tool_invocation(
             !matches!(norm_tool.as_str(), "beforereadfile" | "notebookread")
                 && content_byte_offset == 0;
 
+        let cap_preapproved =
+            role_sandbox::is_capability_preapproved_read_path(role, cap, &valid.repo_rel);
+
         match pre_inspect_file_for_ingestion_with_profile(
             &valid.canonical_or_norm,
             &valid.repo_rel,
@@ -1024,6 +1048,7 @@ fn evaluate_tool_invocation(
             profile,
             ledger,
             true,
+            cap_preapproved,
         ) {
             Ok(_) => {
                 return Decision::allow_with_advisory(format!(
@@ -1067,6 +1092,7 @@ fn evaluate_tool_invocation(
                         profile,
                         ledger,
                         true,
+                        cap_preapproved,
                     ) {
                         Ok(_) => {
                             let end_line = clamped_offset
@@ -1725,6 +1751,7 @@ pub fn pre_inspect_file_for_ingestion(
         &profile,
         ledger,
         deliver_sanitized_on_non_ascii,
+        false,
     )
 }
 
@@ -1739,6 +1766,7 @@ fn pre_inspect_file_for_ingestion_with_profile(
     profile: &RuntimeProfile,
     ledger: &mut SessionLedger,
     deliver_sanitized_on_non_ascii: bool,
+    capability_preapproved: bool,
 ) -> Result<String, Decision> {
     // 1. Check transitive hop depth FIRST (`A -> B -> C` denied before even opening `C`!)
     let max_ref_level = if operator::has_active_elevated_lease(repo_root) {
@@ -1746,17 +1774,18 @@ fn pre_inspect_file_for_ingestion_with_profile(
     } else {
         traversal_ledger::MAX_REFERENCE_LEVEL
     };
-    if let Some(existing) = ledger.nodes.get(repo_rel) {
-        if existing.level > max_ref_level {
-            return Err(Decision::deny(
-                "TRANSITIVE_DEPTH_EXCEEDED",
-                format!(
-                    "Pointer traversal chain '{} -> {repo_rel}' exceeds max depth of {max_ref_level} levels (A -> B allowed; B -> C forbidden). Stop immediately and ask the user.",
-                    existing.chain
-                ),
-                false,
-            ));
-        }
+    if !capability_preapproved
+        && let Some(existing) = ledger.nodes.get(repo_rel)
+        && existing.level > max_ref_level
+    {
+        return Err(Decision::deny(
+            "TRANSITIVE_DEPTH_EXCEEDED",
+            format!(
+                "Pointer traversal chain '{} -> {repo_rel}' exceeds max depth of {max_ref_level} levels (A -> B allowed; B -> C forbidden). Stop immediately and ask the user.",
+                existing.chain
+            ),
+            false,
+        ));
     }
 
     // 2. File size, line count, single-line bomb, & BPE splitter bomb check
@@ -1829,11 +1858,12 @@ fn pre_inspect_file_for_ingestion_with_profile(
             metrics.estimated_tokens = estimate_bpe_tokens(&san.clean_ascii);
         }
         ledger
-            .authorize_and_record_read_with_limits(
+            .authorize_and_record_read_with_scope(
                 repo_rel,
                 metrics.estimated_tokens,
                 profile.max_turn_file_reads,
                 profile.max_turn_tokens,
+                capability_preapproved,
             )
             .map_err(|(code, msg)| Decision::deny(code, msg, false))?;
 
@@ -2169,6 +2199,15 @@ pub fn handle_post_tool_hook_with_context(
 /// obeys disk hygiene (`<= 1 MiB`, UTF-8, no single-line/repetition bombs), is not an immutable
 /// control-plane path, and contains no raw secret literals.
 pub fn handle_post_edit(file_path: &str, cwd: &Path) -> Decision {
+    handle_post_edit_with_session(file_path, cwd, "")
+}
+
+/// Session-aware `post-edit <file>` gate supporting concurrent hook-bound Swarm workers.
+pub fn handle_post_edit_with_session(
+    file_path: &str,
+    cwd: &Path,
+    hook_session_id: &str,
+) -> Decision {
     let repo_root = resolve_repo_root(cwd);
     let valid = match validate_path(&repo_root, cwd, file_path, PathAccess::Write) {
         Ok(v) => v,
@@ -2176,6 +2215,32 @@ pub fn handle_post_edit(file_path: &str, cwd: &Path) -> Decision {
     };
 
     if !valid.canonical_or_norm.exists() {
+        return Decision::allow();
+    }
+
+    if let Some(webfont_res) =
+        budget_guard::inspect_vetted_webfont_asset_on_disk(&valid.canonical_or_norm)
+    {
+        let raw_bytes = match webfont_res {
+            Ok(b) => b,
+            Err(bv) => return Decision::deny(bv.code, bv.detail, false),
+        };
+        if let Ok((_role, Some(cap))) =
+            role_sandbox::resolve_active_role(&repo_root, hook_session_id)
+        {
+            let doc_digest = breadcrumbs::sha256_digest(&raw_bytes);
+            let plan_bytes = swarm_contracts::hex_decode_32(&cap.plan_sha256).unwrap_or([0u8; 32]);
+            let _ = breadcrumbs::append_breadcrumb_for_path(
+                &repo_root,
+                &cap.session_id,
+                &cap.task_id,
+                plan_bytes,
+                swarm_contracts::EventOp::FileEdit,
+                &valid.repo_rel,
+                None,
+                doc_digest,
+            );
+        }
         return Decision::allow();
     }
 
@@ -2200,7 +2265,7 @@ pub fn handle_post_edit(file_path: &str, cwd: &Path) -> Decision {
         );
     }
 
-    if let Ok((_role, Some(cap))) = role_sandbox::resolve_active_role(&repo_root, "") {
+    if let Ok((_role, Some(cap))) = role_sandbox::resolve_active_role(&repo_root, hook_session_id) {
         let doc_digest = breadcrumbs::sha256_digest(content.as_bytes());
         let plan_bytes = swarm_contracts::hex_decode_32(&cap.plan_sha256).unwrap_or([0u8; 32]);
         let _ = breadcrumbs::append_breadcrumb_for_path(

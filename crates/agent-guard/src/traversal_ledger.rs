@@ -431,7 +431,7 @@ impl SessionLedger {
 
     /// Validates whether reading `rel_path` violates the max-2-level pointer hop chain
     /// (`A -> B` allowed, `A -> B -> C` hard-denied!) and records the read + token budget.
-    /// Returns the assigned level (`1` or `2`) of `rel_path`.
+    /// Returns the recorded traversal level of `rel_path`.
     pub fn authorize_and_record_read(
         &mut self,
         rel_path: &str,
@@ -452,6 +452,23 @@ impl SessionLedger {
         max_file_reads: usize,
         max_turn_tokens: usize,
     ) -> Result<u8, (&'static str, String)> {
+        self.authorize_and_record_read_with_scope(
+            rel_path,
+            estimated_tokens,
+            max_file_reads,
+            max_turn_tokens,
+            false,
+        )
+    }
+
+    pub fn authorize_and_record_read_with_scope(
+        &mut self,
+        rel_path: &str,
+        estimated_tokens: usize,
+        max_file_reads: usize,
+        max_turn_tokens: usize,
+        capability_preapproved: bool,
+    ) -> Result<u8, (&'static str, String)> {
         if let Err(msg) = self.check_not_halted() {
             return Err(("SESSION_CIRCUIT_BREAKER_HALTED", msg));
         }
@@ -462,16 +479,17 @@ impl SessionLedger {
             } else {
                 MAX_REFERENCE_LEVEL
             };
-        if let Some(existing) = self.nodes.get(rel_path) {
-            if existing.level > max_ref_level {
-                return Err((
-                    "TRANSITIVE_DEPTH_EXCEEDED",
-                    format!(
-                        "Transitive reference chain '{} -> {rel_path}' reaches level {} (> max {max_ref_level} levels: A -> B allowed, B -> C forbidden). Stop immediately and ask the user.",
-                        existing.chain, existing.level
-                    ),
-                ));
-            }
+        if !capability_preapproved
+            && let Some(existing) = self.nodes.get(rel_path)
+            && existing.level > max_ref_level
+        {
+            return Err((
+                "TRANSITIVE_DEPTH_EXCEEDED",
+                format!(
+                    "Transitive reference chain '{} -> {rel_path}' reaches level {} (> max {max_ref_level} levels: A -> B allowed, B -> C forbidden). Stop immediately and ask the user.",
+                    existing.chain, existing.level
+                ),
+            ));
         }
 
         let already_read = self.nodes.get(rel_path).is_some_and(|n| n.was_read);
@@ -1688,7 +1706,7 @@ fn ledger_file_path_for_hash(session_key_hash: &str) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
-    use super::{SessionLedger, compute_session_key_hash};
+    use super::{MAX_REFERENCE_LEVEL, SessionLedger, TraversalNode, compute_session_key_hash};
     use std::path::Path;
 
     #[test]
@@ -1728,5 +1746,32 @@ mod tests {
             compute_session_key_hash(Path::new("/repo"), "\u{03B1}"),
             compute_session_key_hash(Path::new("/repo"), "\u{03B2}")
         );
+    }
+
+    #[test]
+    fn capability_read_retains_traversal_provenance() {
+        let mut ledger = SessionLedger::new(Path::new("/repo"), "scoped");
+        let path = "docs/assigned.md";
+        let level = MAX_REFERENCE_LEVEL + 1;
+        let chain = "docs/root.md -> docs/intermediate.md";
+        ledger.nodes.insert(
+            path.to_string(),
+            TraversalNode {
+                level,
+                chain: chain.to_string(),
+                was_read: false,
+            },
+        );
+
+        assert_eq!(
+            ledger.authorize_and_record_read_with_scope(path, 100, 5, 1000, true),
+            Ok(level)
+        );
+        assert_eq!(ledger.nodes[path].chain, chain);
+        assert!(ledger.nodes[path].was_read);
+
+        let next = "docs/reference.md";
+        ledger.register_outgoing_pointers(path, &[next.to_string()]);
+        assert_eq!(ledger.nodes[next].level, level + 1);
     }
 }

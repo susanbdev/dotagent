@@ -535,22 +535,22 @@ fn inverted_ring0_allowlist_ssh_hardware_signer_and_target_matched_corpus_ratche
             .success()
     );
 
-    // 1. Checkout a non-`auto/friction-*` branch (`chore/sneaky`) WITHOUT hardware signature and
-    //    verify touching `Cargo.toml`, `dotagent-harness`, or `.claude/*` fails closed!
+    // 1. Autonomous `auto/friction-*` branch (or `--require-ratchet`) is locked to the 5-file
+    //    Ring-2 allowlist: touching `Cargo.toml` or untracked `build.rs` fails closed!
     assert!(
         Command::new("git")
             .current_dir(&repo)
-            .args(["checkout", "-b", "chore/sneaky"])
+            .args(["checkout", "-b", "auto/friction-sneaky"])
             .status()
             .expect("checkout")
             .success()
     );
     fs::write(repo.join("Cargo.toml"), "[workspace]\n# sneaky edit\n").expect("edit Cargo.toml");
     let err_uncommitted =
-        verify_ring0_ratchet(&repo, "main", false).expect_err("uncommitted Cargo.toml must fail");
+        verify_ring0_ratchet(&repo, "main", false).expect_err("autonomous Cargo.toml must fail");
     assert!(err_uncommitted.contains("RING0_RATCHET_VIOLATION"));
 
-    // Untracked file must ALSO fail closed (`Proposal 2B`)!
+    // Untracked file must ALSO fail closed (`Proposal 2B`) in autonomous Ring-2 mode!
     assert!(
         Command::new("git")
             .current_dir(&repo)
@@ -565,7 +565,7 @@ fn inverted_ring0_allowlist_ssh_hardware_signer_and_target_matched_corpus_ratche
     assert!(err_untracked.contains("build.rs"));
     fs::remove_file(repo.join("build.rs")).expect("rm build.rs");
 
-    // 2. Modifying `git` in `cmd_policy.rs` + appending 2 unrelated `rm -rf /` vectors must FAIL
+    // 2. Modifying `git` in `cmd_policy.rs` + appending 2 unrelated `curl` vectors must FAIL
     //    target-matching (`Proposal 2D`), whereas appending 2 net-new `git` abuse vectors PASSES!
     fs::write(
         repo.join("crates/agent-guard/src/cmd_policy.rs"),
@@ -591,8 +591,9 @@ fn inverted_ring0_allowlist_ssh_hardware_signer_and_target_matched_corpus_ratche
     assert!(ok_ring2.enforce_ring0_paths);
     assert_eq!(ok_ring2.added_corpus_vectors, 2);
 
-    // 3. Hardware-signed human commit touching Ring-0 (`Cargo.toml`) passes when signed by key in
-    //    `main:config/allowed_human_signers` and working tree is clean!
+    // 3. Normal human/browser-agent feature branch (`feat/browser-agent-ring0`, non-bot) does NOT
+    //    require per-commit hardware signing to modify Ring-0 (`Cargo.toml`), while STILL blocking
+    //    unsigned edits to `config/allowed_human_signers` and corpus deletion!
     assert!(
         Command::new("git")
             .current_dir(&repo)
@@ -612,9 +613,61 @@ fn inverted_ring0_allowlist_ssh_hardware_signer_and_target_matched_corpus_ratche
     assert!(
         Command::new("git")
             .current_dir(&repo)
-            .args(["checkout", "-b", "feat/human-signed-ring0"])
+            .args(["checkout", "-b", "feat/browser-agent-ring0"])
             .status()
             .expect("branch")
+            .success()
+    );
+    fs::write(
+        repo.join("Cargo.toml"),
+        "[workspace]\n# unsigned browser-agent ring0 edit\n",
+    )
+    .expect("edit Cargo");
+    assert!(
+        Command::new("git")
+            .current_dir(&repo)
+            .args(["add", "Cargo.toml"])
+            .status()
+            .expect("add")
+            .success()
+    );
+    assert!(
+        Command::new("git")
+            .current_dir(&repo)
+            .args(["commit", "-m", "feat: browser agent ring0 update"])
+            .status()
+            .expect("unsigned commit")
+            .success()
+    );
+    let unsigned_human_rep = verify_ring0_ratchet(&repo, "main", false)
+        .expect("unsigned non-bot Ring-0 PR commit must pass without hardware commit signing");
+    assert!(!unsigned_human_rep.human_hardware_signed);
+    assert!(!unsigned_human_rep.enforce_ring0_paths);
+
+    // Passing `--require-ratchet` (`force_ratchet == true`) still blocks Ring-0!
+    assert!(verify_ring0_ratchet(&repo, "main", true).is_err());
+
+    // Unsigned tampering with `config/allowed_human_signers` MUST still fail closed (`UNAUTHENTICATED_SIGNER_KEYRING_MUTATION`)!
+    fs::write(repo.join("config/allowed_human_signers"), "# wiped\n").expect("tamper signers");
+    let tamper_err = verify_ring0_ratchet(&repo, "main", false)
+        .expect_err("unsigned signer keyring mutation must fail");
+    assert!(tamper_err.contains("UNAUTHENTICATED_SIGNER_KEYRING_MUTATION"));
+    assert!(
+        Command::new("git")
+            .current_dir(&repo)
+            .args(["checkout", "--", "config/allowed_human_signers"])
+            .status()
+            .expect("restore signers")
+            .success()
+    );
+
+    // 4. Hardware/SSH key signature verification is strictly enforced on RELEASE TAGS (`v*`)!
+    assert!(
+        Command::new("git")
+            .current_dir(&repo)
+            .args(["checkout", "main"])
+            .status()
+            .expect("checkout main for release tag")
             .success()
     );
     for args in [
@@ -634,34 +687,80 @@ fn inverted_ring0_allowlist_ssh_hardware_signer_and_target_matched_corpus_ratche
                 .success()
         );
     }
-    fs::write(
-        repo.join("Cargo.toml"),
-        "[workspace]\n# signed human edit\n",
+    // Lightweight tag -> rejected (`LIGHTWEIGHT_RELEASE_TAG_FORBIDDEN`)
+    assert!(
+        Command::new("git")
+            .current_dir(&repo)
+            .args(["tag", "v2.1.0-light"])
+            .status()
+            .expect("lightweight tag")
+            .success()
+    );
+    let light_err = agent_guard::ring0_ratchet::verify_release_tag_signature(
+        &repo,
+        "v2.1.0-light",
+        "main",
+        false,
     )
-    .expect("edit Cargo");
-    assert!(
-        Command::new("git")
-            .current_dir(&repo)
-            .args(["add", "Cargo.toml"])
-            .status()
-            .expect("add")
-            .success()
-    );
-    assert!(
-        Command::new("git")
-            .current_dir(&repo)
-            .args(["commit", "-S", "-m", "chore: hardware signed ring0 update"])
-            .status()
-            .expect("signed commit")
-            .success()
-    );
-    let signed_rep =
-        verify_ring0_ratchet(&repo, "main", false).expect("hardware-signed Ring-0 commit passes");
-    assert!(signed_rep.human_hardware_signed);
-    assert!(!signed_rep.enforce_ring0_paths);
+    .expect_err("lightweight release tag must fail");
+    assert!(light_err.contains("LIGHTWEIGHT_RELEASE_TAG_FORBIDDEN"));
 
-    // Passing `--require-ratchet` (`force_ratchet == true`) still blocks Ring-0 even on signed commits!
-    assert!(verify_ring0_ratchet(&repo, "main", true).is_err());
+    // Unsigned annotated tag -> rejected (`UNSIGNED_RELEASE_TAG_FORBIDDEN`)
+    assert!(
+        Command::new("git")
+            .current_dir(&repo)
+            .args(["tag", "-a", "v2.1.0-unsigned", "-m", "unsigned release"])
+            .status()
+            .expect("unsigned annotated tag")
+            .success()
+    );
+    let unsig_err = agent_guard::ring0_ratchet::verify_release_tag_signature(
+        &repo,
+        "v2.1.0-unsigned",
+        "main",
+        false,
+    )
+    .expect_err("unsigned annotated release tag must fail");
+    assert!(unsig_err.contains("UNSIGNED_RELEASE_TAG_FORBIDDEN"));
+
+    // Signed annotated tag (`git tag -s v2.1.0`) -> verified against `main:config/allowed_human_signers`!
+    assert!(
+        Command::new("git")
+            .current_dir(&repo)
+            .args(["tag", "-s", "v2.1.0", "-m", "dotagent v2.1.0"])
+            .status()
+            .expect("signed annotated tag")
+            .success()
+    );
+    let tag_rep =
+        agent_guard::ring0_ratchet::verify_release_tag_signature(&repo, "v2.1.0", "main", false)
+            .expect("SSH-signed release tag must verify");
+    assert_eq!(tag_rep.tag, "v2.1.0");
+    assert_eq!(tag_rep.signer_principal, "test@dotagent.local");
+    let tag_object = Command::new("git")
+        .current_dir(&repo)
+        .args(["rev-parse", "refs/tags/v2.1.0"])
+        .output()
+        .expect("signed tag object");
+    assert!(tag_object.status.success());
+    let tag_object = String::from_utf8(tag_object.stdout).expect("tag object SHA");
+    assert!(
+        Command::new("git")
+            .current_dir(&repo)
+            .args(["update-ref", "refs/tags/v2.1.1", tag_object.trim()])
+            .status()
+            .expect("alias signed tag")
+            .success()
+    );
+    let alias_err =
+        agent_guard::ring0_ratchet::verify_release_tag_signature(&repo, "v2.1.1", "main", false)
+            .expect_err("the signed tag name must match the official ref");
+    assert!(alias_err.contains("RELEASE_TAG_HEADER_MISMATCH"));
+    // And requiring hardware `sk-*` key rejects software `ssh-ed25519` test key in production mode!
+    let prod_sk_err =
+        agent_guard::ring0_ratchet::verify_release_tag_signature(&repo, "v2.1.0", "main", true)
+            .expect_err("software ed25519 must be rejected when require_fido2_sk_key=true");
+    assert!(prod_sk_err.contains("MISSING_HARDWARE_RELEASE_SIGNERS"));
 
     let _ = fs::remove_dir_all(&root);
 }
