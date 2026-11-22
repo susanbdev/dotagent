@@ -16,10 +16,10 @@ use agent_guard::unicode_guard::{ScanMode, scan_unicode};
 use dotagent_compiler::{
     ALLOWED_MCP_URL, ProfileIr, SkillIr, compile_policy_bundle_ir_json, evaluate_rego_policy_gate,
     lower_agent_markdown_for_harness, normalize_toml_to_json_value, parse_profile_toml_to_ir,
-    render_antigravity_harness_json_from_ir, render_claude_settings_from_ir,
-    render_codex_config_from_ir, render_cursor_hooks_from_ir, render_cursor_mcp_json_from_ir,
-    render_gemini_settings_from_ir, render_rego_policy_v2, strip_toml_comment,
-    verify_executable_spec_sync,
+    render_antigravity_harness_json_from_ir, render_antigravity_hooks_from_ir,
+    render_claude_settings_from_ir, render_codex_config_from_ir, render_cursor_hooks_from_ir,
+    render_cursor_mcp_json_from_ir, render_gemini_settings_from_ir, render_rego_policy_v2,
+    strip_toml_comment, verify_executable_spec_sync,
 };
 
 const MAX_SKILL_BYTES: usize = 3_072; // <= 3 KiB per spec Law 4
@@ -990,6 +990,10 @@ fn render_bundle_artifacts(
     map.insert(
         "antigravity/harness.json".to_string(),
         render_antigravity_harness_json_from_ir(coding),
+    );
+    map.insert(
+        "antigravity/hooks.json".to_string(),
+        render_antigravity_hooks_from_ir(coding),
     );
     map.insert(
         "profiles/policy_ir.json".to_string(),

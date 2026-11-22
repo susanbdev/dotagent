@@ -53,7 +53,8 @@ dotagent/
 |   |       +-- bin/dotagent.rs     # Unified `dotagent` operator/fleet multicall CLI
 |   |       +-- bin/agent-guard-sh.rs # Drop-in POSIX `$SHELL` wrapper entrypoint
 |   |       +-- lib.rs              # Multi-harness lifecycle coordinator & repository auditor
-|   |       +-- cli.rs              # Shared CLI router (`pre-tool`, `post-tool`, `on-stop`, `mcp-gateway`, `fleet`)
+|   |       +-- antigravity_adapter.rs # Typed native Google Antigravity hook protocol adapter
+|   |       +-- cli.rs              # Shared CLI router (`pre-tool`, `post-tool`, `antigravity-hook`, `on-stop`, `mcp-gateway`, `fleet`)
 |   |       +-- operator.rs         # `activate`, `deactivate`, `doctor`, `elevate`, & TTY-gated `session-reset`
 |   |       +-- sudo_broker.rs      # Out-of-band human-TTY `sudo-request` / `approve` / `sudo-result` broker
 |   |       +-- fleet.rs            # Polyrepo `fleet <audit|doctor|sync|build-image|configure-github>` & SLSA `self-verify`

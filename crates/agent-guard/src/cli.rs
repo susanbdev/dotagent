@@ -90,6 +90,9 @@ pub fn run_cli_entrypoint() -> ExitCode {
         "verify-receipt" => crate::stop_receipt::run_verify_receipt_cli(&args[1..], &cwd),
         "receipt-pubkey" => crate::stop_receipt::run_receipt_pubkey_cli(&args[1..], &cwd),
         "mcp-gateway" => crate::mcp_gateway::run_mcp_gateway_cli(&args[1..], &cwd),
+        "antigravity-hook" => {
+            crate::antigravity_adapter::run_antigravity_hook_cli(&args[1..], &cwd)
+        }
         "pre-tool" => {
             let payload = match read_bounded_stdin_or_arg(&args[1..]) {
                 Ok(s) => s,

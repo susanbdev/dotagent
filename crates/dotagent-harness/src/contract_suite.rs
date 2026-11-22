@@ -142,7 +142,7 @@ fn run_single_wire_fixture(
     let mut cmd = Command::new(agent_guard_bin);
     sb.configure_isolated_command(&mut cmd);
     cmd.current_dir(&sb.repo_dir)
-        .arg(&fx.subcommand)
+        .args(fx.subcommand.split_whitespace())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -150,12 +150,15 @@ fn run_single_wire_fixture(
         cmd.env("AGENT_GUARD_PROFILE", prof);
     }
 
+    let rendered_stdin = fx
+        .stdin_json
+        .replace("{{REPO_ROOT}}", &sb.repo_dir.to_string_lossy());
     let mut child = cmd
         .spawn()
         .map_err(|e| format!("failed spawning agent-guard: {e}"))?;
     if let Some(mut stdin) = child.stdin.take() {
         stdin
-            .write_all(fx.stdin_json.as_bytes())
+            .write_all(rendered_stdin.as_bytes())
             .map_err(|e| format!("failed writing stdin: {e}"))?;
     }
     let out = child
