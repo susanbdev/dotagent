@@ -174,6 +174,10 @@ class RulesetTests(unittest.TestCase):
             self.api.requests,
         )
 
+        # GitHub supplies these default parameters even when the client omits them.
+        pull_request = next(rule for rule in record["rules"] if rule["type"] == "pull_request")
+        pull_request["parameters"]["required_reviewers"] = []
+        pull_request["parameters"]["require_extra_approval_for_unattributed_changes"] = False
         self.api.requests.clear()
         self.run_repo("--apply")
         self.assertEqual(self.api.writes, [])
@@ -273,6 +277,16 @@ class RulesetTests(unittest.TestCase):
                 else:
                     with self.assertRaisesRegex(rulesets.RulesetError, "lacks green trusted checks"):
                         rulesets.verify_pr_checks(api, args, endpoint, "main")
+
+    def test_repository_preflight_rejects_an_effective_merge_queue(self):
+        full_repo = f"{ORG}/dotagent"
+        args = rulesets.arguments(["--repo", full_repo, "--apply"])
+        api = Mock()
+        api.get.return_value = {"default_branch": "release/main", "allow_squash_merge": True}
+        api.items.return_value = [{"type": "merge_queue"}]
+        with self.assertRaisesRegex(rulesets.RulesetError, "needs merge_group"):
+            rulesets.verify_repo_readiness(api, args)
+        api.items.assert_called_once_with(f"repos/{full_repo}/rules/branches/release%2Fmain?per_page=100")
 
 
 if __name__ == "__main__":

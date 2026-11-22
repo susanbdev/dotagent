@@ -173,6 +173,7 @@ def canonical(value):
         return {
             key: canonical(item) for key, item in value.items()
             if not (key in ("parameters", "required_reviewers") and not item)
+            and not (key == "require_extra_approval_for_unattributed_changes" and item is False)
         }
     if isinstance(value, list):
         return sorted((canonical(item) for item in value), key=lambda item: json.dumps(item, sort_keys=True))
@@ -259,7 +260,7 @@ def verify_repo_readiness(api, args):
         raise RulesetError(f"{args.repo}: enable squash merges on an active repository before applying")
     if args.dotagent:
         default = details["default_branch"]
-        rules = api.get(f"{repo}/rules/branches/{quote(default, safe='')}")
+        rules = api.items(f"{repo}/rules/branches/{quote(default, safe='')}?per_page=100")
         if any(rule.get("type") == "merge_queue" for rule in rules):
             raise RulesetError(f"{args.repo}: the effective native merge queue needs merge_group checks")
         verify_pr_checks(api, args, repo, default)
