@@ -52,6 +52,9 @@ jobs:
           persist-credentials: false
           submodules: false
 
+      - name: Build the trusted Rust release verifier
+        run: cargo build --release --locked -p dotagent-compiler
+
       - name: Resolve a GitHub-verified annotated release request
         id: request
         shell: bash
@@ -81,8 +84,7 @@ jobs:
           git fetch --no-tags origin "${request_ref}"
           [[ "$(git rev-parse FETCH_HEAD)" == "${tag_object}" ]]
           git merge-base --is-ancestor "${target_commit}" "${GITHUB_SHA}"
-          version="$(git show "${target_commit}:Cargo.toml" | python3 -c \
-            'import sys,tomllib; print(tomllib.load(sys.stdin.buffer)["workspace"]["package"]["version"])')"
+          version="$(git show "${target_commit}:Cargo.toml" | target/release/dotagent-compiler release-version --manifest -)"
           [[ "${RELEASE_TAG}" == "v${version}" ]]
           if git show-ref --verify --quiet "${official_ref}"; then
             [[ "$(git rev-parse --verify "${official_ref}")" == "${tag_object}" ]]
@@ -175,6 +177,15 @@ jobs:
           verified="$(gh api "repos/${GITHUB_REPOSITORY}/git/tags/${ref#* }" --jq '.verification.verified')"
           test "${verified}" = "true"
 
+      - name: Install stable & MSRV 1.88.0 Rust toolchains
+        run: |
+          rustup toolchain install stable --profile minimal --component rustfmt,clippy
+          rustup toolchain install 1.88.0 --profile minimal
+          rustup default stable
+
+      - name: Build the Rust release verifier
+        run: cargo build --release --locked -p dotagent-compiler
+
       - name: Verify release tag matches Cargo.toml SemVer & descends from origin/main
         shell: bash
         env:
@@ -186,7 +197,7 @@ jobs:
             echo "UNMERGED_RELEASE_TAG_FORBIDDEN: ${TAG_SHA} is not an ancestor of origin/main" >&2
             exit 1
           fi
-          VER="$(python3 -c 'import re,sys,tomllib; v=tomllib.load(open("Cargo.toml","rb"))["workspace"]["package"]["version"]; assert re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?", v); print(v)')"
+          VER="$(target/release/dotagent-compiler release-version --manifest Cargo.toml)"
           EXPECTED_TAG="v${VER}"
           if [[ "${GITHUB_REF_NAME}" != "${EXPECTED_TAG}" ]]; then
             echo "TAG_VERSION_MISMATCH: tag '${GITHUB_REF_NAME}' != Cargo.toml '${EXPECTED_TAG}'" >&2
@@ -196,28 +207,17 @@ jobs:
       - name: Apply hardened global Git configuration
         run: cp dist/gitconfig.hardened ~/.gitconfig
 
-      - name: Install stable & MSRV 1.88.0 Rust toolchains
-        run: |
-          rustup toolchain install stable --profile minimal --component rustfmt,clippy
-          rustup toolchain install 1.88.0 --profile minimal
-          rustup default stable
-
       - name: Audit supply chain (SHA-256-pinned cargo-deny 0.22.0)
         shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          ARCHIVE="${RUNNER_TEMP}/cargo-deny-0.22.0-x86_64-unknown-linux-musl.tar.gz"
-          python3 - "${ARCHIVE}" <<'PY'
-          import hashlib, sys, urllib.request
-          url = "https://github.com/EmbarkStudios/cargo-deny/releases/download/0.22.0/cargo-deny-0.22.0-x86_64-unknown-linux-musl.tar.gz"
-          expected = "98c56e6a408bfa5c3c60744b6015aaa6aa08f743fdeb88386d06fca035bb1786"
-          data = urllib.request.urlopen(url, timeout=60).read()
-          actual = hashlib.sha256(data).hexdigest()
-          if actual != expected:
-              raise SystemExit(f"cargo-deny SHA-256 mismatch: expected {expected}, got {actual}")
-          with open(sys.argv[1], "wb") as fh:
-              fh.write(data)
-          PY
+          NAME="cargo-deny-0.22.0-x86_64-unknown-linux-musl.tar.gz"
+          ARCHIVE="${RUNNER_TEMP}/${NAME}"
+          gh release download 0.22.0 --repo EmbarkStudios/cargo-deny --pattern "${NAME}" --dir "${RUNNER_TEMP}"
+          target/release/dotagent-compiler verify-file-sha256 "${ARCHIVE}" \
+            98c56e6a408bfa5c3c60744b6015aaa6aa08f743fdeb88386d06fca035bb1786
           tar -xzf "${ARCHIVE}" -C "${RUNNER_TEMP}"
           "${RUNNER_TEMP}/cargo-deny-0.22.0-x86_64-unknown-linux-musl/cargo-deny" check advisories licenses bans sources
 
@@ -235,10 +235,8 @@ jobs:
           cargo run --release --locked -p dotagent-compiler -- verify .
           cargo run --release --locked -p agent-guard --bin dotagent -- audit-repo .
 
-      - name: Run packaging tests (installer, repackager, ceremony script)
-        run: |
-          python3 -B -m unittest discover -s tests/packaging -v
-          shellcheck packaging/install.sh.in scripts/sign-release-yk.sh scripts/activate-local.sh
+      - name: Check installer and ceremony scripts
+        run: shellcheck packaging/install.sh.in scripts/sign-release-yk.sh scripts/activate-local.sh
 
   build-archives:
     name: Build & Smoke-Test Archive (${{ matrix.target }})
@@ -312,6 +310,7 @@ jobs:
           CARGO_DIR="${CARGO_HOME:-$HOME/.cargo}"
           export RUSTFLAGS="--remap-path-prefix=${GITHUB_WORKSPACE}=/dotagent --remap-path-prefix=${CARGO_DIR}=/cargo"
           cargo build --release --locked --workspace --target "${MATRIX_TARGET}"
+          cargo build --release --locked -p dotagent-compiler
 
       - name: Package deterministic release archive & run sterile clean-room smoke test
         shell: bash
@@ -324,12 +323,13 @@ jobs:
           TAG="${GITHUB_REF_NAME}"
           PKG="dotagent-${TAG}-${MATRIX_TARGET}"
           OUT_TAR="release-out/${PKG}.tar.gz"
-          bash scripts/package-release-archive.sh \
+          target/release/dotagent-compiler package-release-archive --repo-root "${GITHUB_WORKSPACE}" \
             --target "${MATRIX_TARGET}" \
             --tag "${TAG}" \
             --out "${OUT_TAR}"
 
-          SMOKE_ARGS=(--archive "${OUT_TAR}" --expect-mode "${MATRIX_EXPECT_MODE}")
+          SMOKE_ARGS=(--archive "${OUT_TAR}" --expect-mode "${MATRIX_EXPECT_MODE}"
+            --compiler "${GITHUB_WORKSPACE}/target/release/dotagent-compiler" --target "${MATRIX_TARGET}" --tag "${TAG}")
           if [[ -n "${MATRIX_RUNNER_PREFIX}" ]]; then
             SMOKE_ARGS+=(--runner-prefix "${MATRIX_RUNNER_PREFIX}")
           fi
@@ -354,17 +354,13 @@ jobs:
             cd "${ALT_DIR}"
             export RUSTFLAGS="--remap-path-prefix=${ALT_DIR}=/dotagent --remap-path-prefix=${CARGO_DIR}=/cargo"
             cargo build --release --locked --workspace --target "${MATRIX_TARGET}"
-            bash scripts/package-release-archive.sh \
+            "${GITHUB_WORKSPACE}/target/release/dotagent-compiler" package-release-archive --repo-root "${ALT_DIR}" \
               --target "${MATRIX_TARGET}" \
               --tag "${TAG}" \
               --out "${RUNNER_TEMP}/alt-${PKG}.tar.gz"
           )
-          SHA_PRIMARY="$(sha256sum "release-out/${PKG}.tar.gz" | awk '{print $1}')"
-          SHA_ALT="$(sha256sum "${RUNNER_TEMP}/alt-${PKG}.tar.gz" | awk '{print $1}')"
-          if [[ "${SHA_PRIMARY}" != "${SHA_ALT}" ]]; then
-            echo "RELEASE_REPRODUCIBILITY_MISMATCH: ${SHA_PRIMARY} != ${SHA_ALT}" >&2
-            exit 1
-          fi
+          SHA_PRIMARY="$(target/release/dotagent-compiler hash-release-file "release-out/${PKG}.tar.gz")"
+          target/release/dotagent-compiler verify-file-sha256 "${RUNNER_TEMP}/alt-${PKG}.tar.gz" "${SHA_PRIMARY}"
 
       - name: Upload verified target archive artifact
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
@@ -388,16 +384,20 @@ jobs:
       - name: Download all target archives
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
+          pattern: archive-*
           path: archives
           merge-multiple: true
 
       - name: Install nfpm (module-proxy checksum verified, no curl)
         run: go install github.com/goreleaser/nfpm/v2/cmd/nfpm@v2.49.0
 
-      - name: Repackage without recompiling
+      - name: Build the Rust release packager
+        run: cargo build --release --locked -p dotagent-compiler
+
+      - name: Build publication assets from verified platform archives
         run: |
           set -euo pipefail
-          python3 -B packaging/repackage.py \
+          target/release/dotagent-compiler repackage-release \
             --archives archives \
             --tag "${GITHUB_REF_NAME}" \
             --signers packaging/release-signer.pub \
@@ -409,7 +409,19 @@ jobs:
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: release-extra
-          path: release-extra
+          path: |
+            release-extra/web/**
+            release-extra/brew/**
+            release-extra/pypi/**
+            release-extra/npm/**
+            release-extra/sys/**
+          if-no-files-found: error
+
+      - name: Upload immutable GitHub release bundle
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-bundle
+          path: release-extra/bundle/*
           if-no-files-found: error
 
   publish-attested-release:
@@ -439,27 +451,17 @@ jobs:
           git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main
           git merge-base --is-ancestor "${TAG_SHA}" refs/remotes/origin/main
 
-      - name: Download all smoke-tested target archives
+      - name: Download the immutable release bundle
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
-          pattern: archive-*
+          name: release-bundle
           path: release
-          merge-multiple: true
 
-      - name: Download repackaged assets
-        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
-        with:
-          name: release-extra
-          path: extra
-
-      - name: Assemble flat release directory and re-verify SHA256SUMS
+      - name: Verify the exact release asset set in Rust
         run: |
           set -euo pipefail
-          find extra -mindepth 2 -type f -exec cp -t release {} +
-          cp extra/SHA256SUMS release/SHA256SUMS
-          cd release
-          sha256sum -c SHA256SUMS
-          ls -1
+          cargo build --release --locked -p dotagent-compiler
+          target/release/dotagent-compiler verify-release-assets --assets release --sums release/SHA256SUMS
 
       - name: Generate SLSA build provenance attestation (every asset)
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
@@ -483,7 +485,7 @@ jobs:
     if: startsWith(github.ref, 'refs/tags/v')
     needs: publish-attested-release
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 10
+    timeout-minutes: 20
     permissions:
       contents: read
       attestations: read
@@ -496,6 +498,15 @@ jobs:
           - os: macos-15
             native_target: aarch64-apple-darwin
     steps:
+      - name: Check out the Rust release verifier
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          submodules: false
+
+      - name: Build the Rust release verifier
+        run: cargo build --release --locked -p dotagent-compiler
+
       - name: Verify SLSA attestations on all published assets & run dotagent self-verify
         shell: bash
         env:
@@ -507,11 +518,23 @@ jobs:
         run: |
           set -euo pipefail
           VERIFY_DIR="${RUNNER_TEMP}/post-release-verify"
-          mkdir -p "${VERIFY_DIR}/unpacked"
-          cd "${VERIFY_DIR}"
-
-          gh release download "${TAG}" --repo "${REPO_FULL}" -p "dotagent-${TAG}-*.tar.gz" -p "SHA256SUMS"
-          gh attestation verify "SHA256SUMS" --repo "${REPO_FULL}" --signer-workflow "${SIGNER_WF}" >/dev/null
+          ASSETS="${VERIFY_DIR}/assets"
+          COMPILER="${GITHUB_WORKSPACE}/target/release/dotagent-compiler"
+          mkdir -p "${ASSETS}"
+          gh release download "${TAG}" --repo "${REPO_FULL}" --pattern '*' --dir "${ASSETS}"
+          attest() {
+            gh attestation verify "$1" --repo "${REPO_FULL}" --signer-workflow "${SIGNER_WF}" \
+              --source-ref "${GITHUB_REF}" --source-digest "${GITHUB_SHA}" \
+              --cert-oidc-issuer https://token.actions.githubusercontent.com --format json
+          }
+          attest "${ASSETS}/SHA256SUMS" >/dev/null
+          "${COMPILER}" verify-release-assets --assets "${ASSETS}" --sums "${ASSETS}/SHA256SUMS"
+          for asset in "${ASSETS}"/*; do
+            case "${asset##*/}" in
+              SHA256SUMS|dotagent-"${TAG}"-*.tar.gz) ;;
+              *) attest "${asset}" >/dev/null ;;
+            esac
+          done
 
           ALL_TARGETS=(
             x86_64-unknown-linux-musl
@@ -519,51 +542,32 @@ jobs:
             aarch64-apple-darwin
             x86_64-apple-darwin
           )
-          for t in "${ALL_TARGETS[@]}"; do
-            f="dotagent-${TAG}-${t}.tar.gz"
-            [[ -f "${f}" ]] || { echo "MISSING_RELEASE_ASSET: ${f}" >&2; exit 1; }
-            gh attestation verify "${f}" --repo "${REPO_FULL}" --signer-workflow "${SIGNER_WF}" --format json > "attestation-${t}.json"
-          done
-
-          shasum -a 256 -c SHA256SUMS
-
           NATIVE_PKG="dotagent-${TAG}-${NATIVE_TARGET}"
-          tar -xzf "${NATIVE_PKG}.tar.gz" -C "${VERIFY_DIR}/unpacked"
+          "${COMPILER}" unpack-release-archive --archive "${ASSETS}/${NATIVE_PKG}.tar.gz" \
+            --target "${NATIVE_TARGET}" --tag "${TAG}" --out-dir "${VERIFY_DIR}/unpacked"
           DOTAGENT_BIN="${VERIFY_DIR}/unpacked/${NATIVE_PKG}/bin/dotagent"
 
           for t in "${ALL_TARGETS[@]}"; do
-            f="dotagent-${TAG}-${t}.tar.gz"
-            python3 - "attestation-${t}.json" "statement-${t}.json" <<'PY'
-          import base64, json, sys
-          bundles = json.load(open(sys.argv[1], "r", encoding="utf-8"))
-          assert isinstance(bundles, list) and len(bundles) >= 1 and isinstance(bundles[0], dict), "invalid attestation bundle"
-          b0 = bundles[0]
-          stmt = (b0.get("verificationResult") or {}).get("statement")
-          if not isinstance(stmt, dict):
-              dsse = (b0.get("bundle") or {}).get("dsseEnvelope") or b0.get("dsseEnvelope")
-              assert isinstance(dsse, dict) and isinstance(dsse.get("payload"), str), "missing dsseEnvelope payload"
-              stmt = json.loads(base64.b64decode(dsse["payload"]).decode("utf-8"))
-          assert isinstance(stmt, dict) and isinstance(stmt.get("subject"), list), "invalid SLSA statement"
-          with open(sys.argv[2], "w", encoding="utf-8") as out:
-              json.dump(stmt, out)
-          PY
+            f="${ASSETS}/dotagent-${TAG}-${t}.tar.gz"
+            bundle="${VERIFY_DIR}/attestation-${t}.json"
+            statement="${VERIFY_DIR}/statement-${t}.json"
+            attest "${f}" > "${bundle}"
+            "${COMPILER}" release-attestation-statement --bundle "${bundle}" --out "${statement}"
             "${DOTAGENT_BIN}" self-verify \
-              --sums "${VERIFY_DIR}/SHA256SUMS" \
-              --subject "${VERIFY_DIR}/${f}" \
-              --provenance "${VERIFY_DIR}/statement-${t}.json"
+              --sums "${ASSETS}/SHA256SUMS" --subject "${f}" --provenance "${statement}"
           done
 
-  publish-ghcr:
-    name: Publish OCI image (ghcr.io, provenance attested)
+  build-oci-image:
+    name: Build immutable multi-arch OCI image
     needs: publish-attested-release
     runs-on: ubuntu-latest
     timeout-minutes: 20
-    environment: release
     permissions:
       contents: read
-      packages: write
-      id-token: write
-      attestations: write
+      attestations: read
+    outputs:
+      archive_sha256: ${{ steps.build.outputs.archive_sha256 }}
+      image_digest: ${{ steps.build.outputs.image_digest }}
     steps:
       - name: Checkout tag (zero persisted credentials)
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -596,10 +600,17 @@ jobs:
       - name: Stage /opt/dotagent per architecture via dotagent fleet build-image
         run: |
           set -euo pipefail
+          cargo build --release --locked -p dotagent-compiler
           mkdir -p unpacked
-          for archive in archives/*.tar.gz; do tar -xzf "${archive}" -C unpacked --no-same-owner; done
           runner="unpacked/dotagent-${GITHUB_REF_NAME}-x86_64-unknown-linux-musl/bin/dotagent"
-          for pair in amd64:x86_64-unknown-linux-musl arm64:aarch64-unknown-linux-musl; do
+          platforms=(amd64:x86_64-unknown-linux-musl arm64:aarch64-unknown-linux-musl)
+          for pair in "${platforms[@]}"; do
+            target="${pair#*:}"
+            target/release/dotagent-compiler unpack-release-archive \
+              --archive "archives/dotagent-${GITHUB_REF_NAME}-${target}.tar.gz" \
+              --target "${target}" --tag "${GITHUB_REF_NAME}" --out-dir unpacked
+          done
+          for pair in "${platforms[@]}"; do
             arch="${pair%%:*}"
             root="unpacked/dotagent-${GITHUB_REF_NAME}-${pair#*:}"
             "${runner}" fleet build-image \
@@ -608,29 +619,80 @@ jobs:
               --bin-dir "${root}/bin"
           done
 
-      - name: Build and push multi-arch image
+      - name: Build and hash the OCI image before publication
         id: build
-        env:
-          GHCR_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          printf '%s' "${GHCR_TOKEN}" | docker login ghcr.io -u "${GITHUB_ACTOR}" --password-stdin
+          archive="${RUNNER_TEMP}/dotagent-image.tar"
           docker buildx create --name dotagent --driver docker-container --use
           docker buildx build \
             --file packaging/Containerfile.oci \
             --platform linux/amd64,linux/arm64 \
             --tag "ghcr.io/susanbdev/dotagent:${GITHUB_REF_NAME#v}" \
             --metadata-file build-metadata.json \
-            --push \
+            --output "type=oci,dest=${archive}" \
             oci-stage
-          digest="$(python3 -B -c 'import json; print(json.load(open("build-metadata.json"))["containerimage.digest"])')"
-          printf 'digest=%s\n' "${digest}" >> "${GITHUB_OUTPUT}"
+          archive_sha256="$(target/release/dotagent-compiler hash-release-file "${archive}")"
+          image_digest="$(target/release/dotagent-compiler release-oci-digest --metadata build-metadata.json)"
+          printf 'archive_sha256=%s\nimage_digest=%s\n' "${archive_sha256}" "${image_digest}" >> "${GITHUB_OUTPUT}"
+
+      - name: Upload immutable OCI image
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-oci-image
+          path: ${{ runner.temp }}/dotagent-image.tar
+          if-no-files-found: error
+
+  publish-ghcr:
+    name: Publish OCI image (ghcr.io, provenance attested)
+    needs: build-oci-image
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    environment: release
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    steps:
+      - name: Check out the Rust release verifier
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          submodules: false
+
+      - name: Download immutable OCI image
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release-oci-image
+          path: oci
+
+      - name: Prepare the Rust verifier and registry adapter
+        run: |
+          cargo build --release --locked -p dotagent-compiler
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends skopeo
+
+      - name: Verify and copy the OCI image without rebuilding
+        env:
+          GHCR_TOKEN: ${{ github.token }}
+          ARCHIVE_SHA256: ${{ needs.build-oci-image.outputs.archive_sha256 }}
+          IMAGE_DIGEST: ${{ needs.build-oci-image.outputs.image_digest }}
+        run: |
+          set -euo pipefail
+          target/release/dotagent-compiler verify-file-sha256 oci/dotagent-image.tar "${ARCHIVE_SHA256}"
+          image="docker://ghcr.io/susanbdev/dotagent:${GITHUB_REF_NAME#v}"
+          authfile="${RUNNER_TEMP}/ghcr-auth.json"
+          printf '%s' "${GHCR_TOKEN}" | skopeo login --authfile "${authfile}" --username "${GITHUB_ACTOR}" --password-stdin ghcr.io
+          skopeo copy --authfile "${authfile}" --all --preserve-digests "oci-archive:oci/dotagent-image.tar" "${image}"
+          skopeo inspect --authfile "${authfile}" --raw "${image}" > "${RUNNER_TEMP}/published-image.json"
+          target/release/dotagent-compiler verify-file-sha256 "${RUNNER_TEMP}/published-image.json" "${IMAGE_DIGEST#sha256:}"
 
       - name: Attest image provenance (pushed to registry)
         uses: actions/attest-build-provenance@c074443f1aee8d4aeeae555aebba3282517eb71b # v2
         with:
           subject-name: ghcr.io/susanbdev/dotagent
-          subject-digest: ${{ steps.build.outputs.digest }}
+          subject-digest: ${{ needs.build-oci-image.outputs.image_digest }}
           push-to-registry: true
 
   publish-pypi:
@@ -641,6 +703,7 @@ jobs:
     environment: release-pypi
     permissions:
       contents: read
+      attestations: read
       id-token: write
     steps:
       - name: Download repackaged assets
@@ -675,12 +738,22 @@ jobs:
     name: Publish packages to npm (Trusted Publishing + provenance)
     needs: publish-attested-release
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 20
     environment: release-npm
     permissions:
       contents: read
+      attestations: read
       id-token: write
     steps:
+      - name: Check out the Rust release verifier
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          submodules: false
+
+      - name: Build the Rust release verifier
+        run: cargo build --release --locked -p dotagent-compiler
+
       - name: Download repackaged assets
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
@@ -713,8 +786,10 @@ jobs:
           set -euo pipefail
           publish_new() {
             pkg="$1"
-            name="$(tar -xOzf "${pkg}" package/package.json | python3 -B -c 'import json,sys; print(json.load(sys.stdin)["name"])')"
-            version="$(tar -xOzf "${pkg}" package/package.json | python3 -B -c 'import json,sys; print(json.load(sys.stdin)["version"])')"
+            metadata="$(target/release/dotagent-compiler release-npm-metadata "${pkg}")"
+            mapfile -t fields <<< "${metadata}"
+            name="${fields[0]}"
+            version="${fields[1]}"
             if npm view "${name}@${version}" version >/dev/null 2>&1; then
               echo "skip ${name}@${version}: already published"
               return 0
@@ -732,6 +807,7 @@ jobs:
     environment: release-homebrew
     permissions:
       contents: read
+      attestations: read
     steps:
       - name: Download repackaged assets
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4

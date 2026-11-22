@@ -30,6 +30,7 @@ pub mod feedback;
 pub mod feedback_loop;
 pub mod fleet;
 pub mod github_governance;
+mod github_rulesets;
 pub mod injection_scan;
 pub mod json;
 pub mod kani_proofs;

@@ -16,7 +16,7 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 15
+    timeout-minutes: 25
     env:
       CARGO_TERM_COLOR: always
       GIT_CONFIG_NOSYSTEM: "1"
@@ -71,8 +71,6 @@ jobs:
 
       - name: Build release binaries, verify bundles, repo audit, StopReceipt, microbench, & sterile cleanroom tarball
         shell: bash
-        env:
-          MATRIX_EXPECT_MODE: ${{ matrix.expect_mode }}
         run: |
           cargo build --release --locked --workspace
           ./target/release/dotagent-compiler verify .
@@ -106,6 +104,73 @@ jobs:
           ./target/release/dotagent-harness bench --quick
           chmod -R u+w target/test-workspaces target/cleanroom-run-* 2>/dev/null || true
           rm -rf target/test-workspaces target/tbench-* target/cleanroom-run-* target/ci.receipt.json || true
+
+      - name: Build and verify macOS universal preview
+        if: runner.os == 'macOS' && github.event_name == 'push' && startsWith(github.ref, 'refs/heads/')
+        shell: bash
+        env:
+          OTHER_TARGET: ${{ runner.arch == 'ARM64' && 'x86_64-apple-darwin' || 'aarch64-apple-darwin' }}
+        run: |
+          set -euo pipefail
+          rustup target add "${OTHER_TARGET}"
+          cargo build --release --locked --workspace --target "${OTHER_TARGET}"
+          ./target/release/dotagent-compiler package-macos-preview \
+            --native ./target/release/dotagent \
+            --other "./target/${OTHER_TARGET}/release/dotagent" \
+            --commit "${GITHUB_SHA}" \
+            --out-dir "${RUNNER_TEMP}/dotagent-macos-preview"
+
+      - name: Exercise the official Rust archive path for both macOS architectures
+        if: runner.os == 'macOS' && github.event_name == 'push' && startsWith(github.ref, 'refs/heads/')
+        shell: bash
+        env:
+          OTHER_TARGET: ${{ runner.arch == 'ARM64' && 'x86_64-apple-darwin' || 'aarch64-apple-darwin' }}
+        run: |
+          set -euo pipefail
+          root="${RUNNER_TEMP}/macos-release-check"
+          mkdir -p "${root}"
+          git archive HEAD | tar -x -C "${root}"
+          compiler="${GITHUB_WORKSPACE}/target/release/dotagent-compiler"
+          native_target="$(rustc -vV | sed -n 's/^host: //p')"
+          if ! arch -x86_64 /usr/bin/true >/dev/null 2>&1; then
+            sudo softwareupdate --install-rosetta --agree-to-license
+          fi
+          for triple in "${native_target}" "${OTHER_TARGET}"; do
+            mkdir -p "${root}/target/${triple}/release"
+            for bin in dotagent agent-guard agent-guard-sh dotagent-compiler swarm-tool dotagent-harness; do
+              binary="${root}/target/${triple}/release/${bin}"
+              cp "target/${triple}/release/${bin}" "${binary}"
+              codesign --force --sign - --timestamp=none "${binary}"
+            done
+            pkg="dotagent-v0.0.0-ci-${triple}"
+            archive="${root}/${pkg}.tar.gz"
+            "${compiler}" package-release-archive --repo-root "${root}" --target "${triple}" --tag v0.0.0-ci --out "${archive}"
+            "${compiler}" package-release-archive --repo-root "${root}" --target "${triple}" --tag v0.0.0-ci --out "${root}/repro-${pkg}.tar.gz"
+            digest="$("${compiler}" hash-release-file "${archive}")"
+            "${compiler}" verify-file-sha256 "${root}/repro-${pkg}.tar.gz" "${digest}"
+            "${compiler}" unpack-release-archive --archive "${archive}" --target "${triple}" --tag v0.0.0-ci --out-dir "${root}/unpacked"
+            for bin in dotagent agent-guard agent-guard-sh dotagent-compiler swarm-tool dotagent-harness; do
+              codesign --verify --strict "${root}/unpacked/${pkg}/bin/${bin}"
+              cmp "${root}/target/${triple}/release/${bin}" "${root}/unpacked/${pkg}/bin/${bin}"
+            done
+            cpu="${triple%%-*}"
+            if [[ "${cpu}" == aarch64 ]]; then cpu=arm64; fi
+            arch "-${cpu}" "${root}/unpacked/${pkg}/bin/dotagent" --version
+            if [[ "${triple}" == x86_64-apple-darwin ]]; then
+              bash scripts/cleanroom-smoke-test.sh --archive "${archive}" --expect-mode seatbelt \
+                --runner-prefix 'arch -x86_64' --compiler "${compiler}" --target "${triple}" --tag v0.0.0-ci
+            fi
+            printf '%s  %s\n' "${digest}" "${pkg}.tar.gz"
+          done
+
+      - name: Upload macOS universal preview
+        if: runner.os == 'macOS' && github.event_name == 'push' && startsWith(github.ref, 'refs/heads/')
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: dotagent-macos-universal
+          path: ${{ runner.temp }}/dotagent-macos-preview/dotagent-macos-universal.tar.gz
+          if-no-files-found: error
+          retention-days: 7
 
   supply-chain-deny:
     name: Supply-Chain Advisory & License Gate (cargo-deny)

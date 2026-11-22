@@ -45,7 +45,10 @@ use crate::feedback::{
     current_host_spool_id, feedback_state_dir, is_ring0_constitutional_code, is_valid_cluster_key,
     load_verified_ballots,
 };
-use crate::github_governance::{DOTAGENT_REQUIRED_CHECKS, validate_github_ident};
+use crate::github_governance::{
+    COPILOT_GATE_CONTEXT as COPILOT_GATE_STATUS_CONTEXT, dotagent_required_checks,
+    validate_github_ident,
+};
 use crate::json::JsonValue;
 use crate::resolve_repo_root;
 use crate::ring0_ratchet::{validate_git_ref_arg, verify_ring0_ratchet};
@@ -3213,7 +3216,6 @@ fn wait_for_pr_ci_and_copilot(
     }
 }
 
-const COPILOT_GATE_STATUS_CONTEXT: &str = "Ring-0 & Copilot Gate";
 const COPILOT_GATE_AUX_CHECK_RUN: &str = "Evaluate Ring-0 & Copilot Gate Status";
 
 /// Polls until the required checks, including the `Ring-0 & Copilot Gate` commit status, are
@@ -3230,11 +3232,8 @@ fn wait_for_required_checks_green(
     let started = Instant::now();
     let is_dotagent_repo = repo.ends_with("/dotagent");
     let gate = if is_dotagent_repo {
-        format!(
-            "{} required checks ({})",
-            DOTAGENT_REQUIRED_CHECKS.len(),
-            DOTAGENT_REQUIRED_CHECKS.join(", ")
-        )
+        let checks: Vec<_> = dotagent_required_checks().collect();
+        format!("{} required checks ({})", checks.len(), checks.join(", "))
     } else {
         "required repository checks".to_string()
     };
@@ -3340,7 +3339,7 @@ fn evaluate_status_rollup(
     }
 
     if require_dotagent_checks {
-        for &req_name in DOTAGENT_REQUIRED_CHECKS {
+        for req_name in dotagent_required_checks() {
             if !include_copilot_gate && req_name == COPILOT_GATE_STATUS_CONTEXT {
                 continue;
             }

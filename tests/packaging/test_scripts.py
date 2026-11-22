@@ -162,8 +162,12 @@ class HygieneTests(unittest.TestCase):
         self.assertEqual(flow["permissions"], {"contents": "read"})
         for name in ("publish-pypi", "publish-npm", "publish-homebrew", "repackage-ecosystem"):
             self.assertNotIn("contents: write", str(flow["jobs"][name].get("permissions")), name)
-        self.assertEqual(flow["jobs"]["publish-pypi"]["permissions"], {"contents": "read", "id-token": "write"})
-        self.assertEqual(flow["jobs"]["publish-npm"]["permissions"], {"contents": "read", "id-token": "write"})
+        oidc_publish = {"contents": "read", "attestations": "read", "id-token": "write"}
+        for name in ("publish-pypi", "publish-npm"):
+            self.assertEqual(flow["jobs"][name]["permissions"], oidc_publish, name)
+        read_provenance = {"contents": "read", "attestations": "read"}
+        for name in ("publish-homebrew", "build-oci-image"):
+            self.assertEqual(flow["jobs"][name]["permissions"], read_provenance, name)
         self.assertNotIn("packages", flow["jobs"]["publish-pypi"]["permissions"])
 
     def test_every_publish_job_sits_behind_a_named_environment(self):
@@ -177,8 +181,9 @@ class HygieneTests(unittest.TestCase):
         self.assertEqual(jobs["build-archives"]["needs"], "verify-release-gate")
         self.assertEqual(jobs["repackage-ecosystem"]["needs"], "build-archives")
         self.assertEqual(jobs["publish-attested-release"]["needs"], "repackage-ecosystem")
-        for name in ("publish-ghcr", "publish-pypi", "publish-npm", "publish-homebrew"):
+        for name in ("build-oci-image", "publish-pypi", "publish-npm", "publish-homebrew"):
             self.assertEqual(jobs[name]["needs"], "publish-attested-release", name)
+        self.assertEqual(jobs["publish-ghcr"]["needs"], "build-oci-image")
         gate = "\n".join(str(step.get("run", "")) for step in jobs["verify-release-gate"]["steps"])
         self.assertIn("merge-base --is-ancestor", gate)
         self.assertIn("verification.verified", gate)
@@ -190,14 +195,24 @@ class HygieneTests(unittest.TestCase):
 
     def test_downstream_jobs_verify_provenance_before_using_assets(self):
         flow = self.load_workflow()
-        for name in ("publish-ghcr", "publish-pypi", "publish-npm", "publish-homebrew"):
+        for name in ("build-oci-image", "publish-pypi", "publish-npm", "publish-homebrew"):
             runs = [str(step.get("run", "")) for step in flow["jobs"][name]["steps"]]
             self.assertTrue(any("gh attestation verify" in run and "--source-digest" in run for run in runs), name)
 
     def test_multiarch_build_uses_a_container_builder(self):
         flow = self.load_workflow()
-        text = "\n".join(str(step.get("run", "")) for step in flow["jobs"]["publish-ghcr"]["steps"])
+        text = "\n".join(str(step.get("run", "")) for step in flow["jobs"]["build-oci-image"]["steps"])
         self.assertLess(text.index("buildx create --name dotagent --driver docker-container"), text.index("buildx build"))
+        self.assertIn("type=oci,dest=", text)
+        self.assertNotIn("--push", text)
+        steps = flow["jobs"]["publish-ghcr"]["steps"]
+        publish = "\n".join(str(step.get("run", "")) for step in steps)
+        verify = publish.index("verify-file-sha256 oci/dotagent-image.tar")
+        copy = publish.index("skopeo copy")
+        self.assertLess(verify, copy)
+        self.assertIn("--all --preserve-digests", publish)
+        self.assertNotIn("buildx build", publish)
+        self.assertTrue(any(step.get("with", {}).get("push-to-registry") for step in steps))
 
     def test_shellcheck_is_clean_when_available(self):
         if shutil.which("shellcheck") is None:

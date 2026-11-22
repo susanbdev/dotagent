@@ -103,6 +103,7 @@ pub fn run_cli_entrypoint() -> ExitCode {
         "activate" => crate::operator::run_activate_cli(&args[1..], &cwd),
         "deactivate" => crate::operator::run_deactivate_cli(&args[1..], &cwd),
         "fleet" => crate::fleet::run_fleet_cli(&args[1..], &cwd),
+        "github-rulesets" => crate::github_rulesets::run_cli(&args[1..]),
         "feedback" => crate::feedback::run_feedback_cli(&args[1..], &cwd),
         "verify-ring0-ratchet" => {
             crate::ring0_ratchet::run_verify_ring0_ratchet_cli(&args[1..], &cwd)
@@ -308,6 +309,7 @@ pub fn run_cli_entrypoint() -> ExitCode {
                  \x20 activate [--workspace <dir>] [--dry-run]  Non-destructive multi-harness activation & backups\n\
                  \x20 deactivate [--workspace <dir>]            Restore .dotagent.bak files & remove deployed plane\n\
                  \x20 fleet <audit|doctor|sync|build-image|configure-github>  Polyrepo sync, image builder, & GitHub Org rulesets\n\
+                 \x20 github-rulesets <scope> [--dry-run|--verify|--apply]   Manage GitHub rulesets\n\
                  \x20 feedback <submit|status|sync-github|run-loop>  Agent friction ballots, AgentPI stream, & autonomous loop\n\
                  \x20 verify-ring0-ratchet [--base origin/main] Verify Ring-0 immutability & monotonic bypass corpus\n\
                  \x20 telemetry <summary|top-denies|baseline|trace|rotate|export-otlp>  Human-TTY-only security analytics\n\

@@ -26,7 +26,7 @@ use crate::budget_guard::load_active_profile;
 use crate::crypto::{
     constant_time_eq_bytes, hex_decode_32, hex_decode_bytes, sha256_bytes, sha256_hex,
 };
-use crate::github_governance::{COPILOT_GATE_CONTEXT, DOTAGENT_REQUIRED_CHECKS, RATCHET_CHECK_RUN};
+use crate::github_governance::{COPILOT_GATE_CONTEXT, RATCHET_CHECK_RUN, dotagent_required_checks};
 use crate::json::JsonValue;
 use crate::{audit_repository, resolve_repo_root};
 
@@ -609,9 +609,7 @@ fn verify_bundle_rollout_provenance(bundle_root: &Path) -> Result<(), String> {
         }
     }
     // Both review gates run on the PR head. Require all remaining checks on the main push.
-    for req in DOTAGENT_REQUIRED_CHECKS
-        .iter()
-        .copied()
+    for req in dotagent_required_checks()
         .filter(|name| !matches!(*name, RATCHET_CHECK_RUN | COPILOT_GATE_CONTEXT))
     {
         match latest.get(req) {
