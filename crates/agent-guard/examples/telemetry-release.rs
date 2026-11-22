@@ -942,6 +942,51 @@ mod unix_harness {
             })?;
         }
 
+        // 1b. If BOTH `supervise-observations` AND `collect-observations` are `SIGSTOP`ped,
+        //     `HostTelemetry::drop` kills the entire supervisor process group so neither is orphaned!
+        {
+            let ws = TempWorkspace::create()?;
+            let mut host = ManagedProcess::spawn(
+                &[&cli],
+                &["hook-daemon", "--idle-secs", "1"],
+                &ws,
+                false,
+                false,
+            )?;
+            let address = ws.state.join("daemon/hook.sock");
+            until("daemon/hook.sock (both stopped)", || {
+                fs::symlink_metadata(&address).ok().map(|_| ())
+            })?;
+            let col_pid = until("collector_pid (both stopped)", || {
+                health(&ws.state)
+                    .get("collector_pid")
+                    .and_then(JsonValue::as_u64)
+                    .filter(|&pid| pid != 0)
+            })?;
+            let ps_out = Command::new("/bin/ps")
+                .args(["-o", "ppid=", "-p", &col_pid.to_string()])
+                .output()
+                .map_err(|e| format!("ps ppid: {e}"))?;
+            let sup_pid: u64 = String::from_utf8_lossy(&ps_out.stdout)
+                .trim()
+                .parse()
+                .map_err(|e| format!("parse supervisor ppid: {e}"))?;
+            if sup_pid > 1 && sup_pid != u64::from(host.pid()) {
+                let _ = signal_pid(sup_pid, "-STOP")?;
+            }
+            let _ = signal_pid(col_pid, "-STOP")?;
+            let exit_status = host.wait_watchdog()?;
+            if !exit_status.success() {
+                return Err(format!(
+                    "hook-daemon idle exit failed while supervisor+collector SIGSTOPped: {exit_status:?}"
+                ));
+            }
+            until(
+                "SIGSTOPped supervisor and collector both terminated",
+                || (!pid_alive(col_pid) && (sup_pid <= 1 || !pid_alive(sup_pid))).then_some(()),
+            )?;
+        }
+
         // 2. Deadlocked store worker (`deadlocked-owned`) exits within bounded finish window and cleans up socket/route!
         {
             let ws = TempWorkspace::create()?;

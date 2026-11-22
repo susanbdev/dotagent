@@ -491,6 +491,7 @@ impl Drop for HostTelemetry {
                     break;
                 }
                 if std::time::Instant::now() >= deadline {
+                    super::transport::kill_process_group(child.id());
                     let _ = child.kill();
                     let _ = child.wait();
                     break;
