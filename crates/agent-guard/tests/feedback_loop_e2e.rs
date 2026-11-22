@@ -1133,9 +1133,8 @@ fn signed_append_only_queue_credential_airlock_post_fix_copilot_and_two_strike_b
     // Write stateful mock `gh` supporting append-only issue comments, forged outsider comment injection,
     // the required checks, structural Copilot inline-comment reviews on commit 1 -> 0 inline comments on commit 2,
     // post-fresh-review stale thread resolution assertion, and squash-merge onto bare `origin/main`!
-    let required_checks = agent_guard::github_governance::DOTAGENT_REQUIRED_CHECKS
-        .iter()
-        .map(|name| JsonValue::Str((*name).to_string()))
+    let required_checks = agent_guard::github_governance::dotagent_required_checks()
+        .map(|name| JsonValue::Str(name.to_string()))
         .collect();
     fs::write(
         root.join("required_checks.json"),

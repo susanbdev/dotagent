@@ -171,12 +171,17 @@ EMPTY_JSON="$(cd "${FIXTURE_REPO}" && bash "${VERIFY_SCRIPT}" --base "${BASE_SHA
     || fail "empty diff should not be eligible_for_auto_enqueue: ${EMPTY_JSON}"
 echo "[test-delivery-scripts] ok 7 - empty diff fails closed by default and disables auto-enqueue"
 
-# Case 8: Verify setup-github-merge-queue.sh manifest & dry-run
+# Case 8: Verify the compatible App manifest and ruleset plan.
 MANIFEST_JSON="$(bash "${SETUP_MQ_SCRIPT}" --print-app-manifest)"
-python3 -c 'import json, sys; d = json.loads(sys.argv[1]); assert d["default_permissions"]["contents"] == "write" and d["default_permissions"]["pull_requests"] == "write"' "${MANIFEST_JSON}"
+python3 -c 'import json, sys; d = json.loads(sys.argv[1]); sys.exit(d["default_permissions"] != {"contents": "write", "metadata": "read"})' "${MANIFEST_JSON}"
 DRY_OUT="$(bash "${SETUP_MQ_SCRIPT}" --owner susanbdev --repo dotagent --promoter-app-id 123456 --dry-run)"
-[[ "${DRY_OUT}" == *"merge_queue"* && "${DRY_OUT}" == *"15368"* && "${DRY_OUT}" == *"dotagent-release-tags"* ]] \
-    || fail "dry-run missing merge_queue / integration_id / tag_ruleset payload"
-echo "[test-delivery-scripts] ok 8 - setup-github-merge-queue.sh manifest & dry-run validated"
+CANONICAL_OUT="$(python3 "${SCRIPT_DIR}/setup-github-rulesets.py" --repo susanbdev/dotagent --promoter-app-id 123456 --dry-run)"
+[[ "${DRY_OUT}" == "${CANONICAL_OUT}" ]] || fail "compatibility dry-run diverged from canonical plan"
+assert_exit_code 2 bash "${SETUP_MQ_SCRIPT}" --all-fleet --apply
+echo "[test-delivery-scripts] ok 8 - promoter App manifest and compatibility ruleset dry-run"
+
+# Case 9: Reconcile mock GitHub rulesets, including refusals and repeated apply.
+python3 -B "${SCRIPT_DIR}/test-github-rulesets.py"
+echo "[test-delivery-scripts] ok 9 - ruleset drift and idempotency"
 
 echo "[test-delivery-scripts] ALL TESTS PASSED"

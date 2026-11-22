@@ -134,4 +134,5 @@ cargo test --workspace --offline
 
 - Formal architecture, trust rings, key hierarchy, and kernel matrix: [THREAT_MODEL.md](THREAT_MODEL.md)
 - Vulnerability reporting and supported versions: [SECURITY.md](SECURITY.md)
+- GitHub repository and organization rulesets: [GitHub ruleset setup and drift checks](docs/GITHUB_RULESETS.md)
 - Release history: [CHANGELOG.md](CHANGELOG.md)

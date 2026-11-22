@@ -1,0 +1,9 @@
+Security Kernel & Harness (ubuntu-latest)
+Security Kernel & Harness (macos-latest)
+Supply-Chain Advisory & License Gate (cargo-deny)
+Container Cleanroom Matrix
+Dual-Directory Reproducibility Proof
+Kani Bounded Model Checking Proofs
+MSRV 1.88.0 Compatibility Gate
+Ring-0 Constitutional Ratchet
+Ring-0 & Copilot Gate

@@ -37,17 +37,11 @@ pub const RULESET_NAME: &str = "dotagent-zero-trust-main";
 pub(crate) const RATCHET_CHECK_RUN: &str = "Ring-0 Constitutional Ratchet";
 pub(crate) const COPILOT_GATE_CONTEXT: &str = "Ring-0 & Copilot Gate";
 
-pub const DOTAGENT_REQUIRED_CHECKS: &[&str] = &[
-    "Security Kernel & Harness (ubuntu-latest)",
-    "Security Kernel & Harness (macos-latest)",
-    "Supply-Chain Advisory & License Gate (cargo-deny)",
-    "Container Cleanroom Matrix",
-    "Dual-Directory Reproducibility Proof",
-    "Kani Bounded Model Checking Proofs",
-    "MSRV 1.88.0 Compatibility Gate",
-    RATCHET_CHECK_RUN,
-    COPILOT_GATE_CONTEXT,
-];
+const DOTAGENT_REQUIRED_CHECKS: &str = include_str!("../../../config/github-required-checks.txt");
+
+pub fn dotagent_required_checks() -> std::str::Lines<'static> {
+    DOTAGENT_REQUIRED_CHECKS.lines()
+}
 
 pub const GOVERNANCE_LABELS: &[(&str, &str, &str)] = &[
     (
@@ -943,10 +937,7 @@ fn discover_required_checks(
     default_branch: &str,
 ) -> Vec<String> {
     if repo_short == "dotagent" {
-        return DOTAGENT_REQUIRED_CHECKS
-            .iter()
-            .map(|s| (*s).to_string())
-            .collect();
+        return dotagent_required_checks().map(str::to_owned).collect();
     }
     if validate_url_safe_branch(default_branch).is_err() {
         return Vec::new();
@@ -1305,12 +1296,26 @@ mod tests {
     use super::*;
 
     #[test]
+    fn required_check_catalog_has_unique_names_and_both_review_gates() {
+        assert!(DOTAGENT_REQUIRED_CHECKS.ends_with('\n'));
+        assert!(!DOTAGENT_REQUIRED_CHECKS.contains('\r'));
+        let mut names = std::collections::BTreeSet::new();
+        for name in dotagent_required_checks() {
+            assert!(!name.is_empty() && name == name.trim());
+            assert!(!name.chars().any(char::is_control));
+            assert!(names.insert(name), "duplicate check name: {name}");
+        }
+        assert!(names.contains(RATCHET_CHECK_RUN));
+        assert!(names.contains(COPILOT_GATE_CONTEXT));
+    }
+
+    #[test]
     fn builds_required_check_non_bypass_ruleset_and_validates_identifiers() {
-        let checks: Vec<String> = DOTAGENT_REQUIRED_CHECKS
-            .iter()
-            .map(|s| (*s).to_string())
+        let checks: Vec<String> = dotagent_required_checks().map(str::to_owned).collect();
+        let checks_without_review: Vec<String> = dotagent_required_checks()
+            .filter(|name| *name != COPILOT_GATE_CONTEXT)
+            .map(str::to_owned)
             .collect();
-        assert_eq!(checks.len(), 9);
         let payload = build_main_ruleset_payload(&checks, true);
         let s = payload.to_json_string();
         assert!(s.contains(RULESET_NAME));
@@ -1323,12 +1328,13 @@ mod tests {
         let empty_fb = build_main_ruleset_payload(&[], false).to_json_string();
         assert!(empty_fb.contains("\"required_approving_review_count\":1"));
         // CI checks without any review gate still require a human approval.
-        let ci_only = build_main_ruleset_payload(&checks[..8], false).to_json_string();
+        let ci_only = build_main_ruleset_payload(&checks_without_review, false).to_json_string();
         assert!(ci_only.contains("\"required_approving_review_count\":1"));
         // The native Copilot rule alone never lowers the human approval floor.
         let copilot_only = build_main_ruleset_payload(&[], true).to_json_string();
         assert!(copilot_only.contains("\"required_approving_review_count\":1"));
-        let copilot_ci = build_main_ruleset_payload(&checks[..6], true).to_json_string();
+        let weak = build_main_ruleset_payload(&checks_without_review, true);
+        let copilot_ci = weak.to_json_string();
         assert!(copilot_ci.contains("\"required_approving_review_count\":1"));
         // With the gate check required, the floor is 0 and checks are pinned to Actions.
         assert!(s.contains("\"required_approving_review_count\":0"));
@@ -1336,7 +1342,6 @@ mod tests {
 
         // The payload written by --apply must verify with zero drift.
         assert!(ruleset_detail_drift(&payload, &checks).is_empty());
-        let weak = build_main_ruleset_payload(&checks[..6], true);
         let drift = ruleset_detail_drift(&weak, &checks);
         assert!(drift.iter().any(|d| d.contains("Ring-0 & Copilot Gate")));
         // An unpinned check (spoofable via the statuses API) is drift.
