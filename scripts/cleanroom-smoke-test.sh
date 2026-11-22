@@ -134,7 +134,13 @@ git -C "${SAMPLE_REPO}" commit -m "chore: cleanroom baseline" >/dev/null
 echo "[cleanroom-smoke] ok 2 - activate deployed harness configs & all 19 global git keys"
 
 # 3. Doctor & Sandbox Mode Parity
-DOCTOR_JSON="$(cd "${SAMPLE_REPO}" && run_bin "${DOTAGENT_DIR}/bin/dotagent" doctor --json "${SAMPLE_REPO}")"
+DOCTOR_ARGS=(doctor --json)
+if [[ "${EXPECT_MODE}" == "seccomp-only" ]]; then
+    # This container deliberately denies Landlock. Assert the exact fallback below.
+    DOCTOR_ARGS+=(--allow-degraded)
+fi
+DOCTOR_JSON="$(cd "${SAMPLE_REPO}" && run_bin "${DOTAGENT_DIR}/bin/dotagent" "${DOCTOR_ARGS[@]}" "${SAMPLE_REPO}")" \
+    || fail "doctor exited unsuccessfully: ${DOCTOR_JSON}"
 DOCTOR_COMPACT="$(printf '%s' "${DOCTOR_JSON}" | tr -d ' \n\r\t')"
 [[ "${DOCTOR_COMPACT}" == *'"healthy":true'* ]] || fail "doctor reported unhealthy: ${DOCTOR_JSON}"
 
@@ -152,9 +158,12 @@ case "${EXPECT_MODE}" in
         (cd "${SAMPLE_REPO}" && run_bin "${DOTAGENT_DIR}/bin/agent-guard" exec-sandbox --require-kernel -- "true") >/dev/null
         ;;
     seccomp-only)
+        [[ "${DOCTOR_JSON}" == *"mode=fallback-env-and-ast-only kernel_enforced=false"* ]] \
+            || fail "expected fallback-env-and-ast-only mode: ${DOCTOR_JSON}"
         rk_rc=0
-        (cd "${SAMPLE_REPO}" && run_bin "${DOTAGENT_DIR}/bin/agent-guard" exec-sandbox --require-kernel -- "true") >/dev/null 2>&1 || rk_rc=$?
-        [[ "${rk_rc}" -eq 2 ]] || fail "expected exec-sandbox --require-kernel exit 2 in seccomp-only mode, got ${rk_rc}"
+        RK_OUT="$(cd "${SAMPLE_REPO}" && run_bin "${DOTAGENT_DIR}/bin/agent-guard" exec-sandbox --require-kernel -- "true" 2>&1)" || rk_rc=$?
+        [[ "${rk_rc}" -eq 2 && "${RK_OUT}" == *"KERNEL_SANDBOX_UNAVAILABLE"* ]] \
+            || fail "expected kernel-sandbox denial in seccomp-only mode (rc=${rk_rc}, out=${RK_OUT})"
         (cd "${SAMPLE_REPO}" && run_bin "${DOTAGENT_DIR}/bin/agent-guard" exec-sandbox --deny-net -- "true") >/dev/null
         ;;
 esac
