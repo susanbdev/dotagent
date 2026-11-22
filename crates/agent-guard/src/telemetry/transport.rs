@@ -70,6 +70,9 @@ fn private_dir(owner: u32, create: bool) -> io::Result<PathBuf> {
 }
 
 fn socket_at<T>(dir: &Path, f: impl FnOnce(&Path) -> io::Result<T>) -> io::Result<T> {
+    if O_NOFOLLOW_FLAG == 0 {
+        return Err(io::Error::from(io::ErrorKind::Unsupported));
+    }
     let path = dir.join(SOCKET);
     if path.as_os_str().len() <= 95 {
         return f(&path);
@@ -117,6 +120,9 @@ fn route(dir: &Path, owner: u32) -> io::Result<[u8; ROUTE_BYTES]> {
     const NONBLOCK: i32 = 0o4000;
     #[cfg(not(target_os = "linux"))]
     const NONBLOCK: i32 = 4;
+    if O_NOFOLLOW_FLAG == 0 {
+        return Err(io::Error::from(io::ErrorKind::Unsupported));
+    }
     let mut file = OpenOptions::new()
         .read(true)
         .custom_flags(O_NOFOLLOW_FLAG | NONBLOCK)
@@ -199,7 +205,7 @@ impl Client {
     }
 }
 
-pub(super) fn active() -> bool {
+fn probe_peer_ready() -> bool {
     enabled()
         && CLIENT
             .try_lock()
@@ -212,13 +218,14 @@ pub(super) fn prepare_baseline() {
         return;
     }
     let deadline = Instant::now() + Duration::from_secs(2);
-    while !active() && Instant::now() < deadline {
+    while !probe_peer_ready() && Instant::now() < deadline {
         std::thread::park_timeout(Duration::from_millis(20));
     }
 }
 
-fn enabled() -> bool {
-    capture::host_capture_allowed()
+pub(super) fn enabled() -> bool {
+    O_NOFOLLOW_FLAG != 0
+        && capture::host_capture_allowed()
         && std::env::var_os("DOTAGENT_TELEMETRY").as_deref() != Some(std::ffi::OsStr::new("0"))
 }
 

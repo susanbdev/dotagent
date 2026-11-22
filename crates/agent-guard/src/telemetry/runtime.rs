@@ -484,7 +484,15 @@ impl Drop for HostTelemetry {
         if let Some(child) = &mut self.child {
             drop(child.stdin.take());
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
-            while matches!(child.try_wait(), Ok(None)) && std::time::Instant::now() < deadline {
+            loop {
+                if !matches!(child.try_wait(), Ok(None)) {
+                    break;
+                }
+                if std::time::Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    break;
+                }
                 std::thread::park_timeout(std::time::Duration::from_millis(5));
             }
         }
@@ -510,7 +518,7 @@ pub(crate) fn audit_active() -> bool {
     }
     #[cfg(unix)]
     {
-        super::transport::active()
+        super::transport::enabled()
     }
     #[cfg(not(unix))]
     {
