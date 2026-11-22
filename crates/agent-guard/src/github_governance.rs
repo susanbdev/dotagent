@@ -34,6 +34,9 @@ use crate::json::JsonValue;
 
 pub const RULESET_NAME: &str = "dotagent-zero-trust-main";
 
+pub(crate) const RATCHET_CHECK_RUN: &str = "Ring-0 Constitutional Ratchet";
+pub(crate) const COPILOT_GATE_CONTEXT: &str = "Ring-0 & Copilot Gate";
+
 pub const DOTAGENT_REQUIRED_CHECKS: &[&str] = &[
     "Security Kernel & Harness (ubuntu-latest)",
     "Security Kernel & Harness (macos-latest)",
@@ -42,8 +45,8 @@ pub const DOTAGENT_REQUIRED_CHECKS: &[&str] = &[
     "Dual-Directory Reproducibility Proof",
     "Kani Bounded Model Checking Proofs",
     "MSRV 1.88.0 Compatibility Gate",
-    "Ring-0 Constitutional Ratchet",
-    "Ring-0 & Copilot Gate",
+    RATCHET_CHECK_RUN,
+    COPILOT_GATE_CONTEXT,
 ];
 
 pub const GOVERNANCE_LABELS: &[(&str, &str, &str)] = &[
@@ -231,7 +234,6 @@ pub fn build_repo_merge_settings_payload() -> JsonValue {
     ])
 }
 
-const COPILOT_GATE_CONTEXT: &str = "Ring-0 & Copilot Gate";
 /// GitHub App id of GitHub Actions; required checks are pinned to it so that a token holding
 /// `statuses: write` cannot forge a green context from outside Actions.
 pub const GITHUB_ACTIONS_INTEGRATION_ID: u64 = 15368;
