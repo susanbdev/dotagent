@@ -20,9 +20,11 @@ use self::api::{
 const USAGE: &str = "Usage: dotagent github-rulesets (--repo OWNER/REPO | --org ORG)\n\
     [--include-repo NAME]... [--dry-run | --verify | --apply]\n\
     [--proof-pr NUMBER] [--promoter-app-id ID]\n\
+    dotagent github-rulesets --org OWNER --print-app-manifest\n\
     --dry-run     Print the desired rulesets offline (default)\n\
     --verify      Check GitHub for drift without writing\n\
-    --apply       Reconcile managed rulesets from a verified administrator's terminal";
+    --apply       Reconcile managed rulesets from a verified administrator's terminal\n\
+    --print-app-manifest  Print the release promoter App manifest offline";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Scope {
@@ -51,6 +53,7 @@ enum Mode {
     Plan,
     Verify,
     Apply,
+    Manifest,
 }
 
 #[derive(Debug)]
@@ -95,13 +98,14 @@ impl Args {
                         Scope::Org(value.to_string())
                     });
                 }
-                "--dry-run" | "--verify" | "--apply" => {
+                "--dry-run" | "--verify" | "--apply" | "--print-app-manifest" => {
                     if mode.is_some() {
                         return Err("choose at most one mode".to_string());
                     }
                     mode = Some(match flag {
                         "--verify" => Mode::Verify,
                         "--apply" => Mode::Apply,
+                        "--print-app-manifest" => Mode::Manifest,
                         _ => Mode::Plan,
                     });
                 }
@@ -142,6 +146,14 @@ impl Args {
             proof_pr,
             promoter_app_id,
         };
+        if args.mode == Mode::Manifest
+            && (!matches!(args.scope, Scope::Org(_))
+                || !args.include_repos.is_empty()
+                || args.proof_pr.is_some()
+                || args.promoter_app_id.is_some())
+        {
+            return Err("use --org OWNER --print-app-manifest without ruleset options".to_string());
+        }
         if !args.include_repos.is_empty() && !matches!(args.scope, Scope::Org(_)) {
             return Err("--include-repo requires --org".to_string());
         }
@@ -160,6 +172,32 @@ fn flag_value<'a>(args: &mut impl Iterator<Item = &'a str>, flag: &str) -> Resul
         .ok_or_else(|| format!("{flag} requires a value"))
 }
 
+fn promoter_app_manifest(owner: &str) -> JsonValue {
+    let repository = format!("{owner}/dotagent");
+    JsonValue::Object(vec![
+        ("name".into(), JsonValue::Str("dotagent-promoter".into())),
+        (
+            "url".into(),
+            JsonValue::Str(format!("https://github.com/{repository}")),
+        ),
+        (
+            "description".into(),
+            JsonValue::Str(format!(
+                "Promotes verified official release tags for {repository}"
+            )),
+        ),
+        ("public".into(), JsonValue::Bool(false)),
+        (
+            "default_permissions".into(),
+            JsonValue::Object(vec![
+                ("contents".into(), JsonValue::Str("write".into())),
+                ("metadata".into(), JsonValue::Str("read".into())),
+            ]),
+        ),
+        ("default_events".into(), JsonValue::Array(Vec::new())),
+    ])
+}
+
 pub(crate) fn run_cli(raw: &[String]) -> ExitCode {
     if matches!(raw, [arg] if matches!(arg.as_str(), "--help" | "-h")) {
         println!("{USAGE}");
@@ -167,6 +205,10 @@ pub(crate) fn run_cli(raw: &[String]) -> ExitCode {
     }
     let result = (|| {
         let args = Args::parse(raw)?;
+        if let (Mode::Manifest, Scope::Org(owner)) = (args.mode, &args.scope) {
+            println!("{}", promoter_app_manifest(owner).to_json_string());
+            return Ok(ExitCode::SUCCESS);
+        }
         let desired = policy::desired(&args)?;
         if args.mode == Mode::Plan {
             let plan = JsonValue::Object(vec![
@@ -897,8 +939,40 @@ mod tests {
             &["--repo", REPO, "--verify", "--apply"][..],
             &["--repo", REPO, "--promoter-app-id", "1"][..],
             &["--org", "fixture-org", "--include-repo", "Dotagent"][..],
+            &["--repo", REPO, "--print-app-manifest"][..],
+            &["--org", "owner/repo", "--print-app-manifest"][..],
+            &["--org", "fixture-org", "--print-app-manifest", "--apply"][..],
+            &[
+                "--org",
+                "fixture-org",
+                "--print-app-manifest",
+                "--include-repo",
+                "library",
+            ][..],
         ] {
             assert!(options(args).is_err(), "{args:?}");
         }
+    }
+
+    #[test]
+    fn manifest_uses_selected_owner_and_minimum_promoter_permissions() {
+        let args =
+            options(&["--org", "fixture-org", "--print-app-manifest"]).expect("manifest arguments");
+        assert_eq!(args.mode, Mode::Manifest);
+        let Scope::Org(owner) = args.scope else {
+            panic!("expected a manifest owner");
+        };
+        let expected = JsonValue::parse(
+            r#"{
+            "name":"dotagent-promoter",
+            "url":"https://github.com/fixture-org/dotagent",
+            "description":"Promotes verified official release tags for fixture-org/dotagent",
+            "public":false,
+            "default_permissions":{"contents":"write","metadata":"read"},
+            "default_events":[]
+        }"#,
+        )
+        .expect("manifest fixture");
+        assert_eq!(promoter_app_manifest(&owner), expected);
     }
 }

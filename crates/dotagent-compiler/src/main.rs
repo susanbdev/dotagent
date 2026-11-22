@@ -3,6 +3,10 @@
 //! `dotagent-compiler`: Deterministic multi-harness bundle compiler and SHA-256
 //! snapshot/policy verifier for `susanbdev/dotagent`.
 
+mod macos_preview;
+#[cfg(any(target_os = "macos", test))]
+mod preview_archive;
+
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::Read;
@@ -33,6 +37,7 @@ fn main() -> ExitCode {
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
 
     match sub {
+        "package-macos-preview" => macos_preview::run_cli(&args[1..]),
         "build" => match build_all(&repo_root) {
             Ok(count) => {
                 println!(
@@ -59,7 +64,10 @@ fn main() -> ExitCode {
             }
         },
         "--help" | "-h" | "help" => {
-            println!("Usage: dotagent-compiler <build|verify> [dotagent_repo_root]");
+            println!(
+                "Usage: dotagent-compiler <build|verify> [dotagent_repo_root]\n\
+                 Preview packaging: dotagent-compiler package-macos-preview --help"
+            );
             ExitCode::SUCCESS
         }
         "--version" | "-V" | "version" => {
@@ -68,7 +76,7 @@ fn main() -> ExitCode {
         }
         other => {
             eprintln!(
-                "[dotagent-compiler HARD DENY :: UNKNOWN_SUBCOMMAND] unrecognized subcommand '{other}' (expected build|verify|--help)"
+                "[dotagent-compiler HARD DENY :: UNKNOWN_SUBCOMMAND] unrecognized subcommand '{other}'"
             );
             ExitCode::from(2)
         }

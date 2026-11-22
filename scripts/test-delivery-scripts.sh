@@ -172,11 +172,19 @@ EMPTY_JSON="$(cd "${FIXTURE_REPO}" && bash "${VERIFY_SCRIPT}" --base "${BASE_SHA
 echo "[test-delivery-scripts] ok 7 - empty diff fails closed by default and disables auto-enqueue"
 
 # Case 8: Verify the compatible App manifest and ruleset plan.
-MANIFEST_JSON="$(bash "${SETUP_MQ_SCRIPT}" --print-app-manifest)"
-python3 -c 'import json, sys; d = json.loads(sys.argv[1]); sys.exit(d["default_permissions"] != {"contents": "write", "metadata": "read"})' "${MANIFEST_JSON}"
 RULESETS_BIN="${DOTAGENT_RULESETS_BIN:-${CARGO_TARGET_DIR:-${REPO_ROOT}/target}/release/dotagent}"
 [[ -x "${RULESETS_BIN}" ]] || fail "build the dotagent release binary or set DOTAGENT_RULESETS_BIN"
-DRY_OUT="$(PATH="$(dirname -- "${RULESETS_BIN}"):${PATH}" bash "${SETUP_MQ_SCRIPT}" --owner susanbdev --repo dotagent --promoter-app-id 123456 --dry-run)"
+RULESETS_BIN="$(cd "$(dirname -- "${RULESETS_BIN}")" && pwd)/$(basename -- "${RULESETS_BIN}")"
+mkdir -p "${TEST_ROOT}/bin"
+ln -s "${RULESETS_BIN}" "${TEST_ROOT}/bin/dotagent"
+WRAPPER_PATH="${TEST_ROOT}/bin:${PATH}"
+MANIFEST_JSON="$(PATH="${WRAPPER_PATH}" bash "${SETUP_MQ_SCRIPT}" --owner fixture-org --print-app-manifest)"
+NATIVE_MANIFEST="$("${RULESETS_BIN}" github-rulesets --org fixture-org --print-app-manifest)"
+[[ -n "${NATIVE_MANIFEST}" && "${MANIFEST_JSON}" == "${NATIVE_MANIFEST}" ]] \
+    || fail "compatibility manifest diverged from native manifest"
+assert_exit_code 2 env PATH="${WRAPPER_PATH}" bash "${SETUP_MQ_SCRIPT}" --owner 'invalid/owner' --print-app-manifest
+assert_exit_code 2 "${RULESETS_BIN}" github-rulesets --org 'invalid/owner' --print-app-manifest
+DRY_OUT="$(PATH="${WRAPPER_PATH}" bash "${SETUP_MQ_SCRIPT}" --owner susanbdev --repo dotagent --promoter-app-id 123456 --dry-run)"
 CANONICAL_OUT="$("${RULESETS_BIN}" github-rulesets --repo susanbdev/dotagent --promoter-app-id 123456 --dry-run)"
 [[ "${DRY_OUT}" == "${CANONICAL_OUT}" ]] || fail "compatibility dry-run diverged from canonical plan"
 assert_exit_code 2 bash "${SETUP_MQ_SCRIPT}" --all-fleet --apply

@@ -46,11 +46,11 @@ The repository ruleset pins these pull-request contexts to GitHub Actions. The r
 
 The first seven also run on pushes to `main`. The Ring-0 job evaluates PRs and branch pushes outside `main`. The server-side gate publishes the `Ring-0 & Copilot Gate` commit status on default-branch pull requests. Native merge queue requires `merge_group` coverage for required checks. Use the squash PR flow with the current workflows. [Guardrail CI](../.github/workflows/ci.yml) · [Review gate](../.github/workflows/copilot-gate.yml) · [GitHub merge queue](https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/configuring-pull-request-merges/managing-a-merge-queue)
 
-The compatibility script `scripts/setup-github-merge-queue.sh` keeps `--print-app-manifest` for offline GitHub App setup and delegates supported single-repository commands to `dotagent`. Use `dotagent github-rulesets --org` in place of the retired organization flags.
+The compatibility script `scripts/setup-github-merge-queue.sh` forwards supported single-repository commands and App manifest requests to `dotagent`. Generate the manifest offline with `dotagent github-rulesets --org OWNER --print-app-manifest`.
 
 ## macOS preview
 
-The macOS push CI job produces a short-lived `dotagent-macos-universal` Actions artifact for Apple silicon and Intel Macs. Its archive contains the ad-hoc signed `dotagent` Mach-O executable, its SHA-256 checksum, and the build revision. Download and extract the artifact, then run the offline plan with the extracted binary. [Guardrail CI](../.github/workflows/ci.yml)
+The macOS push CI job produces a short-lived `dotagent-macos-universal` Actions artifact for Apple silicon and Intel Macs. `dotagent-compiler package-macos-preview` validates the Mach-O inputs, invokes the macOS signing tools, checks the offline CLI, and writes the archive. The archive contains the ad-hoc signed `dotagent` executable, its SHA-256 checksum, and the build revision. [Guardrail CI](../.github/workflows/ci.yml)
 
 ```sh
 tar -xzf dotagent-macos-universal.tar.gz

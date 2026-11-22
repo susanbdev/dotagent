@@ -20,7 +20,9 @@ path = "src/main.rs"
 
 [dependencies]
 agent-guard = { path = "../agent-guard" }
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 regorus = { version = "0.10", default-features = false, features = ["std", "arc"] }
+tar = { version = "0.4", default-features = false }
 
 # `cargo binstall --git https://github.com/susanbdev/dotagent dotagent-compiler` downloads the attested release archive.
 [package.metadata.binstall]

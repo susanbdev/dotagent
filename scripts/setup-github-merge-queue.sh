@@ -22,39 +22,21 @@ while [[ $# -gt 0 ]]; do
             shift 2
             ;;
         --dry-run|--verify|--apply) args+=("$1"); shift ;;
-        --print-app-manifest) manifest=true; shift ;;
+        --print-app-manifest) manifest=true; args+=("$1"); shift ;;
         --all-fleet|--apply-org)
             printf '%s requires the organization entrypoint: dotagent github-rulesets --org ORG\n' "$1" >&2
             exit 2
             ;;
         -h|--help)
-            printf '%s\n' 'Compatibility entrypoint for single-repository rulesets.' \
-                'Use --print-app-manifest to print the release promoter manifest.' \
-                'Native merge-queue provisioning is retired until the required checks support merge_group.'
             exec dotagent github-rulesets --help
             ;;
         *) printf 'Unknown option %s\n' "$1" >&2; exit 2 ;;
     esac
 done
 
-if [[ "${manifest}" == true ]]; then
-    if [[ ! "${owner}" =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]{0,99}$ ]]; then
-        printf 'Invalid GitHub owner\n' >&2
-        exit 2
-    fi
-    cat <<MANIFEST
-{
-  "name": "dotagent-promoter",
-  "url": "https://github.com/${owner}/dotagent",
-  "description": "Promotes verified official release tags for ${owner}/dotagent",
-  "public": false,
-  "default_permissions": {"contents": "write", "metadata": "read"},
-  "default_events": []
-}
-MANIFEST
-    exit 0
-fi
-
 # The stock macOS Bash handles empty arrays under nounset via the + expansion.
+if [[ "${manifest}" == true ]]; then
+    exec dotagent github-rulesets --org "${owner}" ${args[@]+"${args[@]}"}
+fi
 exec dotagent github-rulesets --repo "${owner}/${repo}" \
     ${args[@]+"${args[@]}"}
