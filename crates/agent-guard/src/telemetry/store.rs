@@ -337,7 +337,8 @@ fn append_at(
 ) -> Result<Receipt, CaptureError> {
     prepare_parent(path)?;
     let start = Instant::now();
-    let _lock = ExclusiveFileLockGuard::acquire(path).map_err(|_| CaptureError::LockUnavailable)?;
+    let _lock = ExclusiveFileLockGuard::acquire_observation(path)
+        .map_err(|_| CaptureError::LockUnavailable)?;
     let writer_wait_us = u64::try_from(start.elapsed().as_micros()).unwrap_or(u64::MAX);
     let frame = encode_with_writer_wait(record, writer_wait_us)?;
     let mut file = match regular_metadata(path)? {
@@ -394,7 +395,8 @@ fn write_health(path: &Path, file: &mut File, torn: u64) -> Result<bool, Capture
 
 pub(crate) fn rotate_at(path: &Path, max_bytes: u64, keep: usize) -> Result<bool, CaptureError> {
     prepare_parent(path)?;
-    let _lock = ExclusiveFileLockGuard::acquire(path).map_err(|_| CaptureError::LockUnavailable)?;
+    let _lock = ExclusiveFileLockGuard::acquire_observation(path)
+        .map_err(|_| CaptureError::LockUnavailable)?;
     let Some(meta) = regular_metadata(path)? else {
         return Ok(false);
     };

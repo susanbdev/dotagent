@@ -1235,7 +1235,7 @@ fn gateway_tools_manifest() -> Vec<JsonValue> {
             (
                 "description".to_string(),
                 JsonValue::Str(
-                    "Submit kernel-grounded guardrail false-positive or workflow friction ballot (AgentPI emitted on stderr only)"
+                    "Submit a kernel-grounded guardrail false-positive or workflow friction ballot"
                         .to_string(),
                 ),
             ),

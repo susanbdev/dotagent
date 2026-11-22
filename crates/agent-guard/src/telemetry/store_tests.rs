@@ -3,7 +3,7 @@ use std::collections::BTreeSet;
 use std::io::BufReader;
 use std::process::{Command, Stdio};
 
-use crate::telemetry::{capture, diagnostics};
+use crate::telemetry::{capture, diagnostics, runtime};
 
 fn record(value: u64) -> JsonValue {
     JsonValue::Object(vec![("fixture".into(), JsonValue::Uint(value))])
@@ -64,6 +64,7 @@ impl TestState {
             .args(["--exact", "telemetry::store::tests::process_worker"])
             .env("AGENT_GUARD_STATE_DIR", &self.0)
             .env("DOTAGENT_STORE_TEST_CASE", mode)
+            .env_remove("DOTAGENT_TELEMETRY")
             .stdout(Stdio::null());
         command
     }
@@ -127,15 +128,36 @@ fn recovery_fixture_payload(reason: &'static str) -> capture::Payload {
 }
 
 fn append_recovery_fixture(reason: &'static str) {
-    let result = capture::emit_required(
+    let (_, record) = capture::encode(
         capture::Producer::Guard,
         &capture::Context::default(),
         recovery_fixture_payload(reason),
-    );
-    assert!(
-        matches!(result, capture::EmitResult::Persisted(_)),
-        "persist fixture {reason}"
-    );
+    )
+    .expect("encode recovery fixture");
+    let receipt = append(&record, Durability::Required).expect("persist recovery fixture");
+    assert!(receipt.durable, "persist fixture {reason}");
+}
+
+fn observe_fixture(mut invoke: impl FnMut(), visible: impl Fn() -> bool) {
+    use std::time::Duration;
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        invoke();
+        assert!(
+            runtime::wait_idle(deadline),
+            "fixture observations stayed queued"
+        );
+        if visible() {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "fixture observation remained unavailable"
+        );
+        // This fixture tolerates normal nonblocking admission contention.
+        std::thread::sleep(Duration::from_millis(1));
+    }
 }
 
 #[test]
@@ -448,12 +470,24 @@ fn process_worker() {
             append_recovery_fixture("FIXTURE_AFTER_ROTATION");
         }
         "post-tool" => {
+            runtime::start_global();
             let repo = std::env::var_os("DOTAGENT_STORE_TEST_REPO").expect("synthetic repo");
-            let decision = crate::handle_post_tool_hook(
-                r#"{"tool_name":"Read","tool_response":"ordinary fixture output"}"#,
-                Path::new(&repo),
+            observe_fixture(
+                || {
+                    let decision = crate::handle_post_tool_hook(
+                        r#"{"tool_name":"Read","tool_response":"ordinary fixture output"}"#,
+                        Path::new(&repo),
+                    );
+                    assert!(decision.is_allow(), "{decision:?}");
+                },
+                || {
+                    path.exists()
+                        && read_records(&path).iter().any(|record| {
+                            record.get("event_type").and_then(JsonValue::as_str)
+                                == Some("USAGE_AND_DISPOSITION")
+                        })
+                },
             );
-            assert!(decision.is_allow(), "{decision:?}");
         }
 
         "repair" => {
@@ -482,15 +516,20 @@ fn process_worker() {
             let repo = Path::new("/repository-fixture");
             let session = "session-fixture";
             let code = "FIXTURE_DENY";
-            append_audit_jsonl(
-                repo,
-                session,
-                "Bash",
-                code,
-                "unstructured fixture detail",
-                false,
+            runtime::start_global();
+            observe_fixture(
+                || {
+                    append_audit_jsonl(
+                        repo,
+                        session,
+                        "Bash",
+                        code,
+                        "unstructured fixture detail",
+                        false,
+                    )
+                },
+                || audit_log_has_session_denial(repo, session, code),
             );
-            assert!(audit_log_has_session_denial(repo, session, code));
             assert!(rotate_at(&path, 1, 1).expect("archive legacy record"));
             assert!(!audit_log_has_session_denial(repo, session, code));
 

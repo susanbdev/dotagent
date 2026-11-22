@@ -1268,6 +1268,10 @@ pub fn state_base_dir() -> PathBuf {
             return valid;
         }
     }
+    default_state_base_dir()
+}
+
+fn default_state_base_dir() -> PathBuf {
     if let Ok(home) = std::env::var("HOME") {
         return PathBuf::from(home)
             .join(".local")
@@ -1282,7 +1286,19 @@ pub fn state_base_dir() -> PathBuf {
 /// `AGENT_GUARD_STATE_DIR` override itself. Every auxiliary state tree (feedback spools, vaults,
 /// ratchet scratch) MUST live under this root so it inherits sandbox self-blindness.
 pub(crate) fn state_root_dir() -> PathBuf {
-    let base = state_base_dir();
+    root_from_state_base(state_base_dir())
+}
+
+/// Resolve the protected root without holding the session ledger's shared override cache.
+pub(crate) fn observation_state_root_dir() -> PathBuf {
+    let base = std::env::var("AGENT_GUARD_STATE_DIR")
+        .ok()
+        .and_then(|override_dir| validate_state_dir_override(&override_dir))
+        .unwrap_or_else(default_state_base_dir);
+    root_from_state_base(base)
+}
+
+fn root_from_state_base(base: PathBuf) -> PathBuf {
     if base.file_name().is_some_and(|n| n == "sessions")
         && let Some(parent) = base.parent()
     {
@@ -1292,13 +1308,7 @@ pub(crate) fn state_root_dir() -> PathBuf {
 }
 
 pub fn audit_log_path() -> PathBuf {
-    let base = state_base_dir();
-    if base.file_name().is_some_and(|n| n == "sessions") {
-        if let Some(parent) = base.parent() {
-            return parent.join("audit.jsonl");
-        }
-    }
-    base.join("audit.jsonl")
+    observation_state_root_dir().join("audit.jsonl")
 }
 
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
@@ -1491,7 +1501,7 @@ pub fn atomic_write_nonsymlink_state_file_opts(
     })
 }
 
-/// Appends the legacy audit fields through the protected local audit writer.
+/// Queues a best-effort legacy observation for the protected local audit writer.
 pub fn append_audit_jsonl(
     repo_root: &Path,
     session_id: &str,
@@ -1500,62 +1510,78 @@ pub fn append_audit_jsonl(
     detail: &str,
     halted: bool,
 ) {
+    use crate::telemetry::runtime::{note_invalid_audit, note_invalid_export, submit_audit_task};
     use crate::telemetry::store::{Durability, append};
 
+    const MAX_LEGACY_INPUT_BYTES: usize = 4096;
+    if repo_root.as_os_str().len() > MAX_LEGACY_INPUT_BYTES
+        || session_id.len() > MAX_LEGACY_INPUT_BYTES
+        || tool.len() > MAX_LEGACY_INPUT_BYTES
+    {
+        note_invalid_audit();
+        note_invalid_export();
+        return;
+    }
+    let code = audit_input_prefix(code, 512);
+    let detail = audit_input_prefix(detail, 960);
     let ts_secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .ok()
         .map(|d| d.as_secs());
-    let session_hash = compute_session_key_hash(repo_root, session_id);
-    let (safe_tool, _) = crate::feedback::scrub_high_entropy_and_secrets(tool, 64);
-    let code = audit_ascii(code, 128);
-    let record = JsonValue::Object(vec![
-        (
-            "ts".to_string(),
-            ts_secs.map_or(JsonValue::Null, JsonValue::Uint),
-        ),
-        (
-            "repo".to_string(),
-            JsonValue::Str(audit_ascii(&repo_root.to_string_lossy(), 4096)),
-        ),
-        (
-            "session_id".to_string(),
-            JsonValue::Str(sanitize_session_id(session_id)),
-        ),
-        (
-            "session_hash".to_string(),
-            JsonValue::Str(session_hash[..16].to_string()),
-        ),
-        ("tool".to_string(), JsonValue::Str(safe_tool)),
-        ("code".to_string(), JsonValue::Str(code.clone())),
-        ("halted".to_string(), JsonValue::Bool(halted)),
-        (
-            "detail".to_string(),
-            JsonValue::Str(if detail.is_empty() { "" } else { "[redacted]" }.to_string()),
-        ),
-    ]);
-    if let Err(error) = append(&record, Durability::Buffered) {
-        static REPORTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-        if !REPORTED.swap(true, Ordering::Relaxed) {
-            eprintln!("[DOTAGENT TELEMETRY] Local audit unavailable: {error}");
-        }
-    }
-
-    // Existing separately gated feedback behavior remains compatible with legacy callers.
     if let Some(ts_secs) = ts_secs {
         crate::feedback::record_guard_denial_agentpi_signal(
-            repo_root,
-            &session_hash[..16],
-            tool,
-            &code,
-            &audit_ascii(detail, 240),
-            halted,
-            ts_secs,
+            repo_root, session_id, tool, code, detail, halted, ts_secs,
         );
     }
+
+    let has_detail = !detail.is_empty();
+    let _ = submit_audit_task(|| {
+        let repo_root = repo_root.to_path_buf();
+        let session_id = session_id.to_owned();
+        let tool = tool.to_owned();
+        let code = code.to_owned();
+        move || {
+            let session_hash = compute_session_key_hash(&repo_root, &session_id);
+            let (safe_tool, _) = crate::feedback::scrub_high_entropy_and_secrets(&tool, 64);
+            let record = JsonValue::Object(vec![
+                (
+                    "ts".to_string(),
+                    ts_secs.map_or(JsonValue::Null, JsonValue::Uint),
+                ),
+                (
+                    "repo".to_string(),
+                    JsonValue::Str(audit_ascii(&repo_root.to_string_lossy(), 4096)),
+                ),
+                (
+                    "session_id".to_string(),
+                    JsonValue::Str(sanitize_session_id(&session_id)),
+                ),
+                (
+                    "session_hash".to_string(),
+                    JsonValue::Str(session_hash[..16].to_string()),
+                ),
+                ("tool".to_string(), JsonValue::Str(safe_tool)),
+                ("code".to_string(), JsonValue::Str(audit_ascii(&code, 128))),
+                ("halted".to_string(), JsonValue::Bool(halted)),
+                (
+                    "detail".to_string(),
+                    JsonValue::Str(if has_detail { "[redacted]" } else { "" }.to_string()),
+                ),
+            ]);
+            append(&record, Durability::Buffered).is_ok()
+        }
+    });
 }
 
-fn audit_ascii(raw: &str, max: usize) -> String {
+fn audit_input_prefix(raw: &str, max_bytes: usize) -> &str {
+    let mut end = raw.len().min(max_bytes);
+    while !raw.is_char_boundary(end) {
+        end -= 1;
+    }
+    &raw[..end]
+}
+
+pub(crate) fn audit_ascii(raw: &str, max: usize) -> String {
     raw.chars()
         .take(max)
         .map(|c| {
@@ -1569,7 +1595,7 @@ fn audit_ascii(raw: &str, max: usize) -> String {
 }
 
 /// Host/coordinator-only check for a recent legacy denial in the active audit file.
-/// Typed observations, incomplete frames, and rotated history cannot satisfy this check.
+/// Typed observations, incomplete frames, rotated history, and pending capture are excluded.
 pub fn audit_log_has_session_denial(
     repo_root: &Path,
     session_id: &str,
@@ -1584,7 +1610,7 @@ pub fn audit_log_has_session_denial(
         return false;
     }
     let path = audit_log_path();
-    let Ok(_lock) = ExclusiveFileLockGuard::acquire(&path) else {
+    let Ok(_lock) = ExclusiveFileLockGuard::acquire_observation(&path) else {
         return false;
     };
     let Ok(Some(mut file)) = open_audit_read(&path) else {

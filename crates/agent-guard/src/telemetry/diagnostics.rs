@@ -5,6 +5,8 @@ use std::io::{self, BufRead};
 
 use crate::json::JsonValue;
 
+use super::runtime_health;
+
 const MAX_BYTES_READ: u64 = 8 * 1024 * 1024;
 const MAX_RECORD_BYTES: usize = super::capture::MAX_RECORD_BYTES;
 const MAX_RECORDS: usize = 4_096;
@@ -85,6 +87,7 @@ struct Row {
     component: Option<String>,
     instance: Option<String>,
     sequence: Option<u64>,
+    observed_at_unix_ms: Option<u64>,
     duration_ns: Option<u64>,
     writer_wait_us: Option<u64>,
     elapsed_to_recovery_ns: Option<u64>,
@@ -115,6 +118,7 @@ struct Row {
     failed_appends: Option<u64>,
     torn_bytes: Option<u64>,
     expired_archives: Option<u64>,
+    runtime_snapshot: Option<JsonValue>,
 }
 
 fn text(fields: &JsonValue, key: &str) -> Option<String> {
@@ -202,12 +206,18 @@ impl Row {
             }
         }
 
+        let reason = text(result, "reason_code");
+        let runtime_snapshot = (kind == "CAPTURE_HEALTH"
+            && reason.as_deref() == Some(runtime_health::REASON))
+        .then(|| runtime_health::read(payload))
+        .flatten();
         Some(Self {
             id,
             kind,
             component: text(producer, "component"),
             instance: text(producer, "instance_id"),
             sequence: number(producer, "sequence"),
+            observed_at_unix_ms: number(timing, "observed_at_unix_ms"),
             duration_ns: number(timing, "duration_ns").or_else(|| number(payload, "duration_ns")),
             writer_wait_us: number(timing, "writer_wait_us"),
             elapsed_to_recovery_ns: number(payload, "elapsed_to_recovery_ns"),
@@ -246,10 +256,11 @@ impl Row {
                 .and_then(JsonValue::as_bool),
             assessment: text(payload, "assessment"),
             verification: text(trust, "verification"),
-            reason: text(result, "reason_code"),
+            reason,
             failed_appends: number(payload, "failed_appends"),
             torn_bytes: number(payload, "torn_bytes"),
             expired_archives: number(payload, "expired_archives"),
+            runtime_snapshot,
         })
     }
 
@@ -704,8 +715,64 @@ fn object<const N: usize>(pairs: [(&str, JsonValue); N]) -> JsonValue {
     JsonValue::Object(fields)
 }
 
+fn runtime_snapshots(rows: &[Row]) -> JsonValue {
+    let mut latest = BTreeMap::<&str, (u64, Option<u64>, &JsonValue)>::new();
+    let mut invalid = 0;
+    let mut omitted = 0;
+    for row in rows.iter().rev() {
+        if row.kind != "CAPTURE_HEALTH" || row.reason.as_deref() != Some(runtime_health::REASON) {
+            continue;
+        }
+        let (Some(instance), Some(sequence), Some(snapshot)) = (
+            row.instance.as_deref(),
+            row.sequence,
+            row.runtime_snapshot.as_ref(),
+        ) else {
+            invalid += 1;
+            continue;
+        };
+        if !row.authenticated
+            || row.origin.as_deref() != Some("trusted_capture")
+            || row.component.as_deref() != Some("agent-guard.audit")
+        {
+            invalid += 1;
+            continue;
+        }
+        let candidate = (sequence, row.observed_at_unix_ms, snapshot);
+        if let Some(previous) = latest.get_mut(instance) {
+            if sequence > previous.0 {
+                *previous = candidate;
+            }
+        } else if latest.len() < MAX_GROUPS {
+            latest.insert(instance, candidate);
+        } else {
+            omitted += 1;
+        }
+    }
+    let processes = latest
+        .into_iter()
+        .map(|(instance, (sequence, observed_at, snapshot))| {
+            object([
+                ("producer_instance_id", JsonValue::Str(instance.to_string())),
+                ("producer_sequence", JsonValue::Uint(sequence)),
+                (
+                    "observed_at_unix_ms",
+                    observed_at.map_or(JsonValue::Null, JsonValue::Uint),
+                ),
+                ("snapshot", snapshot.clone()),
+            ])
+        })
+        .collect();
+    object([
+        ("scope", JsonValue::Str("retained_input_window".to_string())),
+        ("processes", JsonValue::Array(processes)),
+        ("invalid_snapshots", JsonValue::Uint(invalid)),
+        ("omitted_snapshots", JsonValue::Uint(omitted)),
+    ])
+}
+
 /// Read only complete records from a bounded input window. The caller supplies the existing
-/// human-authorized reader or an in-memory fixture. Output contains no domain payload bodies.
+/// human-authorized reader or an in-memory fixture. Output contains selected diagnostic fields.
 pub(crate) fn analyze(reader: &mut impl BufRead, trace: Option<&str>) -> io::Result<JsonValue> {
     if trace.is_some_and(|trace| !super::capture::valid_id(trace)) {
         return Err(io::Error::new(
@@ -870,6 +937,7 @@ pub(crate) fn analyze(reader: &mut impl BufRead, trace: Option<&str>) -> io::Res
                 ),
             ]),
         ),
+        ("runtime_health", runtime_snapshots(&rows)),
         (
             "coverage",
             object([
@@ -992,6 +1060,90 @@ mod tests {
             node = node.get(key).unwrap_or_else(|| panic!("missing {key}"));
         }
         node
+    }
+
+    fn runtime_fixture(id: &str, instance: &str, sequence: u64, queued: u64) -> JsonValue {
+        let queue = object([
+            ("queued", JsonValue::Uint(queued)),
+            ("persisted", JsonValue::Uint(0)),
+            ("failed", JsonValue::Uint(0)),
+            ("full", JsonValue::Uint(0)),
+            ("contended", JsonValue::Uint(0)),
+            ("unavailable", JsonValue::Uint(0)),
+            ("closed", JsonValue::Uint(0)),
+            ("invalid", JsonValue::Uint(0)),
+        ]);
+        object([
+            ("schema_version", JsonValue::Uint(1)),
+            ("event_type", string("CAPTURE_HEALTH")),
+            ("event_id", string(id)),
+            (
+                "producer",
+                object([
+                    ("component", string("agent-guard.audit")),
+                    ("instance_id", string(instance)),
+                    ("sequence", JsonValue::Uint(sequence)),
+                ]),
+            ),
+            (
+                "trust",
+                object([
+                    ("origin", string("trusted_capture")),
+                    ("authentication", string("local_host_callsite")),
+                ]),
+            ),
+            (
+                "result",
+                object([
+                    ("reason_code", string(runtime_health::REASON)),
+                    ("completeness", string("complete")),
+                ]),
+            ),
+            (
+                "payload",
+                object([
+                    ("scope", string("process")),
+                    ("audit_queue", queue.clone()),
+                    ("export_queue", queue),
+                ]),
+            ),
+        ])
+    }
+
+    #[test]
+    fn runtime_health_reports_latest_snapshot_of_each_process_in_the_input_window() {
+        let mut malformed = runtime_fixture("bad", "process-c", 9, 88);
+        if let JsonValue::Object(fields) = &mut malformed {
+            fields.retain(|(key, _)| key != "payload");
+        }
+        let records = [
+            runtime_fixture("a-new", "process-a", 6, 7),
+            runtime_fixture("a-old", "process-a", 3, 2),
+            runtime_fixture("b", "process-b", 4, 100),
+            malformed,
+        ];
+        let raw = jsonl(&records);
+        let report = analyze(&mut Cursor::new(&raw), Some("different-trace")).unwrap();
+        let health = find(&report, &["runtime_health"]);
+        assert_eq!(find(health, &["invalid_snapshots"]).as_u64(), Some(1));
+        let processes = find(health, &["processes"]).as_array().unwrap();
+        assert_eq!(processes.len(), 2);
+        assert_eq!(
+            find(&processes[0], &["producer_instance_id"]).as_str(),
+            Some("process-a")
+        );
+        assert_eq!(
+            find(&processes[0], &["producer_sequence"]).as_u64(),
+            Some(6)
+        );
+        assert_eq!(
+            find(&processes[0], &["snapshot", "audit_queue", "queued"]).as_u64(),
+            Some(7)
+        );
+        assert_eq!(
+            find(&processes[1], &["snapshot", "export_queue", "queued"]).as_u64(),
+            Some(100)
+        );
     }
 
     #[test]

@@ -1,15 +1,14 @@
-//! Versioned observations written by host call sites. The wire format carries
+//! Versioned observations submitted by host call sites. The wire format carries
 //! provenance for interpretation and cannot authorize a state transition.
 
 use std::path::Path;
-use std::sync::OnceLock;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::crypto::sha256_hex;
 use crate::json::JsonValue;
 
-use super::store::{self, Durability};
+use super::runtime;
 
 pub(crate) const SCHEMA_VERSION: u64 = 1;
 pub(crate) const MAX_RECORD_BYTES: usize = 16 * 1024;
@@ -19,8 +18,7 @@ const MAX_PAYLOAD_FIELDS: usize = 48;
 const MAX_PAYLOAD_DEPTH: usize = 4;
 const MAX_PAYLOAD_NODES: usize = 192;
 static SEQUENCE: AtomicU64 = AtomicU64::new(0);
-static INSTANCE: OnceLock<String> = OnceLock::new();
-static DIAGNOSTIC_REPORTED: AtomicBool = AtomicBool::new(false);
+static INSTANCE_NANOS: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
@@ -182,6 +180,36 @@ impl Context {
             ..Self::default()
         }
     }
+
+    fn correlation_fields(&self) -> [(&'static str, Option<&str>); 5] {
+        [
+            ("trace_id", self.trace_id.as_deref()),
+            ("parent_event_id", self.parent_event_id.as_deref()),
+            ("execution_id", self.execution_id.as_deref()),
+            ("intervention_id", self.intervention_id.as_deref()),
+            ("source_event_id", self.source_event_id.as_deref()),
+        ]
+    }
+
+    fn work_fields(&self) -> [(&'static str, Option<&str>); 7] {
+        [
+            ("repo_id", self.repo_id.as_deref()),
+            ("session_id", self.session_id.as_deref()),
+            ("root_session_id", self.root_session_id.as_deref()),
+            ("plan_id", self.plan_id.as_deref()),
+            ("task_id", self.task_id.as_deref()),
+            ("allocating_parent_id", self.allocating_parent_id.as_deref()),
+            ("role", self.role.as_deref()),
+        ]
+    }
+
+    fn configuration_fields(&self) -> [(&'static str, Option<&str>); 3] {
+        [
+            ("policy_id", self.policy_id.as_deref()),
+            ("bundle_id", self.bundle_id.as_deref()),
+            ("profile_id", self.profile_id.as_deref()),
+        ]
+    }
 }
 
 #[derive(Debug)]
@@ -220,24 +248,14 @@ impl Payload {
     }
 }
 
-#[derive(Debug)]
-pub(crate) struct Receipt {
-    pub event_id: String,
-    pub storage: store::Receipt,
-}
-
-#[derive(Debug)]
-pub(crate) enum EmitResult {
-    Persisted(Receipt),
-    DroppedNoncritical(&'static str),
-    FailedRequiredEvidence(&'static str),
-}
-
 pub(crate) fn guard_context(
     repo: &Path,
     ledger: &crate::traversal_ledger::SessionLedger,
     profile_id: Option<&str>,
 ) -> Context {
+    if !runtime::audit_active() {
+        return Context::default();
+    }
     Context {
         trace_id: Some(next_local_id()),
         repo_id: Context::for_repo(repo).repo_id,
@@ -250,26 +268,13 @@ pub(crate) fn guard_context(
 }
 
 pub(crate) fn record_guard(context: &Context, payload: Payload) {
-    let _ = record_guard_event(context, payload);
+    let _ = runtime::submit_event(Producer::Guard, context, payload);
 }
 
 pub(crate) fn host_capture_allowed() -> bool {
     // A sandboxed process cannot opt in to host recording with hook input.
     std::env::var("AGENT_GUARD_IN_SANDBOX").as_deref() != Ok("1")
         && std::env::var("AGENT_GUARD_WORKER_LOCK").as_deref() != Ok("1")
-}
-
-fn record_guard_event(context: &Context, payload: Payload) -> Option<String> {
-    if !host_capture_allowed() {
-        return None;
-    }
-    match emit(Producer::Guard, context, payload) {
-        EmitResult::Persisted(receipt) => Some(receipt.event_id),
-        EmitResult::DroppedNoncritical(reason) | EmitResult::FailedRequiredEvidence(reason) => {
-            report_failure(reason);
-            None
-        }
-    }
 }
 
 pub(crate) fn intervention(context: &Context) -> Context {
@@ -280,7 +285,7 @@ pub(crate) fn intervention(context: &Context) -> Context {
 
 pub(crate) fn record_alert(context: &Context, alert: Payload, action: Payload) {
     let mut action_context = intervention(context);
-    action_context.parent_event_id = record_guard_event(context, alert);
+    action_context.parent_event_id = emit(Producer::Guard, context, alert);
     record_guard(&action_context, action);
 }
 
@@ -325,39 +330,10 @@ pub(crate) fn hook_decision(
     .with_result(action, reason_code, disposition)
 }
 
-pub(crate) fn emit(producer: Producer, context: &Context, payload: Payload) -> EmitResult {
-    emit_with_durability(producer, context, payload, Durability::Buffered)
-}
-
-pub(crate) fn emit_required(producer: Producer, context: &Context, payload: Payload) -> EmitResult {
-    emit_with_durability(producer, context, payload, Durability::Required)
-}
-
-fn emit_with_durability(
-    producer: Producer,
-    context: &Context,
-    payload: Payload,
-    durability: Durability,
-) -> EmitResult {
-    let outcome = encode(producer, context, payload).and_then(|(event_id, record)| {
-        store::append(&record, durability)
-            .map(|storage| Receipt { event_id, storage })
-            .map_err(|_| "AUDIT_APPEND_FAILED")
-    });
-    match outcome {
-        Ok(receipt) => EmitResult::Persisted(receipt),
-        Err(reason) => match durability {
-            Durability::Buffered => EmitResult::DroppedNoncritical(reason),
-            Durability::Required => EmitResult::FailedRequiredEvidence(reason),
-        },
-    }
-}
-
-pub(super) fn report_failure(reason: &'static str) {
-    if !DIAGNOSTIC_REPORTED.swap(true, Ordering::Relaxed) {
-        use std::io::Write;
-        let _ = writeln!(std::io::stderr().lock(), "[DOTAGENT CAPTURE] {reason}");
-    }
+/// Returns an event ID only after queue admission. The ID supports correlation while storage is
+/// pending, and a later record can refer to an event that never reaches the audit log.
+pub(crate) fn emit(producer: Producer, context: &Context, payload: Payload) -> Option<String> {
+    runtime::submit_event(producer, context, payload).map(EventIdentity::event_id)
 }
 
 pub(crate) fn unix_time_ms() -> Option<u64> {
@@ -365,26 +341,48 @@ pub(crate) fn unix_time_ms() -> Option<u64> {
     u64::try_from(elapsed.as_millis()).ok()
 }
 
-fn next_identity() -> (String, u64, String) {
-    let instance = INSTANCE.get_or_init(|| {
-        let created = SystemTime::now().duration_since(UNIX_EPOCH).ok();
-        // IDs are local labels. They are neither credentials nor authentication.
-        format!(
-            "{:x}-{:x}",
-            std::process::id(),
-            created.map_or(0, |duration| duration.as_nanos())
-        )
-    });
-    let sequence = SEQUENCE.fetch_add(1, Ordering::Relaxed) + 1;
-    (
-        instance.clone(),
-        sequence,
-        format!("{instance}-{sequence:x}"),
-    )
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct EventIdentity {
+    pid: u32,
+    created: u64,
+    sequence: u64,
+}
+
+impl EventIdentity {
+    fn instance_id(self) -> String {
+        format!("{:x}-{:x}", self.pid, self.created)
+    }
+
+    pub(crate) fn event_id(self) -> String {
+        format!("{:x}-{:x}-{:x}", self.pid, self.created, self.sequence)
+    }
+}
+
+fn next_identity() -> EventIdentity {
+    let mut created = INSTANCE_NANOS.load(Ordering::Relaxed);
+    if created == 0 {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .ok()
+            .and_then(|duration| u64::try_from(duration.as_nanos()).ok())
+            .unwrap_or(1)
+            .max(1);
+        created =
+            match INSTANCE_NANOS.compare_exchange(0, now, Ordering::Relaxed, Ordering::Relaxed) {
+                Ok(_) => now,
+                Err(existing) => existing,
+            };
+    }
+    // IDs are local labels. They are neither credentials nor authentication.
+    EventIdentity {
+        pid: std::process::id(),
+        created,
+        sequence: SEQUENCE.fetch_add(1, Ordering::Relaxed).wrapping_add(1),
+    }
 }
 
 pub(crate) fn next_local_id() -> String {
-    next_identity().2
+    next_identity().event_id()
 }
 
 pub(super) fn valid_id(value: &str) -> bool {
@@ -393,6 +391,101 @@ pub(super) fn valid_id(value: &str) -> bool {
         && value.bytes().all(|byte| {
             byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':' | b'/')
         })
+}
+
+fn context_identifiers(context: &Context) -> impl Iterator<Item = &str> {
+    context
+        .correlation_fields()
+        .into_iter()
+        .chain(context.work_fields())
+        .chain(context.configuration_fields())
+        .filter_map(|(_, value)| value)
+}
+
+fn bounded_payload_storage(value: &JsonValue, depth: usize, nodes: &mut usize) -> bool {
+    if depth > MAX_PAYLOAD_DEPTH || *nodes == MAX_PAYLOAD_NODES {
+        return false;
+    }
+    *nodes += 1;
+    match value {
+        JsonValue::Str(value) => {
+            value.len() <= MAX_ID_BYTES && value.capacity() <= MAX_ID_BYTES * 2
+        }
+        JsonValue::Array(items) => {
+            items.len() <= MAX_PAYLOAD_FIELDS
+                && items.capacity() <= MAX_PAYLOAD_FIELDS.next_power_of_two()
+                && items
+                    .iter()
+                    .all(|value| bounded_payload_storage(value, depth + 1, nodes))
+        }
+        JsonValue::Object(fields) => {
+            fields.len() <= MAX_PAYLOAD_FIELDS
+                && fields.capacity() <= MAX_PAYLOAD_FIELDS.next_power_of_two()
+                && fields.iter().all(|(name, value)| {
+                    name.len() <= MAX_ID_BYTES
+                        && name.capacity() <= MAX_ID_BYTES * 2
+                        && bounded_payload_storage(value, depth + 1, nodes)
+                })
+        }
+        _ => true,
+    }
+}
+
+/// Owned envelope inputs accepted by the telemetry queue. Construction bounds
+/// the retained allocation and captures the source sequence and wall time.
+#[derive(Debug)]
+pub(crate) struct EventDescriptor {
+    producer: Producer,
+    context: Context,
+    payload: Payload,
+    identity: EventIdentity,
+    observed_at_unix_ms: Option<u64>,
+}
+
+impl EventDescriptor {
+    /// The lane calls this only after reserving space and before releasing its
+    /// admission lock, so queued events retain source order under concurrency.
+    pub(crate) fn new(
+        producer: Producer,
+        context: &Context,
+        payload: Payload,
+    ) -> Result<(EventIdentity, Self), &'static str> {
+        if !producer.can_emit(payload.kind) {
+            return Err("DISALLOWED_EMITTER");
+        }
+        if !matches!(payload.body, JsonValue::Object(_))
+            || !bounded_payload_storage(&payload.body, 0, &mut 0)
+        {
+            return Err("INVALID_EVENT_PAYLOAD");
+        }
+        if context_identifiers(context).any(|value| value.len() > MAX_ID_BYTES)
+            || context.causal_links.len() > MAX_CAUSAL_LINKS
+        {
+            return Err("INVALID_CONTEXT");
+        }
+        if context
+            .causal_links
+            .iter()
+            .any(|link| link.event_id.len() > MAX_ID_BYTES)
+        {
+            return Err("INVALID_CAUSAL_LINK");
+        }
+        let identity = next_identity();
+        Ok((
+            identity,
+            Self {
+                producer,
+                context: context.clone(),
+                payload,
+                identity,
+                observed_at_unix_ms: unix_time_ms(),
+            },
+        ))
+    }
+
+    pub(crate) fn encode(self) -> Result<JsonValue, &'static str> {
+        encode_descriptor(self)
+    }
 }
 
 fn bounded_value(value: &JsonValue, depth: usize, nodes: &mut usize) -> bool {
@@ -455,49 +548,26 @@ pub(super) fn encode(
     context: &Context,
     payload: Payload,
 ) -> Result<(String, JsonValue), &'static str> {
-    if !producer.can_emit(payload.kind) {
-        return Err("DISALLOWED_EMITTER");
-    }
-    if !matches!(payload.body, JsonValue::Object(_))
-        || !bounded_value(&payload.body, 0, &mut 0)
+    let (identity, descriptor) = EventDescriptor::new(producer, context, payload)?;
+    Ok((identity.event_id(), descriptor.encode()?))
+}
+
+fn encode_descriptor(descriptor: EventDescriptor) -> Result<JsonValue, &'static str> {
+    let EventDescriptor {
+        producer,
+        context,
+        payload,
+        identity,
+        observed_at_unix_ms,
+    } = descriptor;
+    if !bounded_value(&payload.body, 0, &mut 0)
         || ![payload.action, payload.reason_code, payload.disposition]
             .into_iter()
             .all(valid_id)
     {
         return Err("INVALID_EVENT_PAYLOAD");
     }
-    let correlation_ids = [
-        ("trace_id", context.trace_id.as_deref()),
-        ("parent_event_id", context.parent_event_id.as_deref()),
-        ("execution_id", context.execution_id.as_deref()),
-        ("intervention_id", context.intervention_id.as_deref()),
-        ("source_event_id", context.source_event_id.as_deref()),
-    ];
-    let work_ids = [
-        ("repo_id", context.repo_id.as_deref()),
-        ("session_id", context.session_id.as_deref()),
-        ("root_session_id", context.root_session_id.as_deref()),
-        ("plan_id", context.plan_id.as_deref()),
-        ("task_id", context.task_id.as_deref()),
-        (
-            "allocating_parent_id",
-            context.allocating_parent_id.as_deref(),
-        ),
-        ("role", context.role.as_deref()),
-    ];
-    let config_ids = [
-        ("policy_id", context.policy_id.as_deref()),
-        ("bundle_id", context.bundle_id.as_deref()),
-        ("profile_id", context.profile_id.as_deref()),
-    ];
-    if correlation_ids
-        .iter()
-        .chain(&work_ids)
-        .chain(&config_ids)
-        .filter_map(|(_, id)| *id)
-        .any(|id| !valid_id(id))
-        || context.causal_links.len() > MAX_CAUSAL_LINKS
-    {
+    if context_identifiers(&context).any(|id| !valid_id(id)) {
         return Err("INVALID_CONTEXT");
     }
     let mut links = Vec::with_capacity(context.causal_links.len());
@@ -520,26 +590,24 @@ pub(super) fn encode(
             &[],
         ));
     }
-    let mut correlation = fields(&correlation_ids, &[]);
+    let mut correlation = fields(&context.correlation_fields(), &[]);
     if let JsonValue::Object(fields) = &mut correlation
         && !links.is_empty()
     {
         fields.push(("causal_links".into(), JsonValue::Array(links)));
     }
 
-    let (instance_id, sequence, event_id) = next_identity();
     let (component, origin, evidence, verification) = producer.metadata(payload.kind);
-    let observed = unix_time_ms();
     let record = object([
         ("schema_version", JsonValue::Uint(SCHEMA_VERSION)),
-        ("event_id", text(&event_id)),
+        ("event_id", JsonValue::Str(identity.event_id())),
         ("event_type", text(payload.kind.as_str())),
         (
             "producer",
             object([
                 ("component", text(component)),
-                ("instance_id", text(&instance_id)),
-                ("sequence", JsonValue::Uint(sequence)),
+                ("instance_id", JsonValue::Str(identity.instance_id())),
+                ("sequence", JsonValue::Uint(identity.sequence)),
             ]),
         ),
         (
@@ -548,7 +616,7 @@ pub(super) fn encode(
                 &[("clock", Some("system_wall_and_process_monotonic"))],
                 &[
                     ("occurred_at_unix_ms", context.occurred_at_unix_ms),
-                    ("observed_at_unix_ms", observed),
+                    ("observed_at_unix_ms", observed_at_unix_ms),
                     ("duration_ns", context.duration_ns),
                 ],
             ),
@@ -557,11 +625,14 @@ pub(super) fn encode(
         (
             "work",
             fields(
-                &work_ids,
+                &context.work_fields(),
                 &[("attempt", context.attempt), ("epoch", context.epoch)],
             ),
         ),
-        ("configuration", fields(&config_ids, &[])),
+        (
+            "configuration",
+            fields(&context.configuration_fields(), &[]),
+        ),
         (
             "trust",
             object([
@@ -593,7 +664,7 @@ pub(super) fn encode(
     if record.to_json_string().len() >= MAX_RECORD_BYTES {
         return Err("EVENT_TOO_LARGE");
     }
-    Ok((event_id, record))
+    Ok(record)
 }
 
 pub(super) fn capture_health_record(
@@ -625,6 +696,101 @@ pub(super) fn capture_health_record(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn descriptor_owns_the_admitted_identity_timing_and_causal_context() {
+        let mut context = Context {
+            trace_id: Some("trace-original".into()),
+            parent_event_id: Some("parent-original".into()),
+            causal_links: vec![CausalLink {
+                event_id: "related-original".into(),
+                relation: "responds_to",
+                method: "explicit",
+                algorithm_version: None,
+            }],
+            ..Context::default()
+        };
+        let (identity, descriptor) = EventDescriptor::new(
+            Producer::Guard,
+            &context,
+            Payload::new(
+                EventType::ControlDecision,
+                Completeness::Complete,
+                object([]),
+            ),
+        )
+        .unwrap();
+        let observed_at = descriptor.observed_at_unix_ms;
+        context.trace_id = None;
+        context.parent_event_id = None;
+        context.causal_links.clear();
+        drop(context);
+        let record = std::thread::spawn(move || descriptor.encode())
+            .join()
+            .unwrap()
+            .unwrap();
+        assert_eq!(record.get("event_id"), Some(&text(&identity.event_id())));
+        assert_eq!(
+            record.get("producer").unwrap().get("sequence"),
+            Some(&JsonValue::Uint(identity.sequence))
+        );
+        assert_eq!(
+            record
+                .get("timing")
+                .unwrap()
+                .get("observed_at_unix_ms")
+                .and_then(JsonValue::as_u64),
+            observed_at
+        );
+        let correlation = record.get("correlation").unwrap();
+        assert_eq!(correlation.get("trace_id"), Some(&text("trace-original")));
+        assert_eq!(
+            correlation.get("parent_event_id"),
+            Some(&text("parent-original"))
+        );
+        let links = correlation.get("causal_links").unwrap().as_array().unwrap();
+        assert_eq!(links[0].get("event_id"), Some(&text("related-original")));
+    }
+
+    #[test]
+    fn descriptor_bounds_allocations_and_worker_enforces_wire_limits() {
+        let context = Context::default();
+        let mut overallocated = String::with_capacity(MAX_ID_BYTES * 4);
+        overallocated.push_str("small");
+        let invalid_storage = Payload::new(
+            EventType::ControlDecision,
+            Completeness::Complete,
+            object([("detail", JsonValue::Str(overallocated))]),
+        );
+        assert_eq!(
+            EventDescriptor::new(Producer::Guard, &context, invalid_storage).unwrap_err(),
+            "INVALID_EVENT_PAYLOAD"
+        );
+
+        let wire_invalid = Payload::new(
+            EventType::ControlDecision,
+            Completeness::Complete,
+            object([("detail", text("a bounded string with spaces"))]),
+        );
+        let (_, descriptor) =
+            EventDescriptor::new(Producer::Guard, &context, wire_invalid).unwrap();
+        assert_eq!(descriptor.encode(), Err("INVALID_EVENT_PAYLOAD"));
+
+        let wire_large = Payload::new(
+            EventType::ControlDecision,
+            Completeness::Complete,
+            JsonValue::Object(
+                (0..47)
+                    .map(|index| {
+                        let value = text(&"x".repeat(MAX_ID_BYTES));
+                        (format!("values_{index}"), JsonValue::Array(vec![value; 3]))
+                    })
+                    .collect(),
+            ),
+        );
+        let (_, descriptor) = EventDescriptor::new(Producer::Guard, &context, wire_large).unwrap();
+        assert_eq!(descriptor.encode(), Err("EVENT_TOO_LARGE"));
+    }
 
     #[test]
     fn local_provenance_and_unknown_fields_round_trip() {

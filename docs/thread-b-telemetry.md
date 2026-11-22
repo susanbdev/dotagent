@@ -66,7 +66,44 @@ The writer uses the existing cross-process audit lock. The Unix state directory 
 
 The append path limits active files to a 10 MiB target with up to five numbered archives by default. Rotation reserves room for a bounded health record. Manual rotation shares the writer lock and allows up to 20 archives. Retention is size-based, so the earliest retained wall-clock time depends on event volume and rotation. Use the oldest retained observation and any gap indications when evaluating coverage. The newest recoverable incomplete suffix, at most one frame, is quarantined separately. A missing frame boundary beyond that limit produces a writer error. A pending quarantine allows restart to report the gap before finalizing recovery. Quarantine bytes are outside the diagnostic stream and carry unknown origin.
 
-The append API distinguishes `Persisted`, `DroppedNoncritical` and `FailedRequiredEvidence`. Buffered success acknowledges a complete write to the operating system. Required success includes a data sync and a directory sync on Unix. Failure is returned to the caller with a bounded operator diagnostic. A later successful write can persist a health record for available counters. Failed-write counters are process-local and can be lost when a writer terminates. Logging is synchronous and uses the bounded existing lock wait.
+Trusted hosts start two independent worker lanes before local evaluation. Each lane preallocates 128 queue slots and permits one job in flight. Producers and consumers try the queue lock once per attempt. Consumers retry on their own polling schedule. Full, closed, contended and unavailable lanes reject submissions before building a descriptor or cloning legacy and export inputs. Source sequences are assigned under the admission guard so concurrently admitted typed events from each producer persist in order. The worker validates and builds the wire envelope, serializes records, redacts legacy and export inputs, and performs sink I/O after releasing the queue lock. Set `DOTAGENT_TELEMETRY=0` before startup to disable both lanes.
+
+Call sites still construct bounded domain payloads, and successful admission copies bounded context and takes an observation timestamp. Some legacy and export descriptors allocate bounded owned input. Rejection can release an already constructed payload. Allocator and scheduler costs, as well as host thread creation at startup, affect wall-clock measurements. Submission has no wait for queue capacity, worker progress, I/O, or acknowledgement. No memory, file descriptor, or other handle into protected telemetry state is given to sandboxed workers.
+
+The audit worker writes typed and legacy observations through the protected local store. The independent export worker writes optional AgentPI projections, including guard, plugin and feedback-loop signals, to the existing protected mirror. Explicit feedback command results and MCP replies retain their result channels. `DOTAGENT_AGENTPI_STDERR` no longer enables optional stderr output. The human-authorized `telemetry export-otlp` command continues to read and render a local snapshot in a separate invocation.
+
+The session ledger, authenticated breadcrumbs, signed feedback ballots, coordinator transactions, work-ledger checkpoints and StopReceipts retain their own durability and decision rules. Use session-ledger evidence to ground feedback, checkpoint and permission decisions. The legacy audit lookup provides a best-effort view of the active observation file.
+
+### Delivery and shutdown
+
+| Status | Evidence |
+| --- | --- |
+| `admitted` | An owned descriptor or job was accepted into that process's queue. `queued` remains a compatibility alias. A source event ID can correlate an admitted event whose record never appears. |
+| `persisted` | The worker reported a successful sink operation. Buffered writes carry the sink's existing durability and provide no durable handoff acknowledgement. |
+| `failed` | A worker reported an encoding rejection or sink error for an admitted job. A sink error can follow a partial write. |
+| `dropped` | Admission rejected the submission as full, contended, unavailable, closed, or invalid. The cause counters remain visible. |
+| `pending` | The sampled difference between admissions and reported terminal outcomes. Jobs may be queued, executing, or abandoned after a worker stopped. |
+| `unconfirmed_at_exit` | Admitted work without retained outcome evidence when a process ends. Live samples report this value as unknown. An absent or zero-pending sample cannot establish complete delivery. |
+
+Closing stops admission and lets the workers drain as their sinks permit. The host can exit immediately. Process-scoped `CAPTURE_HEALTH` snapshots are partial and may sample either active or closing workers. They can omit recent completions, disappear on sink failure, or never be produced. Shutdown and restart neither replay pending jobs nor reconcile counters across process instances. Missing observations can reflect disabled capture, unavailable collectors, admission drops, worker failure, process exit, rotation, or reader limits.
+
+In an unwinding build a telemetry worker panic stops its lane, records the panic and worker exit in memory, and leaves accepted work without a reported outcome pending. Future admissions report unavailable. The other lane remains independent. Worker panics are process-fatal in the existing `panic = "abort"` release build. Thread isolation covers sink errors and stalls. Containing a release abort requires moving telemetry processing to a separate process.
+
+Telemetry sink locks and in-process lock registries are separate from the authoritative journals. Authoritative storage retains its existing failure behavior for a shared-volume outage. Capture results have no role in security state transitions.
+
+### Producer lifetimes
+
+| Producer | Lifetime and coverage |
+| --- | --- |
+| CLI pre- and post-tool hooks | Opt-in hot routing evaluates the hook and captures its observations inside the existing host hook daemon. The CLI starts local workers only for local evaluation. Local fallback is one-shot. |
+| CLI pre-compact and safe reads | One process per invocation. Queued work may remain unconfirmed at exit. |
+| Shell wrapper and operator baseline | One process per invocation. The last mediator or prerequisite observations can still be pending when it returns. |
+| MCP gateway | Client-owned stdio session. The gateway can exit at EOF with queued or in-flight records. |
+| Hook daemon and coordinator | Existing idle-bounded host processes. Their own observations can outlive individual requests. |
+| Feedback and plugin projections | Follow the host that observed the action. Coordinator-mediated ballots use the coordinator's export lane after the signed journal write. |
+| Sandbox and locked worker processes | Telemetry lanes are unavailable. |
+
+The existing host hook socket carries authoritative request-and-reply evaluations. A useful independently owned collector for one-shot routes needs a pre-provisioned bounded one-way transport, authenticated host provenance, validated descriptor frames, and restart coverage. The worker-capable coordinator socket remains scoped to its authority operations. Independent collector transport and release panic isolation belong in a separate follow-up because the present host routes cannot supply those properties. Until that work lands, short-lived routes remain best effort and delivery at exit is unconfirmed.
 
 Payload construction uses allowlisted command shapes, names and metrics before serialization. Treat raw prompts, source, shell strings, arbitrary arguments, environment and output as sensitive input. Secret-derived hashes can be reversible for low-entropy values. Use a bounded reference to a retained authorized artifact when available. Character sanitization serves output hygiene. It cannot establish that emitted data is free of secrets.
 
@@ -78,9 +115,9 @@ To extract the contract into a shared Rust component, move the envelope types, p
 
 ### Operator diagnostics
 
-From the repository directory, an authorized operator can run `dotagent telemetry baseline` to record individual observations for `HEAD`, local `main`, cached `origin/main` and working-tree status. Add `--include-review-fixes` to check cached `origin/v2-1-review-fixes` before status. The fixed checks run through the existing sandbox mediator with kernel enforcement required, network denied and read-only access. Status includes changes to recorded submodule commits while ignoring nested submodule dirtiness. The baseline exits unsuccessfully if a prerequisite cannot be established or its record cannot be persisted. Each check has one 10-second monotonic deadline for output collection and the mediator wait. On a timeout, the host attempts to stop the outer mediator process group and records whether it reaped the direct child. Nested execution remains unavailable on this route. Remote freshness is outside this route. Operator signature requirements apply when configured.
+From the repository directory, an authorized operator can run `dotagent telemetry baseline` to record individual observations for `HEAD`, local `main`, cached `origin/main` and working-tree status. Add `--include-review-fixes` to check cached `origin/v2-1-review-fixes` before status. The fixed checks run through the existing sandbox mediator with kernel enforcement required, network denied and read-only access. Status includes changes to recorded submodule commits while ignoring nested submodule dirtiness. The baseline exit status reflects the prerequisite checks. Each check also reports `capture_queued` or `capture_dropped`. Queue admission supplies correlation IDs while persistence is pending. Each check has one 10-second monotonic deadline for output collection and the mediator wait. On a timeout, the host attempts to stop the outer mediator process group and records whether it reaped the direct child. Nested execution remains unavailable on this route. Remote freshness is outside this route. Operator signature requirements apply when configured.
 
-Use `dotagent telemetry trace` for aggregated observations from the beginning of the active file, up to 8 MiB or 4,096 records. Archives are outside this query window. `dotagent telemetry trace --trace-id ID` adds up to 256 rows from a trace and its connected observations. The report includes control settings, interventions, outcomes where linked, truncation and continuation, detector dispositions, storage health and explicit coverage counters. It limits each grouping to 128 keys with overflow counts. A missing or unreadable active file produces an unavailable result. A launch without its observed finish is incomplete in the queried window. Missing predecessor events can reflect earlier rotation. The writer-wait aggregate reports the observed sample count and total microseconds, with a null total when no sample is present. Event durations are reported separately and can overlap.
+Use `dotagent telemetry trace` for aggregated observations from the beginning of the active file, up to 8 MiB or 4,096 records. Archives are outside this query window. `dotagent telemetry trace --trace-id ID` adds up to 256 rows from a trace and its connected observations. The report includes control settings, interventions, outcomes where linked, truncation and continuation, detector dispositions, storage health and explicit coverage counters. It includes up to 128 latest process-scoped runtime snapshots from the retained window, with explicit omitted or invalid snapshot counts. It limits each grouping to 128 keys with overflow counts. A missing or unreadable active file produces an unavailable result. A launch without its observed finish is incomplete in the queried window. Missing predecessor events can reflect earlier rotation. The writer-wait aggregate reports the observed sample count and total microseconds, with a null total when no sample is present. Event durations are reported separately and can overlap.
 
 ## Execution ledger
 
@@ -175,7 +212,7 @@ The integration applies the telemetry and host-wrapper commits on top of `e30d3a
 
 The wrapper omits command text and streams from telemetry. The fixed Git baseline reports the actual static policy denial when linked worktree metadata is unsupported. Its command-policy fixture uses standalone repository metadata.
 
-### Current integration verification
+### Phase 0 integration verification
 
 | Check | Result |
 | --- | --- |
@@ -191,3 +228,60 @@ The wrapper omits command text and streams from telemetry. The fixed Git baselin
 | Native Antigravity | Unverified. The workspace has no connected authenticated runtime. |
 
 Release promotion and hardware signer rotation remain blocked pending independent verification of the existing [release signing requirements](RELEASE_SIGNING.md).
+
+## Nonblocking verification
+
+### Initial implementation at `650205b`
+
+The runtime tests hold a telemetry writer behind a barrier while queue admission, a production PostToolUse decision and shutdown return. Other fixtures hold the real audit-file lock, hold the queue admission mutex, fill the queue, provide an invalid audit destination, and start the hook without a collector. The independent export lane can stall while audit jobs complete. The audit worker counts both injected `EIO` and a Linux `ENOSPC` write to `/dev/full`, then completes another job. A live MCP fixture verifies a successful JSON-RPC ballot result and delivery to the AgentPI mirror. The disk fixture isolates the telemetry write. A failure on a volume that also hosts authoritative state remains subject to the security journals' existing rules.
+
+The telemetry suite passed 45 tests, with three opt-in benchmarks. The FIFO isolation test, MCP fixtures, checkpoint identity and scratch fixtures, webfont fixture, workspace compilation, strict workspace Clippy, and all 58 compiler artifact checks passed. Workspace test compilation covered all 26 test executables. The behavioral run covered the focused suites listed here.
+
+Run the release benchmark on Linux.
+
+```sh
+cargo test -p agent-guard --release --lib --offline --locked \
+  telemetry::runtime::tests::measures_ -- --test-threads=1 --ignored --nocapture
+```
+
+The policy benchmark runs with a no-op sink and drains the enabled lane between batches outside the timed region. The PostToolUse benchmark runs the production hook in separate processes, alternates the order of enabled and disabled modes, discards warmup observations and excludes process startup. The full-queue measurements hold the worker until sampling ends. Admission includes the job wrapper and single try-lock attempt. Wall-clock measurements depend on the host and scheduler.
+
+Linux x86-64 release measurements used Rust 1.100.0 and 2,048 samples per row. Both enabled hook runs persisted every queued observation, including warmup.
+
+| Measurement | p50 | p95 | p99 | Maximum observed |
+| --- | ---: | ---: | ---: | ---: |
+| Guard policy, telemetry disabled | 451 ns | 541 ns | 1,422 ns | 84,868 ns |
+| Guard policy, telemetry enabled | 581 ns | 671 ns | 1,882 ns | 50,255 ns |
+| Guard policy, queue full | 471 ns | 641 ns | 1,883 ns | 43,826 ns |
+| Successful admission alone | 30 ns | 40 ns | 80 ns | 311 ns |
+| Full-queue drop alone | 30 ns | 31 ns | 60 ns | 311 ns |
+| PostToolUse, telemetry disabled | 166.940 µs | 265.799 µs | 318.568 µs | 1,065.199 µs |
+| PostToolUse, telemetry enabled | 183.035 µs | 278.298 µs | 362.354 µs | 1,350.057 µs |
+| Difference between PostToolUse quantiles | +16.095 µs | +12.499 µs | +43.786 µs | — |
+
+### PR #23 remediation
+
+Three causes drove the remediation. Process-owned queues share the lifetime of their producer, so local hooks could exit after admission and before persistence. The emitter previously built and serialized the complete envelope before the queue had a slot, and assigned event sequence before concurrent admission order was known. A worker that unwound could leave its lane marked running, and health snapshots did not express the unknown outcomes at process exit.
+
+| File under `crates/agent-guard/src` | Changed behavior |
+| --- | --- |
+| `telemetry/capture.rs` | `guard_context`, `record_guard`, `emit`, `EventDescriptor::new`, `EventDescriptor::encode`, and the shared `encode` path separate bounded capture from wire encoding and preserve source identity. |
+| `telemetry/runtime.rs` | `Lane::try_admit`, `Lane::submit_with`, `submit_event`, `submit_audit_task` and `submit_export` defer owned snapshot creation until admission. `worker_entry` and `run_worker` expose lane termination and keep queue operations off sink locks. |
+| `telemetry/runtime_health.rs` | `publish` and `read` add partial delivery accounting with legacy snapshot compatibility. |
+| `cli.rs`, `telemetry/observations.rs` | `run_cli_entrypoint` and `eval_hook_preferring_hot_coord` start local workers only for local pre/post evaluation. `ShellMediatorObservation::new` checks available capture before constructing wrapper context. |
+| `traversal_ledger.rs`, `feedback.rs` | `append_audit_jsonl`, `record_guard_denial_agentpi_signal`, and the mirror portion of `commit_ballot_on_host_redacted` defer optional copies until admission. |
+| `feedback_loop.rs`, `plugin_lattice.rs` | `run_worktree_adversarial_copilot_and_merge` and `apply_pre_tool_plugin_lattice` defer constructing their optional export jobs until admission. |
+| `telemetry/runtime_tests.rs` | Adds process exit and restart, concurrent correlation, independent lane panic, full-queue factory, shutdown accounting, and authority isolation fixtures. The production hook test compares both allow and deny outcomes across failure conditions. |
+
+On Linux, 53 focused telemetry tests passed with three benchmarks ignored by default. The tests exercised a real held audit lock, rejection of a file with unsafe permissions, injected `EIO`, and a Linux `/dev/full` write returning `ENOSPC`. A subprocess exited with a pending record and the next process started fresh and wrote its own event. Two stalled telemetry lanes left a halted session journal persisted and an authoritative write failure still returned `STATE_WRITE_ERROR`. Signed ballot append and error propagation precede the optional mirror admission. Checkpoint, receipt and supervisor implementations remain separate from capture.
+
+The optimized benchmark used Rust 1.100.0 on Linux x86-64 with an AMD EPYC 9V74 and five visible CPUs. Each row has 2,048 measured PostToolUse invocations, with two processes per mode and 64 warmup invocations per process. The second round reverses the mode order. The timed interval includes the production hook and excludes process startup. Disabled and unavailable both run without lanes, reached through explicit disablement and absence of runtime startup, respectively. The saturated case holds the worker and fills all slots before measurement. Both enabled processes persisted all their admitted observations after warmup and measurement.
+
+| PostToolUse mode | p50 (us) | p95 (us) | p99 (us) | Maximum (us) |
+| --- | ---: | ---: | ---: | ---: |
+| Disabled | 168.613 | 254.712 | 362.303 | 1,985.549 |
+| Enabled | 199.519 | 328.312 | 438.057 | 1,384.156 |
+| Saturated | 177.417 | 277.707 | 368.733 | 725.439 |
+| Unavailable | 172.228 | 298.548 | 693.400 | 2,078.779 |
+
+The initial enabled run measured 183.035, 278.298 and 362.354 us at p50, p95 and p99. The remediation's enabled quantiles were higher in this run. Its disabled p99 also increased. These runs differ in mode ordering and reflect scheduler and filesystem variation. They establish the observed distribution under each fixture and leave performance improvement unverified. The fixture tests supply the evidence for sink independence.

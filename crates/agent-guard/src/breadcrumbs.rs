@@ -28,7 +28,7 @@ use crate::json::JsonValue;
 use crate::swarm_contracts::{
     AUTH_EVENT_SCHEMA_V1, AuthenticatedEvent, EventOp, hex_decode_32, hex_encode,
 };
-use crate::traversal_ledger::state_base_dir;
+use crate::traversal_ledger::{observation_state_root_dir, state_base_dir, state_root_dir};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SignedBreadcrumbRecord {
@@ -250,13 +250,11 @@ pub fn swarm_state_dir(repo_root: &Path) -> Result<PathBuf, String> {
 /// Out-of-repo lock directory (`~/.local/state/agent-guard/locks`) so exclusive file locks
 /// never create or unlink transient `.lock` files inside Landlocked repository directories.
 pub fn swarm_locks_dir() -> Result<PathBuf, String> {
-    let base = state_base_dir();
-    let parent = if base.file_name().is_some_and(|n| n == "sessions") {
-        base.parent().unwrap_or(&base).to_path_buf()
-    } else {
-        base
-    };
-    let dir = parent.join("locks");
+    locks_dir_under(&state_root_dir())
+}
+
+fn locks_dir_under(state_root: &Path) -> Result<PathBuf, String> {
+    let dir = state_root.join("locks");
     if !dir.is_dir() {
         fs::create_dir_all(&dir)
             .map_err(|e| format!("failed creating swarm locks dir '{}': {e}", dir.display()))?;
@@ -1374,9 +1372,13 @@ impl Drop for InProcFifoGuard {
     }
 }
 
-fn in_proc_fifo_queue(lock_path: &Path) -> Arc<FifoWaiterQueue> {
-    static QUEUES: OnceLock<Mutex<BTreeMap<PathBuf, Arc<FifoWaiterQueue>>>> = OnceLock::new();
-    let map_mu = QUEUES.get_or_init(|| Mutex::new(BTreeMap::new()));
+type FifoRegistry = OnceLock<Mutex<BTreeMap<PathBuf, Arc<FifoWaiterQueue>>>>;
+
+static AUTHORITY_FIFOS: FifoRegistry = OnceLock::new();
+static OBSERVATION_FIFOS: FifoRegistry = OnceLock::new();
+
+fn in_proc_fifo_queue(registry: &FifoRegistry, lock_path: &Path) -> Arc<FifoWaiterQueue> {
+    let map_mu = registry.get_or_init(|| Mutex::new(BTreeMap::new()));
     let mut map = map_mu.lock().unwrap_or_else(|e| e.into_inner());
     Arc::clone(map.entry(lock_path.to_path_buf()).or_insert_with(|| {
         Arc::new(FifoWaiterQueue {
@@ -1392,10 +1394,11 @@ fn in_proc_fifo_queue(lock_path: &Path) -> Arc<FifoWaiterQueue> {
 }
 
 fn acquire_in_proc_fifo(
+    registry: &FifoRegistry,
     lock_path: &Path,
     deadline: Instant,
 ) -> Result<(InProcFifoGuard, bool), String> {
-    let queue = in_proc_fifo_queue(lock_path);
+    let queue = in_proc_fifo_queue(registry, lock_path);
     let mut st = queue.mu.lock().unwrap_or_else(|e| e.into_inner());
     if !st.locked && st.waiters.is_empty() {
         st.locked = true;
@@ -1442,7 +1445,20 @@ pub struct ExclusiveFileLockGuard {
 
 impl ExclusiveFileLockGuard {
     pub fn acquire(target_path: &Path) -> Result<Self, String> {
-        let locks_dir = swarm_locks_dir()?;
+        Self::acquire_in(target_path, swarm_locks_dir()?, &AUTHORITY_FIFOS)
+    }
+
+    /// Preserve the on-disk lock protocol with independent in-process observation waiters.
+    pub(crate) fn acquire_observation(target_path: &Path) -> Result<Self, String> {
+        let locks_dir = locks_dir_under(&observation_state_root_dir())?;
+        Self::acquire_in(target_path, locks_dir, &OBSERVATION_FIFOS)
+    }
+
+    fn acquire_in(
+        target_path: &Path,
+        locks_dir: PathBuf,
+        registry: &FifoRegistry,
+    ) -> Result<Self, String> {
         let norm = match target_path.parent().and_then(|p| fs::canonicalize(p).ok()) {
             Some(canon_parent) => match target_path.file_name() {
                 Some(fname) => canon_parent.join(fname),
@@ -1456,7 +1472,7 @@ impl ExclusiveFileLockGuard {
         let started = Instant::now();
         let deadline = started + Duration::from_secs(3);
 
-        let (in_proc, hot_reacquire) = acquire_in_proc_fifo(&lock_path, deadline)?;
+        let (in_proc, hot_reacquire) = acquire_in_proc_fifo(registry, &lock_path, deadline)?;
         if hot_reacquire && fs::symlink_metadata(&want_path).is_ok() {
             // Another OS process is actively waiting on this lock: yield long enough for its
             // sub-millisecond seniority poll to win `create_new` cleanly (preventing process hogging).
@@ -2002,5 +2018,22 @@ fn set_file_0600(path: &Path) {
     {
         use std::os::unix::fs::PermissionsExt;
         let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o600));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn observational_waiters_are_separate_from_authoritative_waiters() {
+        let lock_path = Path::new("fixture-lock");
+        let authoritative = in_proc_fifo_queue(&AUTHORITY_FIFOS, lock_path);
+        let observational = in_proc_fifo_queue(&OBSERVATION_FIFOS, lock_path);
+        assert!(!Arc::ptr_eq(&authoritative, &observational));
+        assert!(Arc::ptr_eq(
+            &observational,
+            &in_proc_fifo_queue(&OBSERVATION_FIFOS, lock_path),
+        ));
     }
 }
