@@ -367,29 +367,28 @@ pub fn run_sandbox_status_cli() -> ExitCode {
 pub fn probe_host_seccomp_verified() -> Option<bool> {
     #[cfg(target_os = "linux")]
     {
-        if let Ok(exe) = env::current_exe() {
-            let mut candidates = Vec::new();
-            for anc in exe.ancestors().skip(1).take(5) {
-                for name in ["agent-guard", "dotagent"] {
-                    let cand = anc.join(name);
-                    if cand != exe && cand.is_file() && !candidates.contains(&cand) {
-                        candidates.push(cand);
-                    }
-                }
+        let Ok(exe) = env::current_exe() else {
+            return Some(false);
+        };
+        let Ok(meta) = fs::symlink_metadata(&exe) else {
+            return Some(false);
+        };
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if !meta.is_file() || (meta.permissions().mode() & 0o022) != 0 {
+                return Some(false);
             }
-            candidates.push(exe);
-            for bin in candidates {
-                if let Ok(out) = Command::new(bin).arg("--probe-seccomp-child").output()
-                    && out.status.success()
-                {
-                    let text = String::from_utf8_lossy(&out.stdout);
-                    if text.contains("seccomp-verified") {
-                        return Some(true);
-                    }
-                    if text.contains("seccomp-unavailable") {
-                        return Some(false);
-                    }
-                }
+        }
+        if let Ok(out) = Command::new(&exe).arg("--probe-seccomp-child").output()
+            && out.status.success()
+        {
+            let text = String::from_utf8_lossy(&out.stdout);
+            if text.contains("seccomp-verified") {
+                return Some(true);
+            }
+            if text.contains("seccomp-unavailable") {
+                return Some(false);
             }
         }
         Some(false)

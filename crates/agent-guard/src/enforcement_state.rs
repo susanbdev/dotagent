@@ -27,6 +27,7 @@ use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::process::ExitCode;
 
+use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
 
@@ -1307,15 +1308,67 @@ fn validate_antigravity_command_list(
                 format!("Antigravity '{expected_event}' hook missing string 'command'"),
             ));
         };
-        let expected_sub = format!("antigravity-hook {expected_event}");
-        if !cmd.contains(&expected_sub) {
+        let tokens = tokenize_antigravity_hook_command(cmd)?;
+        if tokens.len() < 3
+            || tokens[1] != "antigravity-hook"
+            || tokens[2].as_str() != expected_event
+        {
             return Err((
                 "CONFIG_PROTOCOL_INCOMPATIBLE",
-                format!("Antigravity '{expected_event}' command does not invoke '{expected_sub}'"),
+                format!(
+                    "Antigravity '{expected_event}' command must invoke exact 'antigravity-hook {expected_event}'"
+                ),
             ));
         }
-        let first_tok = cmd.split_whitespace().next().unwrap_or("");
-        let first_path = Path::new(first_tok);
+        let mut idx = 3usize;
+        let mut seen_ws = false;
+        let mut seen_trace = false;
+        while idx < tokens.len() {
+            let flag = tokens[idx].as_str();
+            let Some(val) = tokens.get(idx + 1) else {
+                return Err((
+                    "CONFIG_PROTOCOL_INCOMPATIBLE",
+                    format!(
+                        "Antigravity '{expected_event}' command flag '{flag}' is missing its path argument"
+                    ),
+                ));
+            };
+            match flag {
+                "--workspace" if !seen_ws => {
+                    seen_ws = true;
+                    if !Path::new(val).is_absolute() {
+                        return Err((
+                            "CONFIG_PROTOCOL_INCOMPATIBLE",
+                            format!(
+                                "Antigravity '{expected_event}' --workspace argument must be an absolute path"
+                            ),
+                        ));
+                    }
+                }
+                "--trace-log" if !seen_trace => {
+                    seen_trace = true;
+                    if !Path::new(val).is_absolute() {
+                        return Err((
+                            "CONFIG_PROTOCOL_INCOMPATIBLE",
+                            format!(
+                                "Antigravity '{expected_event}' --trace-log argument must be an absolute path"
+                            ),
+                        ));
+                    }
+                }
+                _ => {
+                    return Err((
+                        "CONFIG_PROTOCOL_INCOMPATIBLE",
+                        format!(
+                            "Antigravity '{expected_event}' command contains unsupported or duplicate flag '{flag}'"
+                        ),
+                    ));
+                }
+            }
+            idx += 2;
+        }
+
+        let first_path = Path::new(&tokens[0]);
         if !first_path.is_absolute() {
             all_bins_match = false;
         } else if let Some(exp_bin) = verified_bin_canon {
@@ -1326,6 +1379,57 @@ fn validate_antigravity_command_list(
         }
     }
     Ok(all_bins_match)
+}
+
+fn tokenize_antigravity_hook_command(cmd: &str) -> Result<Vec<String>, (&'static str, String)> {
+    if cmd.trim().is_empty() || cmd.bytes().any(|b| b < 0x20 || b == 0x7f) {
+        return Err((
+            "CONFIG_PROTOCOL_INCOMPATIBLE",
+            "Antigravity hook command is empty or contains control characters".to_string(),
+        ));
+    }
+    let mut tokens = Vec::new();
+    let mut cur = String::new();
+    let mut in_token = false;
+    let mut in_single = false;
+    for ch in cmd.chars() {
+        if in_single {
+            if ch == '\'' {
+                in_single = false;
+            } else {
+                cur.push(ch);
+            }
+        } else if ch == '\'' {
+            in_single = true;
+            in_token = true;
+        } else if ch == ' ' || ch == '\t' {
+            if in_token {
+                tokens.push(std::mem::take(&mut cur));
+                in_token = false;
+            }
+        } else if matches!(
+            ch,
+            ';' | '|' | '&' | '`' | '$' | '<' | '>' | '(' | ')' | '\\' | '"'
+        ) {
+            return Err((
+                "CONFIG_PROTOCOL_INCOMPATIBLE",
+                format!("Antigravity hook command contains disallowed shell metacharacter '{ch}'"),
+            ));
+        } else {
+            cur.push(ch);
+            in_token = true;
+        }
+    }
+    if in_single {
+        return Err((
+            "CONFIG_PROTOCOL_INCOMPATIBLE",
+            "Antigravity hook command has an unclosed single quote".to_string(),
+        ));
+    }
+    if in_token {
+        tokens.push(cur);
+    }
+    Ok(tokens)
 }
 
 /// Evaluates Property 2 (`ConfigState`) without inferring runtime invocation or enforcement.
@@ -1464,60 +1568,35 @@ pub fn evaluate_config_state(
                 };
             }
 
-            let Some(pre_tool_matchers) = dg.get("PreToolUse").and_then(JsonValue::as_array) else {
-                return ConfigState::Invalid {
-                    adapter_id: adapter_id.to_string(),
-                    config_rel_path: Some(rel_display),
-                    reason_code: "CONFIG_PROTOCOL_INCOMPATIBLE",
-                    detail: "missing required 'dotagent-guard.PreToolUse' matcher array"
-                        .to_string(),
-                };
-            };
-            let mut has_wildcard_matcher = false;
             let mut all_bins_match = verified_bin_canon.is_some();
-            for m in pre_tool_matchers {
-                let matcher_str = m.get("matcher").and_then(JsonValue::as_str).unwrap_or("");
-                if matcher_str == "*" {
-                    has_wildcard_matcher = true;
-                }
-                let Some(inner_hooks) = m.get("hooks").and_then(JsonValue::as_array) else {
+            for tool_ev in ["PreToolUse", "PostToolUse"] {
+                let Some(tool_matchers) = dg.get(tool_ev).and_then(JsonValue::as_array) else {
                     return ConfigState::Invalid {
                         adapter_id: adapter_id.to_string(),
                         config_rel_path: Some(rel_display),
                         reason_code: "CONFIG_PROTOCOL_INCOMPATIBLE",
-                        detail: "PreToolUse matcher entry missing 'hooks' array".to_string(),
+                        detail: format!(
+                            "missing required 'dotagent-guard.{tool_ev}' matcher array"
+                        ),
                     };
                 };
-                match validate_antigravity_command_list(
-                    inner_hooks,
-                    "PreToolUse",
-                    verified_bin_canon.as_deref(),
-                ) {
-                    Ok(matched) => all_bins_match &= matched,
-                    Err((code, detail)) => {
+                let mut has_wildcard_matcher = false;
+                for m in tool_matchers {
+                    let matcher_str = m.get("matcher").and_then(JsonValue::as_str).unwrap_or("");
+                    if matcher_str == "*" {
+                        has_wildcard_matcher = true;
+                    }
+                    let Some(inner_hooks) = m.get("hooks").and_then(JsonValue::as_array) else {
                         return ConfigState::Invalid {
                             adapter_id: adapter_id.to_string(),
                             config_rel_path: Some(rel_display),
-                            reason_code: code,
-                            detail,
+                            reason_code: "CONFIG_PROTOCOL_INCOMPATIBLE",
+                            detail: format!("{tool_ev} matcher entry missing 'hooks' array"),
                         };
-                    }
-                }
-            }
-            if !has_wildcard_matcher {
-                return ConfigState::Invalid {
-                    adapter_id: adapter_id.to_string(),
-                    config_rel_path: Some(rel_display),
-                    reason_code: "CONFIG_INCOMPLETE_MATCHER",
-                    detail: "PreToolUse must register wildcard matcher '*'".to_string(),
-                };
-            }
-
-            for direct_ev in ["SessionStart", "PreInvocation", "PostInvocation", "Stop"] {
-                if let Some(arr) = dg.get(direct_ev).and_then(JsonValue::as_array) {
+                    };
                     match validate_antigravity_command_list(
-                        arr,
-                        direct_ev,
+                        inner_hooks,
+                        tool_ev,
                         verified_bin_canon.as_deref(),
                     ) {
                         Ok(matched) => all_bins_match &= matched,
@@ -1529,6 +1608,40 @@ pub fn evaluate_config_state(
                                 detail,
                             };
                         }
+                    }
+                }
+                if !has_wildcard_matcher {
+                    return ConfigState::Invalid {
+                        adapter_id: adapter_id.to_string(),
+                        config_rel_path: Some(rel_display),
+                        reason_code: "CONFIG_INCOMPLETE_MATCHER",
+                        detail: format!("{tool_ev} must register wildcard matcher '*'"),
+                    };
+                }
+            }
+
+            for direct_ev in ["SessionStart", "PreInvocation", "PostInvocation", "Stop"] {
+                let Some(arr) = dg.get(direct_ev).and_then(JsonValue::as_array) else {
+                    return ConfigState::Invalid {
+                        adapter_id: adapter_id.to_string(),
+                        config_rel_path: Some(rel_display),
+                        reason_code: "CONFIG_PROTOCOL_INCOMPATIBLE",
+                        detail: format!("missing required 'dotagent-guard.{direct_ev}' hook array"),
+                    };
+                };
+                match validate_antigravity_command_list(
+                    arr,
+                    direct_ev,
+                    verified_bin_canon.as_deref(),
+                ) {
+                    Ok(matched) => all_bins_match &= matched,
+                    Err((code, detail)) => {
+                        return ConfigState::Invalid {
+                            adapter_id: adapter_id.to_string(),
+                            config_rel_path: Some(rel_display),
+                            reason_code: code,
+                            detail,
+                        };
                     }
                 }
             }
@@ -2419,13 +2532,82 @@ pub fn evaluate_enforcement_report(
     }
 }
 
-/// Step A of Phase 4: Issues a bounded challenge bound to exact `(mode, workspace, config, binary)` digests.
+/// Builds the canonical length-framed message signed by an independent Ed25519 observer key
+/// to attest whether the host prevented execution of the controlled canary request.
+pub fn build_observer_verdict_message(
+    challenge_id: &str,
+    adapter_id: &str,
+    workspace_sha256: &str,
+    canary_rel_path: &str,
+    host_prevented_execution: bool,
+) -> Vec<u8> {
+    let prevented_tag = if host_prevented_execution { "1" } else { "0" };
+    let fields = [
+        challenge_id,
+        adapter_id,
+        workspace_sha256,
+        canary_rel_path,
+        prevented_tag,
+    ];
+    let mut out = Vec::from(&b"dotagent.observer_verdict.v1\0"[..]);
+    for f in fields {
+        let len = u32::try_from(f.len()).unwrap_or(u32::MAX);
+        out.extend_from_slice(&len.to_be_bytes());
+        out.extend_from_slice(f.as_bytes());
+    }
+    out
+}
+
+/// Signs an authenticated observer verdict using a 32-byte Ed25519 signing seed, returning a
+/// 128-hex-character Ed25519 signature suitable for `--observer-sig`.
+pub fn sign_observer_verdict(
+    signing_key_bytes: &[u8; 32],
+    challenge_id: &str,
+    adapter_id: &str,
+    workspace: &Path,
+    canary_rel_path: &str,
+    host_prevented_execution: bool,
+) -> String {
+    let (_, ws_sha) = canonical_workspace_digest(workspace);
+    let msg = build_observer_verdict_message(
+        challenge_id,
+        adapter_id,
+        &ws_sha,
+        canary_rel_path,
+        host_prevented_execution,
+    );
+    let sk = SigningKey::from_bytes(signing_key_bytes);
+    let sig = sk.sign(&msg);
+    hex_encode(&sig.to_bytes())
+}
+
+/// Derives the 64-hex-character Ed25519 verifying key from a 32-byte observer signing seed.
+pub fn derive_observer_pubkey_hex(signing_key_bytes: &[u8; 32]) -> String {
+    let sk = SigningKey::from_bytes(signing_key_bytes);
+    hex_encode(sk.verifying_key().as_bytes())
+}
+
+fn hex_decode_64(hex: &str) -> Result<[u8; 64], String> {
+    if hex.len() != 128 {
+        return Err("expected 128 hex characters".to_string());
+    }
+    let hi = hex_decode_32(&hex[..64])?;
+    let lo = hex_decode_32(&hex[64..])?;
+    let mut out = [0u8; 64];
+    out[..32].copy_from_slice(&hi);
+    out[32..].copy_from_slice(&lo);
+    Ok(out)
+}
+
+/// Step A of Phase 4: Issues a bounded challenge bound to exact `(mode, workspace, config, binary)`
+/// digests and a pinned Ed25519 observer public key (`observer_pubkey_hex`).
 pub fn begin_verification(
     workspace: &Path,
     bin_dir: &Path,
     adapter_id: &str,
     snapshot: &ProbeSnapshot,
     external_observer_available: bool,
+    observer_pubkey_hex: &str,
 ) -> Result<VerificationChallenge, ContractError> {
     if std::env::var("AGENT_GUARD_IN_SANDBOX").as_deref() == Ok("1")
         || std::env::var("AGENT_GUARD_WORKER_LOCK").as_deref() == Ok("1")
@@ -2449,6 +2631,27 @@ pub fn begin_verification(
             ),
         ));
     }
+
+    let trimmed_pk = observer_pubkey_hex.trim();
+    if trimmed_pk.is_empty() {
+        return Err(ContractError::new(
+            "OBSERVER_KEY_REQUIRED",
+            "begin requires --observer-pubkey <64-hex-ed25519-pubkey> to bind independent observer attestation",
+        ));
+    }
+    let pk_bytes = hex_decode_32(trimmed_pk).map_err(|_| {
+        ContractError::new(
+            "INVALID_OBSERVER_KEY",
+            "observer public key must be 64 hexadecimal characters (32-byte Ed25519 verifying key)",
+        )
+    })?;
+    let _ = VerifyingKey::from_bytes(&pk_bytes).map_err(|_| {
+        ContractError::new(
+            "INVALID_OBSERVER_KEY",
+            "observer public key is not a valid Ed25519 curve point",
+        )
+    })?;
+    let observer_pubkey_norm = trimmed_pk.to_ascii_lowercase();
 
     let installed = evaluate_install_state(bin_dir, snapshot.effective_version());
     let (bin_ver, bin_sha) = match installed {
@@ -2523,7 +2726,7 @@ pub fn begin_verification(
 
     let mac = compute_hmac_tag(
         &key,
-        b"dotagent.enforcement_challenge.v1",
+        b"dotagent.enforcement_challenge.v2",
         &[
             &challenge_id,
             &issued_s,
@@ -2535,12 +2738,13 @@ pub fn begin_verification(
             &bin_ver,
             &bin_sha,
             &canary_rel_path,
+            &observer_pubkey_norm,
         ],
     );
     let doc = JsonValue::Object(vec![
         (
             "schema".to_string(),
-            JsonValue::Str("dotagent.enforcement_challenge.v1".to_string()),
+            JsonValue::Str("dotagent.enforcement_challenge.v2".to_string()),
         ),
         (
             "challenge_id".to_string(),
@@ -2569,6 +2773,10 @@ pub fn begin_verification(
         (
             "canary_rel_path".to_string(),
             JsonValue::Str(canary_rel_path.clone()),
+        ),
+        (
+            "observer_pubkey".to_string(),
+            JsonValue::Str(observer_pubkey_norm),
         ),
         ("mac".to_string(), JsonValue::Str(hex_encode(&mac))),
     ]);
@@ -2672,6 +2880,9 @@ pub fn record_denial_witness(
     let Some(bin_sha) = parsed.get("binary_sha256").and_then(JsonValue::as_str) else {
         return;
     };
+    let Some(obs_pk) = parsed.get("observer_pubkey").and_then(JsonValue::as_str) else {
+        return;
+    };
     let Some(p_mac_hex) = parsed.get("mac").and_then(JsonValue::as_str) else {
         return;
     };
@@ -2682,9 +2893,10 @@ pub fn record_denial_witness(
     let expires_s = expires.to_string();
     let exp_p_mac = compute_hmac_tag(
         &key,
-        b"dotagent.enforcement_challenge.v1",
+        b"dotagent.enforcement_challenge.v2",
         &[
             cid, &issued_s, &expires_s, aid, mode_s, ws_sha, cfg_sha, bin_ver, bin_sha, canary_rel,
+            obs_pk,
         ],
     );
     if !constant_time_eq_bytes(&p_mac, &exp_p_mac) {
@@ -2749,14 +2961,16 @@ pub fn record_denial_witness(
     }
 }
 
-/// Step B of Phase 4: Independent observer verifies hook denial witness, host rejection, absence
-/// of prohibited side effect on disk, and zero drift in `(mode, workspace, config, binary)`.
+/// Step B of Phase 4: Independent observer verifies hook denial witness, Ed25519-signed observer
+/// verdict (`observer_sig_hex`), host rejection, absence of prohibited side effect on disk, and
+/// zero drift in `(mode, workspace, config, binary)`.
 pub fn complete_verification(
     workspace: &Path,
     bin_dir: &Path,
     adapter_id: &str,
     challenge_id: &str,
     host_prevented_execution: bool,
+    observer_sig_hex: Option<&str>,
     snapshot: &ProbeSnapshot,
 ) -> Result<VerificationReceipt, ContractError> {
     if std::env::var("AGENT_GUARD_IN_SANDBOX").as_deref() == Ok("1")
@@ -2810,6 +3024,7 @@ pub fn complete_verification(
         Some(p_bin_ver),
         Some(p_bin_sha),
         Some(canary_rel),
+        Some(p_obs_pk),
         Some(p_mac_hex),
     ) = (
         p_json.get("challenge_id").and_then(JsonValue::as_str),
@@ -2822,6 +3037,7 @@ pub fn complete_verification(
         p_json.get("binary_version").and_then(JsonValue::as_str),
         p_json.get("binary_sha256").and_then(JsonValue::as_str),
         p_json.get("canary_rel_path").and_then(JsonValue::as_str),
+        p_json.get("observer_pubkey").and_then(JsonValue::as_str),
         p_json.get("mac").and_then(JsonValue::as_str),
     )
     else {
@@ -2841,10 +3057,10 @@ pub fn complete_verification(
     let expires_s = expires.to_string();
     let exp_p_mac = compute_hmac_tag(
         &key,
-        b"dotagent.enforcement_challenge.v1",
+        b"dotagent.enforcement_challenge.v2",
         &[
             p_cid, &issued_s, &expires_s, p_aid, p_mode, p_ws_sha, p_cfg_sha, p_bin_ver, p_bin_sha,
-            canary_rel,
+            canary_rel, p_obs_pk,
         ],
     );
     if !constant_time_eq_bytes(&p_mac, &exp_p_mac) {
@@ -2866,6 +3082,49 @@ pub fn complete_verification(
             "enforcement verification challenge expired",
         ));
     }
+
+    // Verify independent Ed25519 observer signature attesting `host_prevented_execution` BEFORE
+    // trusting the caller-supplied boolean (preventing self-attestation after direct hook replay).
+    let Some(sig_hex_raw) = observer_sig_hex.map(str::trim).filter(|s| !s.is_empty()) else {
+        return Err(ContractError::new(
+            "OBSERVER_ATTESTATION_REQUIRED",
+            "complete requires --observer-sig <128-hex-ed25519-signature> from the pinned independent observer key",
+        ));
+    };
+    let pk_bytes = hex_decode_32(p_obs_pk).map_err(|_| {
+        ContractError::new(
+            "MALFORMED_CAPABILITY_RECORD",
+            "pinned observer_pubkey in challenge has invalid encoding",
+        )
+    })?;
+    let verifying_key = VerifyingKey::from_bytes(&pk_bytes).map_err(|_| {
+        ContractError::new(
+            "MALFORMED_CAPABILITY_RECORD",
+            "pinned observer_pubkey in challenge is invalid",
+        )
+    })?;
+    let sig_bytes = hex_decode_64(sig_hex_raw).map_err(|_| {
+        ContractError::new(
+            "FORGED_EVIDENCE_REJECTED",
+            "observer signature must be 128 hexadecimal characters (64-byte Ed25519 signature)",
+        )
+    })?;
+    let signature = Signature::from_bytes(&sig_bytes);
+    let expected_verdict_msg = build_observer_verdict_message(
+        challenge_id,
+        p_aid,
+        p_ws_sha,
+        canary_rel,
+        host_prevented_execution,
+    );
+    verifying_key
+        .verify_strict(&expected_verdict_msg, &signature)
+        .map_err(|_| {
+            ContractError::new(
+                "FORGED_EVIDENCE_REJECTED",
+                "observer verdict Ed25519 signature failed verification against pinned observer public key",
+            )
+        })?;
 
     // Check 1 & 2: Authenticated HookDenialWitness must exist for this exact challenge
     let witness_path = dir.join(format!("witness_{slot}.json"));
@@ -2931,7 +3190,7 @@ pub fn complete_verification(
         ));
     }
 
-    // Check 3: Host must have prevented tool execution
+    // Check 3: Authenticated observer verdict must attest that the host prevented execution
     if !host_prevented_execution {
         return Err(ContractError::new(
             "HOST_DID_NOT_PREVENT_EXECUTION",
@@ -3203,6 +3462,8 @@ pub fn run_verify_enforcement_cli(args: &[String], cwd: &Path) -> ExitCode {
     let mut bin_dir_opt: Option<PathBuf> = None;
     let mut challenge_id: Option<String> = None;
     let mut host_prevented: Option<bool> = None;
+    let mut observer_pubkey: Option<String> = None;
+    let mut observer_sig: Option<String> = None;
     let mut external_observer = false;
     let mut target_ws_opt: Option<PathBuf> = None;
 
@@ -3247,6 +3508,22 @@ pub fn run_verify_enforcement_cli(args: &[String], cwd: &Path) -> ExitCode {
                     return ExitCode::from(2);
                 };
                 challenge_id = Some(v.clone());
+                i += 2;
+            }
+            "--observer-pubkey" => {
+                let Some(v) = args.get(i + 1) else {
+                    eprintln!("[verify-enforcement] missing hex key after --observer-pubkey");
+                    return ExitCode::from(2);
+                };
+                observer_pubkey = Some(v.clone());
+                i += 2;
+            }
+            "--observer-sig" => {
+                let Some(v) = args.get(i + 1) else {
+                    eprintln!("[verify-enforcement] missing hex signature after --observer-sig");
+                    return ExitCode::from(2);
+                };
+                observer_sig = Some(v.clone());
                 i += 2;
             }
             "--host-prevented-execution" => {
@@ -3296,6 +3573,7 @@ pub fn run_verify_enforcement_cli(args: &[String], cwd: &Path) -> ExitCode {
             &adapter_id,
             &snapshot,
             external_observer,
+            observer_pubkey.as_deref().unwrap_or(""),
         ) {
             Ok(ch) => {
                 if json_mode {
@@ -3351,6 +3629,7 @@ pub fn run_verify_enforcement_cli(args: &[String], cwd: &Path) -> ExitCode {
                 &adapter_id,
                 &cid,
                 prevented,
+                observer_sig.as_deref(),
                 &snapshot,
             ) {
                 Ok(rec) => {

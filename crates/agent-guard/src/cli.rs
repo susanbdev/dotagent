@@ -105,17 +105,17 @@ pub fn run_cli_entrypoint() -> ExitCode {
             let decision = eval_hook_preferring_hot_coord("pre-tool", &payload, &cwd, || {
                 handle_pre_tool_hook(&payload, &cwd)
             });
-            if let Decision::Deny { code, .. } = &decision {
+            if let Decision::Deny { code, .. } = &decision
+                && let Some(adapter_id) = infer_single_pre_tool_adapter(&payload)
+            {
                 let ws_root = resolve_repo_root(&cwd);
-                for adapter_id in ["gemini", "claude", "cursor"] {
-                    crate::enforcement_state::record_denial_witness(
-                        &ws_root,
-                        adapter_id,
-                        "PreToolUse",
-                        payload.as_bytes(),
-                        code,
-                    );
-                }
+                crate::enforcement_state::record_denial_witness(
+                    &ws_root,
+                    adapter_id,
+                    "PreToolUse",
+                    payload.as_bytes(),
+                    code,
+                );
             }
             emit_hook_decision(decision, HookPhase::PreTool)
         }
@@ -498,6 +498,21 @@ fn run_read_safe(raw_path: &str, extra: &[String], cwd: &Path) -> ExitCode {
             let _ = ledger.save(&repo_root);
             emit_cli_decision(dec)
         }
+    }
+}
+
+fn infer_single_pre_tool_adapter(raw_payload: &str) -> Option<&'static str> {
+    let parsed = crate::json::JsonValue::parse(raw_payload).ok()?;
+    if parsed.get("cursor_version").is_some() || parsed.get("workspace_roots").is_some() {
+        return Some("cursor");
+    }
+    match parsed
+        .get("hook_event_name")
+        .and_then(crate::json::JsonValue::as_str)
+    {
+        Some("BeforeTool") => Some("gemini"),
+        Some("PreToolUse") => Some("claude"),
+        _ => None,
     }
 }
 

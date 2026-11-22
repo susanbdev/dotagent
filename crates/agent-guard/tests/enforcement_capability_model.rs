@@ -271,6 +271,8 @@ fn test_03_invocation_recorded_without_host_enforcement_proof() {
 
     // Direct production hook replay writes both SessionLedger and trace_log, and even triggers a
     // PendingChallenge denial witness -- NONE of these may certify `host_enforced = verified`!
+    let obs_seed = [0x33u8; 32];
+    let obs_pk = agent_guard::enforcement_state::derive_observer_pubkey_hex(&obs_seed);
     let (b_code, b_out, b_err) = sb.run_cli(
         &[
             "verify-enforcement",
@@ -278,6 +280,8 @@ fn test_03_invocation_recorded_without_host_enforcement_proof() {
             "--json",
             "--execution-mode",
             "local",
+            "--observer-pubkey",
+            &obs_pk,
             "--bin-dir",
             &sb.bin_dir.to_string_lossy(),
             &sb.repo_dir.to_string_lossy(),
@@ -467,6 +471,8 @@ fn test_04_caller_forged_invocation_and_capability_evidence_rejected() {
 }
 
 fn establish_genuine_receipt_via_cli(sb: &CapabilitySandbox) {
+    let obs_seed = [0x5Au8; 32];
+    let obs_pk = agent_guard::enforcement_state::derive_observer_pubkey_hex(&obs_seed);
     let (b_code, b_out, b_err) = sb.run_cli(
         &[
             "verify-enforcement",
@@ -474,6 +480,8 @@ fn establish_genuine_receipt_via_cli(sb: &CapabilitySandbox) {
             "--json",
             "--execution-mode",
             "local",
+            "--observer-pubkey",
+            &obs_pk,
             "--bin-dir",
             &sb.bin_dir.to_string_lossy(),
             &sb.repo_dir.to_string_lossy(),
@@ -510,6 +518,14 @@ fn establish_genuine_receipt_via_cli(sb: &CapabilitySandbox) {
     );
     assert_eq!(h_code, 0);
 
+    let obs_sig = agent_guard::enforcement_state::sign_observer_verdict(
+        &obs_seed,
+        cid,
+        "antigravity",
+        &sb.repo_dir,
+        canary_rel,
+        true,
+    );
     let (c_code, _, c_err) = sb.run_cli(
         &[
             "verify-enforcement",
@@ -523,6 +539,8 @@ fn establish_genuine_receipt_via_cli(sb: &CapabilitySandbox) {
             cid,
             "--host-prevented-execution",
             "true",
+            "--observer-sig",
+            &obs_sig,
             &sb.repo_dir.to_string_lossy(),
         ],
         b"",
@@ -1120,6 +1138,9 @@ fn test_15_authoritative_allow_deny_and_full_5_step_observer_verification_contra
     let sb = CapabilitySandbox::create("t15_full_contract");
     sb.activate_antigravity();
 
+    let obs_seed = [0x77u8; 32];
+    let obs_pk = agent_guard::enforcement_state::derive_observer_pubkey_hex(&obs_seed);
+
     // 15a: Begin challenge -> attempt `complete` before hook invocation -> fails `HOOK_NOT_INVOKED`
     let (_, b1_out, _) = sb.run_cli(
         &[
@@ -1128,6 +1149,8 @@ fn test_15_authoritative_allow_deny_and_full_5_step_observer_verification_contra
             "--json",
             "--execution-mode",
             "local",
+            "--observer-pubkey",
+            &obs_pk,
             "--bin-dir",
             &sb.bin_dir.to_string_lossy(),
             &sb.repo_dir.to_string_lossy(),
@@ -1144,6 +1167,14 @@ fn test_15_authoritative_allow_deny_and_full_5_step_observer_verification_contra
         .get("canary_rel_path")
         .and_then(JsonValue::as_str)
         .expect("canary1");
+    let sig1 = agent_guard::enforcement_state::sign_observer_verdict(
+        &obs_seed,
+        cid1,
+        "antigravity",
+        &sb.repo_dir,
+        canary1,
+        true,
+    );
 
     let (no_hook_code, no_hook_out, _) = sb.run_cli(
         &[
@@ -1158,6 +1189,8 @@ fn test_15_authoritative_allow_deny_and_full_5_step_observer_verification_contra
             cid1,
             "--host-prevented-execution",
             "true",
+            "--observer-sig",
+            &sig1,
             &sb.repo_dir.to_string_lossy(),
         ],
         b"",
@@ -1198,6 +1231,72 @@ fn test_15_authoritative_allow_deny_and_full_5_step_observer_verification_contra
         Some("deny")
     );
 
+    // Unauthenticated self-attestation without `--observer-sig` MUST be rejected (`OBSERVER_ATTESTATION_REQUIRED`)
+    let (unauth_code, unauth_out, _) = sb.run_cli(
+        &[
+            "verify-enforcement",
+            "complete",
+            "--json",
+            "--execution-mode",
+            "local",
+            "--bin-dir",
+            &sb.bin_dir.to_string_lossy(),
+            "--challenge",
+            cid1,
+            "--host-prevented-execution",
+            "true",
+            &sb.repo_dir.to_string_lossy(),
+        ],
+        b"",
+        &[],
+    );
+    assert_eq!(unauth_code, 2);
+    assert_eq!(
+        JsonValue::parse(unauth_out.trim())
+            .expect("unauth json")
+            .get("code")
+            .and_then(JsonValue::as_str),
+        Some("OBSERVER_ATTESTATION_REQUIRED")
+    );
+
+    // Wrong Ed25519 observer key MUST be rejected (`FORGED_EVIDENCE_REJECTED`)
+    let wrong_sig = agent_guard::enforcement_state::sign_observer_verdict(
+        &[0x99u8; 32],
+        cid1,
+        "antigravity",
+        &sb.repo_dir,
+        canary1,
+        true,
+    );
+    let (bad_sig_code, bad_sig_out, _) = sb.run_cli(
+        &[
+            "verify-enforcement",
+            "complete",
+            "--json",
+            "--execution-mode",
+            "local",
+            "--bin-dir",
+            &sb.bin_dir.to_string_lossy(),
+            "--challenge",
+            cid1,
+            "--host-prevented-execution",
+            "true",
+            "--observer-sig",
+            &wrong_sig,
+            &sb.repo_dir.to_string_lossy(),
+        ],
+        b"",
+        &[],
+    );
+    assert_eq!(bad_sig_code, 2);
+    assert_eq!(
+        JsonValue::parse(bad_sig_out.trim())
+            .expect("bad sig json")
+            .get("code")
+            .and_then(JsonValue::as_str),
+        Some("FORGED_EVIDENCE_REJECTED")
+    );
+
     // Simulate broken host ignoring denial and writing the prohibited side effect
     fs::write(sb.repo_dir.join(canary1), "BYPASSED\n").expect("plant side effect");
     let (se_code, se_out, _) = sb.run_cli(
@@ -1213,6 +1312,8 @@ fn test_15_authoritative_allow_deny_and_full_5_step_observer_verification_contra
             cid1,
             "--host-prevented-execution",
             "true",
+            "--observer-sig",
+            &sig1,
             &sb.repo_dir.to_string_lossy(),
         ],
         b"",
@@ -1256,5 +1357,188 @@ fn test_15_authoritative_allow_deny_and_full_5_step_observer_verification_contra
             .and_then(|v| v.get("state"))
             .and_then(JsonValue::as_str),
         Some("verified")
+    );
+}
+
+#[test]
+fn test_16_strict_hook_token_parsing_post_tool_use_check_quoted_paths_and_witness_isolation() {
+    let sb = CapabilitySandbox::create("t16_strict_config");
+    sb.activate_antigravity();
+    let hooks_path = sb.repo_dir.join(".agents/hooks.json");
+    let valid_hooks = fs::read_to_string(&hooks_path).expect("read valid hooks");
+    let snap = local_landlock_snapshot();
+
+    // 16a: Substring suffix attack (`antigravity-hook PreToolUse-malicious`) MUST be rejected!
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&hooks_path, fs::Permissions::from_mode(0o600)).expect("chmod 0600");
+    }
+    let suffix_tampered = valid_hooks.replace(
+        "antigravity-hook PreToolUse",
+        "antigravity-hook PreToolUse-malicious",
+    );
+    fs::write(&hooks_path, suffix_tampered).expect("write suffix tampered hooks");
+    let rep_suffix =
+        evaluate_enforcement_report(&sb.repo_dir, &sb.bin_dir, "antigravity", None, None, &snap);
+    assert!(matches!(
+        rep_suffix.configured,
+        ConfigState::Invalid {
+            reason_code: "CONFIG_PROTOCOL_INCOMPATIBLE",
+            ..
+        }
+    ));
+
+    // 16b: Omitting `PostToolUse` from `dotagent-guard` MUST be rejected!
+    let mut parsed_hooks = JsonValue::parse(&valid_hooks).expect("parse valid hooks");
+    if let JsonValue::Object(ref mut root_entries) = parsed_hooks
+        && let Some((_, JsonValue::Object(dg_entries))) =
+            root_entries.iter_mut().find(|(k, _)| k == "dotagent-guard")
+    {
+        dg_entries.retain(|(k, _)| k != "PostToolUse");
+    }
+    fs::write(&hooks_path, format!("{}\n", parsed_hooks.to_json_string()))
+        .expect("write missing PostToolUse hooks");
+    let rep_no_post =
+        evaluate_enforcement_report(&sb.repo_dir, &sb.bin_dir, "antigravity", None, None, &snap);
+    assert!(matches!(
+        rep_no_post.configured,
+        ConfigState::Invalid {
+            reason_code: "CONFIG_PROTOCOL_INCOMPATIBLE",
+            ..
+        }
+    ));
+
+    // 16c: Workspace & binary paths containing spaces quote safely during `activate` and validate cleanly!
+    let spaced_ws = sb.base.join("workspace with spaces");
+    let spaced_bin_dir = sb.base.join("bin with spaces");
+    fs::create_dir_all(spaced_ws.join(".git")).expect("mkdir spaced .git");
+    fs::create_dir_all(spaced_ws.join("src")).expect("mkdir spaced src");
+    fs::write(spaced_ws.join("AGENTS.md"), "# AGENTS.md\n").expect("spaced AGENTS.md");
+    fs::write(spaced_ws.join("src/lib.rs"), "pub fn ok() {}\n").expect("spaced lib.rs");
+    fs::create_dir_all(&spaced_bin_dir).expect("mkdir spaced bin");
+    fs::copy(
+        sb.bin_dir.join("agent-guard"),
+        spaced_bin_dir.join("agent-guard"),
+    )
+    .expect("copy guard to spaced bin");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(
+            spaced_bin_dir.join("agent-guard"),
+            fs::Permissions::from_mode(0o755),
+        )
+        .expect("chmod 0755 spaced guard");
+    }
+    execute_antigravity_activate(&spaced_bin_dir, &sb.dotagent_root(), &spaced_ws, false)
+        .expect("activate spaced workspace and binary");
+    let rep_spaced = evaluate_enforcement_report(
+        &spaced_ws,
+        &spaced_bin_dir,
+        "antigravity",
+        None,
+        None,
+        &snap,
+    );
+    assert!(
+        matches!(
+            rep_spaced.configured,
+            ConfigState::Valid {
+                pinned_binary_matches: true,
+                protocol_compatible: true,
+                ..
+            }
+        ),
+        "spaced paths must quote and validate cleanly: {:?}",
+        rep_spaced.configured
+    );
+
+    // 16d: Legacy `pre-tool` Gemini denial (`BeforeTool`) must NOT cross-populate a pending `claude` challenge!
+    fs::create_dir_all(spaced_ws.join(".claude")).expect("mkdir .claude");
+    let claude_cfg = format!(
+        "{{\"hooks\":{{\"PreToolUse\":[{{\"matcher\":\"*\",\"hooks\":[{{\"type\":\"command\",\"command\":\"{} pre-tool\"}}]}}]}}}}\n",
+        sb.bin_dir.join("agent-guard").display()
+    );
+    fs::write(spaced_ws.join(".claude/settings.json"), claude_cfg).expect("write claude settings");
+    let obs_seed = [0x42u8; 32];
+    let obs_pk = agent_guard::enforcement_state::derive_observer_pubkey_hex(&obs_seed);
+    let (cb_code, cb_out, cb_err) = sb.run_cli(
+        &[
+            "verify-enforcement",
+            "begin",
+            "--json",
+            "--adapter",
+            "claude",
+            "--execution-mode",
+            "local",
+            "--observer-pubkey",
+            &obs_pk,
+            "--bin-dir",
+            &sb.bin_dir.to_string_lossy(),
+            &spaced_ws.to_string_lossy(),
+        ],
+        b"",
+        &[],
+    );
+    assert_eq!(cb_code, 0, "claude begin failed: {cb_err}");
+    let cb_json = JsonValue::parse(cb_out.trim()).expect("cb json");
+    let claude_cid = cb_json
+        .get("challenge_id")
+        .and_then(JsonValue::as_str)
+        .expect("claude cid");
+    let claude_canary = cb_json
+        .get("canary_rel_path")
+        .and_then(JsonValue::as_str)
+        .expect("claude canary");
+
+    // Send a Gemini (`BeforeTool`) payload referencing `claude_canary` through `pre-tool`
+    let gemini_spoof = format!(
+        r#"{{"session_id":"gem_spoof","hook_event_name":"BeforeTool","tool_name":"Write","tool_input":{{"file_path":"{}/{}"}}}}"#,
+        spaced_ws.display(),
+        claude_canary
+    );
+    let _ = sb.run_cli(&["pre-tool"], gemini_spoof.as_bytes(), &[]);
+
+    let claude_sig = agent_guard::enforcement_state::sign_observer_verdict(
+        &obs_seed,
+        claude_cid,
+        "claude",
+        &spaced_ws,
+        claude_canary,
+        true,
+    );
+    let (cc_code, cc_out, _) = sb.run_cli(
+        &[
+            "verify-enforcement",
+            "complete",
+            "--json",
+            "--adapter",
+            "claude",
+            "--execution-mode",
+            "local",
+            "--bin-dir",
+            &sb.bin_dir.to_string_lossy(),
+            "--challenge",
+            claude_cid,
+            "--host-prevented-execution",
+            "true",
+            "--observer-sig",
+            &claude_sig,
+            &spaced_ws.to_string_lossy(),
+        ],
+        b"",
+        &[],
+    );
+    assert_eq!(
+        cc_code, 2,
+        "Gemini pre-tool payload must NOT create a witness in claude's slot"
+    );
+    assert_eq!(
+        JsonValue::parse(cc_out.trim())
+            .expect("cc json")
+            .get("code")
+            .and_then(JsonValue::as_str),
+        Some("HOOK_NOT_INVOKED")
     );
 }

@@ -2075,13 +2075,7 @@ fn verify_guard_binary_path(candidate: &Path) -> Result<PathBuf, String> {
             ));
         }
     }
-    let abs_s = abs.to_string_lossy();
-    if !is_safe_unquoted_path_str(&abs_s) {
-        return Err(format!(
-            "agent-guard binary path '{}' contains unsafe shell characters",
-            abs.display()
-        ));
-    }
+    let _ = quote_antigravity_path_arg(&abs, "agent-guard binary path")?;
     Ok(abs)
 }
 
@@ -2253,70 +2247,97 @@ fn format_json_pretty_2space(val: &JsonValue, indent: usize, out: &mut String) {
     }
 }
 
+fn quote_antigravity_path_arg(path: &Path, label: &str) -> Result<String, String> {
+    if !path.is_absolute() {
+        return Err(format!(
+            "{label} '{}' must be an absolute path",
+            path.display()
+        ));
+    }
+    let Some(s) = path.to_str() else {
+        return Err(format!("{label} '{}' must be valid UTF-8", path.display()));
+    };
+    if s.is_empty() || s.bytes().any(|b| b < 0x20 || b == 0x7f) {
+        return Err(format!(
+            "{label} '{}' contains disallowed control characters",
+            path.display()
+        ));
+    }
+    if is_safe_unquoted_path_str(s) {
+        Ok(s.to_string())
+    } else {
+        Ok(crate::exec_sandbox::shell_quote_single(s))
+    }
+}
+
 fn pin_antigravity_command_tree(
     val: &JsonValue,
     abs_guard_bin: Option<&Path>,
     abs_workspace: Option<&Path>,
     abs_trace_log: Option<&Path>,
-) -> JsonValue {
+) -> Result<JsonValue, String> {
     let Some(bin) = abs_guard_bin else {
-        return val.clone();
-    };
-    let bin_s = bin.to_string_lossy();
-    if !is_safe_unquoted_path_str(&bin_s) {
-        return val.clone();
-    };
-    let ws_suffix = abs_workspace
-        .map(|w| w.to_string_lossy().into_owned())
-        .filter(|s| is_safe_unquoted_path_str(s))
-        .map(|s| format!(" --workspace {s}"))
-        .unwrap_or_default();
-    let trace_suffix = abs_trace_log
-        .map(|t| t.to_string_lossy().into_owned())
-        .filter(|s| is_safe_unquoted_path_str(s))
-        .map(|s| format!(" --trace-log {s}"))
-        .unwrap_or_default();
-
-    match val {
-        JsonValue::Str(s) => {
-            if let Some(rest) = s.strip_prefix("agent-guard antigravity-hook ") {
-                JsonValue::Str(format!(
-                    "{bin_s} antigravity-hook {rest}{ws_suffix}{trace_suffix}"
-                ))
-            } else if let Some(rest) = s.strip_prefix("agent-guard ") {
-                JsonValue::Str(format!("{bin_s} {rest}"))
-            } else if s == "agent-guard" {
-                JsonValue::Str(bin_s.into_owned())
-            } else {
-                JsonValue::Str(s.clone())
-            }
+        if abs_workspace.is_some() || abs_trace_log.is_some() {
+            return Err(
+                "cannot pin --workspace or --trace-log without a verified agent-guard binary"
+                    .to_string(),
+            );
         }
-        JsonValue::Array(items) => JsonValue::Array(
-            items
-                .iter()
-                .map(|v| {
-                    pin_antigravity_command_tree(v, abs_guard_bin, abs_workspace, abs_trace_log)
-                })
-                .collect(),
+        return Ok(val.clone());
+    };
+    let bin_q = quote_antigravity_path_arg(bin, "agent-guard binary path")?;
+    let ws_suffix = match abs_workspace {
+        Some(w) => format!(
+            " --workspace {}",
+            quote_antigravity_path_arg(w, "workspace path")?
         ),
-        JsonValue::Object(entries) => JsonValue::Object(
-            entries
-                .iter()
-                .map(|(k, v)| {
-                    (
-                        k.clone(),
-                        pin_antigravity_command_tree(
-                            v,
-                            abs_guard_bin,
-                            abs_workspace,
-                            abs_trace_log,
-                        ),
-                    )
-                })
-                .collect(),
+        None => String::new(),
+    };
+    let trace_suffix = match abs_trace_log {
+        Some(t) => format!(
+            " --trace-log {}",
+            quote_antigravity_path_arg(t, "--trace-log path")?
         ),
-        other => other.clone(),
+        None => String::new(),
+    };
+
+    fn rewrite_node(
+        node: &JsonValue,
+        bin_q: &str,
+        ws_suffix: &str,
+        trace_suffix: &str,
+    ) -> JsonValue {
+        match node {
+            JsonValue::Str(s) => {
+                if let Some(rest) = s.strip_prefix("agent-guard antigravity-hook ") {
+                    JsonValue::Str(format!(
+                        "{bin_q} antigravity-hook {rest}{ws_suffix}{trace_suffix}"
+                    ))
+                } else if let Some(rest) = s.strip_prefix("agent-guard ") {
+                    JsonValue::Str(format!("{bin_q} {rest}"))
+                } else if s == "agent-guard" {
+                    JsonValue::Str(bin_q.to_string())
+                } else {
+                    JsonValue::Str(s.clone())
+                }
+            }
+            JsonValue::Array(items) => JsonValue::Array(
+                items
+                    .iter()
+                    .map(|v| rewrite_node(v, bin_q, ws_suffix, trace_suffix))
+                    .collect(),
+            ),
+            JsonValue::Object(entries) => JsonValue::Object(
+                entries
+                    .iter()
+                    .map(|(k, v)| (k.clone(), rewrite_node(v, bin_q, ws_suffix, trace_suffix)))
+                    .collect(),
+            ),
+            other => other.clone(),
+        }
     }
+
+    Ok(rewrite_node(val, &bin_q, &ws_suffix, &trace_suffix))
 }
 
 /// Merges `dist/antigravity/hooks.json` into an optional pre-existing `.agents/hooks.json` without
@@ -2350,7 +2371,7 @@ pub fn merge_antigravity_hooks_json_with_trace(
         abs_guard_bin,
         abs_workspace,
         abs_trace_log,
-    );
+    )?;
     let Some(template_obj) = pinned_template.as_object() else {
         return Err("dist/antigravity/hooks.json root must be a JSON object".to_string());
     };
@@ -2865,19 +2886,7 @@ fn deploy_antigravity_workspace_plane(
     };
     let validated_trace = match trace_log {
         Some(tp) => {
-            if !tp.is_absolute() {
-                return Err(format!(
-                    "--trace-log '{}' must be an absolute path",
-                    tp.display()
-                ));
-            }
-            let tp_s = tp.to_string_lossy();
-            if !is_safe_unquoted_path_str(&tp_s) {
-                return Err(format!(
-                    "--trace-log '{}' contains unsafe shell characters",
-                    tp.display()
-                ));
-            }
+            let _ = quote_antigravity_path_arg(tp, "--trace-log path")?;
             if let Some(parent) = tp.parent() {
                 validate_existing_regular_dir_lstat(parent, "--trace-log parent directory")?;
             }
