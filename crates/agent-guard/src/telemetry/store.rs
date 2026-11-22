@@ -285,7 +285,9 @@ fn recover_tail(path: &Path, file: &mut File) -> Result<u64, CaptureError> {
     quarantined.write_all(torn)?;
     quarantined.sync_data()?;
     sync_parent(path)?;
-    file.set_len(len - torn.len() as u64)?;
+    let recovered_len = len - torn.len() as u64;
+    file.set_len(recovered_len)?;
+    file.seek(SeekFrom::Start(recovered_len))?;
     file.sync_data()?;
     Ok(torn.len() as u64)
 }

@@ -1,6 +1,9 @@
 use super::*;
 use std::collections::BTreeSet;
+use std::io::BufReader;
 use std::process::{Command, Stdio};
+
+use crate::telemetry::{capture, diagnostics};
 
 fn record(value: u64) -> JsonValue {
     JsonValue::Object(vec![("fixture".into(), JsonValue::Uint(value))])
@@ -77,11 +80,62 @@ impl Drop for TestState {
 }
 
 fn read_records(path: &Path) -> Vec<JsonValue> {
-    let raw = fs::read_to_string(path).expect("read fixture frames");
+    let mut raw = String::new();
+    open_audit_read(path)
+        .expect("open protected audit file")
+        .expect("audit file exists")
+        .read_to_string(&mut raw)
+        .expect("read fixture frames");
     assert!(raw.is_empty() || raw.ends_with('\n'));
     raw.lines()
         .map(|line| JsonValue::parse(line).expect("complete JSON object"))
         .collect()
+}
+
+fn check_recovered_diagnostics(path: &Path, record_count: u64, torn_bytes: u64) {
+    let audit = open_audit_read(path)
+        .expect("open protected diagnostic input")
+        .expect("audit file exists");
+    let report = diagnostics::analyze(&mut BufReader::new(audit), None).expect("read diagnostics");
+    let coverage = report.get("coverage").expect("diagnostic coverage");
+    assert_eq!(
+        report.get("records_in_scope").and_then(JsonValue::as_u64),
+        Some(record_count)
+    );
+    for metric in [
+        "invalid_or_incomplete_records_in_input",
+        "unsupported_schema_or_payload_in_input",
+        "duplicate_records_in_input",
+    ] {
+        assert_eq!(
+            coverage.get(metric).and_then(JsonValue::as_u64),
+            Some(0),
+            "{metric}"
+        );
+    }
+    assert_eq!(
+        report
+            .get("capture_health")
+            .and_then(|health| health.get("recorded_torn_bytes"))
+            .and_then(JsonValue::as_u64),
+        Some(torn_bytes),
+    );
+}
+
+fn recovery_fixture_payload(reason: &'static str) -> capture::Payload {
+    capture::hook_decision("post_tool_hook", "allow", reason, "observed", None)
+}
+
+fn append_recovery_fixture(reason: &'static str) {
+    let result = capture::emit_required(
+        capture::Producer::Guard,
+        &capture::Context::default(),
+        recovery_fixture_payload(reason),
+    );
+    assert!(
+        matches!(result, capture::EmitResult::Persisted(_)),
+        "persist fixture {reason}"
+    );
 }
 
 #[test]
@@ -108,32 +162,86 @@ fn processes_serialize_complete_appends() {
 }
 
 #[test]
-fn restart_quarantines_torn_tail_before_append() {
+fn torn_tail_recovery_preserves_diagnostics_after_restart_and_rotation() {
     let state = TestState::new("torn");
     let path = state.active();
-    let mut file = create(&path).expect("open fixture");
-    file.write_all(&encode(&record(97)).expect("encode"))
-        .expect("write complete frame");
-    let unfinished = b"{\"fixture\":99}";
-    file.write_all(unfinished).expect("simulate torn frame");
+    let run = |mode| {
+        let child = state
+            .worker(mode)
+            .stdout(Stdio::piped())
+            .output()
+            .expect("run fixture writer");
+        assert!(
+            child.status.success(),
+            "fixture writer {mode}: {}",
+            String::from_utf8_lossy(&child.stdout),
+        );
+    };
+    run("seed-torn");
+    let seeded = read_records(&path);
+    assert_eq!(seeded.len(), 2);
+
+    let (torn_id, torn_record) = capture::encode(
+        capture::Producer::Guard,
+        &capture::Context::default(),
+        recovery_fixture_payload("FIXTURE_TORN"),
+    )
+    .expect("encode unterminated fixture");
+    let unfinished = torn_record.to_json_string();
+    let meta = regular_metadata(&path)
+        .expect("read fixture metadata")
+        .expect("fixture exists");
+    let mut file = open_existing(&path, &meta, true).expect("open fixture writer");
+    file.write_all(unfinished.as_bytes())
+        .expect("simulate write interrupted before newline");
     drop(file);
 
-    assert!(
-        state
-            .worker("repair")
-            .status()
-            .expect("restart writer")
-            .success()
-    );
+    run("repair-torn");
     assert_eq!(
         fs::read(suffix_path(&path, ".torn")).expect("quarantine"),
-        unfinished
+        unfinished.as_bytes()
     );
-    let records = read_records(&path);
-    assert_eq!(records.len(), 3);
-    assert_eq!(records[0], record(97));
-    assert!(records[1].get("event_type").is_some());
-    assert_eq!(records[2], record(98));
+    assert!(!suffix_path(&path, ".torn.pending").exists());
+    let recovered = read_records(&path);
+    assert_eq!(recovered.len(), 4);
+    assert_eq!(recovered[..2], seeded);
+    assert_eq!(
+        recovered[2].get("event_type").and_then(JsonValue::as_str),
+        Some("CAPTURE_HEALTH")
+    );
+    assert_eq!(
+        recovered[3]
+            .get("result")
+            .and_then(|result| result.get("reason_code"))
+            .and_then(JsonValue::as_str),
+        Some("FIXTURE_REPAIRED")
+    );
+    assert!(
+        recovered
+            .iter()
+            .all(|record| record.get("event_id").and_then(JsonValue::as_str)
+                != Some(torn_id.as_str()))
+    );
+    check_recovered_diagnostics(&path, 4, unfinished.len() as u64);
+
+    run("rotate-repaired");
+    let archive = archive_path(&path, 1);
+    assert_eq!(read_records(&archive), recovered);
+    check_recovered_diagnostics(&archive, 4, unfinished.len() as u64);
+    let active = read_records(&path);
+    assert_eq!(active.len(), 1);
+    assert_eq!(
+        active[0]
+            .get("result")
+            .and_then(|result| result.get("reason_code"))
+            .and_then(JsonValue::as_str),
+        Some("FIXTURE_AFTER_ROTATION")
+    );
+    check_recovered_diagnostics(&path, 1, 0);
+    assert_eq!(
+        fs::read(suffix_path(&path, ".torn")).expect("retained quarantine"),
+        unfinished.as_bytes()
+    );
 }
 
 #[test]
@@ -330,6 +438,15 @@ fn process_worker() {
     assert_eq!(path, PathBuf::from(fixture_state).join("audit.jsonl"));
     match mode.as_str() {
         "benchmark" => report_append_latency(&path),
+        "seed-torn" => {
+            append_recovery_fixture("FIXTURE_SEED_FIRST");
+            append_recovery_fixture("FIXTURE_SEED_SECOND");
+        }
+        "repair-torn" => append_recovery_fixture("FIXTURE_REPAIRED"),
+        "rotate-repaired" => {
+            assert!(rotate_at(&path, 1, 2).expect("rotate recovered fixture"));
+            append_recovery_fixture("FIXTURE_AFTER_ROTATION");
+        }
         "post-tool" => {
             let repo = std::env::var_os("DOTAGENT_STORE_TEST_REPO").expect("synthetic repo");
             let decision = crate::handle_post_tool_hook(
