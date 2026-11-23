@@ -114,12 +114,23 @@ fn cli_binary_supports_list_and_structured_json_reports() {
     );
     let bench_json =
         JsonValue::parse(&String::from_utf8_lossy(&bench_out.stdout)).expect("valid bench JSON");
-    assert_eq!(
-        bench_json
-            .get("benchmarks")
-            .and_then(JsonValue::as_array)
-            .map(<[JsonValue]>::len),
-        Some(5)
+    let expected_bench_len = if cfg!(unix) { 7 } else { 6 };
+    let bench_arr = bench_json
+        .get("benchmarks")
+        .and_then(JsonValue::as_array)
+        .expect("benchmarks array");
+    assert_eq!(bench_arr.len(), expected_bench_len);
+    #[cfg(unix)]
+    assert!(
+        bench_arr
+            .iter()
+            .any(|b| b.get("name").and_then(JsonValue::as_str) == Some("coord_sock_warm_rpc"))
+    );
+    assert!(
+        bench_arr
+            .iter()
+            .any(|b| b.get("name").and_then(JsonValue::as_str)
+                == Some("mcp_gateway_stdio_roundtrip"))
     );
 }
 

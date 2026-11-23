@@ -582,6 +582,7 @@ fn generate_csprng_32_and_jti() -> Result<(ZeroizingKey, String), String> {
 }
 
 fn dispatch_mediated_tool_call(tool_name: &str, args: &JsonValue, cwd: &Path) -> JsonValue {
+    let call_started = std::time::Instant::now();
     let repo_root = resolve_repo_root(cwd);
     let profile = match load_active_profile(&repo_root) {
         Ok(p) => p,
@@ -592,6 +593,11 @@ fn dispatch_mediated_tool_call(tool_name: &str, args: &JsonValue, cwd: &Path) ->
         let _lock = SessionLedger::acquire_lock(&repo_root, &sid);
         SessionLedger::load_or_create(&repo_root, &sid)
     };
+    let mut observation = crate::telemetry::capture::guard_context(
+        &repo_root,
+        &ledger_snapshot,
+        Some(&profile.profile_id),
+    );
     if ledger_snapshot.halted {
         return mcp_tool_error(
             "SESSION_CIRCUIT_BREAKER_HALTED",
@@ -603,8 +609,7 @@ fn dispatch_mediated_tool_call(tool_name: &str, args: &JsonValue, cwd: &Path) ->
     }
 
     // 1. Per-RPC capability classification & taint/profile gate
-    let sub_method = tool_name
-        .strip_prefix("mcp__susanbdev__")
+    let sub_method = crate::strip_approved_mcp_server_prefix(tool_name)
         .or_else(|| tool_name.strip_prefix("mcp__dotagent__"))
         .or_else(|| tool_name.strip_prefix("mcp__dotagent_mcp_gateway__"))
         .unwrap_or(tool_name);
@@ -634,13 +639,36 @@ fn dispatch_mediated_tool_call(tool_name: &str, args: &JsonValue, cwd: &Path) ->
         } else {
             format!("{detail} [denial_id: {denial_id}]")
         };
-        crate::traversal_ledger::append_audit_jsonl(
+        let dur_ns = u64::try_from(call_started.elapsed().as_nanos()).ok();
+        let stages = crate::telemetry::capture::DecisionStageTimings {
+            duration_ns: dur_ns,
+            ..Default::default()
+        };
+        observation.duration_ns = dur_ns;
+        observation
+            .intervention_id
+            .clone_from(&observation.trace_id);
+        crate::traversal_ledger::append_audit_jsonl_with_timings(
             &repo_root,
             &sid,
             tool_name,
             code,
             &full_detail,
             halt,
+            observation.trace_id.as_deref(),
+            observation.span_id.as_deref(),
+            stages,
+        );
+        crate::telemetry::capture::record_guard(
+            &observation,
+            crate::telemetry::capture::hook_decision_with_stages(
+                "mcp_gateway",
+                "deny",
+                code,
+                "denied",
+                None,
+                stages,
+            ),
         );
         return mcp_tool_error(code, &full_detail);
     }
@@ -657,6 +685,23 @@ fn dispatch_mediated_tool_call(tool_name: &str, args: &JsonValue, cwd: &Path) ->
                 ledger_snapshot.file_reads,
                 ledger_snapshot.tool_calls,
                 CANONICAL_UPSTREAM_MCP_URL
+            );
+            let dur_ns = u64::try_from(call_started.elapsed().as_nanos()).ok();
+            let stages = crate::telemetry::capture::DecisionStageTimings {
+                duration_ns: dur_ns,
+                ..Default::default()
+            };
+            observation.duration_ns = dur_ns;
+            crate::telemetry::capture::record_guard(
+                &observation,
+                crate::telemetry::capture::hook_decision_with_stages(
+                    "mcp_gateway",
+                    "allow",
+                    "GUARD_ALLOW",
+                    "allowed",
+                    None,
+                    stages,
+                ),
             );
             mcp_tool_success(&status_txt)
         }

@@ -47,10 +47,148 @@ const MAX_CONFIG_INSPECT_BYTES: u64 = 262_144;
 const MAX_TRACE_INSPECT_BYTES: u64 = 262_144;
 const CHALLENGE_TTL_SECS: u64 = 300;
 
+pub const SIMS_GUEST_ATTESTATION_PATH: &str = "/run/sims/guest-attestation.json";
+const MAX_SIMS_ATTESTATION_BYTES: u64 = 16_384;
+
+#[cfg(test)]
+std::thread_local! {
+    static TEST_SIMS_ATTESTATION_PATH: std::cell::RefCell<Option<PathBuf>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn with_test_sims_attestation<T, F: FnOnce() -> T>(path: &Path, f: F) -> T {
+    struct Reset(Option<PathBuf>);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            let prev = self.0.take();
+            TEST_SIMS_ATTESTATION_PATH.with(|slot| {
+                *slot.borrow_mut() = prev;
+            });
+        }
+    }
+    let prev =
+        TEST_SIMS_ATTESTATION_PATH.with(|slot| slot.borrow_mut().replace(path.to_path_buf()));
+    let _reset = Reset(prev);
+    f()
+}
+
+/// Verifies a `sims.guest_attestation.v1` JSON document from a non-symlink `0444` regular file.
+/// On live hosts (`require_root_owner = true`), both the parent `/run/sims` directory and the
+/// attestation file must be owned by `uid 0` so unprivileged guest processes cannot forge Turbo Mode.
+pub fn verify_sims_guest_attestation_file(path: &Path, require_root_owner: bool) -> bool {
+    if require_root_owner {
+        let Some(parent) = path.parent() else {
+            return false;
+        };
+        let Ok(pmeta) = fs::symlink_metadata(parent) else {
+            return false;
+        };
+        if pmeta.file_type().is_symlink() || !pmeta.file_type().is_dir() {
+            return false;
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::{MetadataExt, PermissionsExt};
+            if pmeta.uid() != 0 || (pmeta.permissions().mode() & 0o022) != 0 {
+                return false;
+            }
+        }
+    }
+
+    let Ok(meta) = fs::symlink_metadata(path) else {
+        return false;
+    };
+    if meta.file_type().is_symlink()
+        || !meta.file_type().is_file()
+        || meta.len() == 0
+        || meta.len() > MAX_SIMS_ATTESTATION_BYTES
+    {
+        return false;
+    }
+
+    #[cfg(unix)]
+    let file = {
+        use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+        if (meta.permissions().mode() & 0o7777) != 0o444 {
+            return false;
+        }
+        if require_root_owner && meta.uid() != 0 {
+            return false;
+        }
+        let Ok(f) = fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(crate::traversal_ledger::O_NOFOLLOW_FLAG)
+            .open(path)
+        else {
+            return false;
+        };
+        let Ok(fmeta) = f.metadata() else {
+            return false;
+        };
+        if !fmeta.is_file()
+            || fmeta.dev() != meta.dev()
+            || fmeta.ino() != meta.ino()
+            || (fmeta.permissions().mode() & 0o7777) != 0o444
+            || (require_root_owner && fmeta.uid() != 0)
+        {
+            return false;
+        }
+        f
+    };
+
+    #[cfg(not(unix))]
+    let file = {
+        let _ = require_root_owner;
+        let Ok(f) = fs::File::open(path) else {
+            return false;
+        };
+        f
+    };
+
+    let mut raw = Vec::with_capacity(meta.len() as usize);
+    if file
+        .take(MAX_SIMS_ATTESTATION_BYTES + 1)
+        .read_to_end(&mut raw)
+        .is_err()
+        || (raw.len() as u64) > MAX_SIMS_ATTESTATION_BYTES
+    {
+        return false;
+    }
+    let Ok(text) = std::str::from_utf8(&raw) else {
+        return false;
+    };
+    let Ok(doc) = JsonValue::parse(text) else {
+        return false;
+    };
+    doc.get("schema").and_then(JsonValue::as_str) == Some("sims.guest_attestation.v1")
+        && doc.get("mountless").and_then(JsonValue::as_bool) == Some(true)
+        && doc.get("zero_nic").and_then(JsonValue::as_bool) == Some(true)
+        && doc.get("egress_mode").and_then(JsonValue::as_str) == Some("vsock_trustless_only")
+}
+
+/// Returns `true` strictly when running inside an attested mountless `sims` microVM
+/// (`0444` `/run/sims/guest-attestation.json` with zero NIC and `Trustless`-only vsock egress).
+pub fn is_attested_sims_microvm() -> bool {
+    #[cfg(test)]
+    {
+        if let Some(test_path) = TEST_SIMS_ATTESTATION_PATH.with(|slot| slot.borrow().clone()) {
+            return verify_sims_guest_attestation_file(&test_path, false);
+        }
+        if let Some(env_path) = std::env::var_os("DOTAGENT_TEST_SIMS_ATTESTATION")
+            && !env_path.is_empty()
+        {
+            return verify_sims_guest_attestation_file(Path::new(&env_path), false);
+        }
+    }
+    verify_sims_guest_attestation_file(Path::new(SIMS_GUEST_ATTESTATION_PATH), true)
+}
+
 /// Detected or explicitly specified host execution environment.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ExecutionMode {
     LocalHost,
+    SimsMicroVm,
     AntigravityRemoteAgentsVm,
     UnsupportedHost(String),
 }
@@ -59,13 +197,14 @@ impl ExecutionMode {
     pub fn as_str(&self) -> &str {
         match self {
             Self::LocalHost => "local-host",
+            Self::SimsMicroVm => "sims-microvm",
             Self::AntigravityRemoteAgentsVm => "antigravity-remote-agents-vm",
             Self::UnsupportedHost(label) => label.as_str(),
         }
     }
 
     pub fn supports_local_observer_verification(&self) -> bool {
-        matches!(self, Self::LocalHost)
+        matches!(self, Self::LocalHost | Self::SimsMicroVm)
     }
 }
 
@@ -106,7 +245,9 @@ impl ProbeSnapshot {
 pub fn detect_execution_mode(mode_override: Option<&str>) -> Result<ExecutionMode, String> {
     match mode_override.map(str::trim) {
         None | Some("") | Some("auto") => {
-            if Path::new("/.vm/bin/vsock-ssh-listener").exists()
+            if is_attested_sims_microvm() {
+                Ok(ExecutionMode::SimsMicroVm)
+            } else if Path::new("/.vm/bin/vsock-ssh-listener").exists()
                 && Path::new("/usr/local/bin/cmdlauncher").exists()
             {
                 Ok(ExecutionMode::AntigravityRemoteAgentsVm)
@@ -115,6 +256,7 @@ pub fn detect_execution_mode(mode_override: Option<&str>) -> Result<ExecutionMod
             }
         }
         Some("local") | Some("local-host") => Ok(ExecutionMode::LocalHost),
+        Some("sims") | Some("sims-microvm") => Ok(ExecutionMode::SimsMicroVm),
         Some("remote-agents") | Some("antigravity-remote-agents-vm") => {
             Ok(ExecutionMode::AntigravityRemoteAgentsVm)
         }
@@ -122,7 +264,7 @@ pub fn detect_execution_mode(mode_override: Option<&str>) -> Result<ExecutionMod
             "unsupported-host".to_string(),
         )),
         Some(other) => Err(format!(
-            "unsupported --execution-mode '{other}' (expected auto|local|remote-agents|unsupported)"
+            "unsupported --execution-mode '{other}' (expected auto|local|sims-microvm|remote-agents|unsupported)"
         )),
     }
 }
@@ -3660,10 +3802,12 @@ pub fn evaluate_enforcement_report(
                         detail,
                     }
                 }
-                ExecutionMode::LocalHost => HostEnforcement::Unverified {
-                    reason_code: code,
-                    detail,
-                },
+                ExecutionMode::LocalHost | ExecutionMode::SimsMicroVm => {
+                    HostEnforcement::Unverified {
+                        reason_code: code,
+                        detail,
+                    }
+                }
             };
             (inv, host_state)
         }
@@ -3745,7 +3889,7 @@ pub fn evaluate_enforcement_report(
                             detail,
                         }
                     }
-                    ExecutionMode::LocalHost => {
+                    ExecutionMode::LocalHost | ExecutionMode::SimsMicroVm => {
                         let (code, detail) = if !matches!(installed, InstallState::Verified { .. })
                         {
                             (

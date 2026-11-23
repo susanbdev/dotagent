@@ -149,9 +149,18 @@ pub(crate) struct CausalLink {
     pub algorithm_version: Option<&'static str>,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DecisionStageTimings {
+    pub duration_ns: Option<u64>,
+    pub ast_eval_ns: Option<u64>,
+    pub path_policy_ns: Option<u64>,
+    pub coord_ipc_ns: Option<u64>,
+}
+
 #[derive(Clone, Debug, Default)]
 pub(crate) struct Context {
     pub trace_id: Option<String>,
+    pub span_id: Option<String>,
     pub parent_event_id: Option<String>,
     pub execution_id: Option<String>,
     pub intervention_id: Option<String>,
@@ -181,9 +190,10 @@ impl Context {
         }
     }
 
-    fn correlation_fields(&self) -> [(&'static str, Option<&str>); 5] {
+    fn correlation_fields(&self) -> [(&'static str, Option<&str>); 6] {
         [
             ("trace_id", self.trace_id.as_deref()),
+            ("span_id", self.span_id.as_deref()),
             ("parent_event_id", self.parent_event_id.as_deref()),
             ("execution_id", self.execution_id.as_deref()),
             ("intervention_id", self.intervention_id.as_deref()),
@@ -246,6 +256,68 @@ impl Payload {
         self.disposition = disposition;
         self
     }
+
+    pub(crate) fn with_stage_timings(mut self, stages: DecisionStageTimings) -> Self {
+        if let JsonValue::Object(ref mut fields) = self.body {
+            for (k, v) in [
+                ("duration_ns", stages.duration_ns),
+                ("ast_eval_ns", stages.ast_eval_ns),
+                ("path_policy_ns", stages.path_policy_ns),
+                ("coord_ipc_ns", stages.coord_ipc_ns),
+            ] {
+                if let Some(ns) = v
+                    && !fields.iter().any(|(ek, _)| ek == k)
+                {
+                    fields.push((k.to_string(), JsonValue::Uint(ns)));
+                }
+            }
+        }
+        self
+    }
+}
+
+pub(crate) fn parse_w3c_traceparent_trace_id(raw: &str) -> Option<String> {
+    let parts: Vec<&str> = raw.trim().split('-').collect();
+    if parts.len() != 4 || parts[0].len() != 2 || parts[2].len() != 16 || parts[3].len() != 2 {
+        return None;
+    }
+    let tid = parts[1];
+    if tid.len() == 32
+        && tid.bytes().all(|b| b.is_ascii_hexdigit())
+        && tid.bytes().any(|b| b != b'0')
+    {
+        Some(tid.to_ascii_lowercase())
+    } else {
+        None
+    }
+}
+
+/// Generates W3C Trace Context identifiers (`trace_id` = 32 lowercase hex, `span_id` = 16 lowercase hex).
+pub fn next_w3c_trace_and_span_ids() -> (String, String) {
+    let id = next_identity();
+    let wall_ns = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .and_then(|d| u64::try_from(d.as_nanos()).ok())
+        .unwrap_or(0);
+    let seed = format!("w3c:{}:{}:{}:{wall_ns}", id.pid, id.created, id.sequence);
+    let digest = sha256_hex(seed.as_bytes());
+    let trace_id = std::env::var("TRACEPARENT")
+        .ok()
+        .or_else(|| std::env::var("W3C_TRACEPARENT").ok())
+        .and_then(|v| parse_w3c_traceparent_trace_id(&v))
+        .unwrap_or_else(|| {
+            let mut t = digest[..32].to_string();
+            if t.bytes().all(|b| b == b'0') {
+                t.replace_range(31..32, "1");
+            }
+            t
+        });
+    let mut span_id = digest[32..48].to_string();
+    if span_id.bytes().all(|b| b == b'0') {
+        span_id.replace_range(15..16, "1");
+    }
+    (trace_id, span_id)
 }
 
 pub(crate) fn guard_context(
@@ -256,8 +328,10 @@ pub(crate) fn guard_context(
     if !runtime::audit_active() {
         return Context::default();
     }
+    let (trace_id, span_id) = next_w3c_trace_and_span_ids();
     Context {
-        trace_id: Some(next_local_id()),
+        trace_id: Some(trace_id),
+        span_id: Some(span_id),
         repo_id: Context::for_repo(repo).repo_id,
         session_id: Some(ledger.session_key_hash.clone()),
         profile_id: profile_id.filter(|id| valid_id(id)).map(str::to_owned),
@@ -315,6 +389,24 @@ pub(crate) fn hook_decision(
     disposition: &'static str,
     limit: Option<(u64, &'static str)>,
 ) -> Payload {
+    hook_decision_with_stages(
+        route,
+        action,
+        reason_code,
+        disposition,
+        limit,
+        DecisionStageTimings::default(),
+    )
+}
+
+pub(crate) fn hook_decision_with_stages(
+    route: &'static str,
+    action: &'static str,
+    reason_code: &'static str,
+    disposition: &'static str,
+    limit: Option<(u64, &'static str)>,
+    stages: DecisionStageTimings,
+) -> Payload {
     let mut body = vec![("route", text(route)), ("control", text(route))];
     if let Some((threshold, unit)) = limit {
         body.extend([
@@ -328,6 +420,7 @@ pub(crate) fn hook_decision(
         object(body),
     )
     .with_result(action, reason_code, disposition)
+    .with_stage_timings(stages)
 }
 
 /// Returns an event ID only after queue admission. The ID supports correlation while storage is

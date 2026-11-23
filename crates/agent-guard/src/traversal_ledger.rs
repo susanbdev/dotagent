@@ -36,6 +36,16 @@ pub const MAX_REFERENCE_LEVEL: u8 = 2;
 pub const MAX_RECENT_DENIALS: usize = 32;
 pub const MAX_RECENT_TRACES: usize = 16;
 
+pub fn effective_max_reference_level(repo_root: &Path) -> u8 {
+    if crate::enforcement_state::is_attested_sims_microvm() {
+        u8::MAX
+    } else if crate::operator::has_active_elevated_lease(repo_root) {
+        10u8
+    } else {
+        MAX_REFERENCE_LEVEL
+    }
+}
+
 pub type HotLedgerCache = Mutex<BTreeMap<String, (u128, u64, u64, SessionLedger)>>;
 
 fn meta_inode(meta: &fs::Metadata) -> u64 {
@@ -473,12 +483,7 @@ impl SessionLedger {
             return Err(("SESSION_CIRCUIT_BREAKER_HALTED", msg));
         }
 
-        let max_ref_level =
-            if crate::operator::has_active_elevated_lease(Path::new(&self.repo_root)) {
-                10u8
-            } else {
-                MAX_REFERENCE_LEVEL
-            };
+        let max_ref_level = effective_max_reference_level(Path::new(&self.repo_root));
         if !capability_preapproved
             && let Some(existing) = self.nodes.get(rel_path)
             && existing.level > max_ref_level
@@ -578,12 +583,7 @@ impl SessionLedger {
         if let Err(msg) = self.check_not_halted() {
             return Err(("SESSION_CIRCUIT_BREAKER_HALTED", msg));
         }
-        let max_ref_level =
-            if crate::operator::has_active_elevated_lease(Path::new(&self.repo_root)) {
-                10u8
-            } else {
-                MAX_REFERENCE_LEVEL
-            };
+        let max_ref_level = effective_max_reference_level(Path::new(&self.repo_root));
         if let Some(existing) = self.nodes.get(rel_path) {
             if existing.level > max_ref_level {
                 return Err((
@@ -1510,6 +1510,31 @@ pub fn append_audit_jsonl(
     detail: &str,
     halted: bool,
 ) {
+    append_audit_jsonl_with_timings(
+        repo_root,
+        session_id,
+        tool,
+        code,
+        detail,
+        halted,
+        None,
+        None,
+        crate::telemetry::capture::DecisionStageTimings::default(),
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn append_audit_jsonl_with_timings(
+    repo_root: &Path,
+    session_id: &str,
+    tool: &str,
+    code: &str,
+    detail: &str,
+    halted: bool,
+    trace_id: Option<&str>,
+    span_id: Option<&str>,
+    stages: crate::telemetry::capture::DecisionStageTimings,
+) {
     use crate::telemetry::protocol::Kind;
     use crate::telemetry::runtime::{note_invalid_audit, note_invalid_export, submit_record};
 
@@ -1534,11 +1559,21 @@ pub fn append_audit_jsonl(
         );
     }
 
+    let (default_tid, default_sid) = crate::telemetry::capture::next_w3c_trace_and_span_ids();
+    let effective_tid = trace_id
+        .filter(|s| s.len() == 32 && s.bytes().all(|b| b.is_ascii_hexdigit()))
+        .map(str::to_ascii_lowercase)
+        .unwrap_or(default_tid);
+    let effective_sid = span_id
+        .filter(|s| s.len() == 16 && s.bytes().all(|b| b.is_ascii_hexdigit()))
+        .map(str::to_ascii_lowercase)
+        .unwrap_or(default_sid);
+
     let has_detail = !detail.is_empty();
     let _ = submit_record(Kind::Legacy, || {
         let session_hash = compute_session_key_hash(repo_root, session_id);
         let safe_tool = crate::telemetry::protocol::tool_class(tool).to_owned();
-        JsonValue::Object(vec![
+        let mut entries = vec![
             (
                 "ts".into(),
                 ts_secs.map_or(JsonValue::Null, JsonValue::Uint),
@@ -1558,7 +1593,20 @@ pub fn append_audit_jsonl(
                 "detail".into(),
                 JsonValue::Str(if has_detail { "[redacted]" } else { "" }.into()),
             ),
-        ])
+            ("trace_id".into(), JsonValue::Str(effective_tid)),
+            ("span_id".into(), JsonValue::Str(effective_sid)),
+        ];
+        for (k, v) in [
+            ("duration_ns", stages.duration_ns),
+            ("ast_eval_ns", stages.ast_eval_ns),
+            ("path_policy_ns", stages.path_policy_ns),
+            ("coord_ipc_ns", stages.coord_ipc_ns),
+        ] {
+            if let Some(ns) = v {
+                entries.push((k.into(), JsonValue::Uint(ns)));
+            }
+        }
+        JsonValue::Object(entries)
     });
 }
 

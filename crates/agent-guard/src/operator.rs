@@ -3000,6 +3000,10 @@ pub(crate) fn execute_activate(
         }
     }
 
+    if !dry_run {
+        crate::coordinator::maybe_auto_warm_on_activate();
+    }
+
     log.push(format!(
         "[activate] Zero-trust guards, non-destructive backups, pinned GUI hooks, zsh/bash PATH, 19-key git lockdown, and read-only control plane active for '{}'.",
         target_ws.display()
@@ -3686,6 +3690,9 @@ pub fn execute_deactivate(
     }
     if let Some(ref wu) = ws_undo {
         wu.cleanup_empty_dirs();
+    }
+    if !dry_run {
+        crate::coordinator::stop_hot_hook_daemon();
     }
     log.extend(ag_lines);
     log.push(format!(
@@ -5151,6 +5158,10 @@ pub fn execute_antigravity_activate_with_trace(
         dry_run,
         &mut log,
     )?;
+
+    if !dry_run {
+        crate::coordinator::maybe_auto_warm_on_activate();
+    }
 
     log.push(format!(
         "[activate] Installed workspace Antigravity hook configuration for '{}' (pinned binary='{}', global config untouched; host_enforced=unverified until observer-verified denial mediation is established; tested Antigravity Remote Agents VM configuration was not mediated).",

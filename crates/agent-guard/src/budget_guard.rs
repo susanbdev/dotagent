@@ -24,6 +24,10 @@ pub const STEP_SOFT_COMPACT_TOKENS: usize = 8_000; // Soft step threshold -> tri
 pub const MAX_TURN_TOKENS: usize = 16_000; // Hard per-step untrusted token ceiling
 pub const MAX_TURN_FILE_READS: usize = 18;
 pub const MAX_TURN_TOOL_CALLS: usize = 28;
+pub const SIMS_MICROVM_MAX_RAW_FILE_BYTES: u64 = 262_144; // 256 KiB read cap in attested SimsMicroVm
+pub const SIMS_MICROVM_MAX_SLICE_LINES: usize = 2_000;
+pub const SIMS_MICROVM_MAX_TURN_TOKENS: usize = 128_000;
+pub const SIMS_MICROVM_MAX_DIRECT_DISCOVERY_CALLS: usize = 64;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ContentMetrics {
@@ -276,13 +280,23 @@ pub fn inspect_file_budget(
     offset_line: Option<usize>,
     limit_lines: Option<usize>,
 ) -> Result<(String, ContentMetrics), BudgetViolation> {
+    let (max_slice, max_raw, max_unsliced) = if crate::enforcement_state::is_attested_sims_microvm()
+    {
+        (
+            SIMS_MICROVM_MAX_SLICE_LINES,
+            SIMS_MICROVM_MAX_RAW_FILE_BYTES,
+            SIMS_MICROVM_MAX_SLICE_LINES,
+        )
+    } else {
+        (MAX_SLICE_LINES, MAX_RAW_FILE_BYTES, MAX_UNSLICED_LINES)
+    };
     inspect_file_budget_with_limits(
         path,
         offset_line,
         limit_lines,
-        MAX_SLICE_LINES,
-        MAX_RAW_FILE_BYTES,
-        MAX_UNSLICED_LINES,
+        max_slice,
+        max_raw,
+        max_unsliced,
     )
 }
 
@@ -692,14 +706,27 @@ impl RuntimeProfile {
         }
     }
 
+    pub fn apply_sims_microvm_turbo(&mut self) {
+        self.max_slice_lines = SIMS_MICROVM_MAX_SLICE_LINES;
+        self.max_raw_file_bytes = SIMS_MICROVM_MAX_RAW_FILE_BYTES;
+        self.max_turn_tokens = SIMS_MICROVM_MAX_TURN_TOKENS;
+        self.max_direct_discovery_calls = SIMS_MICROVM_MAX_DIRECT_DISCOVERY_CALLS;
+        self.max_turn_file_reads = self.max_turn_file_reads.max(120);
+        self.max_turn_tool_calls = self.max_turn_tool_calls.max(128);
+    }
+
     pub fn apply_elevated_lease(&mut self) {
-        self.max_slice_lines = 2_000;
-        self.max_raw_file_bytes = 262_144;
-        self.max_turn_tokens = 64_000;
-        self.max_turn_file_reads = 120;
-        self.max_turn_tool_calls = 120;
-        self.max_direct_discovery_calls = 120;
-        self.max_return_summary_ascii_tokens = Some(2_000);
+        self.max_slice_lines = self.max_slice_lines.max(2_000);
+        self.max_raw_file_bytes = self.max_raw_file_bytes.max(262_144);
+        self.max_turn_tokens = self.max_turn_tokens.max(64_000);
+        self.max_turn_file_reads = self.max_turn_file_reads.max(120);
+        self.max_turn_tool_calls = self.max_turn_tool_calls.max(120);
+        self.max_direct_discovery_calls = self.max_direct_discovery_calls.max(120);
+        self.max_return_summary_ascii_tokens = Some(
+            self.max_return_summary_ascii_tokens
+                .unwrap_or(200)
+                .max(2_000),
+        );
     }
 }
 
@@ -801,10 +828,13 @@ pub fn load_profile_by_id(
                 && entry.file_len == meta.len()
             {
                 let mut cached = entry.profile.clone();
-                if cached.profile_id == "coding-agent"
-                    && crate::operator::has_active_elevated_lease(repo_root)
-                {
-                    cached.apply_elevated_lease();
+                if cached.profile_id == "coding-agent" {
+                    if crate::enforcement_state::is_attested_sims_microvm() {
+                        cached.apply_sims_microvm_turbo();
+                    }
+                    if crate::operator::has_active_elevated_lease(repo_root) {
+                        cached.apply_elevated_lease();
+                    }
                 }
                 return Ok(cached);
             }
@@ -851,9 +881,13 @@ pub fn load_profile_by_id(
         }
     }
 
-    if profile.profile_id == "coding-agent" && crate::operator::has_active_elevated_lease(repo_root)
-    {
-        profile.apply_elevated_lease();
+    if profile.profile_id == "coding-agent" {
+        if crate::enforcement_state::is_attested_sims_microvm() {
+            profile.apply_sims_microvm_turbo();
+        }
+        if crate::operator::has_active_elevated_lease(repo_root) {
+            profile.apply_elevated_lease();
+        }
     }
     Ok(profile)
 }

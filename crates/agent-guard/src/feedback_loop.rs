@@ -1298,6 +1298,469 @@ pub fn run_feedback_sync_github_cli(args: &[String], cwd: &Path) -> ExitCode {
     ExitCode::SUCCESS
 }
 
+pub const FEEDBACK_OUTBOX_SCHEMA_V1: &str = "dotagent.feedback_outbox.v1";
+
+pub struct BuiltFeedbackOutbox {
+    pub json: JsonValue,
+    pub ballot_ids: Vec<String>,
+    pub batch_count: usize,
+    pub pubkey_ed25519_hex: String,
+}
+
+pub fn build_signed_outbox_for_repo(
+    repo_root: &Path,
+    target_repo: &str,
+) -> Result<BuiltFeedbackOutbox, String> {
+    validate_owner_repo(target_repo)?;
+    let all_ballots = load_verified_ballots(repo_root)?;
+    let already_synced = load_synced_ballot_ids();
+    let unsynced: Vec<_> = all_ballots
+        .into_iter()
+        .filter(|b| !already_synced.contains(&b.ballot_id))
+        .collect();
+    let ballot_ids: Vec<String> = unsynced.iter().map(|b| b.ballot_id.clone()).collect();
+    let clusters = aggregate_verified_clusters(&unsynced);
+
+    let (signing_zk, pubkey_hex) = load_or_init_telemetry_signing_key()?;
+    let sk = SigningKey::from_bytes(signing_zk.as_bytes());
+    let node_id = current_host_spool_id().unwrap_or_else(|_| "node_unknown".to_string());
+    let now_ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+
+    let mut batch_values = Vec::with_capacity(clusters.len());
+    for c in &clusters {
+        let mut batch = SignedSyncBatchV2 {
+            schema: SYNC_BATCH_SCHEMA_V2.to_string(),
+            node_id: node_id.clone(),
+            cluster_key: c.cluster_key.clone(),
+            category: c.category.clone(),
+            deny_code: c.deny_code.clone(),
+            target_bin_or_tool: c.target_bin_or_tool.clone(),
+            canonical_shape: c.canonical_shape.clone(),
+            voter_entries: c.voter_entries.clone(),
+            raw_submissions: c.total_raw_submissions,
+            tainted_attempts: c.tainted_attempts,
+            loop_anomalies: c.loop_anomaly_agents,
+            scrubbed_notes: c.scrubbed_notes.clone(),
+            ts_unix: now_ts,
+            pubkey_ed25519_hex: pubkey_hex.clone(),
+            signature_ed25519_hex: String::new(),
+        };
+        let sig = sk.sign(&batch.canonical_signing_bytes(target_repo));
+        batch.signature_ed25519_hex = hex_encode(&sig.to_bytes());
+        batch_values.push(batch.to_json_value());
+    }
+
+    let id_values: Vec<JsonValue> = ballot_ids.iter().cloned().map(JsonValue::Str).collect();
+    let batch_count = batch_values.len();
+    let json = JsonValue::Object(vec![
+        (
+            "schema".to_string(),
+            JsonValue::Str(FEEDBACK_OUTBOX_SCHEMA_V1.to_string()),
+        ),
+        (
+            "signature_domain".to_string(),
+            JsonValue::Str("dotagent:sync-sig:v2".to_string()),
+        ),
+        ("repo".to_string(), JsonValue::Str(target_repo.to_string())),
+        ("node_id".to_string(), JsonValue::Str(node_id)),
+        (
+            "pubkey_ed25519_hex".to_string(),
+            JsonValue::Str(pubkey_hex.clone()),
+        ),
+        ("exported_at_unix".to_string(), JsonValue::Uint(now_ts)),
+        (
+            "ballot_count".to_string(),
+            JsonValue::Uint(ballot_ids.len() as u64),
+        ),
+        ("ballot_ids".to_string(), JsonValue::Array(id_values)),
+        ("batches".to_string(), JsonValue::Array(batch_values)),
+    ]);
+
+    Ok(BuiltFeedbackOutbox {
+        json,
+        ballot_ids,
+        batch_count,
+        pubkey_ed25519_hex: pubkey_hex,
+    })
+}
+
+pub fn write_atomic_outbox_file(out_path: &Path, body: &[u8]) -> Result<(), String> {
+    let raw_s = out_path.to_string_lossy();
+    if raw_s.trim().is_empty() || raw_s.contains(['\n', '\r', '\0']) {
+        return Err("INVALID_OUTBOX_PATH: empty or control-character path".to_string());
+    }
+    if raw_s.starts_with("/tmp/")
+        || raw_s == "/tmp"
+        || raw_s.starts_with("/var/tmp/")
+        || raw_s == "/var/tmp"
+        || raw_s.starts_with("/dev/shm/")
+        || raw_s == "/dev/shm"
+        || out_path.components().any(|c| {
+            matches!(c, Component::ParentDir)
+                || c.as_os_str()
+                    .to_str()
+                    .is_some_and(|seg| matches!(seg, "tmp" | ".tmp" | ".cache" | "node_modules"))
+        })
+    {
+        return Err(format!(
+            "FORBIDDEN_OUTBOX_PATH: refusing outbox path '{}'",
+            out_path.display()
+        ));
+    }
+    if let Ok(existing) = fs::symlink_metadata(out_path)
+        && (existing.file_type().is_symlink() || !existing.file_type().is_file())
+    {
+        return Err(format!(
+            "SYMLINK_OUTBOX_BLOCKED: '{}' must be a regular non-symlink file",
+            out_path.display()
+        ));
+    }
+    let parent = match out_path.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => Path::new("."),
+    };
+    if let Ok(pmeta) = fs::symlink_metadata(parent) {
+        if pmeta.file_type().is_symlink() {
+            return Err(format!(
+                "SYMLINK_OUTBOX_BLOCKED: parent '{}' is a symlink",
+                parent.display()
+            ));
+        }
+    } else {
+        fs::create_dir_all(parent)
+            .map_err(|e| format!("failed creating outbox parent '{}': {e}", parent.display()))?;
+    }
+
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let fname = out_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("outbox.json");
+    let tmp_path = parent.join(format!(".{fname}.{}.{nonce}.tmp", std::process::id()));
+    let _ = fs::remove_file(&tmp_path);
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        let mut f = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .mode(0o600)
+            .custom_flags(crate::traversal_ledger::O_NOFOLLOW_FLAG)
+            .open(&tmp_path)
+            .map_err(|e| format!("failed creating temp outbox '{}': {e}", tmp_path.display()))?;
+        f.write_all(body)
+            .and_then(|()| f.sync_all())
+            .map_err(|e| format!("failed writing temp outbox '{}': {e}", tmp_path.display()))?;
+        let _ = fs::set_permissions(&tmp_path, fs::Permissions::from_mode(0o600));
+    }
+    #[cfg(not(unix))]
+    {
+        fs::write(&tmp_path, body)
+            .map_err(|e| format!("failed writing temp outbox '{}': {e}", tmp_path.display()))?;
+    }
+
+    fs::rename(&tmp_path, out_path).map_err(|e| {
+        let _ = fs::remove_file(&tmp_path);
+        format!("failed renaming outbox to '{}': {e}", out_path.display())
+    })
+}
+
+fn parse_loopback_forward_url(
+    raw_url: &str,
+) -> Result<(std::net::SocketAddr, String, String), String> {
+    let trimmed = raw_url.trim();
+    if trimmed.is_empty()
+        || trimmed
+            .bytes()
+            .any(|b| b.is_ascii_whitespace() || b.is_ascii_control())
+    {
+        return Err(
+            "INVALID_FORWARD_URL: URL must not be empty or contain control/whitespace bytes"
+                .to_string(),
+        );
+    }
+    let Some(rest) = trimmed.strip_prefix("http://") else {
+        return Err(
+            "NON_LOOPBACK_FORWARD_URL_DENIED: --forward-url must target local Trustless tl-proxy over loopback http://127.0.0.1:<port>/..."
+                .to_string(),
+        );
+    };
+    if rest.contains('@') {
+        return Err("INVALID_FORWARD_URL: credentials in URL userinfo are forbidden".to_string());
+    }
+    let (authority, path_part) = match rest.find('/') {
+        Some(idx) => (&rest[..idx], &rest[idx..]),
+        None => (rest, "/"),
+    };
+    let (addr, host_hdr) = if let Some(port_s) = authority.strip_prefix("127.0.0.1:") {
+        let port: u16 = port_s
+            .parse()
+            .ok()
+            .filter(|&p| p > 0)
+            .ok_or_else(|| format!("INVALID_FORWARD_URL: invalid loopback port '{port_s}'"))?;
+        (
+            std::net::SocketAddr::from(([127, 0, 0, 1], port)),
+            format!("127.0.0.1:{port}"),
+        )
+    } else if let Some(port_s) = authority.strip_prefix("localhost:") {
+        let port: u16 = port_s
+            .parse()
+            .ok()
+            .filter(|&p| p > 0)
+            .ok_or_else(|| format!("INVALID_FORWARD_URL: invalid loopback port '{port_s}'"))?;
+        (
+            std::net::SocketAddr::from(([127, 0, 0, 1], port)),
+            format!("127.0.0.1:{port}"),
+        )
+    } else if let Some(port_s) = authority.strip_prefix("[::1]:") {
+        let port: u16 = port_s
+            .parse()
+            .ok()
+            .filter(|&p| p > 0)
+            .ok_or_else(|| format!("INVALID_FORWARD_URL: invalid loopback port '{port_s}'"))?;
+        (
+            std::net::SocketAddr::from(([0, 0, 0, 0, 0, 0, 0, 1], port)),
+            format!("[::1]:{port}"),
+        )
+    } else {
+        return Err(format!(
+            "NON_LOOPBACK_FORWARD_URL_DENIED: authority '{authority}' is forbidden; only 127.0.0.1:<port> or [::1]:<port> tl-proxy allowed"
+        ));
+    };
+    Ok((addr, host_hdr, path_part.to_string()))
+}
+
+/// Ships a signed `dotagent.feedback_outbox.v1` JSON batch over local `Trustless` `tl-proxy`
+/// (`http://127.0.0.1:<port>/...`) with `0` GitHub credentials in environment or HTTP headers.
+pub fn forward_outbox_via_loopback_proxy(url: &str, body: &[u8]) -> Result<u16, String> {
+    // Scrub any stray ambient GitHub token before opening the socket so `0` token ever exists on this path.
+    let _scrubbed = ZeroizingToken::from_env_and_scrub();
+    let (addr, host_hdr, path) = parse_loopback_forward_url(url)?;
+    let mut stream = std::net::TcpStream::connect_timeout(&addr, Duration::from_secs(5))
+        .map_err(|e| format!("tl-proxy connect to {addr} failed: {e}"))?;
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+    let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
+
+    let req_head = format!(
+        "POST {path} HTTP/1.1\r\nHost: {host_hdr}\r\nContent-Type: application/json\r\nX-Dotagent-Sig-Domain: dotagent:sync-sig:v2\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+    stream
+        .write_all(req_head.as_bytes())
+        .and_then(|()| stream.write_all(body))
+        .and_then(|()| stream.flush())
+        .map_err(|e| format!("tl-proxy write to {addr} failed: {e}"))?;
+
+    let mut resp_buf = Vec::with_capacity(512);
+    (&mut stream)
+        .take(8_192)
+        .read_to_end(&mut resp_buf)
+        .map_err(|e| format!("tl-proxy read from {addr} failed: {e}"))?;
+    let resp_str = String::from_utf8_lossy(&resp_buf);
+    let status_line = resp_str.lines().next().unwrap_or("");
+    let code = status_line
+        .split_whitespace()
+        .nth(1)
+        .and_then(|s| s.parse::<u16>().ok())
+        .ok_or_else(|| format!("malformed HTTP status from tl-proxy: '{status_line}'"))?;
+    if !(200..=299).contains(&code) {
+        return Err(format!("tl-proxy returned non-2xx HTTP {code}"));
+    }
+    Ok(code)
+}
+
+/// Automatically stages a signed `dotagent:sync-sig:v2` outbox file under `<feedback_state_dir>/outbox/`
+/// during host `dotagent on-stop` when verified unsynced ballots exist, and optionally forwards via
+/// `DOTAGENT_TRUSTLESS_FORWARD_URL` (`tl-proxy` loopback) with zero GitHub token in env.
+pub fn stage_signed_outbox_on_stop(repo_root: &Path) -> Result<Option<PathBuf>, String> {
+    if std::env::var("AGENT_GUARD_IN_SANDBOX").as_deref() == Ok("1")
+        || std::env::var("AGENT_GUARD_WORKER_LOCK").as_deref() == Ok("1")
+    {
+        return Ok(None);
+    }
+    let target_repo = std::env::var("DOTAGENT_FEEDBACK_TARGET_REPO")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty() && validate_owner_repo(s).is_ok())
+        .unwrap_or_else(|| "susanbdev/dotagent".to_string());
+
+    let built = build_signed_outbox_for_repo(repo_root, &target_repo)?;
+    if built.ballot_ids.is_empty() || built.batch_count == 0 {
+        return Ok(None);
+    }
+
+    let fb_dir = feedback_state_dir()?;
+    ensure_nonsymlink_state_dir(&fb_dir)?;
+    let outbox_dir = fb_dir.join("outbox");
+    ensure_nonsymlink_state_dir(&outbox_dir)?;
+
+    let canon_repo = fs::canonicalize(repo_root).unwrap_or_else(|_| repo_root.to_path_buf());
+    let repo_hash = sha256_hex(canon_repo.to_string_lossy().as_bytes());
+    let staged_path = outbox_dir.join(format!("pending_{}.json", &repo_hash[..16]));
+    let mut payload = built.json.to_json_string();
+    payload.push('\n');
+    write_atomic_outbox_file(&staged_path, payload.as_bytes())?;
+
+    if let Ok(custom_out) = std::env::var("DOTAGENT_FEEDBACK_OUTBOX_FILE") {
+        let trimmed = custom_out.trim();
+        if !trimmed.is_empty() {
+            let _ = write_atomic_outbox_file(Path::new(trimmed), payload.as_bytes());
+        }
+    }
+    if let Ok(fwd_url) = std::env::var("DOTAGENT_TRUSTLESS_FORWARD_URL") {
+        let trimmed = fwd_url.trim();
+        if !trimmed.is_empty()
+            && forward_outbox_via_loopback_proxy(trimmed, payload.as_bytes()).is_ok()
+        {
+            let _ = record_synced_ballot_ids(&built.ballot_ids);
+        }
+    }
+
+    Ok(Some(staged_path))
+}
+
+pub fn run_feedback_export_outbox_cli(args: &[String], cwd: &Path) -> ExitCode {
+    if let Err(e) = verify_feedback_operator_or_ci_loop("dotagent feedback export-outbox") {
+        eprintln!("[AGENT-GUARD HARD DENY] {e}");
+        return ExitCode::from(2);
+    }
+    // Enforce zero ambient GitHub token requirement/retention.
+    let _scrubbed = ZeroizingToken::from_env_and_scrub();
+
+    let mut out_file: Option<PathBuf> = None;
+    let mut forward_url: Option<String> = None;
+    let mut target_repo = String::from("susanbdev/dotagent");
+    let mut mark_synced = false;
+    let mut json_mode = false;
+
+    let mut i = 0usize;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--out" if i + 1 < args.len() => {
+                out_file = Some(PathBuf::from(&args[i + 1]));
+                i += 2;
+            }
+            "--forward-url" if i + 1 < args.len() => {
+                forward_url = Some(args[i + 1].clone());
+                i += 2;
+            }
+            "--repo" if i + 1 < args.len() => {
+                target_repo = args[i + 1].clone();
+                i += 2;
+            }
+            "--mark-synced" => {
+                mark_synced = true;
+                i += 1;
+            }
+            "--json" => {
+                json_mode = true;
+                i += 1;
+            }
+            other => {
+                eprintln!("[dotagent feedback export-outbox] unrecognized argument '{other}'");
+                return ExitCode::from(2);
+            }
+        }
+    }
+
+    if out_file.is_none() && forward_url.is_none() && !json_mode {
+        eprintln!(
+            "[dotagent feedback export-outbox] specify `--out <file>`, `--forward-url <http://127.0.0.1:18080/...>`, or `--json`"
+        );
+        return ExitCode::from(2);
+    }
+
+    let repo_root = resolve_repo_root(cwd);
+    let built = match build_signed_outbox_for_repo(&repo_root, &target_repo) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("[dotagent feedback export-outbox] HARD DENY: {e}");
+            return ExitCode::from(2);
+        }
+    };
+
+    let mut encoded = built.json.to_json_string();
+    encoded.push('\n');
+
+    if let Some(ref out_p) = out_file
+        && let Err(e) = write_atomic_outbox_file(out_p, encoded.as_bytes())
+    {
+        eprintln!("[dotagent feedback export-outbox] write failed: {e}");
+        return ExitCode::from(2);
+    }
+
+    let mut http_status: Option<u16> = None;
+    if let Some(ref url) = forward_url {
+        match forward_outbox_via_loopback_proxy(url, encoded.as_bytes()) {
+            Ok(code) => {
+                http_status = Some(code);
+                mark_synced = true;
+            }
+            Err(e) => {
+                eprintln!("[dotagent feedback export-outbox] forward failed: {e}");
+                return ExitCode::from(2);
+            }
+        }
+    }
+
+    if mark_synced
+        && !built.ballot_ids.is_empty()
+        && let Err(e) = record_synced_ballot_ids(&built.ballot_ids)
+    {
+        eprintln!("[dotagent feedback export-outbox] failed recording synced ballots: {e}");
+        return ExitCode::from(2);
+    }
+
+    if json_mode {
+        println!(
+            "{}",
+            JsonValue::Object(vec![
+                ("ok".to_string(), JsonValue::Bool(true)),
+                ("repo".to_string(), JsonValue::Str(target_repo)),
+                (
+                    "ballot_count".to_string(),
+                    JsonValue::Uint(built.ballot_ids.len() as u64),
+                ),
+                (
+                    "batch_count".to_string(),
+                    JsonValue::Uint(built.batch_count as u64),
+                ),
+                (
+                    "pubkey_ed25519_hex".to_string(),
+                    JsonValue::Str(built.pubkey_ed25519_hex),
+                ),
+                (
+                    "out_file".to_string(),
+                    out_file.map_or(JsonValue::Null, |p| {
+                        JsonValue::Str(p.to_string_lossy().into_owned())
+                    }),
+                ),
+                (
+                    "forward_http_status".to_string(),
+                    http_status.map_or(JsonValue::Null, |c| JsonValue::Uint(u64::from(c))),
+                ),
+                ("outbox".to_string(), built.json),
+            ])
+            .to_json_string()
+        );
+    } else {
+        println!(
+            "[dotagent feedback export-outbox] Exported {} signed batch(es) ({} ballot(s), pubkey={})",
+            built.batch_count,
+            built.ballot_ids.len(),
+            &built.pubkey_ed25519_hex[..16]
+        );
+    }
+    ExitCode::SUCCESS
+}
+
 fn ensure_friction_labels(
     gh: &Path,
     tok: Option<&ZeroizingToken>,
@@ -3874,5 +4337,64 @@ mod tests {
         )
         .expect("json");
         assert!(Ring2RemediationSpec::validate_and_parse(&bad_spec, &ck, false).is_err());
+    }
+
+    #[test]
+    fn outbox_atomic_export_and_trustless_loopback_forwarder_enforce_zero_token_and_loopback_only()
+    {
+        let ws_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(Path::parent)
+            .expect("workspace root");
+        let root = ws_root
+            .join("target/test-workspaces")
+            .join(format!("outbox-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).expect("mkdir test dir");
+
+        // Forbidden /tmp path rejected immediately
+        assert!(write_atomic_outbox_file(Path::new("/tmp/evil-outbox.json"), b"{}").is_err());
+
+        let out_file = root.join("signed_outbox.json");
+        let sample_payload = br#"{"schema":"dotagent.feedback_outbox.v1","signature_domain":"dotagent:sync-sig:v2","batches":[]}"#;
+        write_atomic_outbox_file(&out_file, sample_payload).expect("atomic write");
+        assert_eq!(fs::read(&out_file).expect("read outbox"), sample_payload);
+
+        // Non-loopback and HTTPS external endpoints must be hard-rejected
+        assert!(
+            forward_outbox_via_loopback_proxy("https://api.github.com/repos/x/y", sample_payload)
+                .is_err()
+        );
+        assert!(
+            forward_outbox_via_loopback_proxy("http://192.0.2.10:18080/v1/outbox", sample_payload)
+                .is_err()
+        );
+
+        // Local 127.0.0.1 ephemeral Trustless tl-proxy listener receives signed batch with zero Authorization header
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+        let port = listener.local_addr().expect("local_addr").port();
+        let srv = thread::spawn(move || {
+            let (mut sock, _) = listener.accept().expect("accept");
+            let mut buf = [0u8; 4096];
+            let n = sock.read(&mut buf).expect("read req");
+            let req_text = String::from_utf8_lossy(&buf[..n]).into_owned();
+            sock.write_all(b"HTTP/1.1 202 Accepted\r\nContent-Length: 2\r\n\r\nOK")
+                .expect("write resp");
+            req_text
+        });
+
+        let status = forward_outbox_via_loopback_proxy(
+            &format!("http://127.0.0.1:{port}/v1/feedback/outbox"),
+            sample_payload,
+        )
+        .expect("loopback forward succeeds");
+        assert_eq!(status, 202);
+        let captured_req = srv.join().expect("join mock tl-proxy");
+        assert!(captured_req.starts_with("POST /v1/feedback/outbox HTTP/1.1\r\n"));
+        assert!(captured_req.contains("X-Dotagent-Sig-Domain: dotagent:sync-sig:v2\r\n"));
+        assert!(!captured_req.to_ascii_lowercase().contains("authorization:"));
+        assert!(captured_req.contains("dotagent.feedback_outbox.v1"));
+
+        let _ = fs::remove_dir_all(&root);
     }
 }

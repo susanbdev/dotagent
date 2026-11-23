@@ -370,7 +370,10 @@ fn find_agent_guard_binary() -> Option<PathBuf> {
             if name == "agent-guard" || name == "dotagent" {
                 return Some(exe);
             }
-            if name == "swarm-tool" {
+            if matches!(
+                name,
+                "swarm-tool" | "dotagent-harness" | "dotagent-compiler"
+            ) {
                 let sibling = exe.with_file_name("agent-guard");
                 if is_trusted_executable_file(&sibling) {
                     return Some(sibling);
@@ -983,16 +986,33 @@ pub fn ping_hook_daemon() -> bool {
     }
 }
 
-pub fn ensure_hook_daemon() -> Result<PathBuf, String> {
-    if std::env::var("AGENT_GUARD_IN_SANDBOX").as_deref() == Ok("1")
-        || std::env::var("AGENT_GUARD_WORKER_LOCK").as_deref() == Ok("1")
+fn write_auto_warm_marker(daemon_dir: &Path) {
+    let marker = daemon_dir.join("auto_warm.enabled");
+    if fs::symlink_metadata(&marker).is_ok_and(|m| m.file_type().is_symlink()) {
+        return;
+    }
+    #[cfg(unix)]
     {
-        return Err("HOOK_DAEMON_DENIED_IN_SANDBOX: warm hook daemon is host-only".to_string());
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        if let Ok(mut f) = fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .mode(0o600)
+            .custom_flags(crate::traversal_ledger::O_NOFOLLOW_FLAG)
+            .open(&marker)
+        {
+            let _ = f.write_all(b"1\n");
+            let _ = fs::set_permissions(&marker, fs::Permissions::from_mode(0o600));
+        }
     }
-    let sock_path = hook_daemon_socket_path()?;
-    if ping_hook_daemon() {
-        return Ok(sock_path);
+    #[cfg(not(unix))]
+    {
+        let _ = fs::write(&marker, b"1\n");
     }
+}
+
+fn spawn_hook_daemon_process(sock_path: &Path) -> Result<(), String> {
     let Some(bin) = find_agent_guard_binary() else {
         return Err("agent-guard binary not found to spawn hook daemon".to_string());
     };
@@ -1002,7 +1022,7 @@ pub fn ensure_hook_daemon() -> Result<PathBuf, String> {
     let spawn_lock = parent.join("hook_daemon.spawn");
     let _guard = ExclusiveFileLockGuard::acquire(&spawn_lock)?;
     if ping_hook_daemon() {
-        return Ok(sock_path);
+        return Ok(());
     }
     let mut daemon_cmd = std::process::Command::new(bin);
     daemon_cmd
@@ -1027,6 +1047,20 @@ pub fn ensure_hook_daemon() -> Result<PathBuf, String> {
     let _child = daemon_cmd
         .spawn()
         .map_err(|e| format!("failed spawning hook-daemon: {e}"))?;
+    Ok(())
+}
+
+pub fn ensure_hook_daemon() -> Result<PathBuf, String> {
+    if std::env::var("AGENT_GUARD_IN_SANDBOX").as_deref() == Ok("1")
+        || std::env::var("AGENT_GUARD_WORKER_LOCK").as_deref() == Ok("1")
+    {
+        return Err("HOOK_DAEMON_DENIED_IN_SANDBOX: warm hook daemon is host-only".to_string());
+    }
+    let sock_path = hook_daemon_socket_path()?;
+    if ping_hook_daemon() {
+        return Ok(sock_path);
+    }
+    spawn_hook_daemon_process(&sock_path)?;
     for _ in 0..40 {
         if ping_hook_daemon() {
             return Ok(sock_path);
@@ -1034,6 +1068,86 @@ pub fn ensure_hook_daemon() -> Result<PathBuf, String> {
         std::thread::sleep(Duration::from_millis(10));
     }
     Err("timed out waiting for hook-daemon socket".to_string())
+}
+
+/// Auto-spawns the warm host hook daemon (`hook.sock`) and marks the state namespace for lazy
+/// background re-warming after idle timeouts, unless disabled by `DOTAGENT_NO_AUTO_COORD=1`.
+pub fn ensure_hot_hook_daemon() -> Result<PathBuf, String> {
+    if std::env::var("DOTAGENT_NO_AUTO_COORD").as_deref() == Ok("1") {
+        return Err("HOOK_DAEMON_AUTO_DISABLED: DOTAGENT_NO_AUTO_COORD=1".to_string());
+    }
+    let sock_path = ensure_hook_daemon()?;
+    if let Some(parent) = sock_path.parent() {
+        write_auto_warm_marker(parent);
+    }
+    Ok(sock_path)
+}
+
+/// Spawns `agent-guard hook-daemon` detached without waiting for socket readiness so lazy wakeup
+/// in `eval_hook_preferring_hot_coord` never blocks cold CLI latency.
+pub fn spawn_hot_hook_daemon_detached() -> Result<PathBuf, String> {
+    if std::env::var("DOTAGENT_NO_AUTO_COORD").as_deref() == Ok("1") {
+        return Err("HOOK_DAEMON_AUTO_DISABLED: DOTAGENT_NO_AUTO_COORD=1".to_string());
+    }
+    if std::env::var("AGENT_GUARD_IN_SANDBOX").as_deref() == Ok("1")
+        || std::env::var("AGENT_GUARD_WORKER_LOCK").as_deref() == Ok("1")
+    {
+        return Err("HOOK_DAEMON_DENIED_IN_SANDBOX: warm hook daemon is host-only".to_string());
+    }
+    let sock_path = hook_daemon_socket_path()?;
+    if let Some(parent) = sock_path.parent() {
+        write_auto_warm_marker(parent);
+    }
+    spawn_hook_daemon_process(&sock_path)?;
+    Ok(sock_path)
+}
+
+pub fn maybe_auto_warm_on_activate() {
+    #[cfg(test)]
+    if std::env::var("DOTAGENT_FORCE_TEST_AUTO_COORD").as_deref() != Ok("1") {
+        return;
+    }
+    if std::env::var("DOTAGENT_NO_AUTO_COORD").as_deref() == Ok("1")
+        || std::env::var("AGENT_GUARD_HOT_COORD").as_deref() == Ok("0")
+    {
+        return;
+    }
+    let _ = ensure_hot_hook_daemon();
+}
+
+/// Removes `daemon/auto_warm.enabled` and `daemon/hook.sock` so any warm `hook-daemon` in the
+/// active state namespace detects socket unlink and terminates within `<= 20ms`.
+pub fn stop_hot_hook_daemon() {
+    let daemon_dir = crate::traversal_ledger::state_base_dir().join("daemon");
+    let _ = fs::remove_file(daemon_dir.join("auto_warm.enabled"));
+    let _ = fs::remove_file(daemon_dir.join("hook.sock"));
+}
+
+/// Determines whether `eval_hook_preferring_hot_coord` should use or lazily warm `hook.sock`.
+/// Preserves strict absent-state isolation for unactivated cold workspaces when `daemon/` is absent.
+pub fn should_auto_warm_hook_daemon(repo_root: &Path) -> bool {
+    if std::env::var("DOTAGENT_NO_AUTO_COORD").as_deref() == Ok("1")
+        || std::env::var("AGENT_GUARD_HOT_COORD").as_deref() == Ok("0")
+        || std::env::var("AGENT_GUARD_IN_SANDBOX").as_deref() == Ok("1")
+        || std::env::var("AGENT_GUARD_WORKER_LOCK").as_deref() == Ok("1")
+    {
+        return false;
+    }
+    if std::env::var("AGENT_GUARD_HOT_COORD").as_deref() == Ok("1") {
+        return true;
+    }
+    let daemon_dir = crate::traversal_ledger::state_base_dir().join("daemon");
+    if fs::symlink_metadata(daemon_dir.join("hook.sock")).is_ok()
+        || fs::symlink_metadata(daemon_dir.join("auto_warm.enabled")).is_ok()
+    {
+        return true;
+    }
+    if crate::enforcement_state::is_attested_sims_microvm() {
+        return true;
+    }
+    fs::symlink_metadata(repo_root.join(".claude/settings.json")).is_ok()
+        || fs::symlink_metadata(repo_root.join(".cursor/hooks.json")).is_ok()
+        || fs::symlink_metadata(repo_root.join(".agents/hooks.json")).is_ok()
 }
 
 /// Evaluates `pre-tool` or `post-tool` over the host-only `hook.sock` daemon (`< 150 us` steady-state
@@ -1045,6 +1159,16 @@ pub fn rpc_eval_hook(
     hook_payload: &str,
     cwd: &Path,
 ) -> Result<crate::Decision, String> {
+    rpc_eval_hook_with_mode(repo_root, phase, hook_payload, cwd, true).map(|(d, _)| d)
+}
+
+pub fn rpc_eval_hook_with_mode(
+    repo_root: &Path,
+    phase: &str,
+    hook_payload: &str,
+    cwd: &Path,
+    wait_for_spawn: bool,
+) -> Result<(crate::Decision, u64), String> {
     if std::env::var("AGENT_GUARD_IN_SANDBOX").as_deref() == Ok("1")
         || std::env::var("AGENT_GUARD_WORKER_LOCK").as_deref() == Ok("1")
     {
@@ -1082,6 +1206,9 @@ pub fn rpc_eval_hook(
         let caller_profile = std::env::var("AGENT_GUARD_PROFILE").ok();
         let caller_role = std::env::var("AGENT_GUARD_ROLE").ok();
         let caller_direct_explore = std::env::var("AGENT_GUARD_DIRECT_EXPLORE").ok();
+        let caller_traceparent = std::env::var("TRACEPARENT")
+            .ok()
+            .or_else(|| std::env::var("W3C_TRACEPARENT").ok());
         let req = JsonValue::Object(vec![
             ("op".to_string(), JsonValue::Str("eval_hook".to_string())),
             ("phase".to_string(), JsonValue::Str(phase.to_string())),
@@ -1117,20 +1244,30 @@ pub fn rpc_eval_hook(
                 "caller_direct_explore".to_string(),
                 caller_direct_explore.map_or(JsonValue::Null, JsonValue::Str),
             ),
+            (
+                "caller_traceparent".to_string(),
+                caller_traceparent.map_or(JsonValue::Null, JsonValue::Str),
+            ),
         ]);
+        let ipc_t0 = Instant::now();
         let resp = match send_rpc_request(&sock_path, &req) {
             Ok(r) => r,
-            Err(_) => {
-                let fresh_sock = ensure_hook_daemon()?;
+            Err(_) if wait_for_spawn => {
+                let fresh_sock = ensure_hot_hook_daemon()?;
                 send_rpc_request(&fresh_sock, &req)?
             }
+            Err(_) => {
+                let _ = spawn_hot_hook_daemon_detached();
+                return Err("LAZY_WARM_SPAWNED_FALLBACK_INPROC".to_string());
+            }
         };
+        let coord_ipc_ns = u64::try_from(ipc_t0.elapsed().as_nanos()).unwrap_or(u64::MAX);
         let allow = resp
             .get("allow")
             .and_then(JsonValue::as_bool)
             .ok_or_else(|| "missing allow boolean in eval_hook response".to_string())?;
-        if allow {
-            Ok(crate::Decision::Allow {
+        let decision = if allow {
+            crate::Decision::Allow {
                 advisory: resp
                     .get("advisory")
                     .and_then(JsonValue::as_str)
@@ -1143,7 +1280,7 @@ pub fn rpc_eval_hook(
                     .get("updated_bash_cmd")
                     .and_then(JsonValue::as_str)
                     .map(String::from),
-            })
+            }
         } else {
             let code_str = resp
                 .get("code")
@@ -1158,16 +1295,17 @@ pub fn rpc_eval_hook(
                 .get("halt_session")
                 .and_then(JsonValue::as_bool)
                 .unwrap_or(false);
-            Ok(crate::Decision::Deny {
+            crate::Decision::Deny {
                 code: intern_known_guard_code(code_str),
                 reason,
                 halt_session,
-            })
-        }
+            }
+        };
+        Ok((decision, coord_ipc_ns))
     }
     #[cfg(not(unix))]
     {
-        let _ = (repo_root, phase, hook_payload, cwd);
+        let _ = (repo_root, phase, hook_payload, cwd, wait_for_spawn);
         Err("Unix domain sockets unsupported on this platform".to_string())
     }
 }
@@ -1498,9 +1636,11 @@ pub fn run_hook_daemon_cli(args: &[String]) -> ExitCode {
             Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::new()));
         let last_activity = Arc::new(AtomicU64::new(now_epoch_secs()));
         let active_clients = Arc::new(AtomicUsize::new(0));
+        let mut empty_polls: u32 = 0;
         loop {
             match listener.accept() {
                 Ok((stream, _addr)) => {
+                    empty_polls = 0;
                     last_activity.store(now_epoch_secs(), Ordering::Relaxed);
                     if active_clients.load(Ordering::Relaxed) >= MAX_CONCURRENT_IPC_CLIENTS {
                         drop(stream);
@@ -1515,6 +1655,11 @@ pub fn run_hook_daemon_cli(args: &[String]) -> ExitCode {
                     });
                 }
                 Err(e) if e.kind() == ErrorKind::WouldBlock => {
+                    empty_polls = empty_polls.saturating_add(1);
+                    if empty_polls <= 64 {
+                        std::thread::yield_now();
+                        continue;
+                    }
                     let socket_replaced = socket_dev_ino(&sock_path) != bound_inode;
                     let elapsed =
                         now_epoch_secs().saturating_sub(last_activity.load(Ordering::Relaxed));
@@ -1524,10 +1669,14 @@ pub fn run_hook_daemon_cli(args: &[String]) -> ExitCode {
                         unlink_if_same_inode(&sock_path, bound_inode);
                         return ExitCode::SUCCESS;
                     }
-                    std::thread::sleep(Duration::from_millis(20));
+                    if empty_polls <= 2_500 {
+                        std::thread::sleep(Duration::from_micros(100));
+                    } else {
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
                 }
                 Err(_) => {
-                    std::thread::sleep(Duration::from_millis(20));
+                    std::thread::sleep(Duration::from_millis(10));
                 }
             }
         }
@@ -1539,6 +1688,7 @@ fn handle_hook_daemon_client(
     mut stream: UnixStream,
     hot_cache: &crate::traversal_ledger::HotLedgerCache,
 ) -> Result<(), String> {
+    let ipc_t0 = Instant::now();
     let _ = stream.set_nonblocking(false);
     let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
     let _ = stream.set_write_timeout(Some(Duration::from_secs(2)));
@@ -1550,7 +1700,8 @@ fn handle_hook_daemon_client(
             .read_line(&mut line)
             .map_err(|e| format!("read error: {e}"))?;
     }
-    let resp = match process_hook_daemon_line(line.trim(), hot_cache) {
+    let ipc_read_ns = u64::try_from(ipc_t0.elapsed().as_nanos()).ok();
+    let resp = match process_hook_daemon_line_with_ipc(line.trim(), hot_cache, ipc_read_ns) {
         Ok(val) => val,
         Err(err) => JsonValue::Object(vec![
             ("ok".to_string(), JsonValue::Bool(false)),
@@ -1566,9 +1717,10 @@ fn handle_hook_daemon_client(
     Ok(())
 }
 
-fn process_hook_daemon_line(
+fn process_hook_daemon_line_with_ipc(
     raw: &str,
     hot_cache: &crate::traversal_ledger::HotLedgerCache,
+    coord_ipc_ns: Option<u64>,
 ) -> Result<JsonValue, String> {
     let req = JsonValue::parse(raw).map_err(|e| format!("invalid JSON: {e}"))?;
     let op = req
@@ -1632,12 +1784,15 @@ fn process_hook_daemon_line(
                     .and_then(JsonValue::as_str)
                     .map(String::from),
             };
+            let caller_traceparent = req.get("caller_traceparent").and_then(JsonValue::as_str);
             let decision = match phase {
-                "pre-tool" => crate::handle_pre_tool_hook_with_context(
+                "pre-tool" => crate::handle_pre_tool_hook_with_context_and_ipc(
                     payload,
                     &checked_cwd,
                     &caller_ctx,
                     Some(hot_cache),
+                    coord_ipc_ns,
+                    caller_traceparent,
                 ),
                 "post-tool" => crate::handle_post_tool_hook_with_context(
                     payload,
@@ -1795,9 +1950,11 @@ pub fn run_coordinator_cli(args: &[String], default_cwd: &Path) -> ExitCode {
 
         let last_activity = Arc::new(AtomicU64::new(now_epoch_secs()));
         let active_clients = Arc::new(AtomicUsize::new(0));
+        let mut empty_polls: u32 = 0;
         loop {
             match listener.accept() {
                 Ok((stream, _addr)) => {
+                    empty_polls = 0;
                     if current_hmac_epoch_id(&canon_repo).unwrap_or(bound_epoch) != bound_epoch {
                         drop(stream);
                         if active_clients.load(Ordering::Acquire) == 0 {
@@ -1827,6 +1984,11 @@ pub fn run_coordinator_cli(args: &[String], default_cwd: &Path) -> ExitCode {
                     });
                 }
                 Err(e) if e.kind() == ErrorKind::WouldBlock => {
+                    empty_polls = empty_polls.saturating_add(1);
+                    if empty_polls <= 64 {
+                        std::thread::yield_now();
+                        continue;
+                    }
                     let epoch_retired =
                         current_hmac_epoch_id(&canon_repo).unwrap_or(bound_epoch) != bound_epoch;
                     let socket_replaced = socket_dev_ino(&sock_path) != bound_inode;
@@ -1838,10 +2000,14 @@ pub fn run_coordinator_cli(args: &[String], default_cwd: &Path) -> ExitCode {
                         unlink_if_same_inode(&sock_path, bound_inode);
                         return ExitCode::SUCCESS;
                     }
-                    std::thread::sleep(Duration::from_millis(20));
+                    if empty_polls <= 2_500 {
+                        std::thread::sleep(Duration::from_micros(100));
+                    } else {
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
                 }
                 Err(_) => {
-                    std::thread::sleep(Duration::from_millis(20));
+                    std::thread::sleep(Duration::from_millis(10));
                 }
             }
         }

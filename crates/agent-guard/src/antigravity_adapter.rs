@@ -1777,6 +1777,12 @@ fn handle_stop(parsed: &JsonValue, common: &CommonEnvelope) -> AntigravityOutcom
         };
     }
 
+    if std::env::var("AGENT_GUARD_IN_SANDBOX").as_deref() != Ok("1")
+        && std::env::var("AGENT_GUARD_WORKER_LOCK").as_deref() != Ok("1")
+    {
+        let _ = crate::feedback_loop::stage_signed_outbox_on_stop(&common.repo_root);
+    }
+
     append_audit_jsonl(
         &common.repo_root,
         &common.conversation_id,

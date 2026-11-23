@@ -78,15 +78,40 @@ use sanitizer::{
     DEFAULT_COMPACT_STREAM_MAX_BYTES, DEFAULT_COMPACT_STREAM_MAX_LINES, neuter_to_clean_ascii,
     sanitize_and_compact_bytes_observed, wrap_spotlight_envelope,
 };
-use telemetry::capture::{self, Context as CaptureContext};
+use telemetry::capture::{self, Context as CaptureContext, DecisionStageTimings};
 use telemetry::controls::{
     self, Boundary, Control, ControlAction, LimitSource, OutputMeasurement, ReadMeasurement,
 };
-use traversal_ledger::{SessionLedger, append_audit_jsonl};
+use traversal_ledger::{SessionLedger, append_audit_jsonl, append_audit_jsonl_with_timings};
 use unicode_guard::{ScanMode, scan_unicode};
 
 /// Allowed canonical Zero-Trust MCP endpoint per `dotagent/spec.md` Law 6 (exact server delimiter).
 pub const ALLOWED_MCP_SERVER_PREFIX: &str = "mcp__susanbdev__";
+pub const ALLOWED_AGORA_MCP_PREFIX: &str = "mcp__agora__";
+pub const ALLOWED_AGORA_MCP_ALT_PREFIX: &str = "mcp__agora_mcp__";
+pub const ALLOWED_AGORA_MCP_DASH_PREFIX: &str = "mcp__agora-mcp__";
+
+pub fn strip_approved_mcp_server_prefix(norm_tool: &str) -> Option<&str> {
+    for prefix in [
+        ALLOWED_MCP_SERVER_PREFIX,
+        ALLOWED_AGORA_MCP_PREFIX,
+        ALLOWED_AGORA_MCP_ALT_PREFIX,
+        ALLOWED_AGORA_MCP_DASH_PREFIX,
+    ] {
+        if let Some(sub) = norm_tool.strip_prefix(prefix)
+            && !sub.is_empty()
+        {
+            return Some(sub);
+        }
+    }
+    None
+}
+
+fn add_path_policy_elapsed(stages: &mut DecisionStageTimings, elapsed: std::time::Duration) {
+    if let Ok(ns) = u64::try_from(elapsed.as_nanos()) {
+        stages.path_policy_ns = Some(stages.path_policy_ns.unwrap_or(0).saturating_add(ns));
+    }
+}
 
 /// Canonical SHA-256 of `dist/gemini/GEMINI.md` emitted by `dotagent-compiler`.
 pub const CANONICAL_DIST_GEMINI_SHA256: &str =
@@ -357,6 +382,24 @@ pub fn handle_pre_tool_hook_with_context(
     caller_ctx: &HookCallerContext,
     hot_cache: Option<&traversal_ledger::HotLedgerCache>,
 ) -> Decision {
+    handle_pre_tool_hook_with_context_and_ipc(
+        raw_json,
+        fallback_cwd,
+        caller_ctx,
+        hot_cache,
+        None,
+        None,
+    )
+}
+
+pub(crate) fn handle_pre_tool_hook_with_context_and_ipc(
+    raw_json: &str,
+    fallback_cwd: &Path,
+    caller_ctx: &HookCallerContext,
+    hot_cache: Option<&traversal_ledger::HotLedgerCache>,
+    coord_ipc_ns: Option<u64>,
+    caller_traceparent: Option<&str>,
+) -> Decision {
     let capture_started = std::time::Instant::now();
     let parsed = match JsonValue::parse(raw_json) {
         Ok(v) => v,
@@ -392,6 +435,11 @@ pub fn handle_pre_tool_hook_with_context(
     ledger.apply_root_session_override(caller_ctx.root_session_id.as_deref());
 
     let mut observation = capture::guard_context(&repo_root, &ledger, Some(&profile.profile_id));
+    if observation.trace_id.is_some()
+        && let Some(tp_tid) = caller_traceparent.and_then(capture::parse_w3c_traceparent_trace_id)
+    {
+        observation.trace_id = Some(tp_tid);
+    }
 
     if let Err(msg) = ledger.record_tool_call_with_limit(profile.max_turn_tool_calls) {
         let _ = ledger.save_locked_with_cache(&repo_root, hot_cache);
@@ -459,6 +507,10 @@ pub fn handle_pre_tool_hook_with_context(
         }
     };
 
+    let mut stage_timings = DecisionStageTimings {
+        coord_ipc_ns,
+        ..Default::default()
+    };
     let ring0_decision = if let Some(role_denial) = role_sandbox::enforce_role_pre_tool(
         role,
         cap_opt.as_ref(),
@@ -478,6 +530,7 @@ pub fn handle_pre_tool_hook_with_context(
             &mut ledger,
             &session_id,
             &observation,
+            &mut stage_timings,
             (
                 role,
                 cap_opt.as_ref(),
@@ -499,6 +552,8 @@ pub fn handle_pre_tool_hook_with_context(
     } else {
         ring0_decision
     };
+    let total_ns = u64::try_from(capture_started.elapsed().as_nanos()).ok();
+    stage_timings.duration_ns = total_ns;
     match &mut decision {
         Decision::Deny {
             code,
@@ -544,7 +599,7 @@ pub fn handle_pre_tool_hook_with_context(
                     let _ = role_sandbox::save_session_capability(&repo_root, &c);
                 }
             }
-            append_audit_jsonl(
+            append_audit_jsonl_with_timings(
                 &repo_root,
                 &session_id,
                 if tool_name.is_empty() {
@@ -555,6 +610,9 @@ pub fn handle_pre_tool_hook_with_context(
                 code,
                 reason,
                 *halt_session,
+                observation.trace_id.as_deref(),
+                observation.span_id.as_deref(),
+                stage_timings,
             );
         }
         Decision::Allow { advisory, .. } => {
@@ -592,10 +650,17 @@ pub fn handle_pre_tool_hook_with_context(
             .intervention_id
             .clone_from(&observation.trace_id);
     }
-    observation.duration_ns = u64::try_from(capture_started.elapsed().as_nanos()).ok();
+    observation.duration_ns = total_ns;
     capture::record_guard(
         &observation,
-        capture::hook_decision("pre_tool_hook", action, code, disposition, None),
+        capture::hook_decision_with_stages(
+            "pre_tool_hook",
+            action,
+            code,
+            disposition,
+            None,
+            stage_timings,
+        ),
     );
     decision
 }
@@ -757,6 +822,7 @@ fn evaluate_tool_invocation(
     ledger: &mut SessionLedger,
     raw_session_id: &str,
     observation: &CaptureContext,
+    stages: &mut DecisionStageTimings,
     (role, cap, direct_explore_env, payload_is_airlock_subagent): (
         swarm_contracts::SwarmRole,
         Option<&swarm_contracts::SessionCapability>,
@@ -807,15 +873,15 @@ fn evaluate_tool_invocation(
         );
     }
 
-    // 2. Enforce Zero-Trust MCP server allowlist (`mcp__susanbdev__*` + vetted local `dotagent` gateway tools only)
+    // 2. Enforce Zero-Trust MCP server allowlist (`mcp__susanbdev__*`, `mcp__agora__*` / `mcp__agora_mcp__*`, + local `dotagent` gateway tools only)
     if norm_tool.starts_with("mcp__")
-        && !norm_tool.starts_with(ALLOWED_MCP_SERVER_PREFIX)
+        && strip_approved_mcp_server_prefix(&norm_tool).is_none()
         && is_vetted_local_gateway_mcp_tool(&norm_tool).is_none()
     {
         return Decision::deny(
             "UNVETTED_MCP_SERVER_BLOCKED",
             format!(
-                "MCP tool '{tool_name}' is not from the locked canonical 'susanbdev/mcp' server (`{ALLOWED_MCP_SERVER_PREFIX}*`) or local `dotagent` MCP gateway."
+                "MCP tool '{tool_name}' is not from an approved canonical MCP server (`{ALLOWED_MCP_SERVER_PREFIX}*`, `{ALLOWED_AGORA_MCP_PREFIX}*`, `{ALLOWED_AGORA_MCP_ALT_PREFIX}*`) or local `dotagent` MCP gateway."
             ),
             true,
         );
@@ -866,18 +932,24 @@ fn evaluate_tool_invocation(
             .unwrap_or_else(|| cwd.to_path_buf());
 
         // Validate `cmd_cwd` itself stays inside `repo_root` and out of forbidden zones!
-        if let Err(pv) = validate_path(
+        let pp_t0 = std::time::Instant::now();
+        let cwd_valid = validate_path(
             repo_root,
             cwd,
             &cmd_cwd.to_string_lossy(),
             PathAccess::ListSearch {
                 requested_depth: Some(1),
             },
-        ) {
+        );
+        add_path_policy_elapsed(stages, pp_t0.elapsed());
+        if let Err(pv) = cwd_valid {
             return Decision::deny(pv.code, pv.detail, pv.is_poisoned_zone);
         }
 
-        let plan = match evaluate_shell_command(cmd_str, repo_root, &cmd_cwd, ledger.tainted) {
+        let ast_t0 = std::time::Instant::now();
+        let eval_res = evaluate_shell_command(cmd_str, repo_root, &cmd_cwd, ledger.tainted);
+        stages.ast_eval_ns = u64::try_from(ast_t0.elapsed().as_nanos()).ok();
+        let plan = match eval_res {
             Ok(p) => p,
             Err(cv) => return Decision::deny(cv.code, cv.detail, cv.halt_session),
         };
@@ -1047,7 +1119,10 @@ fn evaluate_tool_invocation(
             return Decision::deny("MISSING_FILE_PATH", "Read tool missing file path.", false);
         };
 
-        let valid = match validate_path(repo_root, cwd, raw_path, PathAccess::Read) {
+        let pp_t0 = std::time::Instant::now();
+        let valid_res = validate_path(repo_root, cwd, raw_path, PathAccess::Read);
+        add_path_policy_elapsed(stages, pp_t0.elapsed());
+        let valid = match valid_res {
             Ok(v) => v,
             Err(pv) => return Decision::deny(pv.code, pv.detail, pv.is_poisoned_zone),
         };
@@ -1474,16 +1549,19 @@ fn evaluate_tool_invocation(
         } else if cap.is_some() {
             role_sandbox::max_walk_depth_for_role(role)
         } else {
-            crate::path_policy::MAX_DIRECTORY_WALK_DEPTH
+            crate::path_policy::effective_max_walk_depth_for_repo(repo_root)
         };
+        let pp_t0 = std::time::Instant::now();
         if candidate.is_file() {
-            let valid = match validate_path_with_max_depth(
+            let valid_res = validate_path_with_max_depth(
                 repo_root,
                 cwd,
                 raw_path,
                 PathAccess::Read,
                 role_max_depth,
-            ) {
+            );
+            add_path_policy_elapsed(stages, pp_t0.elapsed());
+            let valid = match valid_res {
                 Ok(v) => v,
                 Err(pv) => return Decision::deny(pv.code, pv.detail, pv.is_poisoned_zone),
             };
@@ -1491,20 +1569,22 @@ fn evaluate_tool_invocation(
                 return Decision::deny(code, msg, false);
             }
         } else if is_glob_tool {
-            if let Err(pv) = validate_path_with_max_depth(
+            let res = validate_path_with_max_depth(
                 repo_root,
                 cwd,
                 raw_path,
                 PathAccess::ReferencePointer,
                 role_max_depth,
-            ) {
+            );
+            add_path_policy_elapsed(stages, pp_t0.elapsed());
+            if let Err(pv) = res {
                 return Decision::deny(pv.code, pv.detail, pv.is_poisoned_zone);
             }
         } else {
             let req_depth = extract_first_u64(input, &["max_depth", "MaxDepth", "depth"])
                 .map(|d| d as usize)
                 .or(Some(role_max_depth));
-            if let Err(pv) = validate_path_with_max_depth(
+            let res = validate_path_with_max_depth(
                 repo_root,
                 cwd,
                 raw_path,
@@ -1512,7 +1592,9 @@ fn evaluate_tool_invocation(
                     requested_depth: req_depth,
                 },
                 role_max_depth,
-            ) {
+            );
+            add_path_policy_elapsed(stages, pp_t0.elapsed());
+            if let Err(pv) = res {
                 return Decision::deny(pv.code, pv.detail, pv.is_poisoned_zone);
             }
         }
@@ -1528,12 +1610,11 @@ fn evaluate_tool_invocation(
         return Decision::allow();
     }
 
-    // 7. Approved canonical MCP tools (`mcp__susanbdev__*`) and safe non-FS harness meta tools:
+    // 7. Approved canonical MCP tools (`mcp__susanbdev__*`, `mcp__agora__*`) and safe non-FS harness meta tools:
     //    Validate all string arguments for Unicode/injection smuggling and validate any path fields!
     let local_gateway_sub = is_vetted_local_gateway_mcp_tool(&norm_tool);
-    let is_approved_mcp = (norm_tool.starts_with(ALLOWED_MCP_SERVER_PREFIX)
-        && norm_tool.len() > ALLOWED_MCP_SERVER_PREFIX.len())
-        || local_gateway_sub.is_some();
+    let approved_mcp_sub = strip_approved_mcp_server_prefix(&norm_tool);
+    let is_approved_mcp = approved_mcp_sub.is_some() || local_gateway_sub.is_some();
     let is_bare_feedback_or_status = matches!(
         norm_tool.as_str(),
         "dotagent_submit_friction" | "dotagent_status"
@@ -1583,7 +1664,10 @@ fn evaluate_tool_invocation(
             } else {
                 PathAccess::ReferencePointer
             };
-            if let Err(pv) = validate_path(repo_root, cwd, raw_p, access) {
+            let pp_t0 = std::time::Instant::now();
+            let res = validate_path(repo_root, cwd, raw_p, access);
+            add_path_policy_elapsed(stages, pp_t0.elapsed());
+            if let Err(pv) = res {
                 return Decision::deny(pv.code, pv.detail, pv.is_poisoned_zone);
             }
         }
@@ -1609,10 +1693,10 @@ fn evaluate_tool_invocation(
         if is_approved_mcp || is_bare_feedback_or_status {
             let sub_action = if let Some(local_sub) = local_gateway_sub {
                 local_sub
-            } else if is_bare_feedback_or_status {
-                norm_tool.as_str()
+            } else if let Some(mcp_sub) = approved_mcp_sub {
+                mcp_sub
             } else {
-                &norm_tool[ALLOWED_MCP_SERVER_PREFIX.len()..]
+                norm_tool.as_str()
             };
             if let Err((code, reason, halt)) = mcp_policy::authorize_mcp_rpc_invocation(
                 tool_name,
@@ -1867,12 +1951,8 @@ fn pre_inspect_file_for_ingestion_with_profile(
     capability_preapproved: bool,
     observation: &CaptureContext,
 ) -> Result<String, Decision> {
-    // 1. Check transitive hop depth FIRST (`A -> B -> C` denied before even opening `C`!)
-    let max_ref_level = if operator::has_active_elevated_lease(repo_root) {
-        10u8
-    } else {
-        traversal_ledger::MAX_REFERENCE_LEVEL
-    };
+    // 1. Check transitive hop depth FIRST (`A -> B -> C` denied before even opening `C` unless lifted in attested SimsMicroVm!)
+    let max_ref_level = traversal_ledger::effective_max_reference_level(repo_root);
     if !capability_preapproved
         && let Some(existing) = ledger.nodes.get(repo_rel)
         && existing.level > max_ref_level
@@ -3222,4 +3302,204 @@ fn is_forbidden_search_flag(tok: &str) -> bool {
         return true;
     }
     false
+}
+
+#[cfg(all(test, unix))]
+mod sims_turbo_and_agora_tests {
+    use super::*;
+    use std::os::unix::fs::{PermissionsExt, symlink};
+
+    #[test]
+    fn sims_microvm_turbo_mode_attests_0444_lifts_ergonomics_and_preserves_ring0_security() {
+        let base = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/test-workspaces")
+            .join(format!("sims-turbo-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        let repo = base.join("repo");
+        let att_dir = base.join("att");
+        fs::create_dir_all(repo.join(".git")).expect("mkdir .git");
+        fs::create_dir_all(repo.join("src")).expect("mkdir src");
+        fs::create_dir_all(&att_dir).expect("mkdir att");
+        fs::write(repo.join("AGENTS.md"), "# Canonical Root Authority\n").expect("write AGENTS.md");
+
+        let valid_json = r#"{"schema":"sims.guest_attestation.v1","mountless":true,"zero_nic":true,"egress_mode":"vsock_trustless_only"}"#;
+        let att_ok = att_dir.join("guest-attestation.json");
+        fs::write(&att_ok, valid_json).expect("write att_ok");
+        fs::set_permissions(&att_ok, fs::Permissions::from_mode(0o444)).expect("chmod 0444");
+
+        // 1. Writable (0644), symlinked, or non-zero-nic attestations fail closed
+        let att_writable = att_dir.join("writable.json");
+        fs::write(&att_writable, valid_json).expect("write writable");
+        fs::set_permissions(&att_writable, fs::Permissions::from_mode(0o644)).expect("chmod 0644");
+        assert!(!enforcement_state::verify_sims_guest_attestation_file(
+            &att_writable,
+            false
+        ));
+
+        let att_sym = att_dir.join("symlink.json");
+        symlink(&att_ok, &att_sym).expect("symlink");
+        assert!(!enforcement_state::verify_sims_guest_attestation_file(
+            &att_sym, false
+        ));
+
+        let att_bad = att_dir.join("bad.json");
+        fs::write(
+            &att_bad,
+            r#"{"schema":"sims.guest_attestation.v1","mountless":true,"zero_nic":false,"egress_mode":"vsock_trustless_only"}"#,
+        )
+        .expect("write bad");
+        fs::set_permissions(&att_bad, fs::Permissions::from_mode(0o444)).expect("chmod 0444");
+        assert!(!enforcement_state::verify_sims_guest_attestation_file(
+            &att_bad, false
+        ));
+
+        assert_eq!(
+            enforcement_state::detect_execution_mode(Some("sims-microvm")).expect("mode"),
+            enforcement_state::ExecutionMode::SimsMicroVm
+        );
+
+        // Prepare a 500-line (> 150 lines, > 24 KiB) file and an A -> B -> C -> D -> poisoned chain
+        let mut big_rs = String::new();
+        for i in 0..500 {
+            big_rs.push_str(&format!(
+                "pub fn turbo_line_{i}(v: u64) -> u64 {{ v.wrapping_add({i}) }} // padding_token_0123456789\n"
+            ));
+        }
+        fs::write(repo.join("src/big.rs"), &big_rs).expect("write big.rs");
+        fs::write(repo.join("src/a.rs"), "// see src/b.rs\npub fn a() {}\n").expect("a.rs");
+        fs::write(repo.join("src/b.rs"), "// see src/c.rs\npub fn b() {}\n").expect("b.rs");
+        fs::write(repo.join("src/c.rs"), "// see src/d.rs\npub fn c() {}\n").expect("c.rs");
+        fs::write(repo.join("src/d.rs"), "pub fn d() {}\n").expect("d.rs");
+        fs::write(
+            repo.join("src/poison.rs"),
+            "// check node_modules/evil/index.js\npub fn p() {}\n",
+        )
+        .expect("poison.rs");
+
+        // Outside SimsMicroVm, 500-line slice and maxdepth 8 are denied
+        let big_read = r#"{"session_id":"s_host_1","tool_name":"Read","tool_input":{"file_path":"src/big.rs","offset":1,"limit":500}}"#;
+        let host_prof = budget_guard::load_active_profile(&repo).expect("host profile");
+        assert_eq!(host_prof.max_slice_lines, 150);
+        assert_eq!(host_prof.max_turn_tokens, 16_000);
+        assert_eq!(host_prof.max_direct_discovery_calls, 4);
+        assert!(
+            evaluate_shell_command("find src -maxdepth 8 -type f", &repo, &repo, false).is_err()
+        );
+        let _ = big_read;
+
+        // Inside attested SimsMicroVm Turbo Mode:
+        enforcement_state::with_test_sims_attestation(&att_ok, || {
+            assert_eq!(
+                enforcement_state::detect_execution_mode(None).expect("auto mode"),
+                enforcement_state::ExecutionMode::SimsMicroVm
+            );
+            let prof = budget_guard::load_active_profile(&repo).expect("turbo profile");
+            assert_eq!(prof.max_slice_lines, 2_000);
+            assert_eq!(prof.max_raw_file_bytes, 262_144);
+            assert_eq!(prof.max_turn_tokens, 128_000);
+            assert_eq!(prof.max_direct_discovery_calls, 64);
+
+            // Walk depth <= 8 allowed on find, rg, tree; depth 9 and unbounded still denied!
+            assert!(
+                evaluate_shell_command("find src -maxdepth 8 -type f", &repo, &repo, false).is_ok()
+            );
+            assert!(
+                evaluate_shell_command("rg --max-depth 8 turbo_line src", &repo, &repo, false)
+                    .is_ok()
+            );
+            assert!(evaluate_shell_command("tree -L 8 src", &repo, &repo, false).is_ok());
+            assert!(
+                evaluate_shell_command("find src -maxdepth 9 -type f", &repo, &repo, false)
+                    .is_err()
+            );
+            assert!(evaluate_shell_command("find src -type f", &repo, &repo, false).is_err());
+
+            let hot_cache: traversal_ledger::HotLedgerCache =
+                std::sync::Mutex::new(std::collections::BTreeMap::new());
+            let ctx = HookCallerContext::default();
+
+            // 500-line / > 24 KiB read succeeds without truncation!
+            let dec_big = handle_pre_tool_hook_with_context(
+                r#"{"session_id":"s_turbo_1","tool_name":"Read","tool_input":{"file_path":"src/big.rs","offset":1,"limit":500}}"#,
+                &repo,
+                &ctx,
+                Some(&hot_cache),
+            );
+            assert!(
+                matches!(
+                    dec_big,
+                    Decision::Allow {
+                        updated_input_json: None,
+                        ..
+                    }
+                ),
+                "expected full 500-line allow in SimsMicroVm, got {dec_big:?}"
+            );
+
+            // > 4 direct discovery calls succeed (ceiling raised 4 -> 64)!
+            for i in 0..8 {
+                let d_cmd = format!(
+                    r#"{{"session_id":"s_turbo_1","tool_name":"Bash","tool_input":{{"command":"rg --max-depth 8 turbo_line_{i} src"}}}}"#
+                );
+                let dec = handle_pre_tool_hook_with_context(&d_cmd, &repo, &ctx, Some(&hot_cache));
+                assert!(dec.is_allow(), "discovery #{i} denied: {dec:?}");
+            }
+
+            // A -> B -> C -> D 4-hop in-repo chain succeeds!
+            for rel in ["src/a.rs", "src/b.rs", "src/c.rs", "src/d.rs"] {
+                let r_json = format!(
+                    r#"{{"session_id":"s_turbo_1","tool_name":"Read","tool_input":{{"file_path":"{rel}","offset":1,"limit":20}}}}"#
+                );
+                let dec = handle_pre_tool_hook_with_context(&r_json, &repo, &ctx, Some(&hot_cache));
+                assert!(dec.is_allow(), "hop read {rel} denied: {dec:?}");
+            }
+
+            // agora MCP tools allowed; unvetted MCP server still blocked!
+            let agora_ok = handle_pre_tool_hook_with_context(
+                r#"{"session_id":"s_turbo_1","tool_name":"mcp__agora__agora_search","tool_input":{"query":"consensus"}}"#,
+                &repo,
+                &ctx,
+                Some(&hot_cache),
+            );
+            assert!(agora_ok.is_allow(), "agora MCP tool denied: {agora_ok:?}");
+            let evil_mcp = handle_pre_tool_hook_with_context(
+                r#"{"session_id":"s_turbo_1","tool_name":"mcp__evil__search","tool_input":{"query":"x"}}"#,
+                &repo,
+                &ctx,
+                Some(&hot_cache),
+            );
+            assert!(!evil_mcp.is_allow());
+
+            // Ring-0 invariants remain 100% active: .env blocked, git reset --hard blocked, poisoned pointer halts session!
+            let env_deny = handle_pre_tool_hook_with_context(
+                r#"{"session_id":"s_turbo_1","tool_name":"Read","tool_input":{"file_path":".env"}}"#,
+                &repo,
+                &ctx,
+                Some(&hot_cache),
+            );
+            assert!(!env_deny.is_allow());
+
+            let ctx_poison = HookCallerContext::default();
+            let poison_dec = handle_pre_tool_hook_with_context(
+                r#"{"session_id":"s_turbo_poison","tool_name":"Read","tool_input":{"file_path":"src/poison.rs","offset":1,"limit":10}}"#,
+                &repo,
+                &ctx_poison,
+                Some(&hot_cache),
+            );
+            assert!(
+                matches!(
+                    poison_dec,
+                    Decision::Deny {
+                        halt_session: true,
+                        ..
+                    }
+                ),
+                "poisoned pointer to node_modules must still hard-halt in SimsMicroVm: {poison_dec:?}"
+            );
+        });
+
+        let _ = fs::set_permissions(&att_ok, fs::Permissions::from_mode(0o644));
+        let _ = fs::set_permissions(&att_bad, fs::Permissions::from_mode(0o644));
+        let _ = fs::remove_dir_all(&base);
+    }
 }

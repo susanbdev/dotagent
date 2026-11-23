@@ -68,7 +68,15 @@ const AGENT_HARNESS_ENV_MARKERS: &[&str] = &[
     "GITHUB_ACTIONS",
 ];
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+/// Explicit OTLP histogram upper bounds in nanoseconds (`10 us` .. `50 ms`).
+pub const DECISION_DURATION_BOUNDS_NS: &[u64] = &[
+    10_000, 25_000, 50_000, 100_000, 250_000, 500_000, 1_000_000, 2_500_000, 5_000_000, 10_000_000,
+    50_000_000,
+];
+
+const MAX_DURATION_PERCENTILE_SAMPLES: usize = 65_536;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AuditSummary {
     pub total_events: usize,
     pub halted_events: usize,
@@ -78,9 +86,62 @@ pub struct AuditSummary {
     pub max_ts: Option<u64>,
     pub counts_by_code: BTreeMap<String, usize>,
     pub counts_by_tool: BTreeMap<String, usize>,
+    pub decision_duration_count: u64,
+    pub decision_duration_sum_ns: u64,
+    pub decision_duration_min_ns: Option<u64>,
+    pub decision_duration_max_ns: Option<u64>,
+    pub decision_duration_bucket_counts: Vec<u64>,
+    pub decision_duration_p50_ns: Option<u64>,
+    pub decision_duration_p95_ns: Option<u64>,
+    pub decision_duration_p99_ns: Option<u64>,
+}
+
+impl Default for AuditSummary {
+    fn default() -> Self {
+        Self {
+            total_events: 0,
+            halted_events: 0,
+            unique_sessions: 0,
+            unique_repos: 0,
+            min_ts: None,
+            max_ts: None,
+            counts_by_code: BTreeMap::new(),
+            counts_by_tool: BTreeMap::new(),
+            decision_duration_count: 0,
+            decision_duration_sum_ns: 0,
+            decision_duration_min_ns: None,
+            decision_duration_max_ns: None,
+            decision_duration_bucket_counts: vec![0; DECISION_DURATION_BOUNDS_NS.len() + 1],
+            decision_duration_p50_ns: None,
+            decision_duration_p95_ns: None,
+            decision_duration_p99_ns: None,
+        }
+    }
 }
 
 impl AuditSummary {
+    pub fn record_decision_duration_ns(&mut self, duration_ns: u64) {
+        if self.decision_duration_bucket_counts.len() != DECISION_DURATION_BOUNDS_NS.len() + 1 {
+            self.decision_duration_bucket_counts = vec![0; DECISION_DURATION_BOUNDS_NS.len() + 1];
+        }
+        self.decision_duration_count = self.decision_duration_count.saturating_add(1);
+        self.decision_duration_sum_ns = self.decision_duration_sum_ns.saturating_add(duration_ns);
+        self.decision_duration_min_ns = Some(
+            self.decision_duration_min_ns
+                .map_or(duration_ns, |m| m.min(duration_ns)),
+        );
+        self.decision_duration_max_ns = Some(
+            self.decision_duration_max_ns
+                .map_or(duration_ns, |m| m.max(duration_ns)),
+        );
+        let bucket_idx = DECISION_DURATION_BOUNDS_NS
+            .iter()
+            .position(|&bound| duration_ns <= bound)
+            .unwrap_or(DECISION_DURATION_BOUNDS_NS.len());
+        self.decision_duration_bucket_counts[bucket_idx] =
+            self.decision_duration_bucket_counts[bucket_idx].saturating_add(1);
+    }
+
     pub fn top_denies(&self, limit: usize) -> Vec<(String, usize)> {
         let mut pairs: Vec<(String, usize)> = self
             .counts_by_code
@@ -102,6 +163,11 @@ impl AuditSummary {
             .counts_by_tool
             .iter()
             .map(|(k, v)| (k.clone(), JsonValue::Uint(*v as u64)))
+            .collect();
+        let bucket_vals: Vec<JsonValue> = self
+            .decision_duration_bucket_counts
+            .iter()
+            .map(|&c| JsonValue::Uint(c))
             .collect();
         JsonValue::Object(vec![
             (
@@ -135,6 +201,43 @@ impl AuditSummary {
             (
                 "counts_by_tool".to_string(),
                 JsonValue::Object(tool_entries),
+            ),
+            (
+                "decision_duration_count".to_string(),
+                JsonValue::Uint(self.decision_duration_count),
+            ),
+            (
+                "decision_duration_sum_ns".to_string(),
+                JsonValue::Uint(self.decision_duration_sum_ns),
+            ),
+            (
+                "decision_duration_min_ns".to_string(),
+                self.decision_duration_min_ns
+                    .map_or(JsonValue::Null, JsonValue::Uint),
+            ),
+            (
+                "decision_duration_max_ns".to_string(),
+                self.decision_duration_max_ns
+                    .map_or(JsonValue::Null, JsonValue::Uint),
+            ),
+            (
+                "decision_duration_p50_ns".to_string(),
+                self.decision_duration_p50_ns
+                    .map_or(JsonValue::Null, JsonValue::Uint),
+            ),
+            (
+                "decision_duration_p95_ns".to_string(),
+                self.decision_duration_p95_ns
+                    .map_or(JsonValue::Null, JsonValue::Uint),
+            ),
+            (
+                "decision_duration_p99_ns".to_string(),
+                self.decision_duration_p99_ns
+                    .map_or(JsonValue::Null, JsonValue::Uint),
+            ),
+            (
+                "decision_duration_bucket_counts".to_string(),
+                JsonValue::Array(bucket_vals),
             ),
         ])
     }
@@ -175,6 +278,14 @@ pub fn analyze_audit_jsonl_str(raw: &str, repo_filter: Option<&str>) -> AuditSum
     analyze_audit_jsonl_reader(&mut cursor, repo_filter)
 }
 
+fn percentile_u64_sorted(sorted: &[u64], pct: usize) -> Option<u64> {
+    if sorted.is_empty() {
+        return None;
+    }
+    let idx = ((sorted.len() - 1) * pct) / 100;
+    Some(sorted[idx])
+}
+
 /// Streaming line-by-line aggregation over any `BufRead` without loading multi-MiB logs into RAM.
 pub fn analyze_audit_jsonl_reader<R: BufRead>(
     reader: &mut R,
@@ -183,7 +294,10 @@ pub fn analyze_audit_jsonl_reader<R: BufRead>(
     let mut summary = AuditSummary::default();
     let mut sessions = std::collections::BTreeSet::new();
     let mut repos = std::collections::BTreeSet::new();
+    let mut seen_duration_traces = std::collections::BTreeSet::new();
+    let mut duration_samples = Vec::new();
     let mut line = String::new();
+    let filter_sha = repo_filter.map(|f| crate::crypto::sha256_hex(f.as_bytes()));
 
     loop {
         line.clear();
@@ -216,12 +330,52 @@ pub fn analyze_audit_jsonl_reader<R: BufRead>(
             continue;
         };
         if val.get("schema_version").is_some() {
+            if val.get("schema_version").and_then(JsonValue::as_u64) == Some(1)
+                && val.get("event_type").and_then(JsonValue::as_str) == Some("CONTROL_DECISION")
+            {
+                let work_repo = val
+                    .get("work")
+                    .and_then(|w| w.get("repo_id"))
+                    .and_then(JsonValue::as_str)
+                    .unwrap_or("");
+                if let Some(filter) = repo_filter
+                    && !work_repo.contains(filter)
+                    && Some(work_repo) != filter_sha.as_deref()
+                {
+                    continue;
+                }
+                let dur_opt = val
+                    .get("timing")
+                    .and_then(|t| t.get("duration_ns"))
+                    .and_then(JsonValue::as_u64)
+                    .or_else(|| {
+                        val.get("payload")
+                            .and_then(|p| p.get("duration_ns"))
+                            .and_then(JsonValue::as_u64)
+                    });
+                if let Some(dur_ns) = dur_opt {
+                    let trace_opt = val
+                        .get("correlation")
+                        .and_then(|c| c.get("trace_id"))
+                        .and_then(JsonValue::as_str);
+                    let is_dup = trace_opt.is_some_and(|tid| {
+                        seen_duration_traces.len() < MAX_DURATION_PERCENTILE_SAMPLES
+                            && !seen_duration_traces.insert(tid.to_string())
+                    });
+                    if !is_dup {
+                        summary.record_decision_duration_ns(dur_ns);
+                        if duration_samples.len() < MAX_DURATION_PERCENTILE_SAMPLES {
+                            duration_samples.push(dur_ns);
+                        }
+                    }
+                }
+            }
             continue;
         }
         let repo = val.get("repo").and_then(JsonValue::as_str).unwrap_or("");
         if let Some(filter) = repo_filter
             && !repo.contains(filter)
-            && repo != crate::crypto::sha256_hex(filter.as_bytes())
+            && Some(repo) != filter_sha.as_deref()
         {
             continue;
         }
@@ -244,6 +398,19 @@ pub fn analyze_audit_jsonl_reader<R: BufRead>(
             summary.min_ts = Some(summary.min_ts.map_or(ts, |m| m.min(ts)));
             summary.max_ts = Some(summary.max_ts.map_or(ts, |m| m.max(ts)));
         }
+        if let Some(dur_ns) = val.get("duration_ns").and_then(JsonValue::as_u64) {
+            let trace_opt = val.get("trace_id").and_then(JsonValue::as_str);
+            let is_dup = trace_opt.is_some_and(|tid| {
+                seen_duration_traces.len() < MAX_DURATION_PERCENTILE_SAMPLES
+                    && !seen_duration_traces.insert(tid.to_string())
+            });
+            if !is_dup {
+                summary.record_decision_duration_ns(dur_ns);
+                if duration_samples.len() < MAX_DURATION_PERCENTILE_SAMPLES {
+                    duration_samples.push(dur_ns);
+                }
+            }
+        }
         let code = val
             .get("code")
             .and_then(JsonValue::as_str)
@@ -254,6 +421,13 @@ pub fn analyze_audit_jsonl_reader<R: BufRead>(
             .and_then(JsonValue::as_str)
             .unwrap_or("UNKNOWN");
         *summary.counts_by_tool.entry(tool.to_string()).or_insert(0) += 1;
+    }
+
+    if !duration_samples.is_empty() {
+        duration_samples.sort_unstable();
+        summary.decision_duration_p50_ns = percentile_u64_sorted(&duration_samples, 50);
+        summary.decision_duration_p95_ns = percentile_u64_sorted(&duration_samples, 95);
+        summary.decision_duration_p99_ns = percentile_u64_sorted(&duration_samples, 99);
     }
 
     summary.unique_sessions = sessions.len();
@@ -293,6 +467,64 @@ pub fn render_otlp_export_json(summary: &AuditSummary, exported_at_ns: u64) -> J
         })
         .collect();
 
+    let bucket_counts: Vec<JsonValue> =
+        if summary.decision_duration_bucket_counts.len() == DECISION_DURATION_BOUNDS_NS.len() + 1 {
+            summary
+                .decision_duration_bucket_counts
+                .iter()
+                .map(|c| JsonValue::Str(c.to_string()))
+                .collect()
+        } else {
+            vec![JsonValue::Str("0".to_string()); DECISION_DURATION_BOUNDS_NS.len() + 1]
+        };
+    let explicit_bounds: Vec<JsonValue> = DECISION_DURATION_BOUNDS_NS
+        .iter()
+        .map(|&b| JsonValue::Number(b as f64))
+        .collect();
+    let make_int_attr = |k: &str, v: u64| {
+        JsonValue::Object(vec![
+            ("key".to_string(), JsonValue::Str(k.to_string())),
+            (
+                "value".to_string(),
+                JsonValue::Object(vec![(
+                    "intValue".to_string(),
+                    JsonValue::Str(v.to_string()),
+                )]),
+            ),
+        ])
+    };
+    let hist_attrs = vec![
+        make_int_attr("p50_ns", summary.decision_duration_p50_ns.unwrap_or(0)),
+        make_int_attr("p95_ns", summary.decision_duration_p95_ns.unwrap_or(0)),
+        make_int_attr("p99_ns", summary.decision_duration_p99_ns.unwrap_or(0)),
+    ];
+    let mut hist_point_fields = vec![
+        ("attributes".to_string(), JsonValue::Array(hist_attrs)),
+        (
+            "timeUnixNano".to_string(),
+            JsonValue::Str(exported_at_ns.to_string()),
+        ),
+        (
+            "count".to_string(),
+            JsonValue::Str(summary.decision_duration_count.to_string()),
+        ),
+        (
+            "sum".to_string(),
+            JsonValue::Number(summary.decision_duration_sum_ns as f64),
+        ),
+        ("bucketCounts".to_string(), JsonValue::Array(bucket_counts)),
+        (
+            "explicitBounds".to_string(),
+            JsonValue::Array(explicit_bounds),
+        ),
+    ];
+    if let Some(min_ns) = summary.decision_duration_min_ns {
+        hist_point_fields.push(("min".to_string(), JsonValue::Number(min_ns as f64)));
+    }
+    if let Some(max_ns) = summary.decision_duration_max_ns {
+        hist_point_fields.push(("max".to_string(), JsonValue::Number(max_ns as f64)));
+    }
+
     let metrics = vec![
         JsonValue::Object(vec![
             (
@@ -331,6 +563,26 @@ pub fn render_otlp_export_json(summary: &AuditSummary, exported_at_ns: u64) -> J
                         ),
                     ])]),
                 )]),
+            ),
+        ]),
+        JsonValue::Object(vec![
+            (
+                "name".to_string(),
+                JsonValue::Str("dotagent.guard.decision.duration_ns".to_string()),
+            ),
+            ("unit".to_string(), JsonValue::Str("ns".to_string())),
+            (
+                "histogram".to_string(),
+                JsonValue::Object(vec![
+                    (
+                        "aggregationTemporality".to_string(),
+                        JsonValue::Uint(2), // AGGREGATION_TEMPORALITY_CUMULATIVE
+                    ),
+                    (
+                        "dataPoints".to_string(),
+                        JsonValue::Array(vec![JsonValue::Object(hist_point_fields)]),
+                    ),
+                ]),
             ),
         ]),
     ];
@@ -954,5 +1206,45 @@ mod tests {
     fn non_tty_or_sandbox_invocation_is_hard_denied() {
         // Under `cargo test`, stdin/stdout pipes are non-TTY or CI/sandbox markers apply:
         assert!(verify_human_tty_telemetry_gate().is_err());
+    }
+
+    #[test]
+    fn w3c_trace_span_and_otlp_decision_duration_histogram_export() {
+        let (tid, sid) = crate::telemetry::capture::next_w3c_trace_and_span_ids();
+        assert_eq!(tid.len(), 32);
+        assert!(tid.bytes().all(|b| b.is_ascii_hexdigit()));
+        assert!(tid.bytes().any(|b| b != b'0'));
+        assert_eq!(sid.len(), 16);
+        assert!(sid.bytes().all(|b| b.is_ascii_hexdigit()));
+        assert!(sid.bytes().any(|b| b != b'0'));
+
+        let sample = concat!(
+            r#"{"schema_version":1,"event_id":"1-1-1","event_type":"CONTROL_DECISION","producer":{"component":"agent-guard.hook","instance_id":"1-1","sequence":1},"timing":{"clock":"system_wall_and_process_monotonic","duration_ns":42000},"correlation":{"trace_id":"0123456789abcdef0123456789abcdef","span_id":"0123456789abcdef"},"work":{"repo_id":"/w/dotagent","session_id":"s1"},"configuration":{},"trust":{"origin":"trusted_guard","authentication":"local_host_callsite","evidence":"observed","verification":"local_callsite","correlation_scope":"local_trace_and_reported_session"},"result":{"action":"allow","reason_code":"GUARD_ALLOW","disposition":"allowed","completeness":"complete"},"payload":{"route":"pre_tool_hook","control":"pre_tool_hook","duration_ns":42000,"ast_eval_ns":18000,"path_policy_ns":9000}}"#,
+            "\n",
+            r#"{"ts":1700000010,"repo":"/w/dotagent","session_hash":"0123456789abcdef","tool":"Bash","code":"FORBIDDEN_BINARY","halted":false,"detail":"[redacted]","trace_id":"fedcba9876543210fedcba9876543210","span_id":"fedcba9876543210","duration_ns":180000,"ast_eval_ns":95000,"path_policy_ns":12000}"#,
+            "\n",
+            // Duplicate trace_id across Legacy + CONTROL_DECISION must not double-count duration!
+            r#"{"ts":1700000011,"repo":"/w/dotagent","session_hash":"0123456789abcdef","tool":"Read","code":"FORBIDDEN_PATH_ZONE","halted":true,"detail":"[redacted]","trace_id":"0123456789abcdef0123456789abcdef","span_id":"0123456789abcdef","duration_ns":42000}"#,
+            "\n"
+        );
+
+        let sum = analyze_audit_jsonl_str(sample, None);
+        assert_eq!(sum.decision_duration_count, 2);
+        assert_eq!(sum.decision_duration_sum_ns, 222_000);
+        assert_eq!(sum.decision_duration_min_ns, Some(42_000));
+        assert_eq!(sum.decision_duration_max_ns, Some(180_000));
+        assert_eq!(sum.decision_duration_p50_ns, Some(42_000));
+        assert_eq!(sum.decision_duration_p95_ns, Some(42_000));
+        assert_eq!(sum.decision_duration_bucket_counts.iter().sum::<u64>(), 2);
+
+        let otlp = render_otlp_export_json(&sum, 1_700_000_020_000_000_000);
+        let otlp_s = otlp.to_json_string();
+        assert!(otlp_s.contains("dotagent.guard.decision.duration_ns"));
+        assert!(otlp_s.contains("\"histogram\""));
+        assert!(otlp_s.contains("\"bucketCounts\""));
+        assert!(otlp_s.contains("\"explicitBounds\""));
+        assert!(otlp_s.contains("\"p50_ns\""));
+        assert!(otlp_s.contains("\"p95_ns\""));
+        assert!(otlp_s.contains("\"p99_ns\""));
     }
 }

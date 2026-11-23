@@ -100,6 +100,26 @@ pub(crate) fn control_decision(
     action: ControlAction,
     reason: &'static str,
 ) -> Payload {
+    control_decision_with_stages(
+        boundary,
+        control,
+        threshold,
+        source,
+        action,
+        reason,
+        super::capture::DecisionStageTimings::default(),
+    )
+}
+
+pub(crate) fn control_decision_with_stages(
+    boundary: Boundary,
+    control: Control,
+    threshold: u64,
+    source: LimitSource,
+    action: ControlAction,
+    reason: &'static str,
+    stages: super::capture::DecisionStageTimings,
+) -> Payload {
     let (control, unit) = control.fields();
     let (action, disposition) = action.fields();
     let mut fields = vec![
@@ -118,6 +138,7 @@ pub(crate) fn control_decision(
         JsonValue::Object(fields),
     )
     .with_result(action, reason, disposition)
+    .with_stage_timings(stages)
 }
 
 pub(crate) fn read_budget_decision(

@@ -1917,6 +1917,7 @@ pub fn run_feedback_cli(args: &[String], cwd: &Path) -> ExitCode {
     match sub {
         "submit" => run_feedback_submit_cli(&args[1..], cwd),
         "status" => crate::feedback_loop::run_feedback_status_cli(&args[1..], cwd),
+        "export-outbox" => crate::feedback_loop::run_feedback_export_outbox_cli(&args[1..], cwd),
         "sync-github" => crate::feedback_loop::run_feedback_sync_github_cli(&args[1..], cwd),
         "triage" => crate::telemetry::run_operator_feedback_triage_cli(&args[1..], cwd),
         "run-loop" => crate::feedback_loop::run_feedback_loop_cli(&args[1..], cwd),
@@ -1926,6 +1927,7 @@ pub fn run_feedback_cli(args: &[String], cwd: &Path) -> ExitCode {
                    dotagent feedback submit --denial-id <dnl_hex|trc_hex> --category <false_positive_block|missing_safe_flag|pagination_or_budget_friction|unclear_remediation|adapter_or_workflow_bug> [--reason-code <token>] [--json]\n  \
                    dotagent feedback triage [--min-votes 2] [--sshsig <path>] [--json]\n  \
                    dotagent feedback status [--json]\n  \
+                   dotagent feedback export-outbox [--out <file>] [--forward-url <http://127.0.0.1:18080/...>] [--repo <owner/repo>] [--mark-synced] [--json]\n  \
                    dotagent feedback sync-github [--repo <owner/repo>] [--dry-run] [--json]\n  \
                    dotagent feedback run-loop [--repo <owner/repo>] [--min-votes 3] [--min-buckets 2] [--max-merges-per-run 1] [--dry-run]"
             );

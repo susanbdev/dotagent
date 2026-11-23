@@ -18,6 +18,7 @@ use std::path::{Component, Path, PathBuf};
 use crate::unicode_guard::{ScanMode, scan_unicode};
 
 pub const MAX_DIRECTORY_WALK_DEPTH: usize = 2;
+pub const SIMS_MICROVM_MAX_WALK_DEPTH: usize = 8;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PathAccess {
@@ -81,6 +82,9 @@ pub fn effective_max_walk_depth_for_repo(repo_root: &Path) -> usize {
         crate::role_sandbox::resolve_active_role(repo_root, &session_hint)
     {
         return crate::swarm_contracts::INVESTIGATOR_MAX_WALK_DEPTH;
+    }
+    if crate::enforcement_state::is_attested_sims_microvm() {
+        return SIMS_MICROVM_MAX_WALK_DEPTH;
     }
     MAX_DIRECTORY_WALK_DEPTH
 }

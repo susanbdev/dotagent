@@ -101,6 +101,7 @@ fn event_fields(body: &JsonValue) -> bool {
     const MEASUREMENTS: &[&str] = &[
         "argument_summary",
         "assessment",
+        "ast_eval_ns",
         "attempt",
         "boundary",
         "byte_cap_applied",
@@ -114,6 +115,7 @@ fn event_fields(body: &JsonValue) -> bool {
         "continuation_available",
         "control",
         "control_sequences_stripped",
+        "coord_ipc_ns",
         "deadline_ms",
         "detector",
         "detector_signal",
@@ -140,6 +142,7 @@ fn event_fields(body: &JsonValue) -> bool {
         "non_ascii_characters_replaced",
         "observed_status",
         "operation",
+        "path_policy_ns",
         "read_bytes",
         "requested_bytes",
         "requested_check",
@@ -212,6 +215,7 @@ fn event_fields(body: &JsonValue) -> bool {
             correlation,
             &[
                 "trace_id",
+                "span_id",
                 "parent_event_id",
                 "execution_id",
                 "intervention_id",
@@ -342,20 +346,53 @@ impl Record {
                     .all(|k| body.get(k).and_then(JsonValue::as_object).is_some())
             }
             Kind::Legacy => {
-                only(
-                    body,
-                    &[
-                        "ts",
-                        "repo",
-                        "session_hash",
-                        "tool",
-                        "code",
-                        "halted",
-                        "detail",
-                    ],
-                ) && field("session_hash")
-                    .is_some_and(|s| s.len() == 16 && s.bytes().all(|b| b.is_ascii_hexdigit()))
+                let required = [
+                    "ts",
+                    "repo",
+                    "session_hash",
+                    "tool",
+                    "code",
+                    "halted",
+                    "detail",
+                ];
+                let allowed = [
+                    "ts",
+                    "repo",
+                    "session_hash",
+                    "tool",
+                    "code",
+                    "halted",
+                    "detail",
+                    "trace_id",
+                    "span_id",
+                    "duration_ns",
+                    "ast_eval_ns",
+                    "path_policy_ns",
+                    "coord_ipc_ns",
+                ];
+                required.iter().all(|k| body.get(k).is_some())
+                    && fields(Some(body), &allowed)
+                    && field("session_hash")
+                        .is_some_and(|s| s.len() == 16 && s.bytes().all(|b| b.is_ascii_hexdigit()))
                     && matches!(field("detail"), Some("" | "[redacted]"))
+                    && body.get("trace_id").is_none_or(|v| {
+                        v.as_str().is_some_and(|s| {
+                            s.len() == 32 && s.bytes().all(|b| b.is_ascii_hexdigit())
+                        })
+                    })
+                    && body.get("span_id").is_none_or(|v| {
+                        v.as_str().is_some_and(|s| {
+                            s.len() == 16 && s.bytes().all(|b| b.is_ascii_hexdigit())
+                        })
+                    })
+                    && [
+                        "duration_ns",
+                        "ast_eval_ns",
+                        "path_policy_ns",
+                        "coord_ipc_ns",
+                    ]
+                    .iter()
+                    .all(|k| body.get(k).is_none_or(|v| v.as_u64().is_some()))
             }
             Kind::Denial => {
                 only(
