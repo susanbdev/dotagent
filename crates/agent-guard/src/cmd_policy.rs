@@ -1129,7 +1129,7 @@ fn check_single_command(
                     return Err(CommandViolation {
                         code: "SELF_TAMPERING_BLOCKED",
                         detail:
-                            "Agents may only invoke `dotagent feedback submit`; `status`, `sync-github`, `triage`, and `run-loop` are hard-blocked (`SELF_TAMPERING_BLOCKED`)."
+                            "Agents may only invoke `dotagent feedback submit`; `status`, `export-outbox`, `sync-github`, `triage`, and `run-loop` are hard-blocked (`SELF_TAMPERING_BLOCKED`)."
                                 .to_string(),
                         halt_session: true,
                     });
@@ -3430,7 +3430,10 @@ fn check_search_or_walk_command(
                     i += 2;
                     continue;
                 }
-                if let Some(v) = a.strip_prefix("--max-depth=") {
+                if let Some(v) = a.strip_prefix("--max-depth=").or_else(|| {
+                    a.strip_prefix("-d")
+                        .filter(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))
+                }) {
                     max_depth = v.parse().ok();
                     i += 1;
                     continue;

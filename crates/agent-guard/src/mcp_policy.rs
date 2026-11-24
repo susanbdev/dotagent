@@ -162,14 +162,102 @@ pub fn classify_mcp_sub_method(sub_method: &str) -> McpRpcClass {
         return McpRpcClass::ExternalMutation;
     }
 
-    if READONLY_EXACT_METHODS.contains(&lower.as_str())
-        || READONLY_PREFIXES.iter().any(|p| lower.starts_with(p))
+    let normalized_read = lower.strip_prefix("agora_").unwrap_or(lower.as_str());
+    if READONLY_EXACT_METHODS.contains(&normalized_read)
+        || READONLY_PREFIXES
+            .iter()
+            .any(|p| normalized_read.starts_with(p))
     {
         return McpRpcClass::ReadOnly;
     }
 
     // Fail-closed default for any unmodeled RPC verb!
     McpRpcClass::ExternalMutation
+}
+
+/// Validates local stdio MCP server launch commands, permitting only canonical `dotagent` /
+/// `agent-guard` (`mcp-gateway`) and `agora` / `agora-mcp` (`agora serve --stdio`) invocations.
+pub fn validate_mcp_server_command(
+    server_name: &str,
+    command: &str,
+    args: &[String],
+) -> Result<(), (&'static str, String)> {
+    let norm_server = server_name.trim().to_ascii_lowercase();
+    let trimmed_cmd = command.trim();
+    if trimmed_cmd.is_empty()
+        || trimmed_cmd.contains("..")
+        || trimmed_cmd.starts_with("./")
+        || trimmed_cmd.starts_with("../")
+        || trimmed_cmd
+            .bytes()
+            .any(|b| matches!(b, b';' | b'|' | b'&' | b'$' | b'`' | b'\n' | b'\r' | b'\0'))
+    {
+        return Err((
+            "UNVETTED_MCP_SERVER_BLOCKED",
+            format!("MCP server '{server_name}' command '{command}' is untrusted or relative."),
+        ));
+    }
+    if args.iter().any(|a| {
+        a.bytes()
+            .any(|b| matches!(b, b';' | b'|' | b'&' | b'$' | b'`' | b'\n' | b'\r' | b'\0'))
+    }) {
+        return Err((
+            "UNVETTED_MCP_SERVER_BLOCKED",
+            format!("MCP server '{server_name}' arguments contain forbidden control/shell bytes."),
+        ));
+    }
+    let bin_base = trimmed_cmd
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(trimmed_cmd);
+    let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    match norm_server.as_str() {
+        "dotagent" | "dotagent-mcp-gateway" | "dotagent_mcp_gateway" => {
+            let valid_dotagent = matches!(bin_base, "dotagent" | "agent-guard")
+                && matches!(
+                    arg_refs.as_slice(),
+                    ["mcp-gateway", ..] | ["guard", "mcp-gateway", ..]
+                );
+            if !valid_dotagent {
+                return Err((
+                    "UNVETTED_MCP_SERVER_BLOCKED",
+                    format!(
+                        "MCP server '{server_name}' must invoke `dotagent mcp-gateway` or `agent-guard mcp-gateway`."
+                    ),
+                ));
+            }
+            Ok(())
+        }
+        "agora" | "agora-mcp" | "agora_mcp" => {
+            let valid_agora = match bin_base {
+                "agora" => arg_refs.as_slice() == ["serve", "--stdio"],
+                "agora-mcp" => {
+                    arg_refs.as_slice() == ["serve", "--stdio"]
+                        || arg_refs.as_slice() == ["--stdio"]
+                }
+                _ => false,
+            };
+            if !valid_agora {
+                return Err((
+                    "UNVETTED_MCP_SERVER_BLOCKED",
+                    format!(
+                        "MCP server '{server_name}' must invoke `agora serve --stdio` or `agora-mcp serve --stdio`."
+                    ),
+                ));
+            }
+            Ok(())
+        }
+        _ => Err((
+            "UNVETTED_MCP_SERVER_BLOCKED",
+            format!(
+                "MCP server '{server_name}' is not in the stdio allowlist (`dotagent`, `agora`, `agora-mcp`)."
+            ),
+        )),
+    }
+}
+
+pub fn is_approved_mcp_server_command(server_name: &str, command: &str, args: &[String]) -> bool {
+    validate_mcp_server_command(server_name, command, args).is_ok()
 }
 
 /// Evaluates declarative capability authorization for an MCP method under the active profile
@@ -323,5 +411,76 @@ mod tests {
             assert_eq!(err_taint.0, "TAINTED_EXTERNAL_MUTATION_BLOCKED");
             assert!(err_taint.2);
         }
+    }
+
+    #[test]
+    fn allows_agora_and_dotagent_stdio_commands_and_rejects_unvetted_servers() {
+        let s =
+            |items: &[&str]| -> Vec<String> { items.iter().map(|x| (*x).to_string()).collect() };
+        assert!(is_approved_mcp_server_command(
+            "agora",
+            "agora",
+            &s(&["serve", "--stdio"])
+        ));
+        assert!(is_approved_mcp_server_command(
+            "agora-mcp",
+            "/usr/local/bin/agora",
+            &s(&["serve", "--stdio"])
+        ));
+        assert!(is_approved_mcp_server_command(
+            "agora-mcp",
+            "agora-mcp",
+            &s(&["serve", "--stdio"])
+        ));
+        assert!(is_approved_mcp_server_command(
+            "dotagent",
+            "dotagent",
+            &s(&["mcp-gateway"])
+        ));
+        assert!(is_approved_mcp_server_command(
+            "dotagent",
+            "/home/user/.local/bin/agent-guard",
+            &s(&["mcp-gateway", "--cwd", "/repo"])
+        ));
+
+        // Reject relative workspace path, npx, shell metacharacters, wrong args, or unknown server
+        assert!(!is_approved_mcp_server_command(
+            "agora",
+            "./agora",
+            &s(&["serve", "--stdio"])
+        ));
+        assert!(!is_approved_mcp_server_command(
+            "agora",
+            "npx",
+            &s(&["agora", "serve", "--stdio"])
+        ));
+        assert!(!is_approved_mcp_server_command(
+            "agora",
+            "agora",
+            &s(&["serve", "--http"])
+        ));
+        assert!(!is_approved_mcp_server_command(
+            "evil",
+            "agora",
+            &s(&["serve", "--stdio"])
+        ));
+
+        // Read-only agora queries vs mutating agora verbs
+        assert_eq!(
+            classify_mcp_sub_method("agora_search"),
+            McpRpcClass::ReadOnly
+        );
+        assert_eq!(
+            classify_mcp_sub_method("agora_get_thread"),
+            McpRpcClass::ReadOnly
+        );
+        assert_eq!(
+            classify_mcp_sub_method("agora_status"),
+            McpRpcClass::ReadOnly
+        );
+        assert_eq!(
+            classify_mcp_sub_method("agora_post_message"),
+            McpRpcClass::ExternalMutation
+        );
     }
 }

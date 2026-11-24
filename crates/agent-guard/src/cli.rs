@@ -943,9 +943,16 @@ pub(crate) fn eval_hook_preferring_hot_coord<F>(
 where
     F: FnOnce() -> Decision,
 {
-    if std::env::var("AGENT_GUARD_HOT_COORD").as_deref() == Ok("1") {
-        let repo_root = resolve_repo_root(cwd);
-        if let Ok(dec) = crate::coordinator::rpc_eval_hook(&repo_root, phase, payload, cwd) {
+    let repo_root = resolve_repo_root(cwd);
+    if crate::coordinator::should_auto_warm_hook_daemon(&repo_root) {
+        let wait_for_spawn = std::env::var("AGENT_GUARD_HOT_COORD").as_deref() == Ok("1");
+        if let Ok((dec, _ipc_ns)) = crate::coordinator::rpc_eval_hook_with_mode(
+            &repo_root,
+            phase,
+            payload,
+            cwd,
+            wait_for_spawn,
+        ) {
             return dec;
         }
     }
@@ -1027,6 +1034,7 @@ fn run_on_stop(args: &[String], cwd: &Path) -> ExitCode {
     if std::env::var("AGENT_GUARD_IN_SANDBOX").as_deref() != Ok("1")
         && std::env::var("AGENT_GUARD_WORKER_LOCK").as_deref() != Ok("1")
     {
+        let _ = crate::feedback_loop::stage_signed_outbox_on_stop(&repo_root);
         match crate::stop_receipt::issue_verified_stop_receipt(&repo_root, receipt_out.as_deref()) {
             Ok((receipt, path)) => {
                 println!(

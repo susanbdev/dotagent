@@ -136,3 +136,8 @@ cargo test --workspace --offline
 - Vulnerability reporting and supported versions: [SECURITY.md](SECURITY.md)
 - GitHub repository and organization rulesets: [GitHub ruleset setup and drift checks](docs/GITHUB_RULESETS.md)
 - Release history: [CHANGELOG.md](CHANGELOG.md)
+
+## License
+
+**Free for personal, educational, and individual non-commercial use.** Commercial and enterprise use requires a paid commercial license -- see [LICENSE](LICENSE) for full terms.
+
