@@ -528,11 +528,47 @@ fn on_stop_outbox_staging_and_export_outbox_loopback_forward_e2e() {
     let mock_proxy = thread::spawn(move || {
         let (mut sock, _) = listener.accept().expect("accept");
         let _ = sock.set_read_timeout(Some(Duration::from_secs(3)));
-        let mut buf = [0u8; 8192];
-        let n = sock.read(&mut buf).expect("read request");
-        let req_s = String::from_utf8_lossy(&buf[..n]).into_owned();
-        sock.write_all(b"HTTP/1.1 202 Accepted\r\nContent-Length: 2\r\n\r\nOK")
-            .expect("write 202");
+        let mut raw = Vec::with_capacity(8192);
+        let mut chunk = [0u8; 4096];
+        let mut expected_total: Option<usize> = None;
+        loop {
+            match sock.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(n) => {
+                    raw.extend_from_slice(&chunk[..n]);
+                    if expected_total.is_none()
+                        && let Some(hdr_end) = raw.windows(4).position(|w| w == b"\r\n\r\n")
+                    {
+                        let body_start = hdr_end + 4;
+                        let hdr_str = String::from_utf8_lossy(&raw[..hdr_end]);
+                        let content_len = hdr_str
+                            .lines()
+                            .find_map(|line| {
+                                let (k, v) = line.split_once(':')?;
+                                k.trim()
+                                    .eq_ignore_ascii_case("content-length")
+                                    .then(|| v.trim().parse::<usize>().ok())?
+                            })
+                            .unwrap_or(0);
+                        expected_total = Some(body_start + content_len);
+                    }
+                    if let Some(total) = expected_total
+                        && raw.len() >= total
+                    {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+        let req_s = String::from_utf8_lossy(&raw).into_owned();
+        sock.write_all(
+            b"HTTP/1.1 202 Accepted\r\nConnection: close\r\nContent-Length: 2\r\n\r\nOK",
+        )
+        .expect("write 202");
+        let _ = sock.flush();
+        let _ = sock.shutdown(std::net::Shutdown::Write);
+        let _ = sock.read(&mut chunk);
         req_s
     });
 

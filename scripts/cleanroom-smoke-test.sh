@@ -50,8 +50,19 @@ mkdir -p "${CLEAN_HOME}/.local/bin" "${CLEAN_HOME}/.local/run" "${OPT_DIR}" "${S
 
 cleanup() {
     if [[ -n "${CLEAN_ROOT:-}" && "${CLEAN_ROOT}" == "${WORK_BASE_ABS}/cleanroom-run-"* ]]; then
-        chmod -R u+w "${CLEAN_ROOT}" 2>/dev/null || true
-        rm -rf "${CLEAN_ROOT}"
+        rm -f "${CLEAN_HOME}/.local/state/agent-guard/daemon/auto_warm.enabled" \
+              "${CLEAN_HOME}/.local/state/agent-guard/daemon/hook.sock" 2>/dev/null || true
+        for _ in 1 2 3 4 5; do
+            chmod -R u+w "${CLEAN_ROOT}" 2>/dev/null || true
+            if rm -rf "${CLEAN_ROOT}" 2>/dev/null; then
+                break
+            fi
+            sleep 0.1
+        done
+        if [[ -e "${CLEAN_ROOT}" ]]; then
+            chmod -R u+w "${CLEAN_ROOT}" 2>/dev/null || true
+            rm -rf "${CLEAN_ROOT}"
+        fi
     fi
 }
 trap cleanup EXIT

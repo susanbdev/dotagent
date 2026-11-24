@@ -1116,11 +1116,25 @@ pub fn maybe_auto_warm_on_activate() {
 }
 
 /// Removes `daemon/auto_warm.enabled` and `daemon/hook.sock` so any warm `hook-daemon` in the
-/// active state namespace detects socket unlink and terminates within `<= 20ms`.
+/// active state namespace detects socket unlink, drops `HostTelemetry`, and terminates cleanly.
 pub fn stop_hot_hook_daemon() {
-    let daemon_dir = crate::traversal_ledger::state_base_dir().join("daemon");
+    let base_dir = crate::traversal_ledger::state_base_dir();
+    let daemon_dir = base_dir.join("daemon");
+    let sock_path = daemon_dir.join("hook.sock");
+    let was_present = fs::symlink_metadata(&sock_path).is_ok()
+        || fs::symlink_metadata(daemon_dir.join("auto_warm.enabled")).is_ok();
     let _ = fs::remove_file(daemon_dir.join("auto_warm.enabled"));
-    let _ = fs::remove_file(daemon_dir.join("hook.sock"));
+    let _ = fs::remove_file(&sock_path);
+    if was_present {
+        let route_path = base_dir.join("observations/route");
+        let deadline = Instant::now() + Duration::from_millis(350);
+        while Instant::now() < deadline {
+            if !ping_hook_daemon() && fs::symlink_metadata(&route_path).is_err() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
 }
 
 /// Determines whether `eval_hook_preferring_hot_coord` should use or lazily warm `hook.sock`.
