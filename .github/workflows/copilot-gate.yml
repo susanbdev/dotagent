@@ -17,6 +17,7 @@ jobs:
     name: Verify Ring-0 from trusted base
     permissions:
       contents: read
+      pull-requests: read
     # Decoy-PR defense: commit statuses are per-SHA, so a PR aimed at a scratch branch must never
     # mint a green gate status that a second PR (same head SHA) into the default branch inherits.
     # Runs strictly from the trusted default-branch workflow via pull_request_target / pull_request_review.
@@ -27,7 +28,42 @@ jobs:
       CARGO_TERM_COLOR: always
       GIT_CONFIG_NOSYSTEM: "1"
     steps:
-      - name: Checkout PR head commit (full history for merge-base & hardware-key check)
+      # Runs before checkout when zero repository files exist on disk.
+      - name: Check human owner GitHub PR review approval
+        id: owner_review
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO_FULL: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, os, subprocess
+          repo = os.environ["REPO_FULL"]
+          pr_num = int(os.environ["PR_NUMBER"])
+          head_sha = os.environ["PR_HEAD_SHA"]
+          out = subprocess.check_output(
+              ["gh", "api", "--paginate", "--slurp", f"repos/{repo}/pulls/{pr_num}/reviews"],
+              text=True,
+          )
+          pages = json.loads(out) if out.strip() else []
+          reviews = [r for p in pages for r in (p if isinstance(p, list) else [p])]
+          latest = None
+          for rev in reviews:
+              u = rev.get("user") or {}
+              rstate = str(rev.get("state", "")).upper()
+              if rstate not in ("APPROVED", "CHANGES_REQUESTED", "DISMISSED"):
+                  continue
+              if u.get("login") == "susanbeasles" and str(u.get("type", "")).lower() == "user" and rev.get("commit_id") == head_sha:
+                  if latest is None or int(rev.get("id", 0)) >= int(latest.get("id", 0)):
+                      latest = rev
+          approved = bool(latest and str(latest.get("state", "")).upper() == "APPROVED")
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="ascii") as fh:
+              fh.write(f"approved={'true' if approved else 'false'}\n")
+          PY
+
+      - name: Checkout PR head commit (full history for merge-base & SSH signature check)
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           ref: ${{ github.event.pull_request.head.sha }}
@@ -52,6 +88,7 @@ jobs:
           PR_AUTHOR_ASSOC: ${{ github.event.pull_request.author_association }}
           PR_HEAD_REF: ${{ github.event.pull_request.head.ref }}
           EVENT_ACTOR: ${{ github.actor }}
+          OWNER_PR_APPROVED: ${{ steps.owner_review.outputs.approved || 'false' }}
         run: |
           set -euo pipefail
           test "$(git rev-parse --verify HEAD^{commit})" = "${PR_HEAD_SHA}"
@@ -74,8 +111,18 @@ jobs:
                 ;;
               *)
                 if ! git diff --quiet "${BASE_OID}" HEAD -- config/allowed_human_signers scripts/allowed_hardware_signers; then
-                  "${RUNNER_TEMP}/trusted-target/debug/dotagent" verify-ring0-ratchet \
-                    --base "origin/${BASE_REF}"
+                  if [ "${OWNER_PR_APPROVED}" = "true" ]; then
+                    if git -C "${TRUSTED}" grep -q -F -- '--owner-approved' -- crates/agent-guard/src/ring0_ratchet.rs; then
+                      "${RUNNER_TEMP}/trusted-target/debug/dotagent" verify-ring0-ratchet \
+                        --base "origin/${BASE_REF}" --owner-approved
+                    else
+                      "${RUNNER_TEMP}/trusted-target/debug/dotagent" verify-ring0-ratchet \
+                        --base "origin/${BASE_REF}" --corpus-only
+                    fi
+                  else
+                    "${RUNNER_TEMP}/trusted-target/debug/dotagent" verify-ring0-ratchet \
+                      --base "origin/${BASE_REF}"
+                  fi
                 else
                   "${RUNNER_TEMP}/trusted-target/debug/dotagent" verify-ring0-ratchet \
                     --base "origin/${BASE_REF}" --corpus-only

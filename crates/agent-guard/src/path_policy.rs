@@ -8,7 +8,7 @@
 //! - Zero access to secrets/credentials (`.env*`, `*.pem`, `*.key`, `~/.ssh`, `~/.aws`, etc.)
 //! - Component-by-component symlink escape detection (`lstat` + `read_link`)
 //! - Strict per-repo boundary (blocks cross-repo cache/context bleed)
-//! - Single Root Authority File (`<repo_root>/AGENTS.md` ONLY — all nested/shadow instruction files blocked)
+//! - Single Root Authority File (`<repo_root>/AGENTS.md` ONLY -- all nested/shadow instruction files blocked)
 //! - Control-plane immutability (`AGENTS.md`, `.git/`, `.claude/`, `.codex/`, `.cursor/`, `.guard/`)
 //! - Max 2-level directory walk / relative `..` climb restriction
 
@@ -73,11 +73,45 @@ pub fn glob_match_path(pat: &str, path: &str) -> bool {
     pi == p.len()
 }
 
-pub fn effective_max_walk_depth_for_repo(repo_root: &Path) -> usize {
+thread_local! {
+    static REQUEST_SESSION_OVERRIDE: std::cell::RefCell<Option<String>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Scoped per-request session binding for `hook.sock` IPC evaluations so transitive `validate_path`
+/// and `cmd_policy` checks use the caller's session ID rather than ambient daemon environment state.
+pub struct ScopedRequestSession {
+    previous: Option<String>,
+}
+
+impl ScopedRequestSession {
+    pub fn enter(session_id: Option<&str>) -> Self {
+        let next = session_id.map(String::from);
+        let previous = REQUEST_SESSION_OVERRIDE.with(|slot| slot.replace(next));
+        Self { previous }
+    }
+}
+
+impl Drop for ScopedRequestSession {
+    fn drop(&mut self) {
+        let prev = self.previous.take();
+        REQUEST_SESSION_OVERRIDE.with(|slot| {
+            *slot.borrow_mut() = prev;
+        });
+    }
+}
+
+pub fn resolve_max_walk_depth(repo_root: &Path, explicit_session_id: Option<&str>) -> usize {
     if crate::operator::has_active_elevated_lease(repo_root) {
         return crate::swarm_contracts::INVESTIGATOR_MAX_WALK_DEPTH;
     }
-    let session_hint = std::env::var("AGENT_GUARD_SESSION_ID").unwrap_or_default();
+    let session_hint = match explicit_session_id {
+        Some(sid) => sid.to_string(),
+        None => REQUEST_SESSION_OVERRIDE.with(|slot| match slot.borrow().as_deref() {
+            Some(ipc_sid) => ipc_sid.to_string(),
+            None => std::env::var("AGENT_GUARD_SESSION_ID").unwrap_or_default(),
+        }),
+    };
     if let Ok((crate::swarm_contracts::SwarmRole::Investigator, Some(_))) =
         crate::role_sandbox::resolve_active_role(repo_root, &session_hint)
     {
@@ -87,6 +121,10 @@ pub fn effective_max_walk_depth_for_repo(repo_root: &Path) -> usize {
         return SIMS_MICROVM_MAX_WALK_DEPTH;
     }
     MAX_DIRECTORY_WALK_DEPTH
+}
+
+pub fn effective_max_walk_depth_for_repo(repo_root: &Path) -> usize {
+    resolve_max_walk_depth(repo_root, None)
 }
 
 pub fn effective_max_walk_depth() -> usize {

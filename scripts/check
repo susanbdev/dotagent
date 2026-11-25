@@ -1,0 +1,91 @@
+#!/usr/bin/env bash
+# Canonical verification gate for susanbdev/dotagent (`v2.2.0`)
+set -euo pipefail
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "${REPO_ROOT}"
+
+echo "[dotagent/check] 1/7 Verifying Unicode smuggling & 7-bit ASCII authority/delta hygiene..."
+python3 - <<'PY'
+import subprocess, sys
+
+BIDI = {0x202A, 0x202B, 0x202C, 0x202D, 0x202E, 0x2066, 0x2067, 0x2068, 0x2069}
+tracked = [p.decode("utf-8") for p in subprocess.check_output(["git", "ls-files", "-z"]).split(b"\0") if p]
+changed = set(
+    p.decode("utf-8")
+    for p in subprocess.check_output(["git", "diff", "--name-only", "-z", "HEAD"]).split(b"\0")
+    if p
+)
+untracked = set(
+    p.decode("utf-8")
+    for p in subprocess.check_output(["git", "ls-files", "--others", "--exclude-standard", "-z"]).split(b"\0")
+    if p
+)
+strict_ascii_targets = changed | untracked
+bad = []
+
+for rel in sorted(set(tracked) | untracked):
+    if rel.endswith((".png", ".woff2", ".wasm", ".ico", ".gz", ".zip")):
+        continue
+    with open(rel, "rb") as fh:
+        data = fh.read()
+    if b"\x00" in data:
+        bad.append(f"{rel}: NUL byte forbidden")
+        continue
+    must_be_ascii = (
+        rel == "AGENTS.md"
+        or rel.startswith(("dist/", "profiles/", "scripts/"))
+        or rel in strict_ascii_targets
+    )
+    if must_be_ascii:
+        for idx, b in enumerate(data):
+            if b >= 0x80:
+                bad.append(f"{rel}: non-ASCII byte 0x{b:02x} at offset {idx}")
+                break
+    elif not rel.startswith(("tests/", "crates/agent-guard/src/unicode_guard.rs", "crates/agent-guard/tests/")):
+        text = data.decode("utf-8")
+        for ch in text:
+            if ord(ch) in BIDI or (0xE0000 <= ord(ch) <= 0xE007F):
+                bad.append(f"{rel}: forbidden Bidi/Tag codepoint U+{ord(ch):04X}")
+                break
+
+if bad:
+    for item in bad:
+        print(f"HYGIENE_VIOLATION: {item}", file=sys.stderr)
+    sys.exit(1)
+PY
+
+echo "[dotagent/check] 2/7 Checking Rust formatting (cargo fmt)..."
+CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-2}" cargo fmt --all -- --check
+
+echo "[dotagent/check] 3/7 Running strict lints & forbid(unsafe_code) (cargo clippy)..."
+CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-2}" cargo clippy --workspace --all-targets --locked -- -D warnings
+
+echo "[dotagent/check] 4/7 Running unit, adversarial, Swarm v2, v2.2 anti-shim, & property suites..."
+CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-2}" cargo test --workspace --locked
+
+echo "[dotagent/check] 5/7 Running Python packaging & shell syntax suites..."
+python3 -B -m unittest discover -s tests/packaging
+bash -n scripts/*.sh scripts/check
+
+echo "[dotagent/check] 6/7 Building release binaries, verifying bundle compiler, delivery scripts, & repo audit..."
+CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-2}" cargo build --release --locked --workspace
+./target/release/dotagent-compiler verify .
+./target/release/dotagent audit-repo .
+bash scripts/test-delivery-scripts.sh
+
+echo "[dotagent/check] 7/7 Verifying Ed25519 StopReceipt attestation & quick hook microbench..."
+CI_SCRATCH="target/ci-check-$$"
+rm -rf "${CI_SCRATCH}"
+mkdir -p "${CI_SCRATCH}"
+openssl genpkey -algorithm ED25519 -out "${CI_SCRATCH}/receipt_ed25519.pem"
+SEED_HEX="$(openssl pkey -in "${CI_SCRATCH}/receipt_ed25519.pem" -outform DER | tail -c 32 | od -An -tx1 | tr -d ' \n')"
+PUBKEY_HEX="$(openssl pkey -in "${CI_SCRATCH}/receipt_ed25519.pem" -pubout -outform DER | tail -c 32 | od -An -tx1 | tr -d ' \n')"
+rm -f "${CI_SCRATCH}/receipt_ed25519.pem"
+DOTAGENT_RECEIPT_SEED_HEX="${SEED_HEX}" \
+  ./target/release/dotagent on-stop --receipt-out "${CI_SCRATCH}/ci.receipt.json"
+./target/release/dotagent verify-receipt "${CI_SCRATCH}/ci.receipt.json" --repo . --pubkey "${PUBKEY_HEX}"
+./target/release/dotagent-harness bench --quick
+rm -rf "${CI_SCRATCH}"
+
+echo "[dotagent/check] ALL GATES PASSED (dotagent v2.2.0)"

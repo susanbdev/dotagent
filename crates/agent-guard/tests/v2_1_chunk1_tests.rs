@@ -6,8 +6,9 @@ use std::process::Command;
 
 use agent_guard::exec_sandbox::probe_host_sandbox_mode;
 use agent_guard::sshsig_touch::{
-    OPERATOR_SSHSIG_NAMESPACE, SK_ED25519_ALG, load_operator_sk_keys_from_home,
-    verify_fido2_sshsig_ed25519,
+    OPERATOR_SSHSIG_NAMESPACE, SK_ED25519_ALG, SSH_ED25519_ALG,
+    load_operator_or_ssh_keys_from_home, load_operator_sk_keys_from_home,
+    release_signature_has_fido2_touch, verify_fido2_sshsig_ed25519,
 };
 use ed25519_dalek::{Signer, SigningKey};
 use sha2::{Digest, Sha256, Sha512};
@@ -90,6 +91,39 @@ fn mint_sk_sshsig_pem(
     )
 }
 
+fn mint_ssh_ed25519_sshsig_pem(sk: &SigningKey, namespace: &str, challenge: &[u8]) -> String {
+    let msg_hash = Sha512::digest(challenge);
+    let mut preimage = Vec::new();
+    preimage.extend_from_slice(b"SSHSIG");
+    push_ssh_str(&mut preimage, namespace.as_bytes());
+    push_ssh_str(&mut preimage, b"");
+    push_ssh_str(&mut preimage, b"sha512");
+    push_ssh_str(&mut preimage, &msg_hash);
+    let sig = sk.sign(&preimage);
+
+    let mut pk_blob = Vec::new();
+    push_ssh_str(&mut pk_blob, SSH_ED25519_ALG.as_bytes());
+    push_ssh_str(&mut pk_blob, sk.verifying_key().as_bytes());
+
+    let mut sig_blob = Vec::new();
+    push_ssh_str(&mut sig_blob, SSH_ED25519_ALG.as_bytes());
+    push_ssh_str(&mut sig_blob, &sig.to_bytes());
+
+    let mut outer = Vec::new();
+    outer.extend_from_slice(b"SSHSIG");
+    outer.extend_from_slice(&1u32.to_be_bytes());
+    push_ssh_str(&mut outer, &pk_blob);
+    push_ssh_str(&mut outer, namespace.as_bytes());
+    push_ssh_str(&mut outer, b"");
+    push_ssh_str(&mut outer, b"sha512");
+    push_ssh_str(&mut outer, &sig_blob);
+
+    format!(
+        "-----BEGIN SSH SIGNATURE-----\n{}\n-----END SSH SIGNATURE-----\n",
+        encode_base64(&outer)
+    )
+}
+
 fn isolated_test_dir(slug: &str) -> PathBuf {
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let ws_root = manifest_dir
@@ -106,11 +140,25 @@ fn isolated_test_dir(slug: &str) -> PathBuf {
 }
 
 #[test]
-fn fido2_sshsig_rejects_up_zero_and_accepts_up_one() {
+fn operator_sshsig_accepts_standard_ed25519_and_up_zero_while_release_tags_require_fido2_up_one() {
     let sk = SigningKey::from_bytes(&[0x5au8; 32]);
     let pubkey = *sk.verifying_key().as_bytes();
     let challenge = b"dotagent:operator:v1:repo123:0:1795275600";
 
+    // Release tags (`namespace = "git"`) strictly require `sk-*` FIDO2 with `UP=1`!
+    let rel_up1 = mint_sk_sshsig_pem(&sk, b"ssh:dotagent", "git", b"tag v2.2.0", 0x01, 10);
+    assert_eq!(release_signature_has_fido2_touch(&rel_up1), Ok(true));
+    let rel_up0 = mint_sk_sshsig_pem(&sk, b"ssh:dotagent", "git", b"tag v2.2.0", 0x00, 11);
+    assert_eq!(
+        release_signature_has_fido2_touch(&rel_up0)
+            .expect_err("v* release tag signature must reject UP=0")
+            .code,
+        "SSHSIG_USER_PRESENCE_REQUIRED"
+    );
+    let rel_std = mint_ssh_ed25519_sshsig_pem(&sk, "git", b"tag v2.2.0");
+    assert_eq!(release_signature_has_fido2_touch(&rel_std), Ok(false));
+
+    // Operator / plugin / CLI gates accept `sk-*` (`UP=1` and `UP=0`) AND standard `ssh-ed25519`!
     let pem_up1 = mint_sk_sshsig_pem(
         &sk,
         b"ssh:dotagent",
@@ -121,7 +169,7 @@ fn fido2_sshsig_rejects_up_zero_and_accepts_up_one() {
     );
     let cnt =
         verify_fido2_sshsig_ed25519(OPERATOR_SSHSIG_NAMESPACE, challenge, &pem_up1, &[pubkey])
-            .expect("UP=1 hardware touch must verify");
+            .expect("UP=1 sk-ssh-ed25519 must verify");
     assert_eq!(cnt, 77);
 
     let pem_up0 = mint_sk_sshsig_pem(
@@ -132,23 +180,28 @@ fn fido2_sshsig_rejects_up_zero_and_accepts_up_one() {
         0x00,
         78,
     );
-    let err =
+    let cnt_up0 =
         verify_fido2_sshsig_ed25519(OPERATOR_SSHSIG_NAMESPACE, challenge, &pem_up0, &[pubkey])
-            .expect_err("UP=0 without physical touch must fail");
-    assert_eq!(err.code, "SSHSIG_USER_PRESENCE_REQUIRED");
+            .expect("UP=0 sk-ssh-ed25519 without touch must verify for operator gate");
+    assert_eq!(cnt_up0, 78);
+
+    let pem_std = mint_ssh_ed25519_sshsig_pem(&sk, OPERATOR_SSHSIG_NAMESPACE, challenge);
+    let cnt_std =
+        verify_fido2_sshsig_ed25519(OPERATOR_SSHSIG_NAMESPACE, challenge, &pem_std, &[pubkey])
+            .expect("standard ssh-ed25519 must verify for operator gate");
+    assert_eq!(cnt_std, 0);
 
     let base = isolated_test_dir("keyring");
     let cfg = base.join(".config/dotagent");
     fs::create_dir_all(&cfg).expect("cfg dir");
-    let mut pk_blob = Vec::new();
-    push_ssh_str(&mut pk_blob, SK_ED25519_ALG.as_bytes());
-    push_ssh_str(&mut pk_blob, &pubkey);
-    push_ssh_str(&mut pk_blob, b"ssh:dotagent");
+    let mut std_blob = Vec::new();
+    push_ssh_str(&mut std_blob, SSH_ED25519_ALG.as_bytes());
+    push_ssh_str(&mut std_blob, &pubkey);
     fs::write(
         cfg.join("operator_sk_keys"),
         format!(
-            "{SK_ED25519_ALG} {} operator@host\n",
-            encode_base64(&pk_blob)
+            "operator@host namespaces=\"git\" {SSH_ED25519_ALG} {}\n",
+            encode_base64(&std_blob)
         ),
     )
     .expect("write operator_sk_keys");
@@ -156,6 +209,12 @@ fn fido2_sshsig_rejects_up_zero_and_accepts_up_one() {
         .expect("parse keyring")
         .expect("present");
     assert_eq!(loaded, vec![pubkey]);
+    assert_eq!(
+        load_operator_or_ssh_keys_from_home(&base)
+            .expect("fallback loader")
+            .expect("present"),
+        vec![pubkey]
+    );
 }
 
 #[test]

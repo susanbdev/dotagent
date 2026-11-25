@@ -75,6 +75,9 @@ pub enum GuardCode {
     FeedbackOperatorOnly,
     InvalidFeedbackBallot,
     FeedbackRateLimitExceeded,
+    NoUnlinkedRuntimeShim,
+    NoFailOpenFallback,
+    PolyglotGoldenVectors,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -562,9 +565,9 @@ const CATALOG: &[CodeExplanation] = &[
         code: "PLUGIN_HUMAN_TOUCH_REQUIRED",
         severity: "HARD_DENY",
         category: "plugin_lattice",
-        summary: "Operation escalated to `RequireHumanTouch` without a verified FIDO2 `SSHSIG` hardware presence signature.",
-        rationale: "Requires cryptographic `sk-ssh-ed25519@openssh.com` (`UP == 1`) physical touch authorization for sensitive operations.",
-        remediation: "Ask the human operator to authorize with a FIDO2 hardware key.",
+        summary: "Operation escalated to `RequireHumanTouch` without a verified operator OpenSSH `SSHSIG` signature.",
+        rationale: "Requires cryptographic `ssh-ed25519` or `sk-ssh-ed25519@openssh.com` operator signature authorization for sensitive operations.",
+        remediation: "Ask the human operator to authorize with an enrolled SSH key (`AGENT_GUARD_PLUGIN_SSHSIG`).",
     },
     CodeExplanation {
         variant: GuardCode::PluginEvaluationError,
@@ -673,6 +676,33 @@ const CATALOG: &[CodeExplanation] = &[
         summary: "Session exceeded the per-session friction ballot submission ceiling (> 8 submissions; disk writes halted).",
         rationale: "Prevents runaway retry loops or compromised subagents from exhausting disk space under ~/.local/state/agent-guard/feedback.",
         remediation: "Stop submitting duplicate friction ballots in a loop and proceed with a compliant alternative or report the block to the user.",
+    },
+    CodeExplanation {
+        variant: GuardCode::NoUnlinkedRuntimeShim,
+        code: "NO_UNLINKED_RUNTIME_SHIM",
+        severity: "HARD_DENY",
+        category: "audit",
+        summary: "Unlinked JS/Python runtime shim (> 150 SLOC, missing compiled .wasm import, or imperative deploy.py over .tf) rejected.",
+        rationale: "Prevents split-brain deployments where Rust domain crates pass cargo test against mocks while unverified JS shims or REST scripts run in production.",
+        remediation: "Compile workspace Rust crates to wasm32-unknown-unknown, keep host FFI glue <= 150 lines importing .wasm, and use tofu plan/apply instead of scripts/deploy.py.",
+    },
+    CodeExplanation {
+        variant: GuardCode::NoFailOpenFallback,
+        code: "NO_FAIL_OPEN_FALLBACK",
+        severity: "HARD_DENY",
+        category: "audit",
+        summary: "Fail-open catch block, production mock store, or synthetic backup/recovery fallback detected outside tests.",
+        rationale: "Writing synthetic archives to WORM storage or returning clean/restored=true on runtime error silently corrupts audit and disaster-recovery guarantees.",
+        remediation: "Delete synthetic fallback adapters from production paths and fail closed with an explicit error status when required bindings or containers fail.",
+    },
+    CodeExplanation {
+        variant: GuardCode::PolyglotGoldenVectors,
+        code: "POLYGLOT_GOLDEN_VECTORS",
+        severity: "HARD_DENY",
+        category: "audit",
+        summary: "Polyglot contract repository lacks shared vectors/*.json round-trip verification across Rust, TypeScript, Python, and C11.",
+        rationale: "Independent per-language unit tests allow wire serialization drift across AST/cursor/filter formats emitted by TargetEmitter.",
+        remediation: "Commit canonical golden test vectors under vectors/*.json and verify round-trip equivalence in Rust, TypeScript, Python, and C11 inside ./scripts/check.",
     },
 ];
 

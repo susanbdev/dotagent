@@ -209,13 +209,33 @@ pub fn verify_repo_smoke_gate(repo_root: &Path) -> Result<SmokeGateReport, Strin
                 .parent()
                 .map(|d| d.to_string_lossy().into_owned())
                 .unwrap_or_default();
-            for w in collect_wasm_refs(&text, "") {
-                verify_smoke_artifact(&canon, &w, &cfg_name, &mut verified, std::io::sink())?;
+            let mut wasm_refs = collect_wasm_refs(&text, "");
+            for w in &wasm_refs {
+                verify_smoke_artifact(&canon, w, &cfg_name, &mut verified, std::io::sink())?;
             }
             let shim = String::from_utf8(shim_bytes)
                 .map_err(|e| format!("SMOKE_ARTIFACT_MISSING: cannot read '{main_rel}': {e}"))?;
-            for w in collect_wasm_refs(&shim, &pdir) {
-                verify_smoke_artifact(&canon, &w, &main_rel, &mut verified, std::io::sink())?;
+            let shim_wasm = collect_wasm_refs(&shim, &pdir);
+            for w in &shim_wasm {
+                verify_smoke_artifact(&canon, w, &main_rel, &mut verified, std::io::sink())?;
+                if !wasm_refs.contains(w) {
+                    wasm_refs.push(w.clone());
+                }
+            }
+            let has_cargo = fs::symlink_metadata(canon.join("Cargo.toml"))
+                .is_ok_and(|m| !m.file_type().is_symlink() && m.file_type().is_file());
+            if has_cargo {
+                let shim_lines = shim.lines().count();
+                if shim_lines > 150 {
+                    return Err(format!(
+                        "NO_UNLINKED_RUNTIME_SHIM: '{main_rel}' referenced by '{cfg_name}' is {shim_lines} lines (> 150-line host FFI cap)"
+                    ));
+                }
+                if wasm_refs.is_empty() {
+                    return Err(format!(
+                        "NO_UNLINKED_RUNTIME_SHIM: '{cfg_name}' ('{main_rel}') in Cargo workspace must import a compiled .wasm artifact"
+                    ));
+                }
             }
         }
     }

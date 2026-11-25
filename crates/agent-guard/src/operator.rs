@@ -603,7 +603,7 @@ pub(crate) fn verify_plugin_human_touch(
     target_rel_paths: &[String],
 ) -> bool {
     use crate::coordinator::current_hmac_epoch_id;
-    use crate::sshsig_touch::{load_operator_sk_keys_from_home, verify_fido2_sshsig_ed25519};
+    use crate::sshsig_touch::{load_operator_or_ssh_keys_from_home, verify_fido2_sshsig_ed25519};
     use crate::stop_receipt::derive_portable_repo_id;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -623,7 +623,7 @@ pub(crate) fn verify_plugin_human_touch(
     let Ok(home_raw) = std::env::var("HOME") else {
         return false;
     };
-    let Ok(Some(keys)) = load_operator_sk_keys_from_home(Path::new(&home_raw)) else {
+    let Ok(Some(keys)) = load_operator_or_ssh_keys_from_home(Path::new(&home_raw)) else {
         return false;
     };
     let canon = fs::canonicalize(repo_root).unwrap_or_else(|_| repo_root.to_path_buf());
@@ -692,7 +692,7 @@ pub(crate) fn verify_operator_sshsig_gate(
         fs::read_to_string(p).map_err(|e| GuardError::new("SSHSIG_IO", e.to_string()))?
     } else if io::stdin().is_terminal() {
         eprintln!(
-            "[DOTAGENT FIDO2 TOUCH] Paste SSHSIG for challenge '{c0}' (namespace='{OPERATOR_SSHSIG_NAMESPACE}'):"
+            "[DOTAGENT OPERATOR SSHSIG] Paste SSHSIG for challenge '{c0}' (namespace='{OPERATOR_SSHSIG_NAMESPACE}'):"
         );
         let mut buf = String::new();
         io::stdin()
@@ -703,7 +703,7 @@ pub(crate) fn verify_operator_sshsig_gate(
     } else {
         return Err(GuardError::new(
             "SSHSIG_REQUIRED",
-            format!("operator_sk_keys configured; pass --sshsig <file> over challenge '{c0}'"),
+            format!("operator SSH keys configured; pass --sshsig <file> over challenge '{c0}'"),
         ));
     };
     let c1 = format_operator_challenge(action, &repo_id, epoch_id, floor_now.saturating_sub(60));

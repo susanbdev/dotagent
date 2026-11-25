@@ -494,7 +494,8 @@ fn verify_bundle_rollout_provenance(bundle_root: &Path) -> Result<(), String> {
     }
 
     // 1. Accept if HEAD has an annotated tag carrying an SSH signature that verifies against the
-    //    bundle's committed `config/allowed_human_signers` keyring (GPG keyrings are ignored).
+    //    bundle's committed `config/allowed_human_signers` keyring (`v*` release tags continue
+    //    requiring an `sk-*` FIDO2 `UP=1` hardware signature; GPG keyrings are ignored).
     let signers_path = bundle_root.join("config/allowed_human_signers");
     let signers_ok = fs::symlink_metadata(&signers_path)
         .is_ok_and(|m| m.file_type().is_file() && !m.file_type().is_symlink());
@@ -508,14 +509,27 @@ fn verify_bundle_rollout_provenance(bundle_root: &Path) -> Result<(), String> {
             .map(str::trim)
             .filter(|s| !s.is_empty() && !s.starts_with('-'))
         {
-            let is_ssh_signed = trusted_git_cmd(bundle_root).is_ok_and(|mut c| {
+            let tag_sig_ok = trusted_git_cmd(bundle_root).is_ok_and(|mut c| {
                 c.args(["cat-file", "tag", tag]).output().is_ok_and(|o| {
-                    o.status.success()
-                        && String::from_utf8_lossy(&o.stdout)
-                            .contains("-----BEGIN SSH SIGNATURE-----")
+                    if !o.status.success() {
+                        return false;
+                    }
+                    let Some((_, sig_pem)) =
+                        crate::ring0_ratchet::extract_tag_ssh_signature(&o.stdout)
+                    else {
+                        return false;
+                    };
+                    if tag.starts_with('v') {
+                        matches!(
+                            crate::sshsig_touch::release_signature_has_fido2_touch(&sig_pem),
+                            Ok(true)
+                        )
+                    } else {
+                        true
+                    }
                 })
             });
-            if !is_ssh_signed {
+            if !tag_sig_ok {
                 continue;
             }
             if trusted_git_cmd(bundle_root).is_ok_and(|mut c| {

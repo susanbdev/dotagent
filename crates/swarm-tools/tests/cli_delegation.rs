@@ -349,6 +349,7 @@ boundary_interfaces = []
         String::from_utf8_lossy(&fake_true_checkpoint.stderr)
     );
 
+    let kernel_enforced = agent_guard::exec_sandbox::probe_host_sandbox_mode().is_kernel_enforced();
     let real_checkpoint = Command::new(swarm_tool_bin())
         .args([
             "grunt",
@@ -367,47 +368,66 @@ boundary_interfaces = []
         .env("AGENT_GUARD_STATE_DIR", &state)
         .output()
         .unwrap();
-    assert!(
-        real_checkpoint.status.success(),
-        "real unittest checkpoint stderr: {}",
-        String::from_utf8_lossy(&real_checkpoint.stderr)
-    );
+    if kernel_enforced {
+        assert!(
+            real_checkpoint.status.success(),
+            "real unittest checkpoint stderr: {}",
+            String::from_utf8_lossy(&real_checkpoint.stderr)
+        );
 
-    assert!(
-        Command::new(swarm_tool_bin())
-            .args([
-                "grunt",
-                "submit-ledger",
-                "--session",
-                &grunt_sid,
-                "--what",
-                "Updated clamp_pct upper bound to 95 in src/calc.rs. Recorded authenticated edit breadcrumb.",
-                "--why",
-                "Swarm QA domain coverage ceiling caps targets at 95 percent. Verified green test checkpoint on current tree.",
-            ])
+        assert!(
+            Command::new(swarm_tool_bin())
+                .args([
+                    "grunt",
+                    "submit-ledger",
+                    "--session",
+                    &grunt_sid,
+                    "--what",
+                    "Updated clamp_pct upper bound to 95 in src/calc.rs. Recorded authenticated edit breadcrumb.",
+                    "--why",
+                    "Swarm QA domain coverage ceiling caps targets at 95 percent. Verified green test checkpoint on current tree.",
+                ])
+                .current_dir(&repo)
+                .env("AGENT_GUARD_STATE_DIR", &state)
+                .status()
+                .unwrap()
+                .success()
+        );
+
+        // Now `agent-guard on-stop` MUST PASS (exit 0) even without env vars, and close Grunt in `active_sessions.json`!
+        let valid_stop = Command::new(agent_guard_bin())
+            .arg("on-stop")
             .current_dir(&repo)
             .env("AGENT_GUARD_STATE_DIR", &state)
-            .status()
-            .unwrap()
-            .success()
-    );
-
-    // Now `agent-guard on-stop` MUST PASS (exit 0) even without env vars, and close Grunt in `active_sessions.json`!
-    let valid_stop = Command::new(agent_guard_bin())
-        .arg("on-stop")
-        .current_dir(&repo)
-        .env("AGENT_GUARD_STATE_DIR", &state)
-        .env("GIT_CONFIG_GLOBAL", &hardened_gitconfig)
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env_remove("AGENT_GUARD_ROLE")
-        .env_remove("AGENT_GUARD_SESSION_ID")
-        .output()
-        .unwrap();
-    assert!(
-        valid_stop.status.success(),
-        "valid Grunt stop stderr: {}",
-        String::from_utf8_lossy(&valid_stop.stderr)
-    );
+            .env("GIT_CONFIG_GLOBAL", &hardened_gitconfig)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env_remove("AGENT_GUARD_ROLE")
+            .env_remove("AGENT_GUARD_SESSION_ID")
+            .output()
+            .unwrap();
+        assert!(
+            valid_stop.status.success(),
+            "valid Grunt stop stderr: {}",
+            String::from_utf8_lossy(&valid_stop.stderr)
+        );
+    } else {
+        assert!(!real_checkpoint.status.success());
+        assert!(
+            String::from_utf8_lossy(&real_checkpoint.stderr).contains("KERNEL_SANDBOX_UNAVAILABLE"),
+            "degraded kernel must fail closed on checkpoint-green: {}",
+            String::from_utf8_lossy(&real_checkpoint.stderr)
+        );
+        assert!(
+            Command::new(swarm_tool_bin())
+                .args(["master", "close-session", "--session", &grunt_sid])
+                .current_dir(&repo)
+                .env("AGENT_GUARD_STATE_DIR", &state)
+                .env("AGENT_GUARD_ROLE", "master")
+                .status()
+                .unwrap()
+                .success()
+        );
+    }
 
     // 5. REVIEWER & CORONER: mint capabilities -> verify lockfile lookup and HMAC breadcrumb trail
     let rev_mint = Command::new(swarm_tool_bin())
@@ -800,6 +820,7 @@ fn pr6_cli_capabilities_packet_provenance_and_landlock_vault_coordinator_e2e() {
 
     fs::write(repo.join("src/mod_a.rs"), "pub fn alpha() -> u8 { 42 }\n").unwrap();
 
+    let kernel_enforced = agent_guard::exec_sandbox::probe_host_sandbox_mode().is_kernel_enforced();
     let sandboxed_record_cmd = format!(
         "'{}' grunt record-edit --session '{}' --file src/mod_a.rs --lines 1-1",
         swarm_tool_bin().display(),
@@ -811,69 +832,78 @@ fn pr6_cli_capabilities_packet_provenance_and_landlock_vault_coordinator_e2e() {
         .env("AGENT_GUARD_STATE_DIR", &state)
         .output()
         .unwrap();
-    assert!(
-        sb_rec.status.success(),
-        "sandboxed `swarm-tool grunt record-edit` must sign via coordinator Unix socket without vault/hmac.key access! stderr: {}",
-        String::from_utf8_lossy(&sb_rec.stderr)
-    );
+    if kernel_enforced {
+        assert!(
+            sb_rec.status.success(),
+            "sandboxed `swarm-tool grunt record-edit` must sign via coordinator Unix socket without vault/hmac.key access! stderr: {}",
+            String::from_utf8_lossy(&sb_rec.stderr)
+        );
 
-    if landlock_enforced {
-        // Direct shell attempt to read vault/hmac.key inside exec-sandbox MUST be kernel-denied!
-        let steal_cmd = format!("cat '{}'", vault_key.display());
-        let steal_out = Command::new(agent_guard_bin())
-            .args(["exec-sandbox", "--", &steal_cmd])
+        if landlock_enforced {
+            // Direct shell attempt to read vault/hmac.key inside exec-sandbox MUST be kernel-denied!
+            let steal_cmd = format!("cat '{}'", vault_key.display());
+            let steal_out = Command::new(agent_guard_bin())
+                .args(["exec-sandbox", "--", &steal_cmd])
+                .current_dir(&repo)
+                .env("AGENT_GUARD_STATE_DIR", &state)
+                .output()
+                .unwrap();
+            assert!(
+                !steal_out.status.success(),
+                "Linux Landlock MUST deny reading vault/hmac.key inside exec-sandbox!"
+            );
+        }
+
+        // Run `grunt checkpoint-green` (which executes `tests/test_vault_isolated.py` inside `agent-guard exec-sandbox`!)
+        let cp_out = Command::new(swarm_tool_bin())
+            .args([
+                "grunt",
+                "checkpoint-green",
+                "--session",
+                &grunt_sid,
+                "--",
+                "python3",
+                "-m",
+                "unittest",
+                "discover",
+                "-s",
+                "tests",
+            ])
             .current_dir(&repo)
             .env("AGENT_GUARD_STATE_DIR", &state)
             .output()
             .unwrap();
         assert!(
-            !steal_out.status.success(),
-            "Linux Landlock MUST deny reading vault/hmac.key inside exec-sandbox!"
+            cp_out.status.success(),
+            "sandboxed checkpoint-green failed: stdout={} stderr={}",
+            String::from_utf8_lossy(&cp_out.stdout),
+            String::from_utf8_lossy(&cp_out.stderr)
+        );
+
+        let sandboxed_ledger_cmd = format!(
+            "'{}' grunt submit-ledger --session '{}' --what 'Updated alpha return value in src/mod_a.rs. Signed edit via coordinator socket.' --why 'Verified Landlock vault isolation for HMAC secret. Confirmed green unittest suite inside sandbox.'",
+            swarm_tool_bin().display(),
+            grunt_sid
+        );
+        let sb_ledger = Command::new(agent_guard_bin())
+            .args(["exec-sandbox", "--", &sandboxed_ledger_cmd])
+            .current_dir(&repo)
+            .env("AGENT_GUARD_STATE_DIR", &state)
+            .output()
+            .unwrap();
+        assert!(
+            sb_ledger.status.success(),
+            "sandboxed `swarm-tool grunt submit-ledger` failed: stderr={}",
+            String::from_utf8_lossy(&sb_ledger.stderr)
+        );
+    } else {
+        assert!(!sb_rec.status.success());
+        assert!(
+            String::from_utf8_lossy(&sb_rec.stderr).contains("KERNEL_SANDBOX_UNAVAILABLE"),
+            "degraded kernel must fail closed on exec-sandbox: {}",
+            String::from_utf8_lossy(&sb_rec.stderr)
         );
     }
-
-    // Run `grunt checkpoint-green` (which executes `tests/test_vault_isolated.py` inside `agent-guard exec-sandbox`!)
-    let cp_out = Command::new(swarm_tool_bin())
-        .args([
-            "grunt",
-            "checkpoint-green",
-            "--session",
-            &grunt_sid,
-            "--",
-            "python3",
-            "-m",
-            "unittest",
-            "discover",
-            "-s",
-            "tests",
-        ])
-        .current_dir(&repo)
-        .env("AGENT_GUARD_STATE_DIR", &state)
-        .output()
-        .unwrap();
-    assert!(
-        cp_out.status.success(),
-        "sandboxed checkpoint-green failed: stdout={} stderr={}",
-        String::from_utf8_lossy(&cp_out.stdout),
-        String::from_utf8_lossy(&cp_out.stderr)
-    );
-
-    let sandboxed_ledger_cmd = format!(
-        "'{}' grunt submit-ledger --session '{}' --what 'Updated alpha return value in src/mod_a.rs. Signed edit via coordinator socket.' --why 'Verified Landlock vault isolation for HMAC secret. Confirmed green unittest suite inside sandbox.'",
-        swarm_tool_bin().display(),
-        grunt_sid
-    );
-    let sb_ledger = Command::new(agent_guard_bin())
-        .args(["exec-sandbox", "--", &sandboxed_ledger_cmd])
-        .current_dir(&repo)
-        .env("AGENT_GUARD_STATE_DIR", &state)
-        .output()
-        .unwrap();
-    assert!(
-        sb_ledger.status.success(),
-        "sandboxed `swarm-tool grunt submit-ledger` failed: stderr={}",
-        String::from_utf8_lossy(&sb_ledger.stderr)
-    );
 
     // Removed `--internal-exec-sandbox` CLI flag must fail closed (exit 2, UNKNOWN_SUBCOMMAND)
     // even if a caller attempts to supply the former internal token env var.

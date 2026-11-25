@@ -781,15 +781,8 @@ fn inverted_ring0_allowlist_ssh_hardware_signer_and_target_matched_corpus_ratche
             .success()
     );
 
-    // 4. Hardware/SSH key signature verification is strictly enforced on RELEASE TAGS (`v*`)!
-    assert!(
-        Command::new("git")
-            .current_dir(&repo)
-            .args(["checkout", "main"])
-            .status()
-            .expect("checkout main for release tag")
-            .success()
-    );
+    // 3b. Standard `ssh-ed25519` commit signature (no `sk-*` hardware touch) AND approved human-owner
+    //     PR authority BOTH authenticate keyring updates on clean non-bot branches!
     for args in [
         &["config", "gpg.format", "ssh"][..],
         &[
@@ -807,6 +800,349 @@ fn inverted_ring0_allowlist_ssh_hardware_signer_and_target_matched_corpus_ratche
                 .success()
         );
     }
+    assert!(
+        Command::new("git")
+            .current_dir(&repo)
+            .args(["checkout", "-b", "feat/ssh-signed-keyring", "main"])
+            .status()
+            .expect("checkout ssh-signed-keyring")
+            .success()
+    );
+    fs::write(
+        repo.join("config/allowed_human_signers"),
+        format!("{signers_body}# rotated comment\n"),
+    )
+    .expect("update signers");
+    assert!(
+        Command::new("git")
+            .current_dir(&repo)
+            .args(["add", "config/allowed_human_signers"])
+            .status()
+            .expect("add signers")
+            .success()
+    );
+    assert!(
+        Command::new("git")
+            .current_dir(&repo)
+            .args([
+                "commit",
+                "-S",
+                "-m",
+                "chore: standard ssh-ed25519 signed keyring update"
+            ])
+            .status()
+            .expect("ssh-ed25519 signed commit")
+            .success()
+    );
+    let std_ssh_rep = verify_ring0_ratchet(&repo, "main", false)
+        .expect("standard ssh-ed25519 signed commit must verify against allowed_human_signers");
+    assert!(std_ssh_rep.human_hardware_signed);
+
+    assert!(
+        Command::new("git")
+            .current_dir(&repo)
+            .args(["checkout", "feat/browser-agent-ring0"])
+            .status()
+            .expect("back to unsigned branch")
+            .success()
+    );
+    fs::write(
+        repo.join("config/allowed_human_signers"),
+        format!("{signers_body}# owner-approved keyring edit\n"),
+    )
+    .expect("owner-approved signers");
+    assert!(
+        Command::new("git")
+            .current_dir(&repo)
+            .args(["commit", "-am", "chore: owner-approved keyring update"])
+            .status()
+            .expect("commit unsigned keyring")
+            .success()
+    );
+    assert!(
+        verify_ring0_ratchet(&repo, "main", false).is_err(),
+        "without --owner-approved, unsigned keyring commit still fails closed"
+    );
+    let approved_rep =
+        agent_guard::ring0_ratchet::verify_ring0_ratchet_with_authority(&repo, "main", false, true)
+            .expect("approved human owner PR authority must permit clean non-bot keyring update");
+    assert!(approved_rep.human_hardware_signed);
+    // Also verify CLI `--owner-approved` under `GITHUB_ACTOR=github-actions[bot]` (simulating auto-merge push to main)
+    assert!(
+        Command::new(dotagent_bin())
+            .current_dir(&repo)
+            .env("GITHUB_ACTOR", "github-actions[bot]")
+            .args(["verify-ring0-ratchet", "--base", "main", "--owner-approved",])
+            .status()
+            .expect("dotagent verify-ring0-ratchet --owner-approved")
+            .success(),
+        "--owner-approved CLI must authorize clean keyring update without forcing sk-* commit signature"
+    );
+    assert!(
+        agent_guard::ring0_ratchet::verify_ring0_ratchet_with_authority(&repo, "main", true, true)
+            .is_err(),
+        "--require-ratchet must still enforce 5-file Ring-2 allowlist even if owner_approved is true"
+    );
+
+    // 3c. Enrolled `sk-ssh-ed25519@openssh.com` commit signature with `UP=0` (`flags = 0`, no touch)
+    //     MUST pass commit verification, whereas `verify_release_tag_signature` MUST strip
+    //     `no-touch-required` and reject `UP=0` while accepting `UP=1`!
+    {
+        use ed25519_dalek::{Signer, SigningKey};
+        use sha2::{Digest, Sha256, Sha512};
+
+        fn push_ssh_bytes(buf: &mut Vec<u8>, data: &[u8]) {
+            buf.extend_from_slice(&(data.len() as u32).to_be_bytes());
+            buf.extend_from_slice(data);
+        }
+
+        fn b64_encode(data: &[u8]) -> String {
+            const TAB: &[u8; 64] =
+                b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+            let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
+            for c in data.chunks(3) {
+                let n = (u32::from(c[0]) << 16)
+                    | (u32::from(*c.get(1).unwrap_or(&0)) << 8)
+                    | u32::from(*c.get(2).unwrap_or(&0));
+                out.push(TAB[((n >> 18) & 63) as usize] as char);
+                out.push(TAB[((n >> 12) & 63) as usize] as char);
+                out.push(if c.len() > 1 {
+                    TAB[((n >> 6) & 63) as usize] as char
+                } else {
+                    '='
+                });
+                out.push(if c.len() > 2 {
+                    TAB[(n & 63) as usize] as char
+                } else {
+                    '='
+                });
+            }
+            out
+        }
+
+        let sk_signing = SigningKey::from_bytes(&[0x42u8; 32]);
+        let sk_raw_pub = sk_signing.verifying_key().to_bytes();
+        let sk_alg = b"sk-ssh-ed25519@openssh.com";
+        let sk_app = b"ssh:dotagent-e2e";
+        let mut sk_pub_blob = Vec::new();
+        push_ssh_bytes(&mut sk_pub_blob, sk_alg);
+        push_ssh_bytes(&mut sk_pub_blob, &sk_raw_pub);
+        push_ssh_bytes(&mut sk_pub_blob, sk_app);
+        let sk_pub_b64 = b64_encode(&sk_pub_blob);
+
+        let build_sk_sshsig_pem = |payload: &[u8], flags: u8| -> String {
+            let msg_hash = Sha512::digest(payload);
+            let mut tbs = b"SSHSIG".to_vec();
+            push_ssh_bytes(&mut tbs, b"git");
+            push_ssh_bytes(&mut tbs, b"");
+            push_ssh_bytes(&mut tbs, b"sha512");
+            push_ssh_bytes(&mut tbs, &msg_hash);
+
+            let counter = 9u32.to_be_bytes();
+            let mut sk_signed = Vec::new();
+            sk_signed.extend_from_slice(&Sha256::digest(sk_app));
+            sk_signed.push(flags);
+            sk_signed.extend_from_slice(&counter);
+            sk_signed.extend_from_slice(&Sha256::digest(&tbs));
+            let ed_sig = sk_signing.sign(&sk_signed).to_bytes();
+
+            let mut sig_blob = Vec::new();
+            push_ssh_bytes(&mut sig_blob, sk_alg);
+            push_ssh_bytes(&mut sig_blob, &ed_sig);
+            sig_blob.push(flags);
+            sig_blob.extend_from_slice(&counter);
+
+            let mut wire = b"SSHSIG".to_vec();
+            wire.extend_from_slice(&1u32.to_be_bytes());
+            push_ssh_bytes(&mut wire, &sk_pub_blob);
+            push_ssh_bytes(&mut wire, b"git");
+            push_ssh_bytes(&mut wire, b"");
+            push_ssh_bytes(&mut wire, b"sha512");
+            push_ssh_bytes(&mut wire, &sig_blob);
+            let b64 = b64_encode(&wire);
+            let mut pem = String::from("-----BEGIN SSH SIGNATURE-----\n");
+            for chunk in b64.as_bytes().chunks(70) {
+                pem.push_str(std::str::from_utf8(chunk).expect("ascii b64"));
+                pem.push('\n');
+            }
+            pem.push_str("-----END SSH SIGNATURE-----\n");
+            pem
+        };
+
+        assert!(
+            Command::new("git")
+                .current_dir(&repo)
+                .args(["checkout", "-b", "base-with-sk", "main"])
+                .status()
+                .expect("checkout base-with-sk")
+                .success()
+        );
+        // Enroll sk-ssh-ed25519 WITHOUT no-touch-required in base branch to prove commit verify injects/allows UP=0,
+        // and ALSO enroll a second line WITH no-touch-required to prove release-tag verify strips it!
+        let sk_signers = format!(
+            "{signers_body}sk@dotagent.local namespaces=\"git\" sk-ssh-ed25519@openssh.com {sk_pub_b64}\nsk2@dotagent.local namespaces=\"git\",no-touch-required sk-ssh-ed25519@openssh.com {sk_pub_b64}\n"
+        );
+        fs::write(repo.join("config/allowed_human_signers"), &sk_signers).expect("write sk base");
+        assert!(
+            Command::new("git")
+                .current_dir(&repo)
+                .args([
+                    "commit",
+                    "--no-gpg-sign",
+                    "-am",
+                    "chore: enroll sk signer on base"
+                ])
+                .status()
+                .expect("commit sk base")
+                .success()
+        );
+
+        assert!(
+            Command::new("git")
+                .current_dir(&repo)
+                .args(["checkout", "-b", "feat/sk-up0-commit", "base-with-sk"])
+                .status()
+                .expect("checkout sk-up0-commit")
+                .success()
+        );
+        fs::write(
+            repo.join("config/allowed_human_signers"),
+            format!("{sk_signers}# updated under sk UP=0 commit sig\n"),
+        )
+        .expect("edit sk signers");
+        assert!(
+            Command::new("git")
+                .current_dir(&repo)
+                .args([
+                    "commit",
+                    "--no-gpg-sign",
+                    "-am",
+                    "chore: unsigned template for sk UP=0"
+                ])
+                .status()
+                .expect("unsigned template")
+                .success()
+        );
+        let raw_commit = Command::new("git")
+            .current_dir(&repo)
+            .args(["cat-file", "commit", "HEAD"])
+            .output()
+            .expect("cat-file commit")
+            .stdout;
+        let commit_text = String::from_utf8(raw_commit.clone()).expect("utf8 commit");
+        let (hdr, body) = commit_text.split_once("\n\n").expect("commit split");
+        let up0_pem = build_sk_sshsig_pem(&raw_commit, 0);
+        let mut gpgsig_hdr = String::new();
+        for (idx, line) in up0_pem.lines().enumerate() {
+            if idx == 0 {
+                gpgsig_hdr.push_str("gpgsig ");
+            } else {
+                gpgsig_hdr.push(' ');
+            }
+            gpgsig_hdr.push_str(line);
+            gpgsig_hdr.push('\n');
+        }
+        let signed_commit_obj = format!("{hdr}\n{gpgsig_hdr}\n{body}");
+        let mut hash_child = Command::new("git")
+            .current_dir(&repo)
+            .args(["hash-object", "-t", "commit", "-w", "--stdin"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("hash-object commit");
+        hash_child
+            .stdin
+            .take()
+            .expect("stdin")
+            .write_all(signed_commit_obj.as_bytes())
+            .expect("write signed commit");
+        let new_commit_oid = String::from_utf8(hash_child.wait_with_output().expect("wait").stdout)
+            .expect("oid")
+            .trim()
+            .to_string();
+        assert!(
+            Command::new("git")
+                .current_dir(&repo)
+                .args(["reset", "--soft", &new_commit_oid])
+                .status()
+                .expect("reset to sk UP=0 commit")
+                .success()
+        );
+        let sk_up0_rep = verify_ring0_ratchet(&repo, "base-with-sk", false)
+            .expect("sk-ssh-ed25519 commit signature with UP=0 must pass without hardware touch");
+        assert!(sk_up0_rep.human_hardware_signed);
+
+        // Release tags on `base-with-sk`: `UP=0` MUST fail even though `no-touch-required` was present in `config/allowed_human_signers`,
+        // while `UP=1` MUST pass!
+        let base_oid = String::from_utf8(
+            Command::new("git")
+                .current_dir(&repo)
+                .args(["rev-parse", "base-with-sk^{commit}"])
+                .output()
+                .expect("rev-parse base-with-sk")
+                .stdout,
+        )
+        .expect("utf8")
+        .trim()
+        .to_string();
+        for (tag_name, flags, should_pass) in
+            [("v2.2.0-up0", 0u8, false), ("v2.2.0-up1", 1u8, true)]
+        {
+            let unsigned_tag = format!(
+                "object {base_oid}\ntype commit\ntag {tag_name}\ntagger Owner <sk@dotagent.local> 1700000000 +0000\n\nrelease {tag_name}\n"
+            );
+            let tag_sig = build_sk_sshsig_pem(unsigned_tag.as_bytes(), flags);
+            let full_tag = format!("{unsigned_tag}{tag_sig}");
+            let mut mktag = Command::new("git")
+                .current_dir(&repo)
+                .args(["hash-object", "-t", "tag", "-w", "--stdin"])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .spawn()
+                .expect("hash-object tag");
+            mktag
+                .stdin
+                .take()
+                .expect("stdin")
+                .write_all(full_tag.as_bytes())
+                .expect("write tag");
+            let tag_oid = String::from_utf8(mktag.wait_with_output().expect("wait").stdout)
+                .expect("tag oid")
+                .trim()
+                .to_string();
+            assert!(
+                Command::new("git")
+                    .current_dir(&repo)
+                    .args(["update-ref", &format!("refs/tags/{tag_name}"), &tag_oid])
+                    .status()
+                    .expect("update-ref tag")
+                    .success()
+            );
+            let res = agent_guard::ring0_ratchet::verify_release_tag_signature(
+                &repo,
+                tag_name,
+                "base-with-sk",
+                true,
+            );
+            if should_pass {
+                let rep = res.expect("sk UP=1 release tag must pass");
+                assert!(rep.hardware_fido2_signer);
+            } else {
+                let err = res.expect_err("sk UP=0 release tag must be rejected");
+                assert!(err.contains("SSHSIG_USER_PRESENCE_REQUIRED"));
+            }
+        }
+    }
+
+    // 4. Hardware FIDO2 key signature verification is strictly enforced on RELEASE TAGS (`v*`)!
+    assert!(
+        Command::new("git")
+            .current_dir(&repo)
+            .args(["checkout", "main"])
+            .status()
+            .expect("checkout main for release tag")
+            .success()
+    );
     // Lightweight tag -> rejected (`LIGHTWEIGHT_RELEASE_TAG_FORBIDDEN`)
     assert!(
         Command::new("git")
