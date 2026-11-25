@@ -9,7 +9,7 @@
 //! Enforces four hard mechanical guarantees (`dotagent v2.1+`):
 //! 1. **Human SSH Commit / Owner Authority Gate**: Unless `--require-ratchet` is passed, checks
 //!    whether the working tree is clean, `GITHUB_ACTOR` is not an automation bot, and either
-//!    authenticated human-owner PR approval (`--owner-approved` / `DOTAGENT_OWNER_PR_APPROVED=1`)
+//!    authenticated human-owner PR approval (`--owner-approved`)
 //!    is present or **every** commit in `<merge_base>..HEAD` passes OpenSSH signature verification
 //!    (`ssh-keygen -Y verify -n git`, accepting standard `ssh-ed25519` / `ecdsa-sha2-nistp256` as
 //!    well as `sk-*` keys without requiring `UP` touch) against `<merge_base>:config/allowed_human_signers`
@@ -1168,7 +1168,7 @@ fn check_all_commits_human_hardware_signed(
     if has_uncommitted_or_untracked || is_bot_github_actor() {
         return Ok(false);
     }
-    if owner_approved || std::env::var("DOTAGENT_OWNER_PR_APPROVED").as_deref() == Ok("1") {
+    if owner_approved {
         return Ok(true);
     }
 
@@ -1643,7 +1643,7 @@ pub fn verify_ring0_ratchet_with_authority(
     let explicit_owner_approval = !force_ratchet
         && !diff_summary.has_uncommitted_or_untracked
         && std::env::var("DOTAGENT_AUTONOMOUS_LOOP").as_deref() != Ok("1")
-        && (owner_approved || std::env::var("DOTAGENT_OWNER_PR_APPROVED").as_deref() == Ok("1"));
+        && owner_approved;
     let autonomous_context =
         !explicit_owner_approval && is_autonomous_bot_or_loop_context(repo_root, &merge_base);
     let ssh_commit_signed = if force_ratchet || autonomous_context || explicit_owner_approval {

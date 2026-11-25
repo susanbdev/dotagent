@@ -867,6 +867,46 @@ fn inverted_ring0_allowlist_ssh_hardware_signer_and_target_matched_corpus_ratche
         agent_guard::ring0_ratchet::verify_ring0_ratchet_with_authority(&repo, "main", false, true)
             .expect("approved human owner PR authority must permit clean non-bot keyring update");
     assert!(approved_rep.human_hardware_signed);
+    // Ambient DOTAGENT_OWNER_PR_APPROVED=1 / DOTAGENT_PR_APPROVED=1 in env must NEVER grant approval!
+    assert!(
+        !Command::new(dotagent_bin())
+            .current_dir(&repo)
+            .env("DOTAGENT_OWNER_PR_APPROVED", "1")
+            .env("DOTAGENT_PR_APPROVED", "1")
+            .args(["verify-ring0-ratchet", "--base", "main"])
+            .status()
+            .expect("dotagent verify-ring0-ratchet with ambient env")
+            .success(),
+        "ambient DOTAGENT_OWNER_PR_APPROVED=1 must never grant approval without --owner-approved"
+    );
+    let authority_script = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(Path::parent)
+        .expect("workspace root")
+        .join("scripts/verify-pr-authority.sh");
+    assert!(
+        !Command::new("bash")
+            .arg(&authority_script)
+            .current_dir(&repo)
+            .env("DOTAGENT_OWNER_PR_APPROVED", "1")
+            .env("DOTAGENT_PR_APPROVED", "1")
+            .args(["--base", "main", "--head", "HEAD"])
+            .status()
+            .expect("verify-pr-authority.sh with ambient env")
+            .success(),
+        "ambient DOTAGENT_PR_APPROVED=1 / DOTAGENT_OWNER_PR_APPROVED=1 must never grant approval in verify-pr-authority.sh"
+    );
+    assert!(
+        Command::new("bash")
+            .arg(&authority_script)
+            .current_dir(&repo)
+            .args(["--base", "main", "--head", "HEAD", "--owner-approved"])
+            .status()
+            .expect("verify-pr-authority.sh with --owner-approved")
+            .success(),
+        "explicit --owner-approved flag must authorize clean keyring update in verify-pr-authority.sh"
+    );
+
     // Also verify CLI `--owner-approved` under `GITHUB_ACTOR=github-actions[bot]` (simulating auto-merge push to main)
     assert!(
         Command::new(dotagent_bin())

@@ -50,7 +50,7 @@ import base64, json, os, re, subprocess, sys, tomllib
 
 base_ref, head_ref, raw_signers, clean_signers, work_dir, allow_mq_s, boot_empty_s, boot_signer, enforce_s, pr_approved_s = sys.argv[1:11]
 allow_mq, boot_empty, enforce_hw = (allow_mq_s == "true"), (boot_empty_s == "true"), (enforce_s == "1")
-pr_approved = (pr_approved_s == "true") or (os.environ.get("DOTAGENT_PR_APPROVED") == "1") or (os.environ.get("DOTAGENT_OWNER_PR_APPROVED") == "1")
+pr_approved = (pr_approved_s == "true")
 allowed_kt = {
     "ssh-ed25519",
     "ecdsa-sha2-nistp256",

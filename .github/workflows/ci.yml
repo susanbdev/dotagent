@@ -505,7 +505,12 @@ jobs:
               rstate = str(rev.get("state", "")).upper()
               if rstate not in ("APPROVED", "CHANGES_REQUESTED", "DISMISSED"):
                   continue
-              if u.get("login") == "susanbeasles" and str(u.get("type", "")).lower() == "user" and rev.get("commit_id") == head_sha:
+              if (
+                  u.get("id") == 215839550
+                  and u.get("login") == "susanbeasles"
+                  and str(u.get("type", "")).lower() == "user"
+                  and rev.get("commit_id") == head_sha
+              ):
                   if latest is None or int(rev.get("id", 0)) >= int(latest.get("id", 0)):
                       latest = rev
           approved = bool(latest and str(latest.get("state", "")).upper() == "APPROVED")
@@ -532,6 +537,7 @@ jobs:
           GIT_REF: ${{ github.ref }}
           BASE_REF: ${{ github.event.repository.default_branch || 'main' }}
           EVENT_ACTOR: ${{ github.actor }}
+          EVENT_ACTOR_ID: ${{ github.actor_id }}
           CHANGE_AUTHOR: ${{ github.event.pull_request.user.login || github.actor }}
           PR_AUTHOR: ${{ github.event.pull_request.user.login || '' }}
           PR_AUTHOR_TYPE: ${{ github.event.pull_request.user.type || '' }}
@@ -581,7 +587,7 @@ jobs:
                && ! git cat-file -e "${BASE_OID}:config/allowed_human_signers" 2>/dev/null; then
             # Self-extinguishing one-time genesis bootstrap (never compiles PR sources): constrains any
             # non-human/automation actor to the 5-file Ring-2 allowlist and requires authenticated human
-            # owner actor (susanbeasles) + pinned signer digest for the initial enrollment.
+            # owner actor (susanbeasles, id 215839550) + pinned signer digest for the initial enrollment.
             python3 -c 'import sys, textwrap; exec(textwrap.dedent(sys.stdin.read()))' "${TRUSTED}" "${GITHUB_WORKSPACE}" "${BASE_OID}" <<'PY'
           import hashlib, os, subprocess, sys, tomllib
           trusted, ws, base_oid = sys.argv[1], sys.argv[2], sys.argv[3]
@@ -604,7 +610,8 @@ jobs:
           outside_ring2 = [p for p in changed if p not in RING2_ALLOWLIST]
           if outside_ring2:
               actor = os.environ.get("EVENT_ACTOR", "")
-              if actor.endswith("[bot]") or actor != "susanbeasles":
+              actor_id = os.environ.get("EVENT_ACTOR_ID", "")
+              if actor.endswith("[bot]") or actor != "susanbeasles" or actor_id != "215839550":
                   raise SystemExit(
                       f"GENESIS_VIOLATION: paths outside 5-file Ring-2 allowlist ({outside_ring2[:3]}) require authenticated human owner enrollment"
                   )

@@ -473,13 +473,14 @@ jobs:
           KEY_PATH="${RUNNER_TEMP}/release-signer.pem"
           trap 'rm -f "${KEY_PATH}"' EXIT
           printf '%s\n' "${RELEASE_SIGNER_PRIVATE_KEY}" > "${KEY_PATH}"
-          if openssl dgst -sha256 -sign "${KEY_PATH}" -out release/SHA256SUMS.sig release/SHA256SUMS >/dev/null 2>&1; then
-            openssl dgst -sha256 -verify packaging/release-signer.pub \
-              -signature release/SHA256SUMS.sig release/SHA256SUMS
-          else
+          if openssl pkey -pubin -in packaging/release-signer.pub -text -noout 2>/dev/null | grep -qi 'ED25519'; then
             openssl pkeyutl -sign -inkey "${KEY_PATH}" -rawin -in release/SHA256SUMS -out release/SHA256SUMS.sig
             openssl pkeyutl -verify -pubin -inkey packaging/release-signer.pub \
               -rawin -in release/SHA256SUMS -sigfile release/SHA256SUMS.sig
+          else
+            openssl dgst -sha256 -sign "${KEY_PATH}" -out release/SHA256SUMS.sig release/SHA256SUMS
+            openssl dgst -sha256 -verify packaging/release-signer.pub \
+              -signature release/SHA256SUMS.sig release/SHA256SUMS
           fi
           rm -f "${KEY_PATH}"
 
@@ -548,8 +549,17 @@ jobs:
             fi
           done
           if [[ -f "${VERIFY_DIR}/out-of-band/SHA256SUMS.sig" ]]; then
-            openssl dgst -sha256 -verify packaging/release-signer.pub \
-              -signature "${VERIFY_DIR}/out-of-band/SHA256SUMS.sig" "${ASSETS}/SHA256SUMS"
+            OPENSSL_BIN="openssl"
+            if command -v brew >/dev/null 2>&1 && [[ -x "$(brew --prefix openssl@3 2>/dev/null)/bin/openssl" ]]; then
+              OPENSSL_BIN="$(brew --prefix openssl@3)/bin/openssl"
+            fi
+            if "${OPENSSL_BIN}" pkey -pubin -in packaging/release-signer.pub -text -noout 2>/dev/null | grep -qi 'ED25519'; then
+              "${OPENSSL_BIN}" pkeyutl -verify -pubin -inkey packaging/release-signer.pub \
+                -rawin -in "${ASSETS}/SHA256SUMS" -sigfile "${VERIFY_DIR}/out-of-band/SHA256SUMS.sig"
+            else
+              "${OPENSSL_BIN}" dgst -sha256 -verify packaging/release-signer.pub \
+                -signature "${VERIFY_DIR}/out-of-band/SHA256SUMS.sig" "${ASSETS}/SHA256SUMS"
+            fi
           fi
           attest() {
             gh attestation verify "$1" --repo "${REPO_FULL}" --signer-workflow "${SIGNER_WF}" \

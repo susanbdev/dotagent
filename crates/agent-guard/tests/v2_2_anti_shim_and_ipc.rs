@@ -206,6 +206,40 @@ fn v22_anti_shim_fail_open_and_polyglot_vector_laws_enforce_strictly() {
     audit_repository(&worker_ws.0).expect("linked wasm worker <= 150 lines must pass");
     verify_repo_smoke_gate(&worker_ws.0).expect("smoke gate must pass linked wasm worker");
 
+    // 1b. Test JS/MJS/CJS files > 150 lines must NOT false-positive as runtime shims,
+    //     whereas non-test .cjs > 150 lines or `..` Wasm imports escaping repo root MUST fail!
+    fs::create_dir_all(worker_ws.0.join("tests")).expect("mkdir tests");
+    let big_js = "const x = 1;\n".repeat(175);
+    fs::write(worker_ws.0.join("tests/integration.mjs"), &big_js).expect("write test mjs");
+    fs::write(worker_ws.0.join("worker/shim.test.js"), &big_js).expect("write .test.js");
+    audit_repository(&worker_ws.0)
+        .expect("> 150 SLOC test .mjs/.test.js files must not false-positive as runtime shims");
+
+    fs::write(worker_ws.0.join("worker/extra_shim.cjs"), &big_js).expect("write prod cjs");
+    let cjs_errs = audit_repository(&worker_ws.0).expect_err("non-test > 150 SLOC .cjs must fail");
+    assert!(
+        cjs_errs
+            .iter()
+            .any(|e| e.contains("NO_UNLINKED_RUNTIME_SHIM") && e.contains("extra_shim.cjs")),
+        "{cjs_errs:?}"
+    );
+    fs::remove_file(worker_ws.0.join("worker/extra_shim.cjs")).expect("rm prod cjs");
+
+    fs::write(worker_ws.0.join("root.wasm"), b"\0asm\x01\x00\x00\x00").expect("root.wasm");
+    fs::write(
+        worker_ws.0.join("worker/shim.mjs"),
+        "import wasmMod from \"../../../root.wasm\";\nexport default { async fetch() { return new Response(String(Boolean(wasmMod))); } };\n",
+    )
+    .expect("escaping wasm import");
+    let escape_errs = audit_repository(&worker_ws.0)
+        .expect_err(".. traversal past repo root must not clamp to root.wasm");
+    assert!(
+        escape_errs
+            .iter()
+            .any(|e| e.contains("NO_UNLINKED_RUNTIME_SHIM")),
+        "{escape_errs:?}"
+    );
+
     // 2. OpenTofu repo with imperative scripts/deploy.py must fail NO_UNLINKED_RUNTIME_SHIM
     let tf_ws = TempWorkspace::new("tf-deploy-py");
     fs::write(tf_ws.0.join("main.tf"), "terraform {}\n").expect("main.tf");

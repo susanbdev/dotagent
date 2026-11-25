@@ -602,24 +602,24 @@ pub fn audit_anti_shim_and_polyglot_laws(repo_root: &Path, failures: &mut Vec<St
         audit_container_runtime_attestation(repo_root, failures);
     }
 
-    // 4. Scan bounded non-test source files for > 150 SLOC .js/.mjs shims and NO_FAIL_OPEN_FALLBACK violations
+    // 4. Scan bounded non-test source files for > 150 SLOC .js/.mjs/.cjs shims and NO_FAIL_OPEN_FALLBACK violations
     let mut source_files = Vec::new();
     collect_bounded_source_files(repo_root, repo_root, 0, &mut source_files);
     let is_worker_cargo_repo = has_cargo_toml && !wrangler_configs.is_empty();
     for (rel, full) in &source_files {
+        if is_test_rel_path(rel) {
+            continue;
+        }
         let Ok(raw) = fs::read_to_string(full) else {
             continue;
         };
-        if rel.ends_with(".mjs") || rel.ends_with(".js") {
+        if rel.ends_with(".mjs") || rel.ends_with(".js") || rel.ends_with(".cjs") {
             let line_count = raw.lines().count();
             if line_count > MAX_HOST_GLUE_LINES {
                 failures.push(format!(
-                    "NO_UNLINKED_RUNTIME_SHIM: '{rel}' is {line_count} lines (> {MAX_HOST_GLUE_LINES} SLOC JS/MJS ceiling)."
+                    "NO_UNLINKED_RUNTIME_SHIM: '{rel}' is {line_count} lines (> {MAX_HOST_GLUE_LINES} SLOC JS/MJS/CJS ceiling)."
                 ));
             }
-        }
-        if is_test_rel_path(rel) {
-            continue;
         }
         audit_fail_open_patterns(rel, &raw, is_worker_cargo_repo, failures);
     }
@@ -803,7 +803,9 @@ fn collect_wasm_module_refs(text: &str, base_dir: &str) -> Vec<String> {
     for delim in ['"', '\''] {
         for tok in text.split(delim).skip(1).step_by(2).map(str::trim) {
             if tok.ends_with(".wasm") && !tok.contains("://") && !tok.starts_with('/') {
-                let joined = resolve_rel_import(base_dir, tok);
+                let Some(joined) = resolve_rel_import(base_dir, tok) else {
+                    continue;
+                };
                 if !refs.contains(&joined) {
                     refs.push(joined);
                 }
@@ -813,21 +815,30 @@ fn collect_wasm_module_refs(text: &str, base_dir: &str) -> Vec<String> {
     refs
 }
 
-fn resolve_rel_import(base_dir: &str, raw_rel: &str) -> String {
-    let mut parts: Vec<&str> = base_dir
-        .split('/')
-        .filter(|s| !s.is_empty() && *s != ".")
-        .collect();
-    for seg in raw_rel.split('/') {
+fn resolve_rel_import(base_dir: &str, raw_rel: &str) -> Option<String> {
+    let mut parts: Vec<&str> = Vec::new();
+    for seg in base_dir.split('/') {
         match seg {
             "" | "." => {}
             ".." => {
-                let _ = parts.pop();
+                parts.pop()?;
             }
             other => parts.push(other),
         }
     }
-    parts.join("/")
+    for seg in raw_rel.split('/') {
+        match seg {
+            "" | "." => {}
+            ".." => {
+                parts.pop()?;
+            }
+            other => parts.push(other),
+        }
+    }
+    if parts.is_empty() {
+        return None;
+    }
+    Some(parts.join("/"))
 }
 
 fn audit_wrangler_wasm_linkage(
@@ -848,8 +859,13 @@ fn audit_wrangler_wasm_linkage(
         ));
         return;
     };
-    let clean_main = main_rel.trim_start_matches("./");
-    let main_path = repo_root.join(clean_main);
+    let Some(clean_main) = resolve_rel_import("", &main_rel) else {
+        failures.push(format!(
+            "NO_UNLINKED_RUNTIME_SHIM: '{cfg_name}' main '{main_rel}' escapes repository root."
+        ));
+        return;
+    };
+    let main_path = repo_root.join(&clean_main);
     if !is_regular_nonsymlink_file(&main_path) {
         failures.push(format!(
             "NO_UNLINKED_RUNTIME_SHIM: '{cfg_name}' main '{clean_main}' does not exist as a regular file."
@@ -868,7 +884,7 @@ fn audit_wrangler_wasm_linkage(
             "NO_UNLINKED_RUNTIME_SHIM: '{clean_main}' referenced by '{cfg_name}' is {main_lines} lines (> {MAX_HOST_GLUE_LINES}-line host FFI cap)."
         ));
     }
-    let base_dir = Path::new(clean_main)
+    let base_dir = Path::new(&clean_main)
         .parent()
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_default();
@@ -995,7 +1011,7 @@ fn collect_bounded_source_files(
             let Some(ext) = full.extension().and_then(|e| e.to_str()) else {
                 continue;
             };
-            if matches!(ext, "rs" | "mjs" | "js" | "ts" | "tsx")
+            if matches!(ext, "rs" | "mjs" | "js" | "cjs" | "ts" | "tsx")
                 && full.metadata().is_ok_and(|m| m.len() <= 1_048_576)
             {
                 let rel = full
@@ -1015,11 +1031,17 @@ fn is_test_rel_path(rel: &str) -> bool {
     let fname = rel.rsplit('/').next().unwrap_or(rel);
     rel.starts_with("tests/")
         || rel.contains("/tests/")
+        || rel.starts_with("test/")
+        || rel.contains("/test/")
+        || rel.starts_with("__tests__/")
         || rel.contains("/__tests__/")
         || rel.starts_with("bench/")
         || rel.contains("/bench/")
         || fname.ends_with("_test.rs")
         || fname.ends_with("_tests.rs")
+        || fname.ends_with("_test.js")
+        || fname.ends_with("_test.mjs")
+        || fname.ends_with("_test.cjs")
         || fname.contains(".test.")
         || fname.contains(".spec.")
 }
@@ -1154,4 +1176,32 @@ fn dir_references_vectors(dir: &Path, depth: usize) -> bool {
         }
     }
     false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolve_rel_import_rejects_traversal_past_repo_root() {
+        assert_eq!(
+            resolve_rel_import("worker", "./svc.wasm"),
+            Some("worker/svc.wasm".to_string())
+        );
+        assert_eq!(
+            resolve_rel_import("worker", "../pkg/svc.wasm"),
+            Some("pkg/svc.wasm".to_string())
+        );
+        assert_eq!(resolve_rel_import("worker", "../../svc.wasm"), None);
+        assert_eq!(resolve_rel_import("", "../svc.wasm"), None);
+        assert_eq!(resolve_rel_import("a/b", "../../../evil.wasm"), None);
+    }
+
+    #[test]
+    fn test_js_paths_are_recognized_before_sloc_shim_gate() {
+        assert!(is_test_rel_path("tests/e2e_suite.mjs"));
+        assert!(is_test_rel_path("packages/ui/src/widget.test.js"));
+        assert!(is_test_rel_path("packages/ui/__tests__/shim.cjs"));
+        assert!(!is_test_rel_path("worker/runtime_shim.cjs"));
+    }
 }

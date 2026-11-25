@@ -55,7 +55,12 @@ jobs:
               rstate = str(rev.get("state", "")).upper()
               if rstate not in ("APPROVED", "CHANGES_REQUESTED", "DISMISSED"):
                   continue
-              if u.get("login") == "susanbeasles" and str(u.get("type", "")).lower() == "user" and rev.get("commit_id") == head_sha:
+              if (
+                  u.get("id") == 215839550
+                  and u.get("login") == "susanbeasles"
+                  and str(u.get("type", "")).lower() == "user"
+                  and rev.get("commit_id") == head_sha
+              ):
                   if latest is None or int(rev.get("id", 0)) >= int(latest.get("id", 0)):
                       latest = rev
           approved = bool(latest and str(latest.get("state", "")).upper() == "APPROVED")
@@ -84,6 +89,7 @@ jobs:
           PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
           PR_AUTHOR: ${{ github.event.pull_request.user.login }}
+          PR_AUTHOR_ID: ${{ github.event.pull_request.user.id }}
           PR_AUTHOR_TYPE: ${{ github.event.pull_request.user.type }}
           PR_AUTHOR_ASSOC: ${{ github.event.pull_request.author_association }}
           PR_HEAD_REF: ${{ github.event.pull_request.head.ref }}
@@ -133,7 +139,7 @@ jobs:
                && ! git cat-file -e "${BASE_OID}:config/allowed_human_signers" 2>/dev/null; then
             # Self-extinguishing one-time genesis bootstrap (never compiles PR sources): constrains any
             # non-human/automation PR to the 5-file Ring-2 allowlist and requires authenticated human
-            # org-member ownership (susanbeasles, PR #15) + pinned signer digest for the initial enrollment.
+            # org-member ownership (susanbeasles, id 215839550, PR #15) + pinned signer digest for the initial enrollment.
             python3 -c 'import sys, textwrap; exec(textwrap.dedent(sys.stdin.read()))' "${TRUSTED}" "${GITHUB_WORKSPACE}" "${BASE_OID}" <<'PY'
           import hashlib, os, subprocess, sys, tomllib
           trusted, ws, base_oid = sys.argv[1], sys.argv[2], sys.argv[3]
@@ -157,12 +163,14 @@ jobs:
           if outside_ring2:
               actor = os.environ.get("EVENT_ACTOR", "")
               pr_author = os.environ.get("PR_AUTHOR", "")
+              pr_author_id = os.environ.get("PR_AUTHOR_ID", "")
               pr_type = os.environ.get("PR_AUTHOR_TYPE", "")
               pr_assoc = os.environ.get("PR_AUTHOR_ASSOC", "")
               pr_num = os.environ.get("PR_NUMBER", "")
               if (
                   actor.endswith("[bot]")
                   or pr_author != "susanbeasles"
+                  or pr_author_id != "215839550"
                   or pr_type != "User"
                   or pr_assoc not in ("OWNER", "MEMBER")
                   or pr_num != "15"
