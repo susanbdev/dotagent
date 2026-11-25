@@ -1,23 +1,26 @@
 #!/usr/bin/env bash
-# Local YubiKey release ceremony for dotagent (run by the human release owner).
+# Release SHA256SUMS signing script for dotagent (non-hardware OpenSSL key material).
 #
-#   git tag -s v2.1.0 && git push origin v2.1.0     # CI builds + attests everything
-#   scripts/sign-release-yk.sh v2.1.0               # then, on your Mac with the YubiKey
+#   git tag -s v2.1.0 && git push origin v2.1.0                 # FIDO2 sk-* hardware-signed v* tag
+#   scripts/sign-release-yk.sh --key-pem /path/to/key.pem v2.1.0 # standard OpenSSL SHA256SUMS signing
 #
 # What it does, fail-closed at every step:
-#   1. verifies the signed git tag
+#   1. verifies the signed v* git release tag
 #   2. downloads every release asset and runs `gh attestation verify` on each
 #      (pinned workflow, pinned tag ref, pinned OIDC issuer) -- nothing is signed
 #      unless CI provenance checks out
 #   3. (macOS, when identities are configured) lipo's a universal binary set,
 #      codesigns, builds + notarizes + staples dotagent-<tag>-universal-apple-darwin.pkg
-#   4. signs SHA256SUMS (and SHA256SUMS.macos) with the YubiKey PIV P-256 key
-#      and self-verifies against the SPKI pinned inside the released install.sh
+#   4. signs SHA256SUMS (and SHA256SUMS.macos) with standard OpenSSL ECDSA/Ed25519
+#      key material (zero YubiKey PIV / PKCS#11 hardware requirement) and self-verifies
+#      against the SPKI pinned inside the released install.sh
 #   5. uploads the new assets; optionally stages install.sh for susanb.dev
 #
-# Optional env (signing):
+# Optional flags / env (signing):
+#   --key-pem <path>           PEM private key file path (ECDSA P-256 or Ed25519)
+#   --key-stdin                Read PEM private key from stdin
+#   DOTAGENT_SIGNER_KEY_FILE   PEM private key file path fallback when --key-pem is omitted
 #   DOTAGENT_SIGNER_PUB        PEM public key path (default: packaging/release-signer.pub)
-#   DOTAGENT_PIV_SLOT          YubiKey PIV slot (default: 9a)
 # Optional env (macOS .pkg):
 #   DOTAGENT_APP_IDENTITY      "Developer ID Application: ..."
 #   DOTAGENT_INSTALLER_IDENTITY "Developer ID Installer: ..."
@@ -25,8 +28,7 @@
 # Optional env (website promotion):
 #   DOTAGENT_WEB_DIR           checkout/dir served at https://susanb.dev/ (gets dotagent/<tag>/install.sh and dotagent/install.sh)
 #
-# No secrets are read from files or argv, and nothing is written outside
-# ~/.local/state/dotagent-release (never /tmp).
+# Nothing is written outside ~/.local/state/dotagent-release (never /tmp).
 
 set -euo pipefail
 umask 077
@@ -201,32 +203,43 @@ pem_spki() {
 }
 
 sign_file() {
-    local file="$1" pub_pem="$2" slot="${DOTAGENT_PIV_SLOT:-9a}" piv_id
-    rm -f "${file}.sig" "${file}.sha256"
-    if command -v yubico-piv-tool >/dev/null 2>&1; then
-        openssl dgst -sha256 -binary -out "${file}.sha256" "${file}"
-        yubico-piv-tool -s "${slot}" -a verify-pin -a sign -A ECCP256 -i "${file}.sha256" -o "${file}.sig"
-        rm -f "${file}.sha256"
-    elif command -v pkcs11-tool >/dev/null 2>&1; then
-        case "${slot}" in
-            9a) piv_id="01" ;;
-            9c) piv_id="02" ;;
-            9d) piv_id="03" ;;
-            9e) piv_id="04" ;;
-            *) piv_id="${slot}" ;;
-        esac
-        pkcs11-tool --sign --login --id "${piv_id}" --mechanism ECDSA-SHA256 \
-            --signature-format openssl --input-file "${file}" --output-file "${file}.sig"
+    local file="$1" pub_pem="$2" key_pem="$3"
+    rm -f "${file}.sig"
+    if openssl dgst -sha256 -sign "${key_pem}" -out "${file}.sig" "${file}" >/dev/null 2>&1; then
+        openssl dgst -sha256 -verify "${pub_pem}" -signature "${file}.sig" "${file}" >/dev/null 2>&1 \
+            || die "self-verification of ${file##*/}.sig failed"
+    elif openssl pkeyutl -sign -inkey "${key_pem}" -rawin -in "${file}" -out "${file}.sig" >/dev/null 2>&1; then
+        openssl pkeyutl -verify -pubin -inkey "${pub_pem}" -rawin -in "${file}" -sigfile "${file}.sig" >/dev/null 2>&1 \
+            || die "self-verification of ${file##*/}.sig failed"
     else
-        die "install yubico-piv-tool or pkcs11-tool (OpenSC) to sign with your YubiKey PIV slot"
+        die "openssl failed to sign ${file##*/} with provided key material"
     fi
-    openssl dgst -sha256 -verify "${pub_pem}" -signature "${file}.sig" "${file}" >/dev/null 2>&1 \
-        || die "self-verification of ${file##*/}.sig failed"
 }
 
 main() {
-    [[ $# -eq 1 ]] || die "usage: sign-release-yk.sh vX.Y.Z"
-    local tag="$1"
+    local key_pem="${DOTAGENT_SIGNER_KEY_FILE:-}" key_stdin=0 tag=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --key-pem)
+                [[ $# -ge 2 ]] || die "missing path after --key-pem"
+                key_pem="$2"
+                shift 2
+                ;;
+            --key-stdin)
+                key_stdin=1
+                shift
+                ;;
+            -*)
+                die "usage: sign-release-yk.sh [--key-pem <path> | --key-stdin] vX.Y.Z"
+                ;;
+            *)
+                [[ -z "${tag}" ]] || die "usage: sign-release-yk.sh [--key-pem <path> | --key-stdin] vX.Y.Z"
+                tag="$1"
+                shift
+                ;;
+        esac
+    done
+    [[ -n "${tag}" ]] || die "usage: sign-release-yk.sh [--key-pem <path> | --key-stdin] vX.Y.Z"
     [[ "${tag}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "tag must look like v1.2.3"
     for t in git gh openssl tar cut tr grep sed; do require_tool "${t}"; done
 
@@ -267,6 +280,16 @@ main() {
     rm -rf "${dir}"
     mkdir -m 0700 "${dir}"
 
+    local stdin_key_file=""
+    if [[ "${key_stdin}" -eq 1 ]]; then
+        stdin_key_file="${dir}/signer-stdin.pem"
+        cat > "${stdin_key_file}"
+        chmod 0600 "${stdin_key_file}"
+        key_pem="${stdin_key_file}"
+    fi
+    [[ -n "${key_pem}" && -f "${key_pem}" && ! -L "${key_pem}" ]] \
+        || die "pass --key-pem <path>, --key-stdin, or DOTAGENT_SIGNER_KEY_FILE pointing to a regular PEM private key"
+
     download_assets "${tag}" "${dir}"
     verify_attestations "${tag}" "${dir}" "${source_digest}"
     verify_sums "${dir}"
@@ -278,14 +301,17 @@ main() {
     printf -- '-----BEGIN PUBLIC KEY-----\n%s\n-----END PUBLIC KEY-----\n' "${expected_spki}" > "${pub_pem}"
 
     local -a uploads=("${dir}/SHA256SUMS.sig")
-    sign_file "${dir}/SHA256SUMS" "${pub_pem}"
+    sign_file "${dir}/SHA256SUMS" "${pub_pem}" "${key_pem}"
 
     local pkg="dotagent-${tag}-universal-apple-darwin.pkg"
     if pkg_wanted; then
         build_pkg "${tag}" "${dir}"
         printf '%s  %s\n' "$(hash_file "${dir}/${pkg}")" "${pkg}" > "${dir}/SHA256SUMS.macos"
-        sign_file "${dir}/SHA256SUMS.macos" "${pub_pem}"
+        sign_file "${dir}/SHA256SUMS.macos" "${pub_pem}" "${key_pem}"
         uploads+=("${dir}/${pkg}" "${dir}/SHA256SUMS.macos" "${dir}/SHA256SUMS.macos.sig")
+    fi
+    if [[ -n "${stdin_key_file}" ]]; then
+        rm -f "${stdin_key_file}"
     fi
 
     note "uploading ${#uploads[@]} assets"

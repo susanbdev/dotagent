@@ -1422,16 +1422,67 @@ pub fn write_atomic_outbox_file(out_path: &Path, body: &[u8]) -> Result<(), Stri
         Some(p) if !p.as_os_str().is_empty() => p,
         _ => Path::new("."),
     };
-    if let Ok(pmeta) = fs::symlink_metadata(parent) {
-        if pmeta.file_type().is_symlink() {
-            return Err(format!(
-                "SYMLINK_OUTBOX_BLOCKED: parent '{}' is a symlink",
-                parent.display()
-            ));
+    let mut cursor = PathBuf::new();
+    for comp in parent.components() {
+        match comp {
+            Component::Prefix(prefix) => cursor.push(prefix.as_os_str()),
+            Component::RootDir => cursor.push(comp.as_os_str()),
+            Component::CurDir => {
+                if cursor.as_os_str().is_empty() {
+                    cursor.push(".");
+                }
+            }
+            Component::ParentDir => {
+                return Err(format!(
+                    "FORBIDDEN_OUTBOX_PATH: parent traversal forbidden in '{}'",
+                    out_path.display()
+                ));
+            }
+            Component::Normal(seg) => {
+                cursor.push(seg);
+                match fs::symlink_metadata(&cursor) {
+                    Ok(meta) if meta.file_type().is_symlink() => {
+                        return Err(format!(
+                            "SYMLINK_OUTBOX_BLOCKED: ancestor '{}' is a symlink",
+                            cursor.display()
+                        ));
+                    }
+                    Ok(meta) if !meta.file_type().is_dir() => {
+                        return Err(format!(
+                            "SYMLINK_OUTBOX_BLOCKED: ancestor '{}' is not a directory",
+                            cursor.display()
+                        ));
+                    }
+                    Ok(_) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                        fs::create_dir(&cursor).map_err(|ce| {
+                            format!(
+                                "failed creating outbox ancestor '{}': {ce}",
+                                cursor.display()
+                            )
+                        })?;
+                        let post_meta = fs::symlink_metadata(&cursor).map_err(|se| {
+                            format!(
+                                "failed verifying created outbox ancestor '{}': {se}",
+                                cursor.display()
+                            )
+                        })?;
+                        if post_meta.file_type().is_symlink() || !post_meta.file_type().is_dir() {
+                            return Err(format!(
+                                "SYMLINK_OUTBOX_BLOCKED: created ancestor '{}' failed O_NOFOLLOW check",
+                                cursor.display()
+                            ));
+                        }
+                    }
+                    Err(e) => {
+                        return Err(format!(
+                            "failed inspecting outbox ancestor '{}': {e}",
+                            cursor.display()
+                        ));
+                    }
+                }
+            }
         }
-    } else {
-        fs::create_dir_all(parent)
-            .map_err(|e| format!("failed creating outbox parent '{}': {e}", parent.display()))?;
     }
 
     let nonce = SystemTime::now()
@@ -4375,12 +4426,45 @@ mod tests {
         let port = listener.local_addr().expect("local_addr").port();
         let srv = thread::spawn(move || {
             let (mut sock, _) = listener.accept().expect("accept");
-            let mut buf = [0u8; 4096];
-            let n = sock.read(&mut buf).expect("read req");
-            let req_text = String::from_utf8_lossy(&buf[..n]).into_owned();
-            sock.write_all(b"HTTP/1.1 202 Accepted\r\nContent-Length: 2\r\n\r\nOK")
-                .expect("write resp");
-            req_text
+            let _ = sock.set_read_timeout(Some(Duration::from_secs(5)));
+            let _ = sock.set_write_timeout(Some(Duration::from_secs(5)));
+
+            let mut raw_req = Vec::with_capacity(1024);
+            let mut chunk = [0u8; 1024];
+            let header_end = loop {
+                let n = sock.read(&mut chunk).expect("read req headers");
+                assert!(n > 0, "unexpected EOF before HTTP header terminator");
+                raw_req.extend_from_slice(&chunk[..n]);
+                if let Some(pos) = raw_req.windows(4).position(|w| w == b"\r\n\r\n") {
+                    break pos + 4;
+                }
+            };
+            let hdr_str = String::from_utf8_lossy(&raw_req[..header_end]);
+            let content_len = hdr_str
+                .lines()
+                .find_map(|line| {
+                    let (k, v) = line.split_once(':')?;
+                    k.trim()
+                        .eq_ignore_ascii_case("content-length")
+                        .then(|| v.trim().parse::<usize>().expect("parse Content-Length"))
+                })
+                .unwrap_or(0);
+            let total_expected = header_end + content_len;
+            while raw_req.len() < total_expected {
+                let n = sock.read(&mut chunk).expect("read req body");
+                assert!(n > 0, "unexpected EOF while draining HTTP request body");
+                raw_req.extend_from_slice(&chunk[..n]);
+            }
+
+            sock.write_all(
+                b"HTTP/1.1 202 Accepted\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK",
+            )
+            .expect("write resp");
+            sock.flush().expect("flush resp");
+            let _ = sock.shutdown(std::net::Shutdown::Write);
+            while matches!(sock.read(&mut chunk), Ok(n) if n > 0) {}
+
+            String::from_utf8_lossy(&raw_req[..total_expected]).into_owned()
         });
 
         let status = forward_outbox_via_loopback_proxy(

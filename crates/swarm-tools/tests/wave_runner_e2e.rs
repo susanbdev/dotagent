@@ -165,6 +165,21 @@ fn parallel_multi_worktree_wave_reconciles_disjoint_writes_and_retries_round_1_r
         allow_amend: true,
     };
 
+    if !agent_guard::exec_sandbox::probe_host_sandbox_mode().is_kernel_enforced() {
+        let err = run_swarm_dag_supervisor(&repo, dag_json, &cfg).expect_err(
+            "non-Landlock host kernel must fail closed with KERNEL_SANDBOX_UNAVAILABLE",
+        );
+        assert!(err.contains("KERNEL_SANDBOX_UNAVAILABLE"), "got: {err}");
+        let mut dry_cfg = cfg.clone();
+        dry_cfg.dry_run = true;
+        let dry_report = run_swarm_dag_supervisor(&repo, dag_json, &dry_cfg)
+            .expect("dry-run DAG planning and epoch rotation must succeed");
+        assert_eq!(dry_report.waves_completed, 2);
+        assert_eq!(dry_report.tasks_completed.len(), 3);
+        assert!(dry_report.epoch_id.is_none());
+        return;
+    }
+
     let report = run_swarm_dag_supervisor(&repo, dag_json, &cfg).expect("DAG run must succeed");
     assert_eq!(report.waves_completed, 2);
     assert_eq!(report.tasks_completed.len(), 3);

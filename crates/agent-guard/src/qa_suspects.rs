@@ -796,6 +796,8 @@ pub fn verify_live_integration_contracts(
         }
     }
 
+    crate::repo_audit::verify_anti_shim_and_polyglot_laws(&canon_repo)?;
+
     Ok(())
 }
 

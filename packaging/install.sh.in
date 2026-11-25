@@ -15,7 +15,7 @@
 #      "latest" lookups, no mutable API).
 #   6. Archive SHA-256 must equal the digest baked into this script AND the
 #      line in SHA256SUMS, and SHA256SUMS must carry a valid ECDSA P-256
-#      signature (SHA256SUMS.sig) made by the baked hardware release key.
+#      signature (SHA256SUMS.sig) made by the baked release signing key.
 #   7. Archive member names/types audited BEFORE extraction (no absolute paths,
 #      "..", links, devices); extraction never restores owner or mode bits.
 #   8. Extracted `dotagent self-verify` must pass; binaries are swapped in

@@ -3,6 +3,16 @@
 All notable changes to `dotagent` are documented in this file.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.2.0] - 2026-11-24
+
+### Added
+- **Anti-Shim, Fail-Closed, & Polyglot Golden-Vector Audit Laws (`repo_audit.rs`, `smoke_gate.rs`, `qa_suspects.rs`, `diagnostics.rs`)**: Added `NO_UNLINKED_RUNTIME_SHIM` (requiring Cargo + Wrangler workspaces to link compiled `wasm32-unknown-unknown` `.wasm` modules with `<= 150`-line host FFI glue, capping non-test `.mjs`/`.js` files at `<= 150` SLOC, forbidding imperative `scripts/deploy.py` REST bypasses where `.tf` modules exist, and blocking `primitives/dotagent` `dash` stubs and RFC 8032 test keys), `NO_FAIL_OPEN_FALLBACK` (blocking `catch` blocks returning `clean/restored=true`, synthetic container fallback adapters, and Worker `sqlite3` CLI shells), and `POLYGLOT_GOLDEN_VECTORS` (requiring shared `vectors/*.json` round-trip tests across Rust, TypeScript, Python, and C11).
+- **Canonical Root `./scripts/check` Gate**: Added executable `./scripts/check` matching sibling `susanbdev` repositories across ASCII/Unicode hygiene, `cargo fmt`, `clippy`, workspace tests, packaging unittests, release compiler/audit verification, and `StopReceipt` attestation.
+
+### Security
+- **Warm `hook-daemon` Env Hygiene & Per-Request IPC Session Scoping (`coordinator.rs`, `path_policy.rs`, `lib.rs`)**: Added `AGENT_GUARD_DIRECT_EXPLORE` to `spawn_hook_daemon_process` env scrubbing, prevented `hook.sock` requests from falling back to ambient daemon `AGENT_GUARD_DIRECT_EXPLORE`, threaded `session_id` explicitly via `ScopedRequestSession` and `resolve_max_walk_depth` so `SwarmRole::Investigator` preserves `INVESTIGATOR_MAX_WALK_DEPTH` (`6`) over warm `hook.sock`, and replaced the lossy static `KNOWN_GUARD_CODES` whitelist with catalog lookup plus bounded validated reason-code interning.
+- **Full Ancestor `O_NOFOLLOW` Outbox Walk (`feedback_loop.rs`)**: Updated `write_atomic_outbox_file` to verify `symlink_metadata` across every intermediate ancestor directory component rather than only `out_path` and its immediate parent.
+
 ## [2.1.0] - 2026-11-21
 
 ### Added

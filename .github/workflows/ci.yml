@@ -4,6 +4,8 @@ on:
   push:
     branches: ["**"]
   pull_request:
+  pull_request_review:
+    types: [submitted, dismissed]
 
 permissions:
   contents: read
@@ -457,15 +459,66 @@ jobs:
   ring0-constitutional-ratchet:
     name: Ring-0 Constitutional Ratchet
     # Direct pushes to main are blocked by the org ruleset (PR-only); the ratchet is enforced on
-    # every pull request and every non-main branch push against origin/main.
-    if: github.event_name == 'pull_request' || github.ref != 'refs/heads/main'
+    # every pull request, pull request review, and non-main branch push against origin/main.
+    if: github.event_name == 'pull_request' || github.event_name == 'pull_request_review' || github.ref != 'refs/heads/main'
+    permissions:
+      contents: read
+      pull-requests: read
     runs-on: ubuntu-latest
     timeout-minutes: 20
     env:
       CARGO_TERM_COLOR: always
       GIT_CONFIG_NOSYSTEM: "1"
     steps:
-      - name: Checkout PR head (full history for merge-base & hardware-key verification)
+      - name: Check human owner GitHub PR review approval
+        id: owner_review
+        if: github.event_name == 'pull_request' || github.event_name == 'pull_request_review'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO_FULL: ${{ github.repository }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch || 'main' }}
+          PR_BASE_REF: ${{ github.event.pull_request.base.ref || '' }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, os, subprocess
+          repo = os.environ["REPO_FULL"]
+          default_branch = os.environ["DEFAULT_BRANCH"]
+          pr_base_ref = os.environ["PR_BASE_REF"]
+          pr_num = int(os.environ["PR_NUMBER"])
+          head_sha = os.environ["PR_HEAD_SHA"]
+          if pr_base_ref != default_branch:
+              with open(os.environ["GITHUB_OUTPUT"], "a", encoding="ascii") as fh:
+                  fh.write("approved=false\n")
+              raise SystemExit(0)
+          out = subprocess.check_output(
+              ["gh", "api", "--paginate", "--slurp", f"repos/{repo}/pulls/{pr_num}/reviews"],
+              text=True,
+          )
+          pages = json.loads(out) if out.strip() else []
+          reviews = [r for p in pages for r in (p if isinstance(p, list) else [p])]
+          latest = None
+          for rev in reviews:
+              u = rev.get("user") or {}
+              rstate = str(rev.get("state", "")).upper()
+              if rstate not in ("APPROVED", "CHANGES_REQUESTED", "DISMISSED"):
+                  continue
+              if (
+                  u.get("id") == 215839550
+                  and u.get("login") == "susanbeasles"
+                  and str(u.get("type", "")).lower() == "user"
+                  and rev.get("commit_id") == head_sha
+              ):
+                  if latest is None or int(rev.get("id", 0)) >= int(latest.get("id", 0)):
+                      latest = rev
+          approved = bool(latest and str(latest.get("state", "")).upper() == "APPROVED")
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="ascii") as fh:
+              fh.write(f"approved={'true' if approved else 'false'}\n")
+          PY
+
+      - name: Checkout PR head (full history for merge-base & SSH signature verification)
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
@@ -480,12 +533,16 @@ jobs:
 
       - name: Enforce Ring-0 corpus ratchet & autonomous-bot allowlist confinement
         env:
+          EVENT_NAME: ${{ github.event_name }}
+          GIT_REF: ${{ github.ref }}
           BASE_REF: ${{ github.event.repository.default_branch || 'main' }}
           EVENT_ACTOR: ${{ github.actor }}
+          EVENT_ACTOR_ID: ${{ github.actor_id }}
           CHANGE_AUTHOR: ${{ github.event.pull_request.user.login || github.actor }}
           PR_AUTHOR: ${{ github.event.pull_request.user.login || '' }}
           PR_AUTHOR_TYPE: ${{ github.event.pull_request.user.type || '' }}
-          PR_HEAD_REF: ${{ github.head_ref || github.ref_name }}
+          PR_HEAD_REF: ${{ github.event.pull_request.head.ref || github.head_ref || github.ref_name }}
+          OWNER_PR_APPROVED: ${{ steps.owner_review.outputs.approved || 'false' }}
         run: |
           set -euo pipefail
           BASE_OID="$(git rev-parse --verify "origin/${BASE_REF}^{commit}")"
@@ -507,8 +564,19 @@ jobs:
                 ;;
               *)
                 if ! git diff --quiet "${BASE_OID}" HEAD -- config/allowed_human_signers scripts/allowed_hardware_signers; then
-                  "${RUNNER_TEMP}/trusted-target/debug/dotagent" verify-ring0-ratchet \
-                    --base "origin/${BASE_REF}"
+                  if [ "${OWNER_PR_APPROVED}" = "true" ] \
+                     || { [ "${EVENT_NAME}" = "push" ] && [ "${GIT_REF}" = "refs/heads/${BASE_REF}" ]; }; then
+                    if git -C "${TRUSTED}" grep -q -F -- '--owner-approved' -- crates/agent-guard/src/ring0_ratchet.rs; then
+                      "${RUNNER_TEMP}/trusted-target/debug/dotagent" verify-ring0-ratchet \
+                        --base "origin/${BASE_REF}" --owner-approved
+                    else
+                      "${RUNNER_TEMP}/trusted-target/debug/dotagent" verify-ring0-ratchet \
+                        --base "origin/${BASE_REF}" --corpus-only
+                    fi
+                  else
+                    "${RUNNER_TEMP}/trusted-target/debug/dotagent" verify-ring0-ratchet \
+                      --base "origin/${BASE_REF}"
+                  fi
                 else
                   "${RUNNER_TEMP}/trusted-target/debug/dotagent" verify-ring0-ratchet \
                     --base "origin/${BASE_REF}" --corpus-only
@@ -519,7 +587,7 @@ jobs:
                && ! git cat-file -e "${BASE_OID}:config/allowed_human_signers" 2>/dev/null; then
             # Self-extinguishing one-time genesis bootstrap (never compiles PR sources): constrains any
             # non-human/automation actor to the 5-file Ring-2 allowlist and requires authenticated human
-            # owner actor (susanbeasles) + pinned signer digest for the initial enrollment.
+            # owner actor (susanbeasles, id 215839550) + pinned signer digest for the initial enrollment.
             python3 -c 'import sys, textwrap; exec(textwrap.dedent(sys.stdin.read()))' "${TRUSTED}" "${GITHUB_WORKSPACE}" "${BASE_OID}" <<'PY'
           import hashlib, os, subprocess, sys, tomllib
           trusted, ws, base_oid = sys.argv[1], sys.argv[2], sys.argv[3]
@@ -542,7 +610,8 @@ jobs:
           outside_ring2 = [p for p in changed if p not in RING2_ALLOWLIST]
           if outside_ring2:
               actor = os.environ.get("EVENT_ACTOR", "")
-              if actor.endswith("[bot]") or actor != "susanbeasles":
+              actor_id = os.environ.get("EVENT_ACTOR_ID", "")
+              if actor.endswith("[bot]") or actor != "susanbeasles" or actor_id != "215839550":
                   raise SystemExit(
                       f"GENESIS_VIOLATION: paths outside 5-file Ring-2 allowlist ({outside_ring2[:3]}) require authenticated human owner enrollment"
                   )

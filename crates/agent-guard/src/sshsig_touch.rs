@@ -1,6 +1,11 @@
 #![forbid(unsafe_code)]
+#![cfg_attr(
+    not(test),
+    deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)
+)]
 
-//! Pure-Rust OpenSSH `SSHSIG` FIDO2 hardware user-presence (`sk-ssh-ed25519@openssh.com`) gate.
+//! Pure-Rust OpenSSH `SSHSIG` gate: strict FIDO2 `sk-*` (`UP=1`) for `v*` release tags, and
+//! standard `ssh-ed25519` / `sk-ssh-ed25519@openssh.com` verification for operator/plugin/CLI gates.
 
 use std::fs;
 use std::path::Path;
@@ -12,6 +17,7 @@ use crate::crypto::{base64_decode_clean, constant_time_eq_bytes, hex_decode_32, 
 
 pub const OPERATOR_SSHSIG_NAMESPACE: &str = "dotagent-operator@susanb.dev";
 pub const SK_ED25519_ALG: &str = "sk-ssh-ed25519@openssh.com";
+pub const SSH_ED25519_ALG: &str = "ssh-ed25519";
 const SSHSIG_MAGIC: &[u8; 6] = b"SSHSIG";
 const SSH_SK_USER_PRESENCE_REQD: u8 = 0x01;
 
@@ -90,9 +96,9 @@ fn push_ssh_str(out: &mut Vec<u8>, data: &[u8]) {
     out.extend_from_slice(data);
 }
 
-/// Checks the signed FIDO2 attributes of an OpenSSH Git signature. OpenSSH
+/// Checks the signed FIDO2 attributes of an OpenSSH Git release-tag signature. OpenSSH
 /// independently verifies the signature bytes against the enrolled public key.
-pub(crate) fn release_signature_has_fido2_touch(sig_pem: &str) -> Result<bool, GuardError> {
+pub fn release_signature_has_fido2_touch(sig_pem: &str) -> Result<bool, GuardError> {
     let body = sig_pem
         .trim()
         .strip_prefix("-----BEGIN SSH SIGNATURE-----")
@@ -136,8 +142,9 @@ fn release_signature_bytes_have_fido2_touch(raw: &[u8]) -> Result<bool, GuardErr
     Ok(true)
 }
 
-/// Verifies an OpenSSH `SSHSIG` PEM signature made by `sk-ssh-ed25519@openssh.com`,
-/// requiring `flags & 0x01 != 0` (`User Presence` touch) and returning `counter`.
+/// Verifies an OpenSSH `SSHSIG` PEM signature made by either standard `ssh-ed25519`
+/// (returning counter `0`) or `sk-ssh-ed25519@openssh.com` (without requiring `UP=1`,
+/// returning the signed `counter`).
 pub fn verify_fido2_sshsig_ed25519(
     namespace: &str,
     challenge: &[u8],
@@ -160,18 +167,35 @@ pub fn verify_fido2_sshsig_ed25519(
         return Err(gerr("SSHSIG_MALFORMED", "bad SSHSIG preamble"));
     }
     let mut pk_cur = SshCursor(outer.read_bytes()?, 0);
-    if pk_cur.read_str()? != SK_ED25519_ALG {
-        return Err(gerr("SSHSIG_WRONG_KEY_TYPE", "not sk-ssh-ed25519"));
-    }
-    let pk_bytes: [u8; 32] = pk_cur
-        .read_bytes()?
-        .try_into()
-        .map_err(|_| gerr("SSHSIG_MALFORMED", "pubkey must be 32 bytes"))?;
-    let application = pk_cur.read_bytes()?;
-    if !matches!(application, b"ssh:" | b"ssh:dotagent") {
-        return Err(gerr("SSHSIG_WRONG_APPLICATION", "untrusted sk application"));
-    }
-    pk_cur.ensure_empty()?;
+    let pk_alg = pk_cur.read_str()?;
+    let (pk_bytes, sk_application): ([u8; 32], Option<&[u8]>) = match pk_alg {
+        SSH_ED25519_ALG => {
+            let pk: [u8; 32] = pk_cur
+                .read_bytes()?
+                .try_into()
+                .map_err(|_| gerr("SSHSIG_MALFORMED", "pubkey must be 32 bytes"))?;
+            pk_cur.ensure_empty()?;
+            (pk, None)
+        }
+        SK_ED25519_ALG => {
+            let pk: [u8; 32] = pk_cur
+                .read_bytes()?
+                .try_into()
+                .map_err(|_| gerr("SSHSIG_MALFORMED", "pubkey must be 32 bytes"))?;
+            let application = pk_cur.read_bytes()?;
+            if !matches!(application, b"ssh:" | b"ssh:dotagent") {
+                return Err(gerr("SSHSIG_WRONG_APPLICATION", "untrusted sk application"));
+            }
+            pk_cur.ensure_empty()?;
+            (pk, Some(application))
+        }
+        _ => {
+            return Err(gerr(
+                "SSHSIG_WRONG_KEY_TYPE",
+                "expected ssh-ed25519 or sk-ssh-ed25519@openssh.com",
+            ));
+        }
+    };
 
     let sig_ns = outer.read_str()?;
     if sig_ns != namespace {
@@ -182,24 +206,31 @@ pub fn verify_fido2_sshsig_ed25519(
     let mut sg_cur = SshCursor(outer.read_bytes()?, 0);
     outer.ensure_empty()?;
 
-    if sg_cur.read_str()? != SK_ED25519_ALG {
-        return Err(gerr("SSHSIG_WRONG_SIG_TYPE", "not sk-ssh-ed25519"));
+    if sg_cur.read_str()? != pk_alg {
+        return Err(gerr(
+            "SSHSIG_WRONG_SIG_TYPE",
+            "signature algorithm mismatch",
+        ));
     }
     let sig_bytes: [u8; 64] = sg_cur
         .read_bytes()?
         .try_into()
         .map_err(|_| gerr("SSHSIG_MALFORMED", "Ed25519 sig must be 64 bytes"))?;
-    let (flags, counter) = (sg_cur.read_u8()?, sg_cur.read_u32()?);
-    sg_cur.ensure_empty()?;
+    let sk_meta = if sk_application.is_some() {
+        let flags = sg_cur.read_u8()?;
+        let counter = sg_cur.read_u32()?;
+        sg_cur.ensure_empty()?;
+        Some((flags, counter))
+    } else {
+        sg_cur.ensure_empty()?;
+        None
+    };
 
-    if flags & SSH_SK_USER_PRESENCE_REQD == 0 {
-        return Err(gerr("SSHSIG_USER_PRESENCE_REQUIRED", "UP touch bit is 0"));
-    }
     if !allowed_pubkeys
         .iter()
         .any(|k| constant_time_eq_bytes(k, &pk_bytes))
     {
-        return Err(gerr("SSHSIG_UNTRUSTED_PUBKEY", "untrusted sk pubkey"));
+        return Err(gerr("SSHSIG_UNTRUSTED_PUBKEY", "untrusted ssh pubkey"));
     }
     let msg_hash: Vec<u8> = match hash_alg {
         "sha512" => Sha512::digest(challenge).to_vec(),
@@ -213,20 +244,26 @@ pub fn verify_fido2_sshsig_ed25519(
     push_ssh_str(&mut preimage, hash_alg.as_bytes());
     push_ssh_str(&mut preimage, &msg_hash);
 
-    let mut sk_signed = Vec::with_capacity(69);
-    sk_signed.extend_from_slice(&sha256_bytes(application));
-    sk_signed.push(flags);
-    sk_signed.extend_from_slice(&counter.to_be_bytes());
-    sk_signed.extend_from_slice(&sha256_bytes(&preimage));
-
     let vk = VerifyingKey::from_bytes(&pk_bytes)
         .map_err(|_| gerr("SSHSIG_INVALID_PUBKEY", "invalid Ed25519 key"))?;
     if vk.is_weak() {
         return Err(gerr("SSHSIG_WEAK_PUBKEY", "weak Ed25519 key"));
     }
-    vk.verify_strict(&sk_signed, &Signature::from_bytes(&sig_bytes))
-        .map_err(|_| gerr("SSHSIG_VERIFY_FAILED", "signature verification failed"))?;
-    Ok(counter)
+
+    if let (Some(application), Some((flags, counter))) = (sk_application, sk_meta) {
+        let mut sk_signed = Vec::with_capacity(69);
+        sk_signed.extend_from_slice(&sha256_bytes(application));
+        sk_signed.push(flags);
+        sk_signed.extend_from_slice(&counter.to_be_bytes());
+        sk_signed.extend_from_slice(&sha256_bytes(&preimage));
+        vk.verify_strict(&sk_signed, &Signature::from_bytes(&sig_bytes))
+            .map_err(|_| gerr("SSHSIG_VERIFY_FAILED", "signature verification failed"))?;
+        Ok(counter)
+    } else {
+        vk.verify_strict(&preimage, &Signature::from_bytes(&sig_bytes))
+            .map_err(|_| gerr("SSHSIG_VERIFY_FAILED", "signature verification failed"))?;
+        Ok(0)
+    }
 }
 
 pub fn format_operator_challenge(
@@ -238,25 +275,54 @@ pub fn format_operator_challenge(
     format!("dotagent:operator:v1:{action}:{repo_id}:{epoch_id}:{floor_ts_60s}")
 }
 
-pub fn load_operator_sk_keys_from_home(home: &Path) -> Result<Option<Vec<[u8; 32]>>, GuardError> {
-    if home.as_os_str().is_empty() || !home.is_absolute() {
-        return Err(gerr("SSHSIG_CONFIG_INVALID", "HOME must be absolute"));
-    }
-    let dot_cfg = home.join(".config");
-    let cfg_dir = dot_cfg.join("dotagent");
-    let key_file = cfg_dir.join("operator_sk_keys");
-    if fs::symlink_metadata(&dot_cfg).is_ok_and(|m| m.file_type().is_symlink())
-        || fs::symlink_metadata(&cfg_dir).is_ok_and(|m| m.file_type().is_symlink())
+fn parse_ed25519_pubkey_line(line: &str) -> Result<[u8; 32], GuardError> {
+    if line.len() == 64
+        && let Ok(k) = hex_decode_32(line)
     {
-        return Err(gerr("SSHSIG_SYMLINK_TAMPER", ".config path is symlink"));
+        return Ok(k);
     }
-    let Ok(meta) = fs::symlink_metadata(&key_file) else {
+    let toks: Vec<&str> = line.split_whitespace().collect();
+    if let Some(i) = toks.iter().position(|&t| t == SSH_ED25519_ALG)
+        && let Some(b64) = toks.get(i + 1)
+    {
+        let blob =
+            base64_decode_clean(b64, 4_096).map_err(|m| gerr("SSHSIG_KEYRING_INVALID", m))?;
+        let mut cur = SshCursor(&blob, 0);
+        if cur.read_str()? == SSH_ED25519_ALG
+            && let Ok(k) = <[u8; 32]>::try_from(cur.read_bytes()?)
+            && cur.ensure_empty().is_ok()
+        {
+            return Ok(k);
+        }
+    }
+    if let Some(i) = toks.iter().position(|&t| t == SK_ED25519_ALG)
+        && let Some(b64) = toks.get(i + 1)
+    {
+        let blob =
+            base64_decode_clean(b64, 4_096).map_err(|m| gerr("SSHSIG_KEYRING_INVALID", m))?;
+        let mut cur = SshCursor(&blob, 0);
+        if cur.read_str()? == SK_ED25519_ALG
+            && let Ok(k) = <[u8; 32]>::try_from(cur.read_bytes()?)
+            && matches!(cur.read_bytes()?, b"ssh:" | b"ssh:dotagent")
+            && cur.ensure_empty().is_ok()
+        {
+            return Ok(k);
+        }
+    }
+    Err(gerr("SSHSIG_KEYRING_INVALID", "unrecognized ssh key"))
+}
+
+fn read_nonsymlink_keyring_file(
+    key_file: &Path,
+    strict_lines: bool,
+) -> Result<Option<Vec<[u8; 32]>>, GuardError> {
+    let Ok(meta) = fs::symlink_metadata(key_file) else {
         return Ok(None);
     };
     if meta.file_type().is_symlink() || !meta.file_type().is_file() || meta.len() > 65_536 {
-        return Err(gerr("SSHSIG_SYMLINK_TAMPER", "invalid operator_sk_keys"));
+        return Err(gerr("SSHSIG_SYMLINK_TAMPER", "invalid operator key file"));
     }
-    let raw = fs::read_to_string(&key_file)
+    let raw = fs::read_to_string(key_file)
         .map_err(|e| GuardError::new("SSHSIG_KEYRING_IO", e.to_string()))?;
     let mut keys = Vec::new();
     for line in raw
@@ -264,34 +330,69 @@ pub fn load_operator_sk_keys_from_home(home: &Path) -> Result<Option<Vec<[u8; 32
         .map(str::trim)
         .filter(|l| !l.is_empty() && !l.starts_with('#'))
     {
-        if line.len() == 64
-            && let Ok(k) = hex_decode_32(line)
-        {
-            keys.push(k);
-            continue;
+        match parse_ed25519_pubkey_line(line) {
+            Ok(k) => keys.push(k),
+            Err(e) if strict_lines => return Err(e),
+            Err(_) => {}
         }
-        let toks: Vec<&str> = line.split_whitespace().collect();
-        if let Some(i) = toks.iter().position(|&t| t == SK_ED25519_ALG)
-            && let Some(b64) = toks.get(i + 1)
-        {
-            let blob =
-                base64_decode_clean(b64, 4_096).map_err(|m| gerr("SSHSIG_KEYRING_INVALID", m))?;
-            let mut cur = SshCursor(&blob, 0);
-            if cur.read_str()? == SK_ED25519_ALG
-                && let Ok(k) = <[u8; 32]>::try_from(cur.read_bytes()?)
-                && matches!(cur.read_bytes()?, b"ssh:" | b"ssh:dotagent")
-                && cur.ensure_empty().is_ok()
-            {
-                keys.push(k);
-                continue;
-            }
-        }
-        return Err(gerr("SSHSIG_KEYRING_INVALID", "unrecognized sk key"));
     }
-    if keys.is_empty() {
-        return Err(gerr("SSHSIG_KEYRING_EMPTY", "empty operator_sk_keys"));
+    if strict_lines && keys.is_empty() {
+        return Err(gerr("SSHSIG_KEYRING_EMPTY", "empty operator keyring"));
     }
     Ok(Some(keys))
+}
+
+pub fn load_operator_sk_keys_from_home(home: &Path) -> Result<Option<Vec<[u8; 32]>>, GuardError> {
+    if home.as_os_str().is_empty() || !home.is_absolute() {
+        return Err(gerr("SSHSIG_CONFIG_INVALID", "HOME must be absolute"));
+    }
+    let dot_cfg = home.join(".config");
+    let cfg_dir = dot_cfg.join("dotagent");
+    if fs::symlink_metadata(&dot_cfg).is_ok_and(|m| m.file_type().is_symlink())
+        || fs::symlink_metadata(&cfg_dir).is_ok_and(|m| m.file_type().is_symlink())
+    {
+        return Err(gerr("SSHSIG_SYMLINK_TAMPER", ".config path is symlink"));
+    }
+    let mut combined = Vec::new();
+    let mut found_file = false;
+    for filename in ["operator_keys", "operator_sk_keys", "allowed_signers"] {
+        if let Some(keys) = read_nonsymlink_keyring_file(&cfg_dir.join(filename), true)? {
+            found_file = true;
+            combined.extend(keys);
+        }
+    }
+    if !found_file {
+        return Ok(None);
+    }
+    if combined.is_empty() {
+        return Err(gerr("SSHSIG_KEYRING_EMPTY", "empty operator keyring"));
+    }
+    Ok(Some(combined))
+}
+
+/// Loads configured operator keys from `~/.config/dotagent/{operator_keys,operator_sk_keys,allowed_signers}`,
+/// falling back to `~/.ssh/allowed_signers` and `~/.ssh/id_ed25519.pub` when present.
+pub fn load_operator_or_ssh_keys_from_home(
+    home: &Path,
+) -> Result<Option<Vec<[u8; 32]>>, GuardError> {
+    if let Some(keys) = load_operator_sk_keys_from_home(home)? {
+        return Ok(Some(keys));
+    }
+    let dot_ssh = home.join(".ssh");
+    if fs::symlink_metadata(&dot_ssh).is_ok_and(|m| m.file_type().is_symlink()) {
+        return Err(gerr("SSHSIG_SYMLINK_TAMPER", ".ssh path is symlink"));
+    }
+    let mut fallback = Vec::new();
+    for filename in ["allowed_signers", "id_ed25519.pub"] {
+        if let Some(keys) = read_nonsymlink_keyring_file(&dot_ssh.join(filename), false)? {
+            fallback.extend(keys);
+        }
+    }
+    if fallback.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(fallback))
+    }
 }
 
 #[cfg(test)]
@@ -329,5 +430,62 @@ mod tests {
         );
         let raw = git_signature_attributes("ssh-ed25519", 0);
         assert_eq!(release_signature_bytes_have_fido2_touch(&raw), Ok(false));
+    }
+
+    #[test]
+    fn standard_ssh_ed25519_keygen_sign_and_home_fallback_verify() {
+        use std::io::Write;
+        use std::process::{Command, Stdio};
+
+        let manifest = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let root = manifest
+            .parent()
+            .and_then(Path::parent)
+            .expect("ws")
+            .join("target")
+            .join(format!("sshsig-ed25519-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let ssh_dir = root.join(".ssh");
+        fs::create_dir_all(&ssh_dir).expect("mkdir .ssh");
+        let key_path = ssh_dir.join("id_ed25519");
+        assert!(
+            Command::new("ssh-keygen")
+                .args(["-t", "ed25519", "-N", "", "-C", "op@local", "-f"])
+                .arg(&key_path)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .expect("ssh-keygen")
+                .success()
+        );
+        let keys = load_operator_or_ssh_keys_from_home(&root)
+            .expect("load ssh keys")
+            .expect("id_ed25519.pub loaded");
+        assert_eq!(keys.len(), 1);
+
+        let challenge = b"dotagent:operator:v1:repo123:0:1795275600";
+        let mut child = Command::new("ssh-keygen")
+            .args(["-Y", "sign", "-f"])
+            .arg(&key_path)
+            .args(["-n", OPERATOR_SSHSIG_NAMESPACE])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("ssh-keygen -Y sign");
+        child
+            .stdin
+            .take()
+            .expect("stdin")
+            .write_all(challenge)
+            .expect("write");
+        let out = child.wait_with_output().expect("wait");
+        assert!(out.status.success());
+        let sig_pem = String::from_utf8(out.stdout).expect("utf8");
+        assert_eq!(
+            verify_fido2_sshsig_ed25519(OPERATOR_SSHSIG_NAMESPACE, challenge, &sig_pem, &keys),
+            Ok(0)
+        );
+        let _ = fs::remove_dir_all(&root);
     }
 }

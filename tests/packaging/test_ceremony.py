@@ -1,4 +1,4 @@
-"""Integration tests for scripts/sign-release-yk.sh using stubbed git/gh/yubico-piv-tool/Apple tools."""
+"""Integration tests for scripts/sign-release-yk.sh using stubbed git/gh/Apple tools and standard OpenSSL keys."""
 
 import os
 import subprocess
@@ -31,17 +31,6 @@ case "$1 $2" in
 esac
 exit 0
 """,
-    "yubico-piv-tool": """#!/bin/sh
-in="" out=""
-while [ $# -gt 0 ]; do
-  case "$1" in
-    -i) in="$2"; shift 2 ;;
-    -o) out="$2"; shift 2 ;;
-    *) shift ;;
-  esac
-done
-exec /usr/bin/openssl pkeyutl -sign -inkey "${STUB_PRIV_KEY}" -pkeyopt digest:sha256 -in "${in}" -out "${out}"
-""",
     "uname": """#!/bin/sh
 if [ -n "${STUB_DARWIN:-}" ]; then echo Darwin; else exec /usr/bin/uname "$@"; fi
 """,
@@ -63,22 +52,28 @@ class CeremonyIntegrationTests(unittest.TestCase):
             with open(path, "w", encoding="ascii") as handle:
                 handle.write(body)
             os.chmod(path, 0o755)
-        self.key = fx.make_key(self.scratch, "piv")
+        self.key = fx.make_key(self.scratch, "signer")
         self.signer = self.key + ".pub"
         self.release = fx.build_release(self.scratch, key=self.key, signer_pub=self.signer, sign=False)
         self.log = os.path.join(self.scratch, "stub.log")
 
-    def ceremony(self, extra_env=None):
+    def ceremony(self, extra_env=None, extra_args=(), stdin_data=None):
         env = {
             "HOME": self.home,
             "PATH": self.stubs + ":" + fx.CLEAN_PATH,
             "DOTAGENT_SIGNER_PUB": self.signer,
-            "STUB_PRIV_KEY": self.key,
+            "DOTAGENT_SIGNER_KEY_FILE": self.key,
             "STUB_RELEASE_DIR": self.release["dir"],
             "STUB_LOG": self.log,
         }
         env.update(extra_env or {})
-        return subprocess.run(["bash", CEREMONY, fx.TAG], capture_output=True, text=True, env=env)
+        return subprocess.run(
+            ["bash", CEREMONY] + list(extra_args) + [fx.TAG],
+            capture_output=True,
+            text=True,
+            input=stdin_data,
+            env=env,
+        )
 
     def uploads(self):
         if not os.path.exists(self.log):
@@ -98,6 +93,19 @@ class CeremonyIntegrationTests(unittest.TestCase):
             self.assertIn("--source-digest 0123456789abcdef0123456789abcdef01234567", line)
             self.assertIn("--source-ref refs/tags/%s" % fx.TAG, line)
             self.assertIn("--signer-workflow susanbdev/dotagent/.github/workflows/release.yml", line)
+
+    def test_key_pem_flag_and_key_stdin_sign_without_hardware_tools(self):
+        res_flag = self.ceremony(
+            extra_env={"DOTAGENT_SIGNER_KEY_FILE": ""},
+            extra_args=("--key-pem", self.key),
+        )
+        self.assertEqual(res_flag.returncode, 0, res_flag.stderr)
+        res_stdin = self.ceremony(
+            extra_env={"DOTAGENT_SIGNER_KEY_FILE": ""},
+            extra_args=("--key-stdin",),
+            stdin_data=slurp(self.key),
+        )
+        self.assertEqual(res_stdin.returncode, 0, res_stdin.stderr)
 
     def test_attestation_failure_blocks_signing_and_upload(self):
         result = self.ceremony({"STUB_ATTEST_RC": "1"})
@@ -120,7 +128,7 @@ class CeremonyIntegrationTests(unittest.TestCase):
 
     def test_mismatched_private_key_fails_self_verify(self):
         other = fx.make_key(self.scratch, "other")
-        result = self.ceremony({"STUB_PRIV_KEY": other})
+        result = self.ceremony({"DOTAGENT_SIGNER_KEY_FILE": other})
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("self-verification", result.stderr)
         self.assertEqual(self.uploads(), [])

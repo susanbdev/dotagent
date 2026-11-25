@@ -430,6 +430,7 @@ pub(crate) fn handle_pre_tool_hook_with_context_and_ipc(
         Err(bv) => return Decision::deny(bv.code, bv.detail, false),
     };
     let session_id = extract_session_id_with_override(&parsed, caller_ctx.session_id.as_deref());
+    let _request_session_scope = path_policy::ScopedRequestSession::enter(Some(&session_id));
     let _session_lock = SessionLedger::acquire_lock(&repo_root, &session_id);
     let mut ledger = SessionLedger::load_or_create_with_cache(&repo_root, &session_id, hot_cache);
     ledger.apply_root_session_override(caller_ctx.root_session_id.as_deref());
@@ -470,11 +471,11 @@ pub(crate) fn handle_pre_tool_hook_with_context_and_ipc(
 
     let tool_name = extract_tool_name(&parsed);
     let tool_input = parsed.get("tool_input").unwrap_or(&parsed);
-    let direct_explore_env = caller_ctx
-        .direct_explore
-        .as_deref()
-        .map(is_truthy_env_val)
-        .unwrap_or_else(|| env_flag_enabled("AGENT_GUARD_DIRECT_EXPLORE"));
+    let direct_explore_env = match caller_ctx.direct_explore.as_deref() {
+        Some(raw) => is_truthy_env_val(raw),
+        None if coord_ipc_ns.is_some() => false,
+        None => env_flag_enabled("AGENT_GUARD_DIRECT_EXPLORE"),
+    };
     let payload_is_airlock_subagent =
         extract_first_str(&parsed, &["agent_type", "subagent_type", "agent_name"])
             .is_some_and(is_allowed_airlock_subagent_name);
@@ -1549,7 +1550,7 @@ fn evaluate_tool_invocation(
         } else if cap.is_some() {
             role_sandbox::max_walk_depth_for_role(role)
         } else {
-            crate::path_policy::effective_max_walk_depth_for_repo(repo_root)
+            crate::path_policy::resolve_max_walk_depth(repo_root, Some(raw_session_id))
         };
         let pp_t0 = std::time::Instant::now();
         if candidate.is_file() {
@@ -2207,6 +2208,7 @@ pub fn handle_post_tool_hook_with_context(
         Err(bv) => return Decision::deny(bv.code, bv.detail, false),
     };
     let session_id = extract_session_id_with_override(&parsed, caller_ctx.session_id.as_deref());
+    let _request_session_scope = path_policy::ScopedRequestSession::enter(Some(&session_id));
     let _session_lock = SessionLedger::acquire_lock(&repo_root, &session_id);
     let mut ledger = SessionLedger::load_or_create_with_cache(&repo_root, &session_id, hot_cache);
     ledger.apply_root_session_override(caller_ctx.root_session_id.as_deref());

@@ -6,12 +6,15 @@
 
 //! Inverted Ring-0 Constitutional Allowlist Ratchet (`dotagent verify-ring0-ratchet`).
 //!
-//! Enforces four hard mechanical guarantees (`dotagent v2.1`):
-//! 1. **Hardware-Signed Human Commit Gate**: Unless `--require-ratchet` is passed, checks whether
-//!    the working tree is clean, `GITHUB_ACTOR` is not an automation bot, and **every** commit in
-//!    `<merge_base>..HEAD` passes cryptographic FIDO2/SSH verification (`ssh-keygen -Y verify -n git`)
-//!    against `<merge_base>:config/allowed_human_signers`. Otherwise, strict Ring-2 ratchet mode
-//!    executes unconditionally regardless of branch name or PR label.
+//! Enforces four hard mechanical guarantees (`dotagent v2.1+`):
+//! 1. **Human SSH Commit / Owner Authority Gate**: Unless `--require-ratchet` is passed, checks
+//!    whether the working tree is clean, `GITHUB_ACTOR` is not an automation bot, and either
+//!    authenticated human-owner PR approval (`--owner-approved`)
+//!    is present or **every** commit in `<merge_base>..HEAD` passes OpenSSH signature verification
+//!    (`ssh-keygen -Y verify -n git`, accepting standard `ssh-ed25519` / `ecdsa-sha2-nistp256` as
+//!    well as `sk-*` keys without requiring `UP` touch) against `<merge_base>:config/allowed_human_signers`
+//!    (and `scripts/allowed_hardware_signers`). Annotated `v*` release tags (`--verify-release-tag`)
+//!    continue strictly requiring FIDO2 `sk-*` (`UP=1`) hardware signatures.
 //! 2. **Complete Working-Tree + Untracked + Mode Diff**: Computes `merge_base` (failing closed on
 //!    shallow clones), unions `git diff --raw -z <merge_base>` (committed + staged + unstaged edits
 //!    and file modes) with `git ls-files --others --exclude-standard -z` (untracked files), and
@@ -43,7 +46,7 @@ use crate::resolve_repo_root;
 use crate::traversal_ledger::{ensure_nonsymlink_state_dir, extract_target_bin_or_tool};
 use crate::unicode_guard::{ScanMode, scan_unicode};
 
-/// Exact 5-file Ring-2 allowlist permitted in non-hardware-signed / autonomous PRs.
+/// Exact 5-file Ring-2 allowlist permitted in autonomous / bot PRs (`--require-ratchet`).
 pub const RING2_EXACT_ALLOWED_PATHS: &[&str] = &[
     "crates/agent-guard/src/cmd_policy.rs",
     "crates/agent-guard/src/mcp_policy.rs",
@@ -949,6 +952,103 @@ pub fn extract_commit_ssh_gpgsig(raw_commit: &[u8]) -> Option<(Vec<u8>, String)>
     Some((unsigned_payload.into_bytes(), sig_pem))
 }
 
+fn is_ssh_key_type_token(tok: &str) -> bool {
+    matches!(
+        tok,
+        "ssh-ed25519"
+            | "ssh-rsa"
+            | "ssh-dss"
+            | "ecdsa-sha2-nistp256"
+            | "ecdsa-sha2-nistp384"
+            | "ecdsa-sha2-nistp521"
+            | "sk-ssh-ed25519@openssh.com"
+            | "sk-ecdsa-sha2-nistp256@openssh.com"
+    ) || tok.starts_with("ssh-")
+        || tok.starts_with("sk-ssh-")
+        || tok.starts_with("sk-ecdsa-")
+        || tok.starts_with("ecdsa-sha2-")
+}
+
+fn split_signer_options(opts: &str) -> Vec<&str> {
+    let mut items = Vec::new();
+    let mut in_quotes = false;
+    let mut esc = false;
+    let mut start = 0usize;
+    for (idx, b) in opts.bytes().enumerate() {
+        if esc {
+            esc = false;
+            continue;
+        }
+        if b == b'\\' && in_quotes {
+            esc = true;
+            continue;
+        }
+        if b == b'"' {
+            in_quotes = !in_quotes;
+            continue;
+        }
+        if b == b',' && !in_quotes {
+            let seg = &opts[start..idx];
+            if !seg.is_empty() {
+                items.push(seg);
+            }
+            start = idx + 1;
+        }
+    }
+    let tail = &opts[start..];
+    if !tail.is_empty() {
+        items.push(tail);
+    }
+    items
+}
+
+fn format_allowed_signers_for_openssh(raw: &str, inject_no_touch_for_sk: bool) -> String {
+    let mut out = String::new();
+    for line in raw.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        let mut parts: Vec<String> = trimmed.split_whitespace().map(String::from).collect();
+        if parts.len() >= 3 && is_ssh_key_type_token(&parts[1]) {
+            let is_sk = parts[1].starts_with("sk-");
+            if inject_no_touch_for_sk && is_sk {
+                parts.insert(1, "no-touch-required".to_string());
+            }
+        } else if parts.len() >= 4 {
+            let is_sk = parts[2].starts_with("sk-");
+            let mut cleaned_opts: Vec<&str> = split_signer_options(&parts[1])
+                .into_iter()
+                .filter(|opt| !opt.is_empty() && *opt != "no-touch-required")
+                .collect();
+            if inject_no_touch_for_sk && is_sk {
+                cleaned_opts.push("no-touch-required");
+            }
+            if cleaned_opts.is_empty() {
+                parts.remove(1);
+            } else {
+                parts[1] = cleaned_opts.join(",");
+            }
+        }
+        out.push_str(&parts.join(" "));
+        out.push('\n');
+    }
+    out
+}
+
+/// Formats `allowed_signers` for Git commit signature verification ONLY: injects/preserves
+/// `no-touch-required` on `sk-*` keys so `sk-*` commit signatures with `UP=0` never force a
+/// hardware touch on OpenSSH versions enforcing `allowed_signers` touch policy.
+pub fn prepare_allowed_signers_for_commit_verify(raw: &str) -> String {
+    format_allowed_signers_for_openssh(raw, true)
+}
+
+/// Formats `allowed_signers` for `v*` release tag verification: strictly strips
+/// `no-touch-required` from every signer line so `UP=1` hardware presence is mandatory.
+pub fn sanitize_allowed_signers_for_release_tag(raw: &str) -> String {
+    format_allowed_signers_for_openssh(raw, false)
+}
+
 fn verify_commit_ssh_signature_against_signers(
     repo_root: &Path,
     commit_oid: &str,
@@ -965,6 +1065,11 @@ fn verify_commit_ssh_signature_against_signers(
     let Some((unsigned_payload, sig_pem)) = extract_commit_ssh_gpgsig(&cat_out.stdout) else {
         return Ok(false);
     };
+    let commit_signers = prepare_allowed_signers_for_commit_verify(allowed_signers_content);
+    let fallback_signers = sanitize_allowed_signers_for_release_tag(allowed_signers_content);
+    if commit_signers.trim().is_empty() {
+        return Ok(false);
+    }
 
     let scratch = crate::traversal_ledger::state_root_dir().join("ratchet-verify");
     ensure_nonsymlink_state_dir(&scratch)?;
@@ -991,46 +1096,61 @@ fn verify_commit_ssh_signature_against_signers(
     };
 
     let res = (|| -> Result<bool, String> {
-        write_private(&signers_path, allowed_signers_content.as_bytes())?;
+        write_private(&signers_path, commit_signers.as_bytes())?;
         write_private(&sig_path, sig_pem.as_bytes())?;
 
-        let find_out = Command::new("ssh-keygen")
+        let mut find_out = Command::new("ssh-keygen")
             .args(["-Y", "find-principals", "-f"])
             .arg(&signers_path)
             .arg("-s")
             .arg(&sig_path)
             .output()
             .map_err(|e| format!("ssh-keygen -Y find-principals failed: {e}"))?;
+        if !find_out.status.success()
+            && commit_signers != fallback_signers
+            && String::from_utf8_lossy(&find_out.stderr).contains("unknown key option")
+        {
+            // OpenSSH <= 9.6 predates `no-touch-required` in `allowed_signers` and already
+            // accepts `sk-*` `UP=0` signatures without it.
+            let _ = fs::remove_file(&signers_path);
+            write_private(&signers_path, fallback_signers.as_bytes())?;
+            find_out = Command::new("ssh-keygen")
+                .args(["-Y", "find-principals", "-f"])
+                .arg(&signers_path)
+                .arg("-s")
+                .arg(&sig_path)
+                .output()
+                .map_err(|e| format!("ssh-keygen -Y find-principals fallback failed: {e}"))?;
+        }
         if !find_out.status.success() {
             return Ok(false);
         }
-        let principal = String::from_utf8_lossy(&find_out.stdout)
-            .lines()
-            .next()
-            .unwrap_or("")
-            .trim()
-            .to_string();
-        if principal.is_empty() {
-            return Ok(false);
+        for line in String::from_utf8_lossy(&find_out.stdout).lines() {
+            let principal = line.trim();
+            if principal.is_empty() {
+                continue;
+            }
+            let mut verify_child = Command::new("ssh-keygen")
+                .args(["-Y", "verify", "-f"])
+                .arg(&signers_path)
+                .args(["-I", principal, "-n", "git", "-s"])
+                .arg(&sig_path)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .map_err(|e| format!("ssh-keygen -Y verify spawn failed: {e}"))?;
+            if let Some(mut stdin) = verify_child.stdin.take() {
+                let _ = stdin.write_all(&unsigned_payload);
+            }
+            let status = verify_child
+                .wait()
+                .map_err(|e| format!("ssh-keygen -Y verify wait failed: {e}"))?;
+            if status.success() {
+                return Ok(true);
+            }
         }
-
-        let mut verify_child = Command::new("ssh-keygen")
-            .args(["-Y", "verify", "-f"])
-            .arg(&signers_path)
-            .args(["-I", &principal, "-n", "git", "-s"])
-            .arg(&sig_path)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .map_err(|e| format!("ssh-keygen -Y verify spawn failed: {e}"))?;
-        if let Some(mut stdin) = verify_child.stdin.take() {
-            let _ = stdin.write_all(&unsigned_payload);
-        }
-        let status = verify_child
-            .wait()
-            .map_err(|e| format!("ssh-keygen -Y verify wait failed: {e}"))?;
-        Ok(status.success())
+        Ok(false)
     })();
 
     let _ = fs::remove_file(&signers_path);
@@ -1043,9 +1163,13 @@ fn check_all_commits_human_hardware_signed(
     base_ref: &str,
     merge_base: &str,
     has_uncommitted_or_untracked: bool,
+    owner_approved: bool,
 ) -> Result<bool, String> {
     if has_uncommitted_or_untracked || is_bot_github_actor() {
         return Ok(false);
+    }
+    if owner_approved {
+        return Ok(true);
     }
 
     let signers_spec = format!("{merge_base}:config/allowed_human_signers");
@@ -1054,13 +1178,10 @@ fn check_all_commits_human_hardware_signed(
         .output()
         .map_err(|e| format!("git show '{signers_spec}' failed: {e}"))?;
 
-    let signers_text = if !signers_out.status.success() {
+    let mut signers_text = if !signers_out.status.success() {
         // One-time self-extinguishing genesis enrollment: `merge_base` must descend from the
         // v2.0.0 genesis SHA, `base_ref` must still lack `config/allowed_human_signers`, and
         // `HEAD:config/allowed_human_signers` must match the pinned SHA-256 digest byte-for-byte.
-        // Without an authenticated human-owner CI enrollment context (or hardware-signed commits
-        // verifying against the newly enrolled keyring below), the verifier remains in strict
-        // 5-file Ring-2 ratchet mode (`Ok(false)`).
         let base_oid = resolve_git_commit_oid(repo_root, base_ref)?;
         let mb_oid = resolve_git_commit_oid(repo_root, merge_base)?;
         let descends_from_v2_genesis = git_cmd(repo_root)
@@ -1082,40 +1203,54 @@ fn check_all_commits_human_hardware_signed(
             .status()
             .is_ok_and(|s| s.success());
         if !(descends_from_v2_genesis && base_lacks_signers) {
-            return Ok(false);
+            String::new()
+        } else {
+            let head_signers = git_cmd(repo_root)
+                .args([
+                    "show",
+                    "--end-of-options",
+                    "HEAD:config/allowed_human_signers",
+                ])
+                .output()
+                .map_err(|e| format!("git show HEAD:config/allowed_human_signers failed: {e}"))?;
+            if !head_signers.status.success()
+                || crate::crypto::sha256_hex(&head_signers.stdout) != RING0_GENESIS_SIGNERS_SHA256
+            {
+                return Ok(false);
+            }
+            let authenticated_ci_owner_enrollment = std::env::var("GITHUB_ACTIONS").as_deref()
+                == Ok("true")
+                && std::env::var("GITHUB_REPOSITORY").as_deref() == Ok("susanbdev/dotagent")
+                && std::env::var("GITHUB_ACTOR").as_deref() == Ok("susanbeasles")
+                && std::env::var("DOTAGENT_GENESIS_ENROLLMENT_PR").as_deref() == Ok("15")
+                && matches!(
+                    std::env::var("DOTAGENT_GENESIS_PR_ASSOC").as_deref(),
+                    Ok("OWNER") | Ok("MEMBER")
+                );
+            if authenticated_ci_owner_enrollment {
+                eprintln!(
+                    "[ring0-ratchet] GENESIS_SIGNER_ENROLLMENT: base {base_oid} has no signer keyring; accepting authenticated human-owner pinned-digest enrollment once."
+                );
+                return Ok(true);
+            }
+            String::from_utf8_lossy(&head_signers.stdout).into_owned()
         }
-        let head_signers = git_cmd(repo_root)
-            .args([
-                "show",
-                "--end-of-options",
-                "HEAD:config/allowed_human_signers",
-            ])
-            .output()
-            .map_err(|e| format!("git show HEAD:config/allowed_human_signers failed: {e}"))?;
-        if !head_signers.status.success()
-            || crate::crypto::sha256_hex(&head_signers.stdout) != RING0_GENESIS_SIGNERS_SHA256
-        {
-            return Ok(false);
-        }
-        let authenticated_ci_owner_enrollment = std::env::var("GITHUB_ACTIONS").as_deref()
-            == Ok("true")
-            && std::env::var("GITHUB_REPOSITORY").as_deref() == Ok("susanbdev/dotagent")
-            && std::env::var("GITHUB_ACTOR").as_deref() == Ok("susanbeasles")
-            && std::env::var("DOTAGENT_GENESIS_ENROLLMENT_PR").as_deref() == Ok("15")
-            && matches!(
-                std::env::var("DOTAGENT_GENESIS_PR_ASSOC").as_deref(),
-                Ok("OWNER") | Ok("MEMBER")
-            );
-        if authenticated_ci_owner_enrollment {
-            eprintln!(
-                "[ring0-ratchet] GENESIS_SIGNER_ENROLLMENT: base {base_oid} has no signer keyring; accepting authenticated human-owner pinned-digest enrollment once."
-            );
-            return Ok(true);
-        }
-        String::from_utf8_lossy(&head_signers.stdout).into_owned()
     } else {
         String::from_utf8_lossy(&signers_out.stdout).into_owned()
     };
+
+    let extra_spec = format!("{merge_base}:scripts/allowed_hardware_signers");
+    if let Ok(extra_out) = git_cmd(repo_root)
+        .args(["show", "--end-of-options", &extra_spec])
+        .output()
+        && extra_out.status.success()
+    {
+        if !signers_text.ends_with('\n') && !signers_text.is_empty() {
+            signers_text.push('\n');
+        }
+        signers_text.push_str(&String::from_utf8_lossy(&extra_out.stdout));
+    }
+
     let has_enrolled_signer = signers_text
         .lines()
         .any(|l| !l.trim().is_empty() && !l.trim().starts_with('#'));
@@ -1492,12 +1627,26 @@ pub fn verify_ring0_ratchet(
     base_ref: &str,
     force_ratchet: bool,
 ) -> Result<RatchetReport, String> {
+    verify_ring0_ratchet_with_authority(repo_root, base_ref, force_ratchet, false)
+}
+
+pub fn verify_ring0_ratchet_with_authority(
+    repo_root: &Path,
+    base_ref: &str,
+    force_ratchet: bool,
+    owner_approved: bool,
+) -> Result<RatchetReport, String> {
     validate_git_ref_arg(base_ref)?;
     let merge_base = resolve_merge_base(repo_root, base_ref)?;
     let diff_summary = collect_working_and_commit_diff(repo_root, &merge_base)?;
 
-    let autonomous_context = is_autonomous_bot_or_loop_context(repo_root, &merge_base);
-    let human_hardware_signed = if force_ratchet || autonomous_context {
+    let explicit_owner_approval = !force_ratchet
+        && !diff_summary.has_uncommitted_or_untracked
+        && std::env::var("DOTAGENT_AUTONOMOUS_LOOP").as_deref() != Ok("1")
+        && owner_approved;
+    let autonomous_context =
+        !explicit_owner_approval && is_autonomous_bot_or_loop_context(repo_root, &merge_base);
+    let ssh_commit_signed = if force_ratchet || autonomous_context || explicit_owner_approval {
         false
     } else {
         check_all_commits_human_hardware_signed(
@@ -1505,8 +1654,10 @@ pub fn verify_ring0_ratchet(
             base_ref,
             &merge_base,
             diff_summary.has_uncommitted_or_untracked,
+            false,
         )?
     };
+    let human_hardware_signed = explicit_owner_approval || ssh_commit_signed;
 
     // Per-commit hardware signatures are NOT required for human/browser-agent PRs; strict 5-file
     // Ring-2 confinement applies strictly to autonomous loop / `[bot]` / `auto/*` / `--require-ratchet` runs.
@@ -1521,15 +1672,16 @@ pub fn verify_ring0_ratchet(
 
     for path in &diff_summary.changed_files {
         verify_no_symlink_along_repo_rel(repo_root, path)?;
-        // Protect enrolled release-tag FIDO2 trust anchors even on non-bot PRs so an agent VM
-        // cannot silently replace or wipe `config/allowed_human_signers`.
+        // Protect enrolled release-tag trust anchors even on non-bot PRs so an agent VM
+        // cannot silently replace or wipe `config/allowed_human_signers` without an enrolled
+        // SSH commit signature or approved human owner PR authority.
         if matches!(
             path.as_str(),
             "config/allowed_human_signers" | "scripts/allowed_hardware_signers"
         ) && !human_hardware_signed
         {
             return Err(format!(
-                "RING0_RATCHET_VIOLATION: UNAUTHENTICATED_SIGNER_KEYRING_MUTATION: modifying trust-anchor '{path}' requires a verified hardware signature from an enrolled signer"
+                "RING0_RATCHET_VIOLATION: UNAUTHENTICATED_SIGNER_KEYRING_MUTATION: modifying trust-anchor '{path}' requires a verified SSH signature from an enrolled signer or approved human owner authority"
             ));
         }
         if enforce_ring0_paths && !is_ring2_allowed_path(path) {
@@ -1791,6 +1943,13 @@ pub fn verify_release_tag_signature(
             "MISSING_RELEASE_SIGNERS: '{signers_spec}' not found on base branch"
         ));
     }
+    let clean_release_signers =
+        sanitize_allowed_signers_for_release_tag(&String::from_utf8_lossy(&signers_out.stdout));
+    if clean_release_signers.trim().is_empty() {
+        return Err(format!(
+            "MISSING_RELEASE_SIGNERS: '{signers_spec}' contains zero active signers"
+        ));
+    }
 
     let scratch = crate::traversal_ledger::state_root_dir().join("ratchet-verify");
     ensure_nonsymlink_state_dir(&scratch)?;
@@ -1817,7 +1976,7 @@ pub fn verify_release_tag_signature(
     };
 
     let verify_res = (|| -> Result<String, String> {
-        write_private(&signers_path, &signers_out.stdout)?;
+        write_private(&signers_path, clean_release_signers.as_bytes())?;
         write_private(&sig_path, sig_pem.as_bytes())?;
 
         let find_out = Command::new("ssh-keygen")
@@ -1926,6 +2085,7 @@ pub fn run_verify_ring0_ratchet_cli(args: &[String], cwd: &Path) -> ExitCode {
     let mut base_ref = String::from("origin/main");
     let mut force_ratchet = false;
     let mut corpus_only = false;
+    let mut owner_approved = false;
     let mut json_mode = false;
     let mut repo_override: Option<String> = None;
     let mut release_tag: Option<String> = None;
@@ -1949,6 +2109,10 @@ pub fn run_verify_ring0_ratchet_cli(args: &[String], cwd: &Path) -> ExitCode {
                 force_ratchet = true;
                 i += 1;
             }
+            "--owner-approved" => {
+                owner_approved = true;
+                i += 1;
+            }
             "--corpus-only" => {
                 corpus_only = true;
                 i += 1;
@@ -1959,7 +2123,7 @@ pub fn run_verify_ring0_ratchet_cli(args: &[String], cwd: &Path) -> ExitCode {
             }
             other => {
                 eprintln!(
-                    "[dotagent verify-ring0-ratchet] unrecognized argument '{other}' (expected --base <ref> [--require-ratchet] [--verify-release-tag <vX.Y.Z>] [--repo <dir>] [--json])"
+                    "[dotagent verify-ring0-ratchet] unrecognized argument '{other}' (expected --base <ref> [--require-ratchet] [--owner-approved] [--verify-release-tag <vX.Y.Z>] [--repo <dir>] [--json])"
                 );
                 return ExitCode::from(2);
             }
@@ -1998,7 +2162,7 @@ pub fn run_verify_ring0_ratchet_cli(args: &[String], cwd: &Path) -> ExitCode {
     let res = if corpus_only {
         verify_corpus_monotonic_only(&target_dir, &base_ref)
     } else {
-        verify_ring0_ratchet(&target_dir, &base_ref, force_ratchet)
+        verify_ring0_ratchet_with_authority(&target_dir, &base_ref, force_ratchet, owner_approved)
     };
 
     match res {
@@ -2007,7 +2171,7 @@ pub fn run_verify_ring0_ratchet_cli(args: &[String], cwd: &Path) -> ExitCode {
                 println!("{}", report.to_json_value().to_json_string());
             } else {
                 println!(
-                    "[RING0 RATCHET OK] base='{}' merge_base='{}' hw_signed={} enforce_ring0={} changed={} corpus={} (+{} new vectors)",
+                    "[RING0 RATCHET OK] base='{}' merge_base='{}' ssh_signed={} enforce_ring0={} changed={} corpus={} (+{} new vectors)",
                     report.base_ref,
                     &report.merge_base[..report.merge_base.len().min(12)],
                     report.human_hardware_signed,
@@ -2086,5 +2250,53 @@ vectors = [
         assert!(!is_ring2_allowed_path(
             "crates/agent-guard/tests/other_arbitrary_test.rs"
         ));
+    }
+
+    #[test]
+    fn commit_verify_injects_no_touch_while_release_tag_strips_it() {
+        let raw = r#"
+# comment
+owner@susanb.dev namespaces="git" sk-ssh-ed25519@openssh.com AAAAGnNrLXNzaC1lZDI1NTE5QG9wZW5zc2guY29tAAAAIONErNAQxLFUrTlkW6aphr1CYrio2kjFDCAGaZAW15GeAAAAE3NzaDpnaXRodWItcGVyc29uYWw=
+owner2@susanb.dev namespaces="git",no-touch-required sk-ecdsa-sha2-nistp256@openssh.com AAAAInNrLWVjZHNhLXNoYTItbmlzdHAyNTZAb3BlbnNzaC5jb20=
+bare@susanb.dev sk-ssh-ed25519@openssh.com AAAAGnNrLXNzaC1lZDI1NTE5QG9wZW5zc2guY29tAAAAIONErNAQxLFUrTlkW6aphr1CYrio2kjFDCAGaZAW15GeAAAAE3NzaDpnaXRodWItcGVyc29uYWw=
+onlyopt@susanb.dev no-touch-required sk-ssh-ed25519@openssh.com AAAAGnNrLXNzaC1lZDI1NTE5QG9wZW5zc2guY29tAAAAIONErNAQxLFUrTlkW6aphr1CYrio2kjFDCAGaZAW15GeAAAAE3NzaDpnaXRodWItcGVyc29uYWw=
+std@susanb.dev namespaces="git",no-touch-required ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAID000000000000000000000000000000000000000000
+"#;
+        let commit_fmt = prepare_allowed_signers_for_commit_verify(raw);
+        let commit_lines: Vec<&str> = commit_fmt.lines().collect();
+        assert_eq!(commit_lines.len(), 5);
+        assert!(
+            commit_lines[0]
+                .contains("namespaces=\"git\",no-touch-required sk-ssh-ed25519@openssh.com")
+        );
+        assert!(
+            commit_lines[1].contains(
+                "namespaces=\"git\",no-touch-required sk-ecdsa-sha2-nistp256@openssh.com"
+            )
+        );
+        assert!(
+            commit_lines[2]
+                .starts_with("bare@susanb.dev no-touch-required sk-ssh-ed25519@openssh.com ")
+        );
+        assert!(
+            commit_lines[3]
+                .starts_with("onlyopt@susanb.dev no-touch-required sk-ssh-ed25519@openssh.com ")
+        );
+        assert!(commit_lines[4].starts_with("std@susanb.dev namespaces=\"git\" ssh-ed25519 "));
+
+        let release_fmt = sanitize_allowed_signers_for_release_tag(raw);
+        assert!(!release_fmt.contains("no-touch-required"));
+        let rel_lines: Vec<&str> = release_fmt.lines().collect();
+        assert_eq!(rel_lines.len(), 5);
+        assert!(
+            rel_lines[0]
+                .starts_with("owner@susanb.dev namespaces=\"git\" sk-ssh-ed25519@openssh.com ")
+        );
+        assert!(rel_lines[1].starts_with(
+            "owner2@susanb.dev namespaces=\"git\" sk-ecdsa-sha2-nistp256@openssh.com "
+        ));
+        assert!(rel_lines[2].starts_with("bare@susanb.dev sk-ssh-ed25519@openssh.com "));
+        assert!(rel_lines[3].starts_with("onlyopt@susanb.dev sk-ssh-ed25519@openssh.com "));
+        assert!(rel_lines[4].starts_with("std@susanb.dev namespaces=\"git\" ssh-ed25519 "));
     }
 }

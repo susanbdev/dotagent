@@ -115,7 +115,7 @@ fn review_regressions_sshsig_app_quorum_binding_and_repo_local_bin_blocks() {
         verify_fido2_sshsig_ed25519("dotagent-operator", b"chal", &foreign_pem, &[pk]).is_err(),
         "foreign FIDO2 RP application must be rejected"
     );
-    let valid_pem = build_sk_sshsig_pem(&sk, b"ssh:", "dotagent-operator", b"chal", 0x01);
+    let valid_pem = build_sk_sshsig_pem(&sk, b"ssh:", "dotagent-operator", b"chal", 0x00);
     assert_eq!(
         verify_fido2_sshsig_ed25519("dotagent-operator", b"chal", &valid_pem, &[pk]).expect("ok"),
         7
