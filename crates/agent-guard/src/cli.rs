@@ -8,6 +8,7 @@ use crate::budget_guard::{
     MAX_SLICED_FILE_BYTES, estimate_bpe_tokens, inspect_file_on_disk_hygiene,
 };
 use crate::cmd_policy::evaluate_shell_command;
+use crate::diagnostics::format_denial;
 use crate::injection_scan::scan_untrusted_content;
 use crate::json::JsonValue;
 use crate::path_policy::{PathAccess, validate_path};
@@ -715,33 +716,7 @@ fn emit_hook_decision(decision: Decision, phase: HookPhase) -> ExitCode {
 
 fn emit_hook_denial(code: &str, reason: &str, halt_session: bool) -> ExitCode {
     let is_sanitized_replacement = code == "NON_ASCII_SANITIZED_PREBUFFER";
-    let is_recoverable_bound = !halt_session
-        && matches!(
-            code,
-            "FILE_BYTE_BUDGET_EXCEEDED"
-                | "FILE_BYTE_CAP_EXCEEDED"
-                | "LINE_COUNT_BUDGET_EXCEEDED"
-                | "SLICE_LINE_CAP_EXCEEDED"
-                | "TOKEN_ESTIMATE_EXCEEDED"
-                | "TURN_TOKEN_BUDGET_EXCEEDED"
-                | "TURN_READ_COUNT_EXCEEDED"
-                | "TURN_TOOL_CALL_LIMIT_EXCEEDED"
-                | "UNBOUNDED_GIT_LOG"
-                | "MAX_DEPTH_EXCEEDED"
-        );
-    let full_msg = if is_sanitized_replacement {
-        format!(
-            "[AGENT-GUARD PRE-BUFFER ASCII SANITIZER :: {code}] Untrusted input/output contained non-ASCII bytes or escape triggers and was neutered prior to entering your context buffer. Use ONLY the clean 7-bit ASCII payload below (do NOT re-read raw):\n{reason}"
-        )
-    } else if is_recoverable_bound {
-        format!(
-            "[AGENT-GUARD BOUND GUIDANCE :: {code}] {reason} -- Adjust the call to stay within micro-window bounds (e.g. `offset`/`limit <= 150`, `--max-depth 2`, `git log -n 20`) or compact step context."
-        )
-    } else {
-        format!(
-            "[AGENT-GUARD HARD DENY :: {code}] {reason} -- STOP IMMEDIATELY. Do NOT attempt workarounds, alternate tools, or encodings. Report this block verbatim to the user."
-        )
-    };
+    let full_msg = format_denial(code, reason, halt_session);
     eprintln!("{full_msg}");
 
     let mut hook_specific = vec![
@@ -781,8 +756,12 @@ fn emit_cli_decision(decision: Decision) -> ExitCode {
             println!("ALLOW");
             ExitCode::SUCCESS
         }
-        Decision::Deny { code, reason, .. } => {
-            eprintln!("[AGENT-GUARD HARD DENY :: {code}] {reason}");
+        Decision::Deny {
+            code,
+            reason,
+            halt_session,
+        } => {
+            eprintln!("{}", format_denial(code, &reason, halt_session));
             ExitCode::from(2)
         }
     }

@@ -36,6 +36,23 @@ fn agent_guard_bin() -> PathBuf {
     p
 }
 
+/// Runs `cmd`, retrying only on `ETXTBSY` (os error 26). Exec of a freshly copied binary can
+/// race a concurrent `fork` in another test thread that still holds the copy's write fd.
+fn retry_output_on_etxtbsy(cmd: &mut Command) -> std::io::Result<std::process::Output> {
+    const ATTEMPTS: u32 = 5;
+    const BACKOFF: std::time::Duration = std::time::Duration::from_millis(15);
+    let mut attempt = 1;
+    loop {
+        match cmd.output() {
+            Err(e) if e.raw_os_error() == Some(26) && attempt < ATTEMPTS => {
+                attempt += 1;
+                std::thread::sleep(BACKOFF);
+            }
+            other => return other,
+        }
+    }
+}
+
 #[test]
 fn end_to_end_swarm_tool_role_delegation_and_fail_closed_on_stop_cli() {
     let dir = workspace_root()
@@ -942,7 +959,8 @@ fn pr6_cli_capabilities_packet_provenance_and_landlock_vault_coordinator_e2e() {
         fs::set_permissions(&fake_ag, fs::Permissions::from_mode(0o755)).unwrap();
         fs::set_permissions(&fake_home_dir, fs::Permissions::from_mode(0o755)).unwrap();
     }
-    let home_hijack = Command::new(&isolated_swarm_tool)
+    let mut hijack_cmd = Command::new(&isolated_swarm_tool);
+    hijack_cmd
         .args([
             "grunt",
             "checkpoint-green",
@@ -958,9 +976,8 @@ fn pr6_cli_capabilities_packet_provenance_and_landlock_vault_coordinator_e2e() {
         ])
         .current_dir(&repo)
         .env("AGENT_GUARD_STATE_DIR", &state)
-        .env("HOME", dir.join("fake_home"))
-        .output()
-        .unwrap();
+        .env("HOME", dir.join("fake_home"));
+    let home_hijack = retry_output_on_etxtbsy(&mut hijack_cmd).unwrap();
     assert_eq!(home_hijack.status.code(), Some(2));
     let hijack_stderr = String::from_utf8_lossy(&home_hijack.stderr);
     assert!(

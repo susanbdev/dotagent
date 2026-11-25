@@ -825,3 +825,83 @@ pub fn run_explain_cli(args: &[String]) -> ExitCode {
     }
     ExitCode::SUCCESS
 }
+
+/// Denial codes that are recoverable by narrowing the call (budget and window bounds).
+fn is_recoverable_bound(code: &str) -> bool {
+    matches!(
+        code,
+        "FILE_BYTE_BUDGET_EXCEEDED"
+            | "FILE_BYTE_CAP_EXCEEDED"
+            | "LINE_COUNT_BUDGET_EXCEEDED"
+            | "SLICE_LINE_CAP_EXCEEDED"
+            | "TOKEN_ESTIMATE_EXCEEDED"
+            | "TURN_TOKEN_BUDGET_EXCEEDED"
+            | "TURN_READ_COUNT_EXCEEDED"
+            | "TURN_TOOL_CALL_LIMIT_EXCEEDED"
+            | "UNBOUNDED_GIT_LOG"
+            | "MAX_DEPTH_EXCEEDED"
+    )
+}
+
+/// Single source of truth for the `[AGENT-GUARD <KIND> :: <code>]` label so every hook, CLI,
+/// and adapter path emits the same shortened denial text and cannot drift.
+fn denial_label(code: &str, halt_session: bool) -> &'static str {
+    if code == "NON_ASCII_SANITIZED_PREBUFFER" {
+        "PRE-BUFFER ASCII SANITIZER"
+    } else if !halt_session && is_recoverable_bound(code) {
+        "BOUND GUIDANCE"
+    } else {
+        "HARD DENY"
+    }
+}
+
+/// Formats the full model-facing denial message.
+pub fn format_denial(code: &str, reason: &str, halt_session: bool) -> String {
+    let label = denial_label(code, halt_session);
+    match label {
+        "PRE-BUFFER ASCII SANITIZER" => format!(
+            "[AGENT-GUARD {label} :: {code}] Input neutered to 7-bit ASCII; use only this payload (do not re-read raw):\n{reason}"
+        ),
+        "BOUND GUIDANCE" => format!(
+            "[AGENT-GUARD {label} :: {code}] {reason} -- Narrow the call or compact step context."
+        ),
+        _ => format!(
+            "[AGENT-GUARD {label} :: {code}] {reason} -- STOP; no workarounds; report to user."
+        ),
+    }
+}
+
+/// Reason-free label for channels where the full message is already delivered elsewhere.
+pub fn format_denial_tag(code: &str, halt_session: bool) -> String {
+    format!(
+        "[AGENT-GUARD {} :: {code}]",
+        denial_label(code, halt_session)
+    )
+}
+
+#[cfg(test)]
+mod denial_format_tests {
+    use super::*;
+
+    #[test]
+    fn denial_kinds_use_shared_shortened_text() {
+        let hard = format_denial("FORBIDDEN_DIRECTORY_ACCESS", "r", true);
+        assert_eq!(
+            hard,
+            "[AGENT-GUARD HARD DENY :: FORBIDDEN_DIRECTORY_ACCESS] r -- STOP; no workarounds; report to user."
+        );
+        let bound = format_denial("SLICE_LINE_CAP_EXCEEDED", "r", false);
+        assert!(bound.starts_with("[AGENT-GUARD BOUND GUIDANCE :: SLICE_LINE_CAP_EXCEEDED] r"));
+        assert!(bound.ends_with("Narrow the call or compact step context."));
+        // halt_session promotes a bound code to a hard deny.
+        assert!(format_denial("SLICE_LINE_CAP_EXCEEDED", "r", true).contains("HARD DENY"));
+        assert!(
+            format_denial("NON_ASCII_SANITIZED_PREBUFFER", "p", false)
+                .starts_with("[AGENT-GUARD PRE-BUFFER ASCII SANITIZER ::")
+        );
+        assert_eq!(
+            format_denial_tag("MAX_DEPTH_EXCEEDED", false),
+            "[AGENT-GUARD BOUND GUIDANCE :: MAX_DEPTH_EXCEEDED]"
+        );
+    }
+}
