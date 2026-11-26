@@ -30,6 +30,7 @@ use std::process::ExitCode;
 
 use crate::budget_guard::{STEP_SOFT_COMPACT_TOKENS, load_active_profile};
 use crate::cmd_policy::{inspect_repo_build_config_traps, inspect_repo_git_config_and_hooks};
+use crate::diagnostics::{format_denial, format_denial_tag};
 use crate::json::JsonValue;
 use crate::path_policy::{PathAccess, lexical_normalize, validate_path};
 use crate::repo_audit::audit_github_workflows;
@@ -151,7 +152,12 @@ impl AdapterRejection {
     }
 
     fn formatted(&self) -> String {
-        format!("[AGENT-GUARD HARD DENY :: {}] {}", self.code, self.reason)
+        format_denial(self.code, &self.reason, true)
+    }
+
+    /// Reason-free form for stderr when stdout JSON already carries the full reason.
+    fn tag(&self) -> String {
+        format_denial_tag(self.code, true)
     }
 }
 
@@ -583,11 +589,21 @@ fn reject_for_event(event: AntigravityEvent, rej: &AdapterRejection) -> Antigrav
         .to_json_string(),
     };
 
+    let stdout_has_reason = !matches!(
+        event,
+        AntigravityEvent::PostToolUse | AntigravityEvent::Stop
+    );
+    let stderr_diagnostic = if stdout_has_reason {
+        rej.tag()
+    } else {
+        formatted
+    };
+
     AntigravityOutcome {
         event: Some(event),
         enforcement: Some(event.enforcement_class()),
         stdout_json: Some(stdout_json),
-        stderr_diagnostic: Some(formatted),
+        stderr_diagnostic: Some(stderr_diagnostic),
         exit_code: 0,
     }
 }
@@ -1339,50 +1355,21 @@ fn format_pre_tool_outcome(decision: Decision, original_args: &JsonValue) -> Ant
             reason,
             halt_session,
         } => {
-            let msg = format_denial_reason(code, &reason, halt_session);
+            let msg = format_denial(code, &reason, halt_session);
             let out = JsonValue::Object(vec![
                 ("decision".to_string(), JsonValue::Str("deny".to_string())),
-                ("reason".to_string(), JsonValue::Str(msg.clone())),
+                ("reason".to_string(), JsonValue::Str(msg)),
             ])
             .to_json_string();
             AntigravityOutcome {
                 event: Some(AntigravityEvent::PreToolUse),
                 enforcement: Some(EventEnforcementClass::ToolGate),
                 stdout_json: Some(out),
-                stderr_diagnostic: Some(msg),
+                // Exit 0: the host parses the stdout JSON, so stderr carries only the label.
+                stderr_diagnostic: Some(format_denial_tag(code, halt_session)),
                 exit_code: 0,
             }
         }
-    }
-}
-
-fn format_denial_reason(code: &str, reason: &str, halt_session: bool) -> String {
-    if code == "NON_ASCII_SANITIZED_PREBUFFER" {
-        format!(
-            "[AGENT-GUARD PRE-BUFFER ASCII SANITIZER :: {code}] Untrusted file contained non-ASCII bytes or escape triggers and was neutered prior to entering your context buffer. Use ONLY the clean 7-bit ASCII payload below (do NOT re-read raw):\n{reason}"
-        )
-    } else if !halt_session
-        && matches!(
-            code,
-            "FILE_BYTE_BUDGET_EXCEEDED"
-                | "FILE_BYTE_CAP_EXCEEDED"
-                | "LINE_COUNT_BUDGET_EXCEEDED"
-                | "SLICE_LINE_CAP_EXCEEDED"
-                | "TOKEN_ESTIMATE_EXCEEDED"
-                | "TURN_TOKEN_BUDGET_EXCEEDED"
-                | "TURN_READ_COUNT_EXCEEDED"
-                | "TURN_TOOL_CALL_LIMIT_EXCEEDED"
-                | "UNBOUNDED_GIT_LOG"
-                | "MAX_DEPTH_EXCEEDED"
-        )
-    {
-        format!(
-            "[AGENT-GUARD BOUND GUIDANCE :: {code}] {reason} -- Adjust the call to stay within micro-window bounds (e.g. StartLine/EndLine <= 150 lines, --max-depth 2, git log -n 20) or compact step context."
-        )
-    } else {
-        format!(
-            "[AGENT-GUARD HARD DENY :: {code}] {reason} -- STOP IMMEDIATELY. Do NOT attempt workarounds, alternate tools, or encodings. Report this block verbatim to the user."
-        )
     }
 }
 
